@@ -1,0 +1,127 @@
+name: Feature
+description: Nova funcionalidade verificavel
+title: "feat(<modulo>): "
+labels:
+  - type:feature
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use este template para funcionalidades pequenas e verificaveis.
+
+        Regras do projeto:
+        - `main` e reservada para release funcional final.
+        - `dev` e a branch de integracao.
+        - Crie uma branch por issue.
+        - PRs devem ser pequenos e apontar para `dev`, exceto release final.
+        - Use Conventional Commits.
+  - type: textarea
+    id: contexto
+    attributes:
+      label: Contexto
+      description: Explique por que esta funcionalidade existe.
+      placeholder: "Ex.: O host precisa expor uma configuracao persistente para..."
+    validations:
+      required: true
+  - type: textarea
+    id: objetivo
+    attributes:
+      label: Objetivo
+      description: Descreva a entrega verificavel esperada.
+      placeholder: "Ao final desta issue, deve ser possivel..."
+    validations:
+      required: true
+  - type: dropdown
+    id: modulo
+    attributes:
+      label: Modulo afetado
+      multiple: true
+      options:
+        - lumabridge-protocol
+        - lumabridge-idd-driver
+        - lumabridge-host
+        - lumabridge-client
+        - lumabridge-tools
+        - docs
+        - .github
+    validations:
+      required: true
+  - type: textarea
+    id: escopo
+    attributes:
+      label: Escopo
+      description: Liste o que deve ser incluido.
+      placeholder: |
+        - Item 1
+        - Item 2
+        - Item 3
+    validations:
+      required: true
+  - type: textarea
+    id: fora_do_escopo
+    attributes:
+      label: Fora do escopo
+      description: Liste o que nao deve ser feito nesta issue.
+      placeholder: |
+        - Nao implementar UI sofisticada.
+        - Nao alterar outros modulos.
+    validations:
+      required: true
+  - type: textarea
+    id: criterios
+    attributes:
+      label: Criterios de aceite
+      description: Use criterios objetivos e verificaveis.
+      placeholder: |
+        - [ ] Criterio verificavel 1
+        - [ ] Criterio verificavel 2
+        - [ ] Criterio verificavel 3
+    validations:
+      required: true
+  - type: textarea
+    id: testes
+    attributes:
+      label: Testes esperados
+      description: Informe testes automatizados, manuais ou justificativa se nao aplicavel.
+      placeholder: |
+        - [ ] Teste unitario, se aplicavel
+        - [ ] Teste de integracao, se aplicavel
+        - [ ] Teste manual, se aplicavel
+    validations:
+      required: true
+  - type: textarea
+    id: documentacao
+    attributes:
+      label: Documentacao
+      description: Informe documentacao que deve ser criada ou atualizada.
+      placeholder: |
+        - [ ] README/guia atualizado
+        - [ ] ADR atualizada, se alterar arquitetura
+    validations:
+      required: false
+  - type: textarea
+    id: riscos
+    attributes:
+      label: Riscos
+      description: Liste riscos tecnicos, operacionais ou de seguranca.
+      placeholder: |
+        - Risco:
+        - Mitigacao:
+    validations:
+      required: true
+  - type: textarea
+    id: dependencias
+    attributes:
+      label: Dependencias
+      description: Liste issues, decisoes ou ambientes necessarios.
+      placeholder: "Depende de #..."
+    validations:
+      required: false
+  - type: input
+    id: branch
+    attributes:
+      label: Branch sugerida
+      description: Use o padrao do projeto, como feature/<nome-curto>.
+      placeholder: "feature/<nome-curto>"
+    validations:
+      required: true

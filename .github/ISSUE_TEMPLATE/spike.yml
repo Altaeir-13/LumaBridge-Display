@@ -1,0 +1,109 @@
+name: Spike tecnico
+description: Investigacao tecnica com saida documentada
+title: "spike(<modulo>): "
+labels:
+  - type:spike
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use este template para investigacoes tecnicas com resultado documentado.
+
+        Um spike nao e implementacao final. Ele deve responder uma pergunta tecnica, produzir evidencias e orientar uma decisao futura.
+  - type: textarea
+    id: contexto
+    attributes:
+      label: Contexto
+      description: Explique por que este spike e necessario.
+      placeholder: "Ex.: O transporte LAN precisa ser validado antes da integracao..."
+    validations:
+      required: true
+  - type: textarea
+    id: pergunta
+    attributes:
+      label: Pergunta tecnica a responder
+      description: Formule a pergunta que o spike deve responder.
+      placeholder: "Ex.: UDP/RTP atende a latencia alvo em LAN para payload sintetico?"
+    validations:
+      required: true
+  - type: textarea
+    id: hipotese
+    attributes:
+      label: Hipotese
+      description: Declare a hipotese que sera testada.
+      placeholder: "A hipotese e que..."
+    validations:
+      required: true
+  - type: textarea
+    id: escopo
+    attributes:
+      label: Escopo
+      description: Liste atividades permitidas no spike.
+      placeholder: |
+        - Criar prova tecnica isolada
+        - Registrar logs e metricas
+        - Documentar resultado
+    validations:
+      required: true
+  - type: textarea
+    id: fora_do_escopo
+    attributes:
+      label: Fora do escopo
+      description: Reforce que o spike nao deve virar entrega final.
+      placeholder: |
+        - Nao integrar ao produto final
+        - Nao criar UI final
+        - Nao misturar modulos nao relacionados
+    validations:
+      required: true
+  - type: textarea
+    id: criterios_saida
+    attributes:
+      label: Criterios de saida
+      description: Defina como saberemos que o spike respondeu a pergunta.
+      placeholder: |
+        - [ ] Evidencia coletada
+        - [ ] Limitacoes documentadas
+        - [ ] Recomendacao registrada
+    validations:
+      required: true
+  - type: textarea
+    id: evidencias
+    attributes:
+      label: Evidencias esperadas
+      description: Liste logs, metricas, screenshots ou notas tecnicas esperadas.
+      placeholder: |
+        - Logs
+        - Medicoes
+        - Screenshots
+        - Documento de conclusao
+    validations:
+      required: true
+  - type: textarea
+    id: riscos
+    attributes:
+      label: Riscos
+      description: Liste riscos do spike e cuidado com interpretacao dos resultados.
+      placeholder: |
+        - Risco:
+        - Mitigacao:
+    validations:
+      required: true
+  - type: textarea
+    id: decisao
+    attributes:
+      label: Decisao esperada
+      description: Informe qual decisao o spike deve destravar.
+      placeholder: "Este spike deve decidir se..."
+    validations:
+      required: true
+  - type: textarea
+    id: documentacao
+    attributes:
+      label: Documentacao
+      description: Informe onde o resultado deve ser registrado.
+      placeholder: |
+        - [ ] Nota de spike em docs/
+        - [ ] ADR, se a decisao afetar arquitetura
+    validations:
+      required: true
