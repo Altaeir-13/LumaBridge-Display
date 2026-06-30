@@ -1,0 +1,83 @@
+name: Documentacao
+description: Documentacao, ADRs, guias ou planejamento
+title: "docs: "
+labels:
+  - type:docs
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use este template para documentacao, ADRs, guias, planejamento e governanca.
+  - type: textarea
+    id: contexto
+    attributes:
+      label: Contexto
+      description: Explique por que esta documentacao e necessaria.
+      placeholder: "Contexto..."
+    validations:
+      required: true
+  - type: textarea
+    id: objetivo
+    attributes:
+      label: Objetivo
+      description: Descreva o resultado documental esperado.
+      placeholder: "O objetivo e..."
+    validations:
+      required: true
+  - type: textarea
+    id: documentos
+    attributes:
+      label: Documentos afetados
+      description: Liste documentos existentes ou novos documentos previstos.
+      placeholder: |
+        - docs/...
+        - README.md
+    validations:
+      required: true
+  - type: textarea
+    id: escopo
+    attributes:
+      label: Escopo
+      description: Liste o que deve ser documentado.
+      placeholder: |
+        - Item 1
+        - Item 2
+    validations:
+      required: true
+  - type: textarea
+    id: fora_do_escopo
+    attributes:
+      label: Fora do escopo
+      description: Liste o que nao deve ser alterado nesta issue.
+      placeholder: |
+        - Nao implementar codigo funcional
+        - Nao alterar workflows
+    validations:
+      required: true
+  - type: textarea
+    id: criterios
+    attributes:
+      label: Criterios de aceite
+      description: Defina criterios objetivos para concluir a documentacao.
+      placeholder: |
+        - [ ] Documento criado/atualizado
+        - [ ] Conteudo revisado
+        - [ ] Links e referencias conferidos
+    validations:
+      required: true
+  - type: textarea
+    id: revisao
+    attributes:
+      label: Revisao esperada
+      description: Informe quem ou que tipo de revisao e esperada.
+      placeholder: "Revisao tecnica, produto, seguranca, performance..."
+    validations:
+      required: false
+  - type: textarea
+    id: relacao
+    attributes:
+      label: Relacao com modulos/issues
+      description: Relacione modulos, milestones ou issues relevantes.
+      placeholder: "Relacionado a #..."
+    validations:
+      required: false

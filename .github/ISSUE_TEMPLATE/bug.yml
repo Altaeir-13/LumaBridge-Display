@@ -1,0 +1,114 @@
+name: Bug
+description: Comportamento incorreto ou regressao
+title: "fix(<modulo>): "
+labels:
+  - type:bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use este template para comportamento incorreto, regressao ou falha reproduzivel.
+  - type: textarea
+    id: descricao
+    attributes:
+      label: Descricao do problema
+      description: Resuma o problema observado.
+      placeholder: "Descreva o problema..."
+    validations:
+      required: true
+  - type: textarea
+    id: esperado
+    attributes:
+      label: Comportamento esperado
+      description: O que deveria acontecer?
+      placeholder: "O esperado e..."
+    validations:
+      required: true
+  - type: textarea
+    id: atual
+    attributes:
+      label: Comportamento atual
+      description: O que acontece de fato?
+      placeholder: "Atualmente..."
+    validations:
+      required: true
+  - type: textarea
+    id: reproduzir
+    attributes:
+      label: Passos para reproduzir
+      description: Liste passos claros e ordenados.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: ambiente
+    attributes:
+      label: Ambiente
+      description: Informe OS, hardware, drivers, versao, branch e configuracao relevante.
+      placeholder: |
+        - Host:
+        - Cliente:
+        - GPU/driver:
+        - Branch/commit:
+    validations:
+      required: true
+  - type: textarea
+    id: evidencias
+    attributes:
+      label: Logs/evidencias
+      description: Cole logs, screenshots ou metricas relevantes. Nao inclua segredos.
+      placeholder: |
+        ```txt
+        [HOST][ERROR] ...
+        ```
+    validations:
+      required: false
+  - type: dropdown
+    id: impacto
+    attributes:
+      label: Impacto
+      options:
+        - Bloqueia MVP
+        - Quebra funcionalidade principal
+        - Degrada desempenho/latencia
+        - Afeta diagnostico/documentacao
+        - Baixo impacto
+    validations:
+      required: true
+  - type: dropdown
+    id: modulo
+    attributes:
+      label: Modulo afetado
+      multiple: true
+      options:
+        - lumabridge-protocol
+        - lumabridge-idd-driver
+        - lumabridge-host
+        - lumabridge-client
+        - lumabridge-tools
+        - docs
+        - .github
+    validations:
+      required: true
+  - type: textarea
+    id: causa
+    attributes:
+      label: Possivel causa
+      description: Se houver suspeita, descreva. Caso contrario, informe que ainda e desconhecida.
+      placeholder: "Possivel causa..."
+    validations:
+      required: false
+  - type: textarea
+    id: criterios
+    attributes:
+      label: Criterios de aceite
+      description: Como confirmar que o bug foi corrigido?
+      placeholder: |
+        - [ ] Caso reproduzido antes da correcao
+        - [ ] Correcao validada
+        - [ ] Teste/regressao adicionado, se aplicavel
+    validations:
+      required: true
