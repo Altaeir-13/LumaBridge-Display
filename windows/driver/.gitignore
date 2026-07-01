@@ -1,0 +1,17 @@
+.vs/
+x64/
+Debug/
+Release/
+*.obj
+*.pdb
+*.dll
+*.exp
+*.lib
+*.log
+*.tlog
+*.lastbuildstate
+*.recipe
+*.cat
+*.cer
+*.inf_loc
+*.vcxproj.user
