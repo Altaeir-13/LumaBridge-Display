@@ -1,0 +1,45 @@
+[Version]
+Signature="$WINDOWS NT$"
+Class=Display
+ClassGuid={4d36e968-e325-11ce-bfc1-08002be10318}
+Provider=%ManufacturerName%
+DriverVer=07/01/2026,0.0.1.0
+CatalogFile=LumaBridgeIddDriver.cat
+PnpLockdown=1
+
+[Manufacturer]
+%ManufacturerName%=Standard,NTamd64
+
+[Standard.NTamd64]
+%LumaBridgeDeviceName%=LumaBridge_Install, Root\LumaBridgeIddDriver
+
+[LumaBridge_Install.NT]
+CopyFiles=UMDriverCopy
+
+[LumaBridge_Install.NT.Services]
+AddService=WUDFRd,0x000001fa,WUDFRD_ServiceInstall
+
+[LumaBridge_Install.NT.Wdf]
+UmdfService=LumaBridgeIddDriver,LumaBridge_UMDF_Service
+
+[LumaBridge_UMDF_Service]
+UmdfLibraryVersion=2.35.0
+ServiceBinary=%13%\LumaBridgeIddDriver.dll
+
+[WUDFRD_ServiceInstall]
+DisplayName=%WUDFRDDisplayName%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%12%\WUDFRd.sys
+
+[DestinationDirs]
+UMDriverCopy=13
+
+[UMDriverCopy]
+LumaBridgeIddDriver.dll
+
+[Strings]
+ManufacturerName="LumaBridge"
+LumaBridgeDeviceName="LumaBridge IDD Driver Build Foundation"
+WUDFRDDisplayName="Windows Driver Foundation - User-mode Driver Framework Reflector"

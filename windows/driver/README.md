@@ -1,144 +1,134 @@
-# LumaBridge IDD Driver Scaffold
+# LumaBridge IDD Driver
 
 ## Objetivo do modulo
 
-`windows/driver` sera o modulo responsavel pelo futuro driver de monitor virtual do LumaBridge Display no Windows.
+`windows/driver` e o modulo reservado para o futuro driver de monitor virtual do LumaBridge Display no Windows.
 
-O objetivo tecnico do modulo e permitir que o Windows reconheca um monitor virtual real, usando o modelo oficial de Indirect Display Driver. Este scaffold cria apenas o ponto documental inicial do modulo. Ele nao cria driver funcional, nao registra adaptador, nao enumera monitor e nao processa frames.
+Nesta etapa, o modulo contem uma fundacao minima compilavel com WDK/UMDF/IddCx. Ela valida a estrutura de build do driver, mas nao cria monitor virtual funcional.
 
-## Relacao com IddCx
+## Escopo atual
 
-IddCx, ou Indirect Display Driver Class Extension, e a extensao de classe usada por drivers de display indireto no Windows.
+Incluido agora:
 
-No LumaBridge Display, IddCx deve orientar a implementacao futura para:
+- solucao Visual Studio/MSBuild;
+- projeto WDK UMDF x64;
+- entrada `DriverEntry` minima;
+- chamada minima a `WdfDriverCreate`;
+- callback `LumaBridgeEvtDeviceAdd` como stub;
+- include de `wdf.h` e `IddCx.h`;
+- INF minimo de desenvolvimento;
+- `.gitignore` local para artefatos de build.
 
-- registrar um adaptador de display indireto;
-- expor um monitor virtual ao Windows;
-- declarar modos de video iniciais;
-- receber callbacks do sistema operacional;
-- receber uma swapchain em etapa futura;
-- manter a responsabilidade de driver separada de host, protocolo, streaming e NVENC.
+Nao incluido:
 
-O Microsoft IddSample pode ser usado como referencia conceitual para estrutura e fluxo do driver, mas nenhum codigo foi copiado neste scaffold.
-
-## Relacao com WDK
-
-O driver futuro deve ser construido com Visual Studio/Build Tools, MSVC, Windows SDK e Windows Driver Kit alinhados.
-
-O ambiente validado na preparacao da issue #12 usa:
-
-- Visual Studio Build Tools 18.x / VS2026.
-- MSVC `14.51.36231`.
-- Windows SDK ativo `10.0.28000.0`.
-- WDK/ferramentas e headers da familia `10.0.28000.0`.
-- `IddCx.h` disponivel no Windows Kits.
-- `Wdf.h` disponivel no Windows Kits.
-- `stampinf.exe` disponivel no Developer Command Prompt.
-- `Inf2Cat.exe` disponivel por caminho completo no Windows Kits.
-
-Detalhes do ambiente estao documentados em `docs/setup/windows-wdk-environment.md`.
-
-## Escopo atual do scaffold
-
-Este scaffold inclui somente:
-
-- a pasta `windows/driver`;
-- este `README.md`;
-- documentacao do spike em `docs/spikes/windows-idd-driver-scaffold.md`.
-
-Foi avaliado que ainda nao e tecnicamente seguro criar arquivos `.vcxproj`, `.sln`, `.inf`, `.cpp`, `.h`, `.props` ou `.targets` nesta etapa, porque isso sugeriria um projeto de driver compilavel sem uma fundacao minima de codigo, INF e configuracao WDK revisada.
-
-## Fora do escopo
-
-Este scaffold nao inclui:
-
-- driver funcional;
+- inicializacao de IddCx;
+- criacao de adapter;
 - criacao de monitor virtual;
-- enumeracao de adaptador;
+- modos de video;
 - processamento de swapchain;
-- instalacao ou remocao de driver;
-- modo de teste do Windows;
+- instalacao de driver;
 - assinatura de driver;
-- host Windows;
-- client Linux;
-- protocolo;
-- streaming;
-- NVENC;
-- instalador;
-- codigo copiado do IddSample.
+- host, client, protocolo, streaming ou NVENC.
 
-## Estrutura planejada
-
-Estrutura futura esperada, ainda nao criada neste spike:
+## Estrutura
 
 ```text
 windows/
   driver/
+    .gitignore
     README.md
     LumaBridgeIddDriver.sln
     LumaBridgeIddDriver/
       LumaBridgeIddDriver.vcxproj
+      LumaBridgeIddDriver.vcxproj.filters
       Driver.cpp
       Driver.h
-      Adapter.cpp
-      Adapter.h
-      Monitor.cpp
-      Monitor.h
-      SwapChainProcessor.cpp
-      SwapChainProcessor.h
-      Trace.h
       LumaBridgeIddDriver.inf
-      LumaBridgeIddDriver.idl
-    tests/
-      README.md
 ```
 
-Responsabilidades planejadas:
+## Requisitos
 
-- `Driver.*`: entrada UMDF, inicializacao e ciclo de vida do driver.
-- `Adapter.*`: adaptador indireto e callbacks IddCx de adaptador.
-- `Monitor.*`: monitor virtual, modos expostos e estado de conexao.
-- `SwapChainProcessor.*`: recebimento e processamento inicial de swapchain em etapa futura.
-- `Trace.h`: logging/tracing do driver.
-- `.inf`: instalacao de desenvolvimento do driver em etapa futura.
+Ambiente validado em `docs/setup/windows-wdk-environment.md`:
 
-## Comandos de build esperados
+- Visual Studio Build Tools 18.x / VS2026;
+- MSVC `14.51.36231`;
+- Windows SDK `10.0.28000.0`;
+- WDK `10.0.28000.0`;
+- `WindowsUserModeDriver10.0`;
+- UMDF 2.35;
+- IddCx 1.4;
+- Developer Command Prompt ou Developer PowerShell com ambiente do Visual Studio carregado.
 
-Nao ha comando de build funcional neste scaffold, porque ainda nao existe solucao, projeto, INF ou codigo de driver.
+## Como abrir e buildar
 
-Quando o projeto de driver existir, a validacao devera ser feita em Developer Command Prompt ou Developer PowerShell com o ambiente do Visual Studio carregado. O ambiente validado na issue #12 usa:
+Ambiente usado para validacao:
 
 ```bat
 cmd.exe /c ""C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64 -no_logo"
 ```
 
-Comandos esperados para uma etapa futura:
+Validar ferramentas:
 
 ```bat
 where.exe msbuild
 where.exe cl
 where.exe link
 where.exe stampinf
-msbuild windows\driver\LumaBridgeIddDriver.sln /p:Configuration=Debug /p:Platform=x64
-"C:\Program Files (x86)\Windows Kits\10\bin\10.0.28000.0\x86\Inf2Cat.exe" /?
+where.exe inf2cat
 ```
 
-Observacao: `Inf2Cat.exe` foi encontrado por caminho completo, mas nao no PATH do Developer Command Prompt.
+Observacao: `Inf2Cat.exe` pode nao estar no PATH. O caminho completo validado e:
 
-## Limitacoes
+```text
+C:\Program Files (x86)\Windows Kits\10\bin\10.0.28000.0\x86\Inf2Cat.exe
+```
 
-- Este scaffold nao prova compilacao de driver.
-- Este scaffold nao prova instalacao de driver.
-- Este scaffold nao prova que o Windows reconhece monitor virtual.
-- Este scaffold nao ativa modo de teste.
-- Este scaffold nao valida `.inf`.
-- Este scaffold nao inclui codigo C++.
-- Este scaffold nao inclui dependencias do host.
+Build esperado:
+
+```bat
+msbuild windows\driver\LumaBridgeIddDriver.sln /p:Configuration=Debug /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0.28000.0
+```
+
+Resultado validado neste spike:
+
+```text
+LumaBridgeIddDriver.vcxproj -> windows\driver\x64\Debug\LumaBridgeIddDriver.dll
+Inf2Cat task was skipped as there were no inf files to process
+DrvCat task was skipped as there was no catalog file to process
+```
+
+Artefatos locais esperados, quando o build passa:
+
+```text
+windows/driver/x64/Debug/
+```
+
+Esses artefatos sao ignorados por `windows/driver/.gitignore` e nao devem ser commitados.
+
+## Decisoes de build
+
+- `IDDCX_VERSION=1.4` foi configurado como `IDDCX_VERSION_MAJOR=1` e `IDDCX_VERSION_MINOR=4`, pois o header `IddCxFuncEnum.h` do WDK 10.0.28000.0 exige essas macros.
+- `Windows.h` e incluido antes de `wdf.h` e `IddCx.h` para disponibilizar tipos basicos usados pela cadeia de headers do SDK/IddCx.
+- O warning `C4471` emitido por `WudfWdm.h` no UMDF 2.35 foi suprimido especificamente no projeto.
+- `Driver_SpectreMitigation=false` evita exigir as bibliotecas Spectre opcionais do MSVC neste spike.
+- `EnableTestSign=false` e `SignMode=Off` mantem assinatura fora do escopo.
+- O INF minimo acompanha o projeto como arquivo de desenvolvimento e nao e empacotado/instalado nesta etapa.
+
+## Limites da fundacao compilavel
+
+O codigo atual valida somente a base de build:
+
+- `DriverEntry` inicializa `WDF_DRIVER_CONFIG`;
+- `DriverEntry` chama `WdfDriverCreate`;
+- `LumaBridgeEvtDeviceAdd` retorna `STATUS_NOT_IMPLEMENTED`;
+- `IddCx.h` e incluido para validar disponibilidade de headers/propriedades WDK.
+
+O codigo atual nao chama APIs IddCx e nao deve ser instalado como driver funcional.
 
 ## Proximos passos
 
-1. Revisar o IddSample apenas como referencia conceitual e respeitando licenca.
-2. Definir a estrutura minima de solucao/projeto WDK antes de criar `.sln`, `.vcxproj` ou `.inf`.
-3. Criar uma issue separada para a fundacao compilavel do driver.
-4. Nessa issue futura, adicionar codigo minimo, INF de desenvolvimento e build MSBuild.
-5. Somente depois validar instalacao em ambiente de desenvolvimento e enumeracao de monitor virtual.
+1. Criar uma issue separada para inicializacao IddCx minima.
+2. Definir adapter e monitor virtual somente nessa issue futura.
+3. Validar build e INF antes de qualquer instalacao.
+4. Documentar fluxo de instalacao de desenvolvimento separadamente.
+5. Manter host, client, protocolo, streaming e NVENC fora do driver.
