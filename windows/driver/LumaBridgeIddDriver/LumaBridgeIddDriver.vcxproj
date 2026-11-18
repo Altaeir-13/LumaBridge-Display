@@ -94,6 +94,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>d3d11.lib;dxgi.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -107,18 +108,21 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>d3d11.lib;dxgi.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="Adapter.cpp" />
     <ClCompile Include="Driver.cpp" />
     <ClCompile Include="MonitorModes.cpp" />
+    <ClCompile Include="SwapChainProcessor.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Adapter.h" />
     <ClInclude Include="AdapterStateMachine.h" />
     <ClInclude Include="Driver.h" />
     <ClInclude Include="MonitorModes.h" />
+    <ClInclude Include="SwapChainProcessor.h" />
     <ClInclude Include="Trace.h" />
   </ItemGroup>
   <ItemGroup>
