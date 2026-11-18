@@ -150,4 +150,69 @@ LumaBridgeTraceError(
     LumaBridgeTraceEmit("ERROR", stage, status, state, message);
 }
 
+/// Emits a structured runtime metrics snapshot using the [LB-DRIVER] [METRICS] convention
+/// without copying or storing any desktop pixel or visual surface contents.
+inline void
+LumaBridgeTraceMetrics(
+    DriverDiagnosticStage stage,
+    AdapterLifecycleState adapterState,
+    const char* monitorStateName,
+    unsigned long long monitorCreates,
+    unsigned long long monitorArrivals,
+    unsigned long long monitorDepartures,
+    unsigned long long monitorDepartureFailures,
+    const char* swapChainStateName,
+    bool swapChainActive,
+    unsigned long long swapChainsAssigned,
+    unsigned long long swapChainsDeleted,
+    unsigned long long framesAcquired,
+    unsigned long long framesProcessed,
+    unsigned long long framesDropped,
+    double acquireFps,
+    double processFps,
+    unsigned long long lastFrameUs,
+    unsigned long long avgFrameUs,
+    unsigned long long maxFrameUs,
+    unsigned long long dxgiDeviceRemovedErrors,
+    unsigned long long transientErrors,
+    unsigned long long fatalErrors,
+    SIZE_T workingSetKb,
+    SIZE_T privateUsageKb,
+    DWORD handleCount
+    ) noexcept
+{
+    char buffer[512]{};
+    _snprintf_s(
+        buffer,
+        sizeof(buffer),
+        _TRUNCATE,
+        "[LB-DRIVER] [METRICS] stage=%s adapterState=%s monitorState=%s monCreate=%llu monArrive=%llu monDepart=%llu monDepartFail=%llu scState=%s scActive=%u scAssigned=%llu scDeleted=%llu framesAcq=%llu framesProc=%llu framesDrop=%llu acqFps=%.2f procFps=%.2f lastUs=%llu avgUs=%llu maxUs=%llu dxgiDevRem=%llu transientErr=%llu fatalErr=%llu wsKB=%llu privKB=%llu handles=%lu\n",
+        DriverDiagnosticStageToString(stage),
+        AdapterLifecycleStateToString(adapterState),
+        (monitorStateName != nullptr) ? monitorStateName : "Unknown",
+        monitorCreates,
+        monitorArrivals,
+        monitorDepartures,
+        monitorDepartureFailures,
+        (swapChainStateName != nullptr) ? swapChainStateName : "Unknown",
+        swapChainActive ? 1U : 0U,
+        swapChainsAssigned,
+        swapChainsDeleted,
+        framesAcquired,
+        framesProcessed,
+        framesDropped,
+        acquireFps,
+        processFps,
+        lastFrameUs,
+        avgFrameUs,
+        maxFrameUs,
+        dxgiDeviceRemovedErrors,
+        transientErrors,
+        fatalErrors,
+        static_cast<unsigned long long>(workingSetKb),
+        static_cast<unsigned long long>(privateUsageKb),
+        static_cast<unsigned long>(handleCount));
+    OutputDebugStringA(buffer);
+}
+
 } // namespace lumabridge::driver

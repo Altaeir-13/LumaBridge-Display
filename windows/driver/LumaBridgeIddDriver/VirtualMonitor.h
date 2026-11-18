@@ -40,8 +40,54 @@ enum class VirtualMonitorState : uint32_t
     Arrived,
     Departing,
     Departed,
+    Suspended,
+    Stopping,
+    Stopped,
     Faulted,
 };
+
+/// Returns a concise ASCII name for a VirtualMonitorState value.
+inline const char*
+VirtualMonitorStateToString(
+    VirtualMonitorState state
+    ) noexcept
+{
+    switch (state)
+    {
+    case VirtualMonitorState::NotCreated:
+        return "NotCreated";
+    case VirtualMonitorState::Creating:
+        return "Creating";
+    case VirtualMonitorState::Created:
+        return "Created";
+    case VirtualMonitorState::Arriving:
+        return "Arriving";
+    case VirtualMonitorState::Arrived:
+        return "Arrived";
+    case VirtualMonitorState::Departing:
+        return "Departing";
+    case VirtualMonitorState::Departed:
+        return "Departed";
+    case VirtualMonitorState::Suspended:
+        return "Suspended";
+    case VirtualMonitorState::Stopping:
+        return "Stopping";
+    case VirtualMonitorState::Stopped:
+        return "Stopped";
+    case VirtualMonitorState::Faulted:
+        return "Faulted";
+    default:
+        return "Unknown";
+    }
+}
+
+/// Derives a persistent, deterministic RFC 4122 GUID per device instance and connector.
+/// Preserves kMvpVirtualMonitorContainerId for primary instance (0, 0).
+GUID
+DeriveMonitorContainerId(
+    uint32_t deviceInstanceIndex,
+    uint32_t connectorIndex
+    ) noexcept;
 
 /// Synchronized state and diagnostic snapshot of VirtualMonitorManager.
 struct VirtualMonitorSnapshot
@@ -56,11 +102,15 @@ struct VirtualMonitorSnapshot
     uint64_t CreateCount{0};
     uint64_t ArrivalCount{0};
     uint64_t DepartureCount{0};
+    uint64_t DepartureFailures{0};
+    uint64_t UnconfirmedRemovalBlockedCount{0};
+    uint64_t LateCreateRejectedCount{0};
     uint64_t SkippedDisabledCount{0};
     uint64_t DuplicateArrivalPreventedCount{0};
     uint64_t PartialInitFailures{0};
     uint64_t UnarrivedDeletions{0};
     NTSTATUS LastErrorStatus{STATUS_SUCCESS};
+    NTSTATUS LastDepartureStatus{STATUS_SUCCESS};
 };
 
 /// Abstraction over IddCx monitor creation/arrival/departure DDIs for deterministic unit tests.
@@ -69,7 +119,8 @@ class IVirtualMonitorBackend
 public:
     virtual ~IVirtualMonitorBackend() = default;
 
-    /// Creates an IDDCX_MONITOR object configured without EDID (IDDCX_MONITOR_DESCRIPTION_TYPE_UNCONFIGURED).
+    /// Creates an IDDCX_MONITOR object configured without EDID
+    /// (IDDCX_MONITOR_DESCRIPTION_TYPE_EDID with DataSize = 0, pData = nullptr).
     virtual NTSTATUS CreateMonitor(
         void* adapterHandle,
         uint32_t connectorIndex,
@@ -94,10 +145,26 @@ public:
         void* monitorHandle
         ) noexcept = 0;
 
-    /// Stops any active swapchain processing associated with the monitor prior to departure.
+    /// Stops swapchain processing scoped specifically to monitorHandle prior to departure.
     virtual void StopMonitorSwapChain(
         void* monitorHandle
         ) noexcept = 0;
+
+    /// Acquires an additional handle reference across IddCx calls when supported by backend (WdfObjectReference).
+    virtual void AcquireMonitorReference(
+        void* monitorHandle
+        ) noexcept
+    {
+        (void)monitorHandle;
+    }
+
+    /// Releases a previously held handle reference once removal is confirmed (WdfObjectDereference).
+    virtual void ReleaseMonitorReference(
+        void* monitorHandle
+        ) noexcept
+    {
+        (void)monitorHandle;
+    }
 };
 
 /// Thread-safe manager for the single MVP virtual monitor lifecycle.
@@ -105,8 +172,11 @@ public:
 class VirtualMonitorManager final
 {
 public:
-    explicit VirtualMonitorManager(IVirtualMonitorBackend* backend) noexcept;
-    ~VirtualMonitorManager() = default;
+    explicit VirtualMonitorManager(
+        IVirtualMonitorBackend* backend,
+        uint32_t deviceInstanceIndex = 0U
+        ) noexcept;
+    ~VirtualMonitorManager();
 
     VirtualMonitorManager(const VirtualMonitorManager&) = delete;
     VirtualMonitorManager& operator=(const VirtualMonitorManager&) = delete;
@@ -118,12 +188,24 @@ public:
     bool IsActivationEnabled() const noexcept;
 
     /// Creates and announces the single MVP virtual monitor if enabled and not already arrived.
-    /// Cleans up partial creations if arrival fails so no orphan IDDCX_MONITOR remains.
+    /// Rejects late creation during suspend/shutdown and blocks recreation while removal is unconfirmed.
     NTSTATUS EnsureMonitorArrived(void* adapterHandle) noexcept;
 
     /// Safely stops swapchain processing and departs (or deletes if unarrived) the virtual monitor.
-    /// Idempotent when no monitor is active; allows clean recreation on subsequent EnsureMonitorArrived.
+    /// Preserves the monitor handle if IddCxMonitorDeparture fails until retry or WDF cleanup confirms removal.
     NTSTATUS DepartMonitor() noexcept;
+
+    /// Transitions manager into Suspended (D0Exit), departs active monitor, and blocks creation until OnResume().
+    NTSTATUS OnSuspend() noexcept;
+
+    /// Exits Suspended state on D0Entry unless permanent Shutdown() has occurred.
+    NTSTATUS OnResume() noexcept;
+
+    /// Enters irreversible teardown (Stopping -> Stopped), departs any active monitor, and blocks future creation.
+    NTSTATUS Shutdown() noexcept;
+
+    /// Returns the currently tracked monitor handle, or nullptr if none / unconfirmed removal is absent.
+    void* GetActiveMonitorHandle() const noexcept;
 
     /// Notifies manager that WDF cleaned up the monitor object (e.g., during EvtCleanupCallback).
     void NotifyMonitorObjectCleanedUp(void* monitorHandle) noexcept;
@@ -132,9 +214,16 @@ public:
     VirtualMonitorSnapshot GetSnapshot() const noexcept;
 
 private:
+    bool IsReentrantOperationCall() const noexcept;
+    NTSTATUS DepartMonitorLocked(bool keepSuspendedState) noexcept;
+
     IVirtualMonitorBackend* m_backend{nullptr};
+    uint32_t m_deviceInstanceIndex{0U};
     SRWLOCK m_operationLock{SRWLOCK_INIT};
     mutable SRWLOCK m_stateLock{SRWLOCK_INIT};
+    volatile LONG m_operationLockOwnerThreadId{0};
+    volatile LONG m_shutdownRequested{0};
+    bool m_suspended{false};
     void* m_monitorHandle{nullptr};
     VirtualMonitorSnapshot m_snapshot{};
 };
