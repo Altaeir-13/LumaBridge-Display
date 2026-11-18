@@ -28,6 +28,7 @@ Incluido agora:
 - 16 testes unitarios deterministicos da maquina de estados e associacao multi-dispositivo em `windows/driver/tests/AdapterLifecycleTests.cpp` (escopo puramente de logica de estado/associacao, distinto de testes em runtime real WDF/IddCx);
 - pacote INF estruturado (`LumaBridgeIddDriver.inf`) com `Include = wudfrd.inf`, `UmdfExtensions = IddCx0102`, `UpperFilters = IndirectKmd`, `ClassVer = 2.0`, `DeviceGroupId`, `UmdfHostProcessSharing = ProcessSharingDisabled` e decoracao `NT$ARCH$.10.0...22000` (politica explicita de suporte exclusivo ao Windows 11 x64), integrado ao `.vcxproj` com `StampInf`, `InfVerif`, `Inf2Cat` (`10_CO_X64;10_NI_X64;10_GE_X64`, cobrindo Windows 11 21H2, 22H2/23H2 e 24H2/25H2+) e `DrvCat` (mantendo `SignMode=Off` e `EnableTestSign=false`, gerando `.dll`, `.inf` e `.cat` nao assinados em `$(PackageDir)` e `$(OutDir)` — ver `docs/setup/windows-idd-driver-packaging.md`);
 - 5 testes automatizados de consistencia estatica e integridade criptografica de catalogo (`CryptCAT*`, `CryptCATAdminCalcHashFromFileHandle2`, `CryptQueryObject`, `WinVerifyTrust` e cenarios negativos) em `windows/driver/tests/DriverPackageValidationTests.cpp`;
+- ferramenta automatizada em `windows/driver/scripts/` (`LumaBridgeDriverCommon.psm1`, `Test-LumaBridgePrerequisites.ps1`, `Invoke-LumaBridgePackageSigning.ps1`, `Install-LumaBridgeDriver.ps1`, `Set-LumaBridgeVirtualMonitor.ps1`, `Collect-LumaBridgeDiagnostics.ps1`, `Uninstall-LumaBridgeDriver.ps1`) com `-DryRun`, lookup PnP dinamico, verificacao criptografica, coleta de diagnosticos sem pixels e rollback seguro (ver `docs/setup/windows-idd-functional-validation.md`);
 - `.gitignore` local para artefatos de build.
 
 Fora do escopo atual (issues dedicadas):
@@ -68,6 +69,14 @@ windows/
       MonitorModesTests.cpp
       SwapChainLifecycleTests.cpp
       VirtualMonitorLifecycleTests.cpp
+    scripts/
+      LumaBridgeDriverCommon.psm1
+      Test-LumaBridgePrerequisites.ps1
+      Invoke-LumaBridgePackageSigning.ps1
+      Install-LumaBridgeDriver.ps1
+      Set-LumaBridgeVirtualMonitor.ps1
+      Collect-LumaBridgeDiagnostics.ps1
+      Uninstall-LumaBridgeDriver.ps1
 ```
 
 ## Requisitos
