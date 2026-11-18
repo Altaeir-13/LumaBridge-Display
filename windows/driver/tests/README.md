@@ -44,7 +44,7 @@
 11. `MonitorAndTargetModesEnforceDistinctVSyncDividers` — regressao confirmando `vSyncFreqDivider == 0` exclusivo de monitor modes e `vSyncFreqDivider == 1` exclusivo de target modes/commit;
 12. `CommitValidationRejectsUnadvertisedTimingsWithMatchingActiveResolution` — regressao rejeitando timings nao anunciados mesmo para resolucoes 1080p60 validas.
 
-`SwapChainLifecycleTests.cpp` executa **13 testes unitarios deterministicos** sobre `SwapChainProcessor.h` / `SwapChainProcessor.cpp` (independentes de GPU fisica via mock de `ISwapChainBackend`):
+`SwapChainLifecycleTests.cpp` executa **15 testes unitarios deterministicos** sobre `SwapChainProcessor.h` / `SwapChainProcessor.cpp` (independentes de GPU fisica via mock de `ISwapChainBackend`):
 
 1. `AssignProcessFramesAndUnassignLifecycle` — atribuicao, processamento de frames, invariantes de metricas, desatribuicao e preservacao do handle `hNextSurfaceAvailable`;
 2. `PendingAcquireWaitsOnSurfaceEventWithoutBusyWaiting` — retorno `E_PENDING` aguardando evento do SO sem busy-wait;
@@ -58,9 +58,11 @@
 10. `TransientErrorsRetryAndRecoverBeforeEscalating` — recuperacao de erros transitorios abaixo de `kMaxConsecutiveTransientErrors` e escalonamento ao atingir o limite;
 11. `CircuitBreakerStopsUnboundedSwapChainRecreationLoops` — estado `Faulted` apos `kMaxConsecutiveSwapChainFailures` falhas consecutivas bloqueando recriacoes ilimitadas ate `OnResume()`;
 12. `SuspendAndShutdownPreventLateOrPostTeardownAssignments` — bloqueio de atribuicoes durante `Suspended` (ate `OnResume()`) e bloqueio permanente apos `Shutdown()` (`Stopped`);
-13. `ReentrantUnassignDuringDeleteDoesNotDeadlockOrDoubleDelete` — prevencao de deadlock e dupla delecao quando `DeleteSwapChainObject` aciona `UnassignSwapChain` reentrantemente na thread do caller ou da worker thread.
+13. `ReentrantUnassignDuringDeleteDoesNotDeadlockOrDoubleDelete` — prevencao de deadlock e dupla delecao quando `DeleteSwapChainObject` aciona `UnassignSwapChain` reentrantemente na thread do caller ou da worker thread;
+14. `StaleMonitorUnassignDoesNotStopNewMonitorSwapChain` — regressao garantindo que `UnassignSwapChainForMonitor` de monitor antigo ignora e preserva a swapchain ativa de monitor recem-criado;
+15. `FrameTimingAndFpsMetricsRecordedWithoutStoringPixels` — registra `AcquireFps`, `ProcessFps` e latencias QPC em microssegundos (`LastFrameProcessingTimeUs`, `TotalFrameProcessingTimeUs`, `AvgFrameProcessingTimeUs`, `MaxFrameProcessingTimeUs`) sem copiar pixels.
 
-`VirtualMonitorLifecycleTests.cpp` executa **10 testes unitarios deterministicos** sobre `VirtualMonitor.h` / `VirtualMonitor.cpp` (independentes de WUDFHost/GPU via mock de `IVirtualMonitorBackend`):
+`VirtualMonitorLifecycleTests.cpp` executa **15 testes unitarios deterministicos** sobre `VirtualMonitor.h` / `VirtualMonitor.cpp` (independentes de WUDFHost/GPU via mock de `IVirtualMonitorBackend`):
 
 1. `DisabledByDefaultSkipsMonitorCreationAndArrival` — confirma que o monitor permanece desabilitado por padrao sem chamar `IddCxMonitorCreate` ou `IddCxMonitorArrival`;
 2. `ControlledActivationCreatesAndArrivesSingleMonitorWithPersistentIdentity` — valida criacao e chegada com `ConnectorIndex = 0` e `ContainerId` persistente;
@@ -71,7 +73,12 @@
 7. `DepartureIsIdempotentWhenMonitorNotActive` — garante idempotencia de `DepartMonitor()`;
 8. `DisablingActivationAfterDeparturePreventsSubsequentArrival` — impede nova chegada apos desativacao;
 9. `NotifyMonitorObjectCleanedUpResetsActiveHandleSafely` — limpa handle ativo no cleanup WDF do monitor;
-10. `RejectsNullAdapterHandleWhenEnabled` — rejeita adaptador nulo com `STATUS_INVALID_PARAMETER`.
+10. `RejectsNullAdapterHandleWhenEnabled` — rejeita adaptador nulo com `STATUS_INVALID_PARAMETER`;
+11. `FailedDeparturePreservesHandleBlocksRecreationAndRecovers` — preserva `m_monitorHandle` quando `IddCxMonitorDeparture` falha, bloqueia recriacao (`STATUS_DEVICE_BUSY`) e recupera apos retry bem-sucedido ou cleanup WDF;
+12. `SuspendResumeAndLateCreateCancellation` — valida estados `Suspended`/`OnResume()` e delecao imediata caso `OnSuspend()` ocorra durante `CreateMonitor`;
+13. `IrreversibleShutdownAndInFlightTeardownCancellation` — garante `Shutdown()` irreversivel, rejeicao permanente de `OnResume()`/`EnsureMonitorArrived()` e desconexao imediata caso ocorra durante `ArriveMonitor`;
+14. `ReentrantBackendCallbacksDoNotDeadlockOrLeakReferences` — garante ausencia de deadlock e balanco exato de referencias em callbacks reentrantes;
+15. `DerivedContainerIdsAreUniqueAndRfc4122ValidPerInstance` — confirma `ContainerId` deterministico, unico por instancia/conector e valido segundo RFC 4122.
 
 ## Fronteira com validacao em runtime WDF/IddCx
 

@@ -6,7 +6,7 @@ Issue relacionada: #25 (Milestone M3 - Windows Virtual Display)
 
 ## 1. Estrategia adotada
 
-O driver `LumaBridgeIddDriver` (UMDF 2.31 / IddCx 1.4+) adota a estrategia de **modos padrao fornecidos pelo driver sem descricao EDID** (`IDDCX_MONITOR_DESCRIPTION_TYPE_UNCONFIGURED`):
+O driver `LumaBridgeIddDriver` (UMDF 2.31 / IddCx 1.4+) adota a estrategia de **modos padrao fornecidos pelo driver sem bloco EDID** (`IDDCX_MONITOR_DESCRIPTION_TYPE_EDID` com `DataSize = 0` e `pData = nullptr`):
 
 - O monitor virtual nao depende de um bloco EDID sintetico fixo de 128 bytes.
 - `EvtIddCxMonitorGetDefaultDescriptionModes` fornece os modos padrao do monitor com `IDDCX_MONITOR_MODE_ORIGIN_DRIVER` e sinaliza o modo preferencial.
@@ -19,7 +19,7 @@ O driver `LumaBridgeIddDriver` (UMDF 2.31 / IddCx 1.4+) adota a estrategia de **
 Foram avaliadas duas alternativas para a entrega MVP:
 
 1. **EDID sintetico + `EvtIddCxParseMonitorDescription`:** requer geracao e manutencao de descritores binarios CEA/VESA, checksum e blocos de extensao, sem ganho funcional para o MVP SDR progressivo.
-2. **Sem EDID (`IDDCX_MONITOR_DESCRIPTION_TYPE_UNCONFIGURED`) + `EvtIddCxMonitorGetDefaultDescriptionModes`:** contrato nativo do IddCx onde o driver declara diretamente os `IDDCX_MONITOR_MODE` com `IDDCX_MONITOR_MODE_ORIGIN_DRIVER` e o indice preferencial.
+2. **Sem EDID (`IDDCX_MONITOR_DESCRIPTION_TYPE_EDID` com `DataSize = 0` e `pData = nullptr`) + `EvtIddCxMonitorGetDefaultDescriptionModes`:** contrato nativo do IddCx 1.4 onde o driver declara diretamente os `IDDCX_MONITOR_MODE` com `IDDCX_MONITOR_MODE_ORIGIN_DRIVER` e o indice preferencial.
 
 Selecionou-se a **alternativa 2** por simplicidade, menor superficie de erro e aderencia direta ao modelo de display virtual por software. Caso uma entrega futura necessite capacidades avancadas (como metadados HDR ou passthrough de EDID fisico), `EvtIddCxParseMonitorDescription` podera ser estendido sem alterar a arquitetura de `MonitorModes`.
 
