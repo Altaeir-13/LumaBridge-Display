@@ -32,7 +32,7 @@
     <IDDCX_VERSION_MAJOR>1</IDDCX_VERSION_MAJOR>
     <IDDCX_VERSION_MINOR>4</IDDCX_VERSION_MINOR>
     <IDDCX_MINIMUM_VERSION_REQUIRED>4</IDDCX_MINIMUM_VERSION_REQUIRED>
-    <Driver_SpectreMitigation>false</Driver_SpectreMitigation>
+    <Driver_SpectreMitigation>Spectre</Driver_SpectreMitigation>
     <EnableTestSign>false</EnableTestSign>
     <SignMode>Off</SignMode>
     <EnableInf2cat>true</EnableInf2cat>
@@ -52,7 +52,7 @@
     <IDDCX_VERSION_MAJOR>1</IDDCX_VERSION_MAJOR>
     <IDDCX_VERSION_MINOR>4</IDDCX_VERSION_MINOR>
     <IDDCX_MINIMUM_VERSION_REQUIRED>4</IDDCX_MINIMUM_VERSION_REQUIRED>
-    <Driver_SpectreMitigation>false</Driver_SpectreMitigation>
+    <Driver_SpectreMitigation>Spectre</Driver_SpectreMitigation>
     <EnableTestSign>false</EnableTestSign>
     <SignMode>Off</SignMode>
     <EnableInf2cat>true</EnableInf2cat>

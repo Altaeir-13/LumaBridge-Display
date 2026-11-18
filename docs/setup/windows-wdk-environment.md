@@ -201,29 +201,15 @@ Esta issue nao realizou:
 - Assinatura de driver.
 - Alteracao direta em `main`.
 
-## 10. Atualizacao — Bibliotecas MSVC Spectre (Issue #20)
+## 10. Atualizacao — Bibliotecas MSVC Spectre (Issue #20 resolvida)
 
-A verificacao do catalogo do Visual Studio BuildTools (`C:\ProgramData\Microsoft\VisualStudio\Packages\_Instances\00d6571e\catalog.json`, versao `18.7.11925.98`, toolset `MSVC 14.51.36231`) confirmou que o subdiretorio `lib\spectre` nao esta instalado localmente.
+As bibliotecas MSVC Spectre para o toolset ativo (`MSVC 14.51.36231`) foram instaladas e confirmadas em:
 
-Componentes exatos correspondentes ao toolset ativo:
+- `C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.51.36231\lib\spectre\x64`
 
-- `Microsoft.VisualStudio.Component.VC.14.51.x86.x64.Spectre` (bibliotecas MSVC v14.51 com mitigacao Spectre para x86/x64)
-- `Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre` (runtimes VC++ x86/x64 com mitigacao Spectre)
+Com isso:
 
-Comando para instalacao em **Prompt/PowerShell como Administrador** (nao executavel sem elevacao administrativa):
-
-```bat
-"C:\Program Files (x86)\Microsoft Visual Studio\Installer\setup.exe" modify ^
-  --installPath "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools" ^
-  --add Microsoft.VisualStudio.Component.VC.14.51.x86.x64.Spectre ^
-  --add Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre ^
-  --passive --norestart
-```
-
-Apos a instalacao, confirmar a presenca das bibliotecas com:
-
-```powershell
-Get-ChildItem "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.51.36231\lib\spectre\x64"
-```
-
-Somente apos essa confirmacao deve-se alterar `<Driver_SpectreMitigation>true</Driver_SpectreMitigation>` em `windows/driver/LumaBridgeIddDriver/LumaBridgeIddDriver.vcxproj`, executar rebuild `Debug|x64` e `Release|x64` e encerrar a issue #20.
+1. `windows/driver/LumaBridgeIddDriver/LumaBridgeIddDriver.vcxproj` foi restaurado para `<Driver_SpectreMitigation>Spectre</Driver_SpectreMitigation>` nas configuracoes `Debug|x64` e `Release|x64` (valor reconhecido pelo `EnumProperty` em `drivercl.xml` do WDK `10.0.28000.0`, equivalente a UI "Enabled" / `/Qspectre`).
+2. Rebuilds completos `Debug|x64` e `Release|x64` concluiram com `0` erros e `0` warnings (incluindo `StampInf`, `InfVerif`, `Inf2Cat` e `DrvCat`).
+3. Os logs `.tlog` (`CL.command.1.tlog` e `link.read.1.tlog`) em `Debug|x64` e `Release|x64` confirmaram `/Qspectre` em todas as unidades de compilacao e vinculacao direta de `libcmt.lib`, `libcpmt.lib`, `oldnames.lib` e `libvcruntime.lib` de `lib\spectre\x64`.
+4. Todas as suítes de testes unitarios e validacao de pacote passaram apos o rebuild.
