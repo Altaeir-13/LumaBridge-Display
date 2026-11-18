@@ -112,11 +112,13 @@
   <ItemGroup>
     <ClCompile Include="Adapter.cpp" />
     <ClCompile Include="Driver.cpp" />
+    <ClCompile Include="MonitorModes.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Adapter.h" />
     <ClInclude Include="AdapterStateMachine.h" />
     <ClInclude Include="Driver.h" />
+    <ClInclude Include="MonitorModes.h" />
     <ClInclude Include="Trace.h" />
   </ItemGroup>
   <ItemGroup>
