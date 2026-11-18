@@ -107,7 +107,9 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Adapter.h" />
+    <ClInclude Include="AdapterStateMachine.h" />
     <ClInclude Include="Driver.h" />
+    <ClInclude Include="Trace.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="LumaBridgeIddDriver.inf" />

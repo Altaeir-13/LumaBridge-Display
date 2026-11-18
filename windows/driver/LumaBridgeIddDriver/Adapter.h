@@ -1,6 +1,8 @@
 #pragma once
 
 #include "Driver.h"
+#include "AdapterStateMachine.h"
+#include "Trace.h"
 
 namespace lumabridge::driver {
 
@@ -14,27 +16,14 @@ inline constexpr wchar_t kEndpointFriendlyName[] = L"LumaBridge Virtual Display 
 inline constexpr wchar_t kEndpointModelName[] = L"LumaBridge Indirect Display";
 inline constexpr wchar_t kEndpointManufacturerName[] = L"LumaBridge";
 
-/// Lifecycle states for the WDF device and indirect display adapter.
-enum class AdapterLifecycleState : UINT32
-{
-    Uninitialized = 0,
-    DeviceConfigured,
-    DeviceInitialized,
-    AdapterInitPending,
-    AdapterReady,
-    AdapterFailed,
-    DeviceStopped,
-};
-
 /// Per-WDFDEVICE state tracking the associated IddCx adapter and lifecycle status.
 struct DeviceContext
 {
+    SRWLOCK StateLock{SRWLOCK_INIT};
     WDFDEVICE WdfDevice{nullptr};
     IDDCX_ADAPTER AdapterObject{nullptr};
     ULONG IddCxRuntimeVersion{0};
-    NTSTATUS LastAdapterInitStatus{STATUS_PENDING};
-    UINT32 CommittedPathCount{0};
-    AdapterLifecycleState State{AdapterLifecycleState::Uninitialized};
+    AdapterLifecycleTracker Lifecycle{};
 };
 
 /// Per-IDDCX_ADAPTER context linking back to the parent WDFDEVICE.

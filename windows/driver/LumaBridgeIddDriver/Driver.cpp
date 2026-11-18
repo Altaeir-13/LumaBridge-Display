@@ -1,6 +1,11 @@
 #include "Driver.h"
 #include "Adapter.h"
 
+using lumabridge::driver::AdapterLifecycleState;
+using lumabridge::driver::DriverDiagnosticStage;
+using lumabridge::driver::LumaBridgeTraceError;
+using lumabridge::driver::LumaBridgeTraceInfo;
+
 extern "C"
 _Use_decl_annotations_
 NTSTATUS
@@ -13,12 +18,29 @@ DriverEntry(
     WDF_DRIVER_CONFIG_INIT(&config, LumaBridgeEvtDeviceAdd);
     config.EvtDriverUnload = LumaBridgeEvtDriverUnload;
 
-    return WdfDriverCreate(
+    const NTSTATUS status = WdfDriverCreate(
         DriverObject,
         RegistryPath,
         WDF_NO_OBJECT_ATTRIBUTES,
         &config,
         WDF_NO_HANDLE);
+
+    if (!NT_SUCCESS(status))
+    {
+        LumaBridgeTraceError(
+            DriverDiagnosticStage::DriverEntry,
+            status,
+            AdapterLifecycleState::Uninitialized,
+            "WdfDriverCreate failed");
+        return status;
+    }
+
+    LumaBridgeTraceInfo(
+        DriverDiagnosticStage::DriverEntry,
+        status,
+        AdapterLifecycleState::Uninitialized,
+        "WdfDriverCreate succeeded");
+    return status;
 }
 
 _Use_decl_annotations_
@@ -28,6 +50,12 @@ LumaBridgeEvtDriverUnload(
     )
 {
     UNREFERENCED_PARAMETER(Driver);
+
+    LumaBridgeTraceInfo(
+        DriverDiagnosticStage::DriverUnload,
+        STATUS_SUCCESS,
+        AdapterLifecycleState::Uninitialized,
+        "Driver unloading");
 }
 
 _Use_decl_annotations_
@@ -41,6 +69,11 @@ LumaBridgeEvtDeviceAdd(
 
     if (DeviceInit == nullptr)
     {
+        LumaBridgeTraceError(
+            DriverDiagnosticStage::DeviceAdd,
+            STATUS_INVALID_PARAMETER,
+            AdapterLifecycleState::Uninitialized,
+            "EvtDeviceAdd received null DeviceInit");
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -64,8 +97,19 @@ LumaBridgeEvtDeviceAdd(
     status = WdfDeviceCreate(&DeviceInit, &deviceAttributes, &device);
     if (!NT_SUCCESS(status))
     {
+        LumaBridgeTraceError(
+            DriverDiagnosticStage::WdfDeviceCreate,
+            status,
+            AdapterLifecycleState::DeviceConfigured,
+            "WdfDeviceCreate failed");
         return status;
     }
+
+    LumaBridgeTraceInfo(
+        DriverDiagnosticStage::WdfDeviceCreate,
+        status,
+        AdapterLifecycleState::DeviceConfigured,
+        "WdfDeviceCreate succeeded");
 
     return LumaBridgeInitializeDeviceContext(device);
 }
