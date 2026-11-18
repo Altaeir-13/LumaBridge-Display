@@ -144,7 +144,8 @@ NTSTATUS
 SwapChainProcessor::AssignSwapChain(
     void* swapChainHandle,
     HANDLE nextSurfaceAvailableEvent,
-    LUID renderAdapterLuid
+    LUID renderAdapterLuid,
+    void* ownerMonitorHandle
     ) noexcept
 {
     if (IsReentrantLifecycleCall() || InterlockedCompareExchange(&m_shutdownRequested, 0, 0) != 0)
@@ -252,6 +253,7 @@ SwapChainProcessor::AssignSwapChain(
     {
         ExclusiveSrwLock metricsGuard(&m_metricsLock);
         m_activeSwapChain = swapChainHandle;
+        m_ownerMonitorHandle = ownerMonitorHandle;
         m_nextSurfaceAvailableEvent = nextSurfaceAvailableEvent;
         m_stopEvent = static_cast<ScopedWin32Handle&&>(stopEvent);
         m_startGateEvent = static_cast<ScopedWin32Handle&&>(startGateEvent);
@@ -295,6 +297,73 @@ SwapChainProcessor::UnassignSwapChain() noexcept
 
     {
         ExclusiveSrwLock metricsGuard(&m_metricsLock);
+        ++m_metrics.UnassignCount;
+    }
+
+    StopAndCleanupActiveSessionLocked();
+
+    {
+        ExclusiveSrwLock metricsGuard(&m_metricsLock);
+        if (InterlockedCompareExchange(&m_shutdownRequested, 0, 0) != 0)
+        {
+            m_metrics.State = SwapChainProcessorState::Stopped;
+        }
+        else if (m_metrics.State == SwapChainProcessorState::Active)
+        {
+            m_metrics.State = SwapChainProcessorState::Ready;
+        }
+    }
+
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS
+SwapChainProcessor::UnassignSwapChainForMonitor(
+    void* monitorHandle
+    ) noexcept
+{
+    if (monitorHandle == nullptr)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (IsReentrantLifecycleCall())
+    {
+        bool shouldSignalStop = false;
+        {
+            ExclusiveSrwLock metricsGuard(&m_metricsLock);
+            if (m_activeSwapChain != nullptr)
+            {
+                if (m_ownerMonitorHandle == monitorHandle)
+                {
+                    shouldSignalStop = true;
+                }
+                else
+                {
+                    ++m_metrics.StaleMonitorUnassignIgnoredCount;
+                }
+            }
+        }
+        if (shouldSignalStop && m_stopEvent.IsValid())
+        {
+            (void)SetEvent(m_stopEvent.Get());
+        }
+        return STATUS_SUCCESS;
+    }
+
+    OwnedLifecycleLockGuard lifecycleGuard(&m_lifecycleLock, &m_lifecycleLockOwnerThreadId);
+
+    {
+        ExclusiveSrwLock metricsGuard(&m_metricsLock);
+        if (m_activeSwapChain == nullptr)
+        {
+            return STATUS_SUCCESS;
+        }
+        if (m_ownerMonitorHandle != monitorHandle)
+        {
+            ++m_metrics.StaleMonitorUnassignIgnoredCount;
+            return STATUS_SUCCESS;
+        }
         ++m_metrics.UnassignCount;
     }
 
@@ -463,10 +532,22 @@ SwapChainProcessor::WorkerLoop(
         return;
     }
 
+    LARGE_INTEGER qpcFreqLi{};
+    (void)QueryPerformanceFrequency(&qpcFreqLi);
+    const uint64_t qpcFreq = (qpcFreqLi.QuadPart > 0) ? static_cast<uint64_t>(qpcFreqLi.QuadPart) : 10000000ULL;
+
     const HANDLE waitHandles[2] = {nextSurfaceAvailableEvent, stopEvent};
     uint32_t consecutiveTransientErrors = 0;
     bool processedAnyFrameInSession = false;
     bool exitedDueToPermanentFailure = false;
+    bool windowInitialized = false;
+    bool hasCompletedWindow = false;
+    uint64_t windowStartQpc = 0;
+    uint64_t windowAcquired = 0;
+    uint64_t windowProcessed = 0;
+    uint64_t timedFrames = 0;
+    double latchedAcquireFps = 0.0;
+    double latchedProcessFps = 0.0;
 
     for (;;)
     {
@@ -481,6 +562,9 @@ SwapChainProcessor::WorkerLoop(
             exitedDueToPermanentFailure = true;
             break;
         }
+
+        LARGE_INTEGER frameStartQpcLi{};
+        (void)QueryPerformanceCounter(&frameStartQpcLi);
 
         SwapChainFrameMetadata frameMeta{};
         const HRESULT acquireHr = m_backend->ReleaseAndAcquireBuffer(swapChainHandle, frameMeta);
@@ -551,6 +635,12 @@ SwapChainProcessor::WorkerLoop(
             break;
         }
 
+        if (!windowInitialized)
+        {
+            windowStartQpc = static_cast<uint64_t>(frameStartQpcLi.QuadPart);
+            windowInitialized = true;
+        }
+
         {
             ExclusiveSrwLock metricsGuard(&m_metricsLock);
             ++m_metrics.FramesAcquired;
@@ -613,14 +703,63 @@ SwapChainProcessor::WorkerLoop(
             break;
         }
 
+        LARGE_INTEGER frameEndQpcLi{};
+        (void)QueryPerformanceCounter(&frameEndQpcLi);
+        const uint64_t startQpc = static_cast<uint64_t>(frameStartQpcLi.QuadPart);
+        const uint64_t endQpc = static_cast<uint64_t>(frameEndQpcLi.QuadPart);
+        const uint64_t frameTicks = (endQpc >= startQpc) ? (endQpc - startQpc) : 0ULL;
+        const uint64_t frameTimeUs = (frameTicks * 1000000ULL) / qpcFreq;
+
+        ++timedFrames;
+        ++windowAcquired;
         if (frameMeta.HasValidSurface)
         {
+            ++windowProcessed;
             consecutiveTransientErrors = 0;
             processedAnyFrameInSession = true;
+        }
+
+        const uint64_t windowTicks = (endQpc > windowStartQpc) ? (endQpc - windowStartQpc) : 1ULL;
+        const double elapsedSec = static_cast<double>(windowTicks) / static_cast<double>(qpcFreq);
+
+        {
             ExclusiveSrwLock metricsGuard(&m_metricsLock);
-            ++m_metrics.FramesProcessed;
-            m_metrics.ConsecutiveFailures = 0;
-            m_metrics.LastPresentationFrameNumber = frameMeta.PresentationFrameNumber;
+            if (frameMeta.HasValidSurface)
+            {
+                ++m_metrics.FramesProcessed;
+                m_metrics.ConsecutiveFailures = 0;
+                m_metrics.LastPresentationFrameNumber = frameMeta.PresentationFrameNumber;
+            }
+
+            m_metrics.LastFrameProcessingTimeUs = frameTimeUs;
+            m_metrics.TotalFrameProcessingTimeUs += frameTimeUs;
+            if (frameTimeUs > m_metrics.MaxFrameProcessingTimeUs)
+            {
+                m_metrics.MaxFrameProcessingTimeUs = frameTimeUs;
+            }
+            m_metrics.AvgFrameProcessingTimeUs = m_metrics.TotalFrameProcessingTimeUs / timedFrames;
+
+            if (elapsedSec >= 1.0)
+            {
+                latchedAcquireFps = static_cast<double>(windowAcquired) / elapsedSec;
+                latchedProcessFps = static_cast<double>(windowProcessed) / elapsedSec;
+                hasCompletedWindow = true;
+                m_metrics.AcquireFps = latchedAcquireFps;
+                m_metrics.ProcessFps = latchedProcessFps;
+                windowStartQpc = endQpc;
+                windowAcquired = 0;
+                windowProcessed = 0;
+            }
+            else if (!hasCompletedWindow || elapsedSec >= 0.25)
+            {
+                m_metrics.AcquireFps = static_cast<double>(windowAcquired) / elapsedSec;
+                m_metrics.ProcessFps = static_cast<double>(windowProcessed) / elapsedSec;
+            }
+            else
+            {
+                m_metrics.AcquireFps = latchedAcquireFps;
+                m_metrics.ProcessFps = latchedProcessFps;
+            }
         }
     }
 
@@ -633,6 +772,7 @@ SwapChainProcessor::WorkerLoop(
         {
             swapChainToDelete = m_activeSwapChain;
             m_activeSwapChain = nullptr;
+            m_ownerMonitorHandle = nullptr;
             m_metrics.IsActive = false;
             m_metrics.ActiveRenderAdapterLuid = LUID{0, 0};
             ++m_metrics.SwapChainDeletedCount;
@@ -702,6 +842,7 @@ SwapChainProcessor::StopAndCleanupActiveSessionLocked() noexcept
                 ++m_metrics.SwapChainDeletedCount;
             }
         }
+        m_ownerMonitorHandle = nullptr;
         m_metrics.IsActive = false;
         m_metrics.ActiveRenderAdapterLuid = LUID{0, 0};
     }

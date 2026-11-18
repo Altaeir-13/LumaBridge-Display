@@ -200,3 +200,16 @@ Esta issue nao realizou:
 - Instalador.
 - Assinatura de driver.
 - Alteracao direta em `main`.
+
+## 10. Atualizacao — Bibliotecas MSVC Spectre (Issue #20 resolvida)
+
+As bibliotecas MSVC Spectre para o toolset ativo (`MSVC 14.51.36231`) foram instaladas e confirmadas em:
+
+- `C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.51.36231\lib\spectre\x64`
+
+Com isso:
+
+1. `windows/driver/LumaBridgeIddDriver/LumaBridgeIddDriver.vcxproj` foi restaurado para `<Driver_SpectreMitigation>Spectre</Driver_SpectreMitigation>` nas configuracoes `Debug|x64` e `Release|x64` (valor reconhecido pelo `EnumProperty` em `drivercl.xml` do WDK `10.0.28000.0`, equivalente a UI "Enabled" / `/Qspectre`).
+2. Rebuilds completos `Debug|x64` e `Release|x64` concluiram com `0` erros e `0` warnings (incluindo `StampInf`, `InfVerif`, `Inf2Cat` e `DrvCat`).
+3. Os logs `.tlog` (`CL.command.1.tlog` e `link.read.1.tlog`) em `Debug|x64` e `Release|x64` confirmaram `/Qspectre` em todas as unidades de compilacao e vinculacao direta de `libcmt.lib`, `libcpmt.lib`, `oldnames.lib` e `libvcruntime.lib` de `lib\spectre\x64`.
+4. Todas as suítes de testes unitarios e validacao de pacote passaram apos o rebuild.

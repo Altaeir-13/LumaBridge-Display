@@ -5,6 +5,7 @@
 #include "MonitorModes.h"
 #include "SwapChainProcessor.h"
 #include "Trace.h"
+#include "VirtualMonitor.h"
 
 namespace lumabridge::driver {
 

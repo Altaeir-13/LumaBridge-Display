@@ -33,6 +33,31 @@ enum class SwapChainProcessorState : uint32_t
     Faulted,
 };
 
+/// Returns a concise ASCII name for a SwapChainProcessorState value.
+inline const char*
+SwapChainProcessorStateToString(
+    SwapChainProcessorState state
+    ) noexcept
+{
+    switch (state)
+    {
+    case SwapChainProcessorState::Ready:
+        return "Ready";
+    case SwapChainProcessorState::Active:
+        return "Active";
+    case SwapChainProcessorState::Suspended:
+        return "Suspended";
+    case SwapChainProcessorState::Stopping:
+        return "Stopping";
+    case SwapChainProcessorState::Stopped:
+        return "Stopped";
+    case SwapChainProcessorState::Faulted:
+        return "Faulted";
+    default:
+        return "Unknown";
+    }
+}
+
 /// Per-frame metadata extracted from IDDCX_METADATA without copying desktop pixel contents.
 struct SwapChainFrameMetadata
 {
@@ -51,6 +76,7 @@ struct SwapChainMetricsSnapshot
     uint64_t AssignCount{0};
     uint64_t AbandonedAssignCount{0};
     uint64_t UnassignCount{0};
+    uint64_t StaleMonitorUnassignIgnoredCount{0};
     uint64_t FramesAcquired{0};
     uint64_t FramesProcessed{0};
     uint64_t FramesDropped{0};
@@ -60,6 +86,12 @@ struct SwapChainMetricsSnapshot
     uint64_t FatalErrors{0};
     uint64_t CircuitBreakerRejections{0};
     uint64_t SwapChainDeletedCount{0};
+    uint64_t LastFrameProcessingTimeUs{0};
+    uint64_t TotalFrameProcessingTimeUs{0};
+    uint64_t AvgFrameProcessingTimeUs{0};
+    uint64_t MaxFrameProcessingTimeUs{0};
+    double AcquireFps{0.0};
+    double ProcessFps{0.0};
     uint32_t ConsecutiveFailures{0};
     uint32_t LastPresentationFrameNumber{0};
     HRESULT LastErrorHResult{S_OK};
@@ -179,12 +211,18 @@ public:
     NTSTATUS AssignSwapChain(
         void* swapChainHandle,
         HANDLE nextSurfaceAvailableEvent,
-        LUID renderAdapterLuid
+        LUID renderAdapterLuid,
+        void* ownerMonitorHandle = nullptr
         ) noexcept;
 
     /// Cooperatively stops the worker thread, joins it, and deletes the driver-owned swapchain once.
     /// Idempotent and reentrancy-safe.
     NTSTATUS UnassignSwapChain() noexcept;
+
+    /// Stops active swapchain processing only if it belongs to monitorHandle (ignoring stale monitors).
+    NTSTATUS UnassignSwapChainForMonitor(
+        void* monitorHandle
+        ) noexcept;
 
     /// Suspends swapchain processing (D0Exit) and rejects new assignments until OnResume().
     NTSTATUS OnSuspend() noexcept;
@@ -232,6 +270,7 @@ private:
     volatile LONG m_shutdownRequested{0};
 
     void* m_activeSwapChain{nullptr};
+    void* m_ownerMonitorHandle{nullptr};
     HANDLE m_nextSurfaceAvailableEvent{nullptr}; // Owned by OS/IddCx; never closed by driver.
     ScopedWin32Handle m_stopEvent{};
     ScopedWin32Handle m_startGateEvent{};

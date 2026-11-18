@@ -17,8 +17,9 @@ Nesta entrega:
 ## 2. Arquitetura e separacao de responsabilidades
 
 1. **`SwapChainProcessor` (`SwapChainProcessor.h` / `SwapChainProcessor.cpp`):**
-   - Orquestra ciclo de vida (`AssignSwapChain`, `UnassignSwapChain`, `~SwapChainProcessor`), thread dedicada, cancelamento cooperativo via evento manual-reset (`m_stopEvent`), espera bloqueante sem busy-wait (`WaitForMultipleObjects`), tratamento de `E_PENDING` e `DXGI_ERROR_DEVICE_REMOVED`/`DXGI_ERROR_DEVICE_RESET` e registro de metricas (`SwapChainMetricsSnapshot`).
+   - Orquestra ciclo de vida (`AssignSwapChain`, `UnassignSwapChain`, `UnassignSwapChainForMonitor`, `~SwapChainProcessor`), thread dedicada, cancelamento cooperativo via evento manual-reset (`m_stopEvent`), espera bloqueante sem busy-wait (`WaitForMultipleObjects`), tratamento de `E_PENDING` e `DXGI_ERROR_DEVICE_REMOVED`/`DXGI_ERROR_DEVICE_RESET` e registro de metricas (`SwapChainMetricsSnapshot`).
    - Desacoplado das DDIs reais por `ISwapChainBackend`, permitindo testes unitarios deterministicos independentes de GPU fisica.
+   - Rastreia `m_ownerMonitorHandle` para garantir que callbacks `UnassignSwapChainForMonitor` de monitores antigos sejam ignorados (`StaleMonitorUnassignIgnoredCount`) quando outro monitor ja detiver a swapchain ativa.
 2. **`D3d11IddCxSwapChainBackend` e `DeviceSwapChainHost` (`Adapter.cpp`):**
    - Seleciona o adaptador grafico via `CreateDXGIFactory1` -> `IDXGIFactory4::EnumAdapterByLuid(RenderAdapterLuid)`.
    - Cria o dispositivo Direct3D 11 com `D3D11_CREATE_DEVICE_BGRA_SUPPORT` (feature levels `11_1` -> `10_0`) e o associa ao swapchain via `IddCxSwapChainSetDevice`.
@@ -43,17 +44,18 @@ Nesta entrega:
 
 `SwapChainMetricsSnapshot` contabiliza sem armazenar nenhum dado visual do desktop:
 
-- `AssignAttempts`, `AssignCount`, `AbandonedAssignCount`, `UnassignCount`, `SwapChainDeletedCount`
+- `AssignAttempts`, `AssignCount`, `AbandonedAssignCount`, `UnassignCount`, `StaleMonitorUnassignIgnoredCount`, `SwapChainDeletedCount`
 - `FramesAcquired`, `FramesProcessed`, `FramesDropped`
+- `AcquireFps`, `ProcessFps`, `LastFrameProcessingTimeUs`, `TotalFrameProcessingTimeUs`, `AvgFrameProcessingTimeUs`, `MaxFrameProcessingTimeUs` (medidos via `QueryPerformanceCounter`/`QueryPerformanceFrequency`)
 - `EmptyAcquireWaits` (`E_PENDING` aguardando `hNextSurfaceAvailable`)
 - `TransientErrors`, `DeviceRemovedErrors` (`DXGI_ERROR_DEVICE_REMOVED` / `DXGI_ERROR_DEVICE_RESET`), `FatalErrors`
 - `CircuitBreakerRejections`, `ConsecutiveFailures`, `LastErrorHResult`
 - `LastPresentationFrameNumber`, `ActiveRenderAdapterLuid`, `State`, `IsActive`
+- Emissao em log estruturado `[LB-DRIVER] [METRICS]` em `Trace.h` / `Adapter.cpp`, incluindo estados de adaptador e monitor virtual e consumo do processo host (`wsKB`, `privKB`, `handles`).
 
-## 5. Resultados dos testes e pendencias
+## 5. Resultados dos testes e estado da mitigacao Spectre
 
-- `SwapChainLifecycleTests.exe`: **13 testes unitarios deterministicos** aprovados (`0` falhas), sem depender de GPU fisica.
-- `MonitorModesTests.exe`: **12/12** aprovados; `AdapterLifecycleTests.exe`: **16/16** aprovados; `DriverPackageValidationTests.exe`: **5/5** aprovados.
+- `SwapChainLifecycleTests.exe`: **15 testes unitarios deterministicos** aprovados (`0` falhas), sem depender de GPU fisica.
+- `VirtualMonitorLifecycleTests.exe`: **15/15** aprovados; `MonitorModesTests.exe`: **12/12** aprovados; `AdapterLifecycleTests.exe`: **16/16** aprovados; `DriverPackageValidationTests.exe`: **5/5** aprovados.
 - `MSBuild` `Debug|x64` e `Release|x64`: **0 erros, 0 warnings**.
-- **Pendencia Spectre (issue #20):** `Driver_SpectreMitigation=false` permanece registrado porque as bibliotecas MSVC Spectre (`lib\spectre`) continuam ausentes no Build Tools local; deve ser resolvido antes da assinatura/instalacao em maquina pessoal.
-- **Proximo passo elegivel:** implementacao controlada de `IddCxMonitorCreate` / `IddCxMonitorArrival` / `IddCxMonitorDeparture` associando `LumaBridgeMonitorContext` ao `WDFDEVICE` e validacao de ciclo completo em ambiente controlado.
+- **Mitigacao Spectre (issue #20 resolvida):** `<Driver_SpectreMitigation>Spectre</Driver_SpectreMitigation>` restaurado com bibliotecas MSVC `14.51.36231\lib\spectre\x64` verificadas nos `.tlog` de compilacao (`/Qspectre`) e linkagem.
