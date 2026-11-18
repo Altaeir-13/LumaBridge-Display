@@ -68,7 +68,7 @@ A separacao explicita entre `$(IntDir)` (`obj/$(ProjectName)/`) e `$(PackageDir)
 | `[Version] CatalogFile` | `LumaBridgeIddDriver.cat` | Vincula o catalogo de seguranca gerado pelo `Inf2Cat`. |
 | `[Version] DriverVer` | Fonte `07/01/2026,0.1.0.0`; carimbado por `StampInf` | Atualizado automaticamente no build (`-d "*" -v "*"`) para garantir carimbo valido de data/versao. |
 | `[Version] PnpLockdown` | `1` | Impede modificacoes diretas nos binarios do driver fora dos pacotes no Driver Store (requisito Universal INF). |
-| `[Manufacturer]` / `[Standard.NT$ARCH$.10.0...18362]` | `Standard,NTamd64.10.0...18362` (apos `StampInf`) | Restringe a instalacao ao Windows 10 1903 (build `18362`) ou superior em `amd64`, satisfazendo a exigencia de versao minima de `DIRID 13 (UMDF)` (`10.0.17134`), `UMDF 2.25+` e `IddCx 1.4` (`10.0.18362`) sem erros 1199 no `InfVerif`. |
+| `[Manufacturer]` / `[Standard.NT$ARCH$.10.0...22000]` | `Standard,NTamd64.10.0...22000` (apos `StampInf`) | Restringe a instalacao exclusivamente ao Windows 11 x64 (build `22000` / 21H2 ou superior, cobrindo 22H2/23H2/24H2/25H2+), sem declarar suporte a Windows 10, satisfazendo `DIRID 13 (UMDF)`, `UMDF 2.31` (`>= 2.25`), `IddCx 1.4` e `wudfrd.inf` sem erros 1199 no `InfVerif`. |
 | Hardware ID exclusivo | `Root\LumaBridgeIddDriver` | Hardware ID dedicado do LumaBridge para enumeracao virtual futura, sem colisao com drivers inbox ou Parsec. |
 | `[SourceDisksNames]` / `[SourceDisksFiles]` | `1 = %DiskName%` / `LumaBridgeIddDriver.dll = 1` | Mapeia explicitamente todos os binarios do pacote (obrigatorio para validacao no `InfVerif` / `Inf2Cat`). |
 | `[DestinationDirs]` / `[UMDriverCopy]` | `UMDriverCopy = 13` / `LumaBridgeIddDriver.dll,,,0x00000100` | Usa `DIRID 13` (Driver Store — Run from Driver Store) em vez de copiar manualmente para `System32\drivers\UMDF`, com `COPYFLG_NOPRUNE` (`0x100`). |
@@ -103,8 +103,8 @@ A comparacao com o driver inbox `C:\Windows\INF\rdpidd.inf` identificou diretiva
 
 - **UMDF compilado/alinhado:** `2.31` com `UMDF_MINIMUM_VERSION_REQUIRED=25` (`2.25`).
 - **IddCx compilado/alinhado:** `1.4` com `IDDCX_MINIMUM_VERSION_REQUIRED=4`.
-- **INF TargetOSVersion:** `NTamd64.10.0...18362` (Windows 10 versao 1903 ou superior, incluindo Windows 11 Pro x64 target build `26300`).
-- **Catalogo `Inf2Cat`:** `Inf2CatWindowsVersionList = 10_19H1_X64`, `Inf2CatUseLocalTime = true`.
+- **INF TargetOSVersion:** `NTamd64.10.0...22000` (politica explicita de suporte exclusivo ao Windows 11 x64, cobrindo 21H2, 22H2/23H2 e 24H2/25H2+, validado no host Windows 11 build `26300` onde `C:\Windows\INF\wudfrd.inf`, `WUDFx02000.dll` `2.35` e `IddCx.dll` `1.12` estao presentes).
+- **Catalogo `Inf2Cat`:** `Inf2CatWindowsVersionList = 10_CO_X64;10_NI_X64;10_GE_X64`, `Inf2CatUseLocalTime = true` (identificadores suportados pelo WDK `10.0.28000.0`; `10_GE_X64` cobre a familia Windows 11 24H2/25H2+).
 
 ### Papel de `EnableInf2cat`, `SignMode` e `EnableTestSign`
 

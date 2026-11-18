@@ -4,6 +4,15 @@
 #include <Windows.h>
 #undef WIN32_NO_STATUS
 
+#include <bcrypt.h>
+#include <mscat.h>
+#include <softpub.h>
+#include <wincrypt.h>
+#include <wintrust.h>
+
+#pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "wintrust.lib")
+
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -344,56 +353,350 @@ IsValidUnsignedX64DriverDll(
     return securityDir.VirtualAddress == 0 && securityDir.Size == 0;
 }
 
-bool
-ContainsUtf16LeCaseInsensitive(
-    const std::vector<uint8_t>& bytes,
-    const std::string& asciiNeedle
+std::string
+WideToLowerAscii(
+    const wchar_t* wide
     )
 {
-    if (asciiNeedle.empty() || bytes.size() < asciiNeedle.size() * 2)
+    if (wide == nullptr)
     {
-        return false;
+        return {};
     }
 
-    const std::string lowerNeedle = ToLowerAscii(asciiNeedle);
-    const size_t needleByteCount = lowerNeedle.size() * 2;
-    for (size_t i = 0; i + needleByteCount <= bytes.size(); ++i)
+    std::string out;
+    for (const wchar_t* p = wide; *p != L'\0'; ++p)
     {
-        bool matched = true;
-        for (size_t j = 0; j < lowerNeedle.size(); ++j)
+        if (*p > 0x7F)
         {
-            const uint8_t lo = bytes[i + j * 2];
-            const uint8_t hi = bytes[i + j * 2 + 1];
-            const char folded = static_cast<char>(std::tolower(lo));
-            if (hi != 0 || folded != lowerNeedle[j])
-            {
-                matched = false;
-                break;
-            }
+            out.push_back('?');
         }
-        if (matched)
+        else
         {
-            return true;
+            out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(*p))));
         }
     }
-    return false;
+    return out;
 }
 
 bool
-IsValidUnsignedCatalog(
-    const std::vector<uint8_t>& bytes
+IsFileUnsignedViaWinTrust(
+    const std::filesystem::path& filePath
     )
 {
-    // Microsoft security catalogs are DER-encoded PKCS#7 SignedData CTLs starting with SEQUENCE (0x30).
-    if (bytes.size() < 64 || bytes[0] != 0x30)
+    WINTRUST_FILE_INFO fileInfo{};
+    fileInfo.cbStruct = sizeof(fileInfo);
+    const std::wstring widePath = filePath.wstring();
+    fileInfo.pcwszFilePath = widePath.c_str();
+
+    WINTRUST_DATA trustData{};
+    trustData.cbStruct = sizeof(trustData);
+    trustData.dwUIChoice = WTD_UI_NONE;
+    trustData.fdwRevocationChecks = WTD_REVOKE_NONE;
+    trustData.dwUnionChoice = WTD_CHOICE_FILE;
+    trustData.pFile = &fileInfo;
+    trustData.dwStateAction = WTD_STATEACTION_VERIFY;
+    trustData.dwProvFlags = WTD_SAFER_FLAG;
+
+    GUID policyGuid = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    const LONG status = WinVerifyTrust(nullptr, &policyGuid, &trustData);
+
+    trustData.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(nullptr, &policyGuid, &trustData);
+
+    return status == TRUST_E_NOSIGNATURE || status == CRYPT_E_NO_SIGNER;
+}
+
+bool
+IsUnsignedCatalogCtl(
+    const std::filesystem::path& catPath
+    )
+{
+    const std::wstring widePath = catPath.wstring();
+    DWORD encoding = 0;
+    DWORD contentType = 0;
+    DWORD formatType = 0;
+    HCRYPTMSG hMsg = nullptr;
+
+    if (!CryptQueryObject(
+            CERT_QUERY_OBJECT_FILE,
+            widePath.c_str(),
+            CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED | CERT_QUERY_CONTENT_FLAG_CTL,
+            CERT_QUERY_FORMAT_FLAG_BINARY,
+            0,
+            &encoding,
+            &contentType,
+            &formatType,
+            nullptr,
+            &hMsg,
+            nullptr))
     {
         return false;
     }
 
-    return ContainsUtf16LeCaseInsensitive(bytes, "lumabridgeidddriver.dll") &&
-           ContainsUtf16LeCaseInsensitive(bytes, "lumabridgeidddriver.inf") &&
-           ContainsUtf16LeCaseInsensitive(bytes, "root\\lumabridgeidddriver") &&
-           ContainsUtf16LeCaseInsensitive(bytes, "_v100_x64_19h1");
+    DWORD signerCount = 0;
+    if (hMsg != nullptr)
+    {
+        DWORD signerCountSize = sizeof(signerCount);
+        const BOOL gotSigners = CryptMsgGetParam(
+            hMsg,
+            CMSG_SIGNER_COUNT_PARAM,
+            0,
+            &signerCount,
+            &signerCountSize);
+        CryptMsgClose(hMsg);
+        if (!gotSigners || signerCount != 0)
+        {
+            return false;
+        }
+    }
+
+    return IsFileUnsignedViaWinTrust(catPath);
+}
+
+bool
+ComputeAuthenticodeSipHashSha256(
+    HCATADMIN hCatAdmin,
+    const std::filesystem::path& filePath,
+    std::vector<uint8_t>& outDigest
+    )
+{
+    const std::wstring widePath = filePath.wstring();
+    HANDLE hFile = CreateFileW(
+        widePath.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (hFile == INVALID_HANDLE_VALUE)
+    {
+        return false;
+    }
+
+    DWORD hashSize = 0;
+    (void)CryptCATAdminCalcHashFromFileHandle2(hCatAdmin, hFile, &hashSize, nullptr, 0);
+    if (hashSize == 0 || GetLastError() != ERROR_INSUFFICIENT_BUFFER)
+    {
+        CloseHandle(hFile);
+        return false;
+    }
+
+    outDigest.resize(hashSize);
+    const BOOL ok = CryptCATAdminCalcHashFromFileHandle2(
+        hCatAdmin,
+        hFile,
+        &hashSize,
+        outDigest.data(),
+        0);
+    CloseHandle(hFile);
+    if (!ok)
+    {
+        outDigest.clear();
+        return false;
+    }
+    outDigest.resize(hashSize);
+    return true;
+}
+
+bool
+ValidateUnsignedCatalogForDirectory(
+    const std::filesystem::path& catPath,
+    const std::filesystem::path& packageRootDir
+    )
+{
+    if (!std::filesystem::is_regular_file(catPath))
+    {
+        return false;
+    }
+
+    if (!IsUnsignedCatalogCtl(catPath))
+    {
+        return false;
+    }
+
+    std::wstring wideCatPath = catPath.wstring();
+    HANDLE hCat = CryptCATOpen(wideCatPath.data(), CRYPTCAT_OPEN_EXISTING, 0, 0, 0);
+    if (hCat == INVALID_HANDLE_VALUE)
+    {
+        return false;
+    }
+
+    bool hasWin11OsAttr = false;
+    {
+        CRYPTCATATTRIBUTE* attr = nullptr;
+        while ((attr = CryptCATEnumerateCatAttr(hCat, attr)) != nullptr)
+        {
+            const std::string tagLower = WideToLowerAscii(attr->pwszReferenceTag);
+            if ((tagLower == "os" || tagLower == "osattr") &&
+                attr->pbValue != nullptr &&
+                attr->cbValue >= sizeof(wchar_t))
+            {
+                const auto* wideVal = reinterpret_cast<const wchar_t*>(attr->pbValue);
+                std::wstring osAttrWide(wideVal, attr->cbValue / sizeof(wchar_t));
+                while (!osAttrWide.empty() && osAttrWide.back() == L'\0')
+                {
+                    osAttrWide.pop_back();
+                }
+                const std::string osAttr = WideToLowerAscii(osAttrWide.c_str());
+                // Inf2Cat encodes catalog-level OS attribute for Windows 11 21H2/22H2/24H2+ x64.
+                if (osAttr.find("_v100_x64_21h2") != std::string::npos &&
+                    osAttr.find("_v100_x64_22h2") != std::string::npos &&
+                    osAttr.find("_v100_x64_24h2") != std::string::npos &&
+                    osAttr.find("19h1") == std::string::npos)
+                {
+                    hasWin11OsAttr = true;
+                }
+            }
+        }
+    }
+
+    HCATADMIN hCatAdminSha256 = nullptr;
+    HCATADMIN hCatAdminSha1 = nullptr;
+    if (!CryptCATAdminAcquireContext2(
+            &hCatAdminSha256,
+            nullptr,
+            BCRYPT_SHA256_ALGORITHM,
+            nullptr,
+            0) ||
+        !CryptCATAdminAcquireContext2(
+            &hCatAdminSha1,
+            nullptr,
+            BCRYPT_SHA1_ALGORITHM,
+            nullptr,
+            0))
+    {
+        if (hCatAdminSha256 != nullptr)
+        {
+            CryptCATAdminReleaseContext(hCatAdminSha256, 0);
+        }
+        if (hCatAdminSha1 != nullptr)
+        {
+            CryptCATAdminReleaseContext(hCatAdminSha1, 0);
+        }
+        CryptCATClose(hCat);
+        return false;
+    }
+
+    std::vector<uint8_t> expectedDllSha256;
+    std::vector<uint8_t> expectedInfSha256;
+    std::vector<uint8_t> expectedDllSha1;
+    std::vector<uint8_t> expectedInfSha1;
+    const bool hashedAll =
+        ComputeAuthenticodeSipHashSha256(
+            hCatAdminSha256,
+            packageRootDir / "LumaBridgeIddDriver.dll",
+            expectedDllSha256) &&
+        ComputeAuthenticodeSipHashSha256(
+            hCatAdminSha256,
+            packageRootDir / "LumaBridgeIddDriver.inf",
+            expectedInfSha256) &&
+        ComputeAuthenticodeSipHashSha256(
+            hCatAdminSha1,
+            packageRootDir / "LumaBridgeIddDriver.dll",
+            expectedDllSha1) &&
+        ComputeAuthenticodeSipHashSha256(
+            hCatAdminSha1,
+            packageRootDir / "LumaBridgeIddDriver.inf",
+            expectedInfSha1);
+
+    CryptCATAdminReleaseContext(hCatAdminSha256, 0);
+    CryptCATAdminReleaseContext(hCatAdminSha1, 0);
+
+    if (!hashedAll)
+    {
+        CryptCATClose(hCat);
+        return false;
+    }
+
+    bool foundDllSha256 = false;
+    bool foundInfSha256 = false;
+    size_t memberCount = 0;
+
+    CRYPTCATMEMBER* member = nullptr;
+    while ((member = CryptCATEnumerateMember(hCat, member)) != nullptr)
+    {
+        ++memberCount;
+        if (member->pIndirectData == nullptr ||
+            member->pIndirectData->Digest.pbData == nullptr ||
+            member->pIndirectData->Digest.cbData == 0 ||
+            member->pIndirectData->DigestAlgorithm.pszObjId == nullptr)
+        {
+            CryptCATClose(hCat);
+            return false;
+        }
+
+        const std::string algOid(member->pIndirectData->DigestAlgorithm.pszObjId);
+        const bool isSha256 = (algOid == szOID_NIST_sha256);
+        const bool isSha1 = (algOid == szOID_OIWSEC_sha1);
+        if (!isSha256 && !isSha1)
+        {
+            CryptCATClose(hCat);
+            return false;
+        }
+
+        const std::vector<uint8_t> memberDigest(
+            member->pIndirectData->Digest.pbData,
+            member->pIndirectData->Digest.pbData + member->pIndirectData->Digest.cbData);
+
+        std::string memberFileName;
+        CRYPTCATATTRIBUTE* memberAttr = nullptr;
+        while ((memberAttr = CryptCATEnumerateAttr(hCat, member, memberAttr)) != nullptr)
+        {
+            if (WideToLowerAscii(memberAttr->pwszReferenceTag) == "file" &&
+                memberAttr->pbValue != nullptr &&
+                memberAttr->cbValue >= sizeof(wchar_t))
+            {
+                const auto* wideName = reinterpret_cast<const wchar_t*>(memberAttr->pbValue);
+                std::wstring nameWide(wideName, memberAttr->cbValue / sizeof(wchar_t));
+                while (!nameWide.empty() && nameWide.back() == L'\0')
+                {
+                    nameWide.pop_back();
+                }
+                memberFileName = WideToLowerAscii(nameWide.c_str());
+                break;
+            }
+        }
+
+        const std::string refTagLower = WideToLowerAscii(member->pwszReferenceTag);
+        if (memberFileName == "lumabridgeidddriver.dll" ||
+            refTagLower == "lumabridgeidddriver.dll")
+        {
+            const auto& expected = isSha256 ? expectedDllSha256 : expectedDllSha1;
+            if (memberDigest != expected)
+            {
+                CryptCATClose(hCat);
+                return false;
+            }
+            if (isSha256)
+            {
+                foundDllSha256 = true;
+            }
+        }
+        else if (memberFileName == "lumabridgeidddriver.inf" ||
+                 refTagLower == "lumabridgeidddriver.inf")
+        {
+            const auto& expected = isSha256 ? expectedInfSha256 : expectedInfSha1;
+            if (memberDigest != expected)
+            {
+                CryptCATClose(hCat);
+                return false;
+            }
+            if (isSha256)
+            {
+                foundInfSha256 = true;
+            }
+        }
+        else
+        {
+            // Unexpected catalog member indicates stale or contaminated package directory.
+            CryptCATClose(hCat);
+            return false;
+        }
+    }
+
+    CryptCATClose(hCat);
+    return hasWin11OsAttr && memberCount >= 2 && foundDllSha256 && foundInfSha256;
 }
 
 bool
@@ -439,10 +742,10 @@ ValidateStampedInfDocument(
     EXPECT_TRUE(SectionHasNormalizedEntry(doc, "Version", "PnpLockdown = 1"));
     EXPECT_TRUE(IsValidStampedDriverVer(FindSectionDirectiveValue(doc, "Version", "DriverVer")));
 
-    EXPECT_TRUE(SectionHasNormalizedEntry(doc, "Manufacturer", "%ManufacturerName% = Standard,NTamd64.10.0...18362"));
+    EXPECT_TRUE(SectionHasNormalizedEntry(doc, "Manufacturer", "%ManufacturerName% = Standard,NTamd64.10.0...22000"));
     EXPECT_TRUE(SectionHasNormalizedEntry(
         doc,
-        "Standard.NTamd64.10.0...18362",
+        "Standard.NTamd64.10.0...22000",
         "%LumaBridgeDeviceName% = LumaBridge_Install, Root\\LumaBridgeIddDriver"));
 
     EXPECT_TRUE(SectionHasNormalizedEntry(doc, "LumaBridge_Install.NT", "CopyFiles = UMDriverCopy"));
@@ -487,14 +790,17 @@ ValidateStampedInfDocument(
         "HKR,\"WUDF\",\"DeviceGroupId\",%REG_SZ%,\"LumaBridgeIddGroup\""));
 }
 
-void
-ValidateBuiltConfigurationPackage(
+bool
+ValidatePackageAndOutDirConsistency(
     const std::filesystem::path& configOutDir
     )
 {
     const std::filesystem::path packageDir = configOutDir / "LumaBridgeIddDriver";
-    EXPECT_TRUE(std::filesystem::is_directory(configOutDir));
-    EXPECT_TRUE(std::filesystem::is_directory(packageDir));
+    if (!std::filesystem::is_directory(configOutDir) ||
+        !std::filesystem::is_directory(packageDir))
+    {
+        return false;
+    }
 
     const std::filesystem::path pkgDll = packageDir / "LumaBridgeIddDriver.dll";
     const std::filesystem::path pkgInf = packageDir / "LumaBridgeIddDriver.inf";
@@ -504,13 +810,6 @@ ValidateBuiltConfigurationPackage(
     const std::filesystem::path outInf = configOutDir / "LumaBridgeIddDriver.inf";
     const std::filesystem::path outCat = configOutDir / "LumaBridgeIddDriver.cat";
 
-    EXPECT_TRUE(std::filesystem::exists(pkgDll));
-    EXPECT_TRUE(std::filesystem::exists(pkgInf));
-    EXPECT_TRUE(std::filesystem::exists(pkgCat));
-    EXPECT_TRUE(std::filesystem::exists(outDll));
-    EXPECT_TRUE(std::filesystem::exists(outInf));
-    EXPECT_TRUE(std::filesystem::exists(outCat));
-
     std::vector<uint8_t> pkgDllBytes;
     std::vector<uint8_t> outDllBytes;
     std::vector<uint8_t> pkgInfBytes;
@@ -518,19 +817,48 @@ ValidateBuiltConfigurationPackage(
     std::vector<uint8_t> pkgCatBytes;
     std::vector<uint8_t> outCatBytes;
 
-    EXPECT_TRUE(ReadBinaryFile(pkgDll, pkgDllBytes));
-    EXPECT_TRUE(ReadBinaryFile(outDll, outDllBytes));
-    EXPECT_TRUE(ReadBinaryFile(pkgInf, pkgInfBytes));
-    EXPECT_TRUE(ReadBinaryFile(outInf, outInfBytes));
-    EXPECT_TRUE(ReadBinaryFile(pkgCat, pkgCatBytes));
-    EXPECT_TRUE(ReadBinaryFile(outCat, outCatBytes));
+    if (!ReadBinaryFile(pkgDll, pkgDllBytes) ||
+        !ReadBinaryFile(outDll, outDllBytes) ||
+        !ReadBinaryFile(pkgInf, pkgInfBytes) ||
+        !ReadBinaryFile(outInf, outInfBytes) ||
+        !ReadBinaryFile(pkgCat, pkgCatBytes) ||
+        !ReadBinaryFile(outCat, outCatBytes))
+    {
+        return false;
+    }
 
-    EXPECT_TRUE(pkgDllBytes == outDllBytes);
-    EXPECT_TRUE(pkgInfBytes == outInfBytes);
-    EXPECT_TRUE(pkgCatBytes == outCatBytes);
+    if (pkgDllBytes != outDllBytes ||
+        pkgInfBytes != outInfBytes ||
+        pkgCatBytes != outCatBytes)
+    {
+        return false;
+    }
 
-    EXPECT_TRUE(IsValidUnsignedX64DriverDll(pkgDllBytes));
-    EXPECT_TRUE(IsValidUnsignedCatalog(pkgCatBytes));
+    if (!IsValidUnsignedX64DriverDll(pkgDllBytes) ||
+        !IsFileUnsignedViaWinTrust(pkgDll))
+    {
+        return false;
+    }
+
+    if (!ValidateUnsignedCatalogForDirectory(pkgCat, packageDir) ||
+        !ValidateUnsignedCatalogForDirectory(outCat, configOutDir))
+    {
+        return false;
+    }
+
+    return true;
+}
+
+void
+ValidateBuiltConfigurationPackage(
+    const std::filesystem::path& configOutDir
+    )
+{
+    EXPECT_TRUE(ValidatePackageAndOutDirConsistency(configOutDir));
+
+    const std::filesystem::path packageDir = configOutDir / "LumaBridgeIddDriver";
+    std::vector<uint8_t> pkgInfBytes;
+    EXPECT_TRUE(ReadBinaryFile(packageDir / "LumaBridgeIddDriver.inf", pkgInfBytes));
 
     const std::string infText(pkgInfBytes.begin(), pkgInfBytes.end());
     const InfDocument doc = ParseInfText(infText);
@@ -542,6 +870,43 @@ ValidateBuiltConfigurationPackage(
     {
         EXPECT_TRUE(std::filesystem::exists(packageDir / fileName));
         EXPECT_TRUE(std::filesystem::exists(configOutDir / fileName));
+    }
+}
+
+struct TempDirGuard
+{
+    std::filesystem::path Path;
+
+    explicit TempDirGuard(const wchar_t* prefix)
+    {
+        const DWORD pid = GetCurrentProcessId();
+        const ULONGLONG tick = GetTickCount64();
+        Path = std::filesystem::temp_directory_path() /
+               (std::wstring(prefix) + L"_" + std::to_wstring(pid) + L"_" + std::to_wstring(tick));
+        std::error_code ec;
+        std::filesystem::remove_all(Path, ec);
+        std::filesystem::create_directories(Path / "LumaBridgeIddDriver", ec);
+    }
+
+    ~TempDirGuard()
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(Path, ec);
+    }
+};
+
+void
+CopyValidPackageToTemp(
+    const std::filesystem::path& sourceOutDir,
+    const std::filesystem::path& destOutDir
+    )
+{
+    const std::filesystem::path srcPkg = sourceOutDir / "LumaBridgeIddDriver";
+    const std::filesystem::path dstPkg = destOutDir / "LumaBridgeIddDriver";
+    for (const char* name : {"LumaBridgeIddDriver.dll", "LumaBridgeIddDriver.inf", "LumaBridgeIddDriver.cat"})
+    {
+        std::filesystem::copy_file(srcPkg / name, dstPkg / name, std::filesystem::copy_options::overwrite_existing);
+        std::filesystem::copy_file(sourceOutDir / name, destOutDir / name, std::filesystem::copy_options::overwrite_existing);
     }
 }
 
@@ -563,7 +928,6 @@ TestParserAndHelperRejectInvalidInputs()
 
     const std::vector<uint8_t> bogusBytes{'M', 'Z', 0x00, 0x01};
     EXPECT_TRUE(!IsValidUnsignedX64DriverDll(bogusBytes));
-    EXPECT_TRUE(!IsValidUnsignedCatalog(bogusBytes));
 }
 
 void
@@ -575,7 +939,7 @@ TestSourceInfContainsStampInfPlaceholders()
 
     const std::string text(rawBytes.begin(), rawBytes.end());
     const InfDocument doc = ParseInfText(text);
-    EXPECT_TRUE(SectionHasNormalizedEntry(doc, "Manufacturer", "%ManufacturerName% = Standard,NT$ARCH$.10.0...18362"));
+    EXPECT_TRUE(SectionHasNormalizedEntry(doc, "Manufacturer", "%ManufacturerName% = Standard,NT$ARCH$.10.0...22000"));
     EXPECT_TRUE(SectionHasNormalizedEntry(doc, "LumaBridge_UMDF_Service", "UmdfLibraryVersion = $UMDFVERSION$"));
     EXPECT_TRUE(SectionHasNormalizedEntry(doc, "Version", "CatalogFile = LumaBridgeIddDriver.cat"));
 }
@@ -590,6 +954,88 @@ void
 TestReleasePackageArtifactsValidAndConsistent()
 {
     ValidateBuiltConfigurationPackage("windows/driver/x64/Release");
+}
+
+void
+TestNegativeTamperedAndInconsistentPackagesRejected()
+{
+    const std::filesystem::path debugOut = "windows/driver/x64/Debug";
+    const std::filesystem::path releaseOut = "windows/driver/x64/Release";
+
+    // 1. Tampered DLL must fail Authenticode catalog hash verification.
+    {
+        TempDirGuard tmp(L"lb_tamper_dll");
+        CopyValidPackageToTemp(debugOut, tmp.Path);
+
+        std::vector<uint8_t> dllBytes;
+        EXPECT_TRUE(ReadBinaryFile(tmp.Path / "LumaBridgeIddDriver" / "LumaBridgeIddDriver.dll", dllBytes));
+        EXPECT_TRUE(dllBytes.size() > 512);
+        dllBytes.back() ^= 0xFF;
+        {
+            std::ofstream out(tmp.Path / "LumaBridgeIddDriver" / "LumaBridgeIddDriver.dll", std::ios::binary | std::ios::trunc);
+            out.write(reinterpret_cast<const char*>(dllBytes.data()), static_cast<std::streamsize>(dllBytes.size()));
+        }
+        {
+            std::ofstream out(tmp.Path / "LumaBridgeIddDriver.dll", std::ios::binary | std::ios::trunc);
+            out.write(reinterpret_cast<const char*>(dllBytes.data()), static_cast<std::streamsize>(dllBytes.size()));
+        }
+        EXPECT_TRUE(!ValidatePackageAndOutDirConsistency(tmp.Path));
+    }
+
+    // 2. Tampered INF must fail catalog member hash verification.
+    {
+        TempDirGuard tmp(L"lb_tamper_inf");
+        CopyValidPackageToTemp(debugOut, tmp.Path);
+
+        {
+            std::ofstream out(tmp.Path / "LumaBridgeIddDriver" / "LumaBridgeIddDriver.inf", std::ios::binary | std::ios::app);
+            out << "\n; tampered\n";
+        }
+        {
+            std::ofstream out(tmp.Path / "LumaBridgeIddDriver.inf", std::ios::binary | std::ios::app);
+            out << "\n; tampered\n";
+        }
+        EXPECT_TRUE(!ValidatePackageAndOutDirConsistency(tmp.Path));
+    }
+
+    // 3. Corrupted catalog must fail CryptCATOpen / CryptQueryObject.
+    {
+        TempDirGuard tmp(L"lb_corrupt_cat");
+        CopyValidPackageToTemp(debugOut, tmp.Path);
+
+        const std::vector<uint8_t> bogusCat{0x30, 0x82, 0x00, 0x10, 0x01, 0x02, 0x03, 0x04};
+        for (const auto& catPath : {
+                 tmp.Path / "LumaBridgeIddDriver" / "LumaBridgeIddDriver.cat",
+                 tmp.Path / "LumaBridgeIddDriver.cat"})
+        {
+            std::ofstream out(catPath, std::ios::binary | std::ios::trunc);
+            out.write(reinterpret_cast<const char*>(bogusCat.data()), static_cast<std::streamsize>(bogusCat.size()));
+        }
+        EXPECT_TRUE(!ValidatePackageAndOutDirConsistency(tmp.Path));
+    }
+
+    // 4. Cross-configuration inconsistent catalog (Debug catalog paired with Release binaries) must fail.
+    {
+        TempDirGuard tmp(L"lb_inconsistent_cat");
+        CopyValidPackageToTemp(releaseOut, tmp.Path);
+        std::filesystem::copy_file(
+            debugOut / "LumaBridgeIddDriver" / "LumaBridgeIddDriver.cat",
+            tmp.Path / "LumaBridgeIddDriver" / "LumaBridgeIddDriver.cat",
+            std::filesystem::copy_options::overwrite_existing);
+        std::filesystem::copy_file(
+            debugOut / "LumaBridgeIddDriver.cat",
+            tmp.Path / "LumaBridgeIddDriver.cat",
+            std::filesystem::copy_options::overwrite_existing);
+        EXPECT_TRUE(!ValidatePackageAndOutDirConsistency(tmp.Path));
+    }
+
+    // 5. Missing artifact in OutDir or PackageDir must fail.
+    {
+        TempDirGuard tmp(L"lb_missing_artifact");
+        CopyValidPackageToTemp(debugOut, tmp.Path);
+        std::filesystem::remove(tmp.Path / "LumaBridgeIddDriver.cat");
+        EXPECT_TRUE(!ValidatePackageAndOutDirConsistency(tmp.Path));
+    }
 }
 
 template <typename Fn>
@@ -617,10 +1063,12 @@ RunTest(
 int
 main()
 {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     RunTest("ParserAndHelperRejectInvalidInputs", TestParserAndHelperRejectInvalidInputs);
     RunTest("SourceInfContainsStampInfPlaceholders", TestSourceInfContainsStampInfPlaceholders);
     RunTest("DebugPackageArtifactsValidAndConsistent", TestDebugPackageArtifactsValidAndConsistent);
     RunTest("ReleasePackageArtifactsValidAndConsistent", TestReleasePackageArtifactsValidAndConsistent);
+    RunTest("NegativeTamperedAndInconsistentPackagesRejected", TestNegativeTamperedAndInconsistentPackagesRejected);
 
     std::printf("Summary: %d tests run, %d assertion failures.\n", g_TestsRun, g_TestsFailed);
     return (g_TestsFailed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;

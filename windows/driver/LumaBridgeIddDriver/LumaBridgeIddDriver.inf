@@ -15,9 +15,9 @@ DriverVer = 07/01/2026,0.1.0.0
 PnpLockdown = 1
 
 [Manufacturer]
-%ManufacturerName% = Standard,NT$ARCH$.10.0...18362
+%ManufacturerName% = Standard,NT$ARCH$.10.0...22000
 
-[Standard.NT$ARCH$.10.0...18362]
+[Standard.NT$ARCH$.10.0...22000]
 %LumaBridgeDeviceName% = LumaBridge_Install, Root\LumaBridgeIddDriver
 
 [SourceDisksNames]
