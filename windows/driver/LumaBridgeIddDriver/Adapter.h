@@ -8,7 +8,6 @@
 namespace lumabridge::driver {
 
 inline constexpr UINT kMaxMonitorsSupported = 1;
-inline constexpr UINT64 kMaxDisplayPipelineRate = 2560ULL * 1440ULL * 60ULL;
 inline constexpr DWORD kAdapterInitSlotWaitTimeoutMs = 5000;
 inline constexpr UINT kEndpointMajorVersion = 0;
 inline constexpr UINT kEndpointMinorVersion = 1;

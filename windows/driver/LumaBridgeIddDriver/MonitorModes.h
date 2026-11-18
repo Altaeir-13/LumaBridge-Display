@@ -21,8 +21,10 @@ namespace lumabridge::driver {
 
 inline constexpr uint32_t kDefaultRefreshRateHz = 60;
 inline constexpr uint32_t kMaxSupportedVideoModes = 2;
-inline constexpr uint64_t kDefaultMaxDisplayPipelineRate = 2560ULL * 1440ULL * 60ULL;
+inline constexpr uint64_t kMaxDisplayPipelineRate = 2560ULL * 1440ULL * 60ULL;
 inline constexpr uint32_t kNoPreferredModeIndex = 0xffffffffU;
+inline constexpr uint32_t kMonitorModeVSyncDivider = 0U;
+inline constexpr uint32_t kTargetModeVSyncDivider = 1U;
 
 /// Canonical description of a progressive SDR virtual monitor video mode.
 struct VideoModeSpec
@@ -73,9 +75,18 @@ ValidateVideoModeSpec(
     uint64_t maxPipelineRate
     ) noexcept;
 
-/// Validates a DISPLAYCONFIG_VIDEO_SIGNAL_INFO against supported MVP modes and pipeline bandwidth.
+/// Validates a DISPLAYCONFIG_VIDEO_SIGNAL_INFO for IDDCX_MONITOR_MODE (requires vSyncFreqDivider == 0
+/// and exact match with an advertised MVP video mode).
 bool
-ValidateDisplayConfigVideoSignalInfo(
+ValidateMonitorModeVideoSignalInfo(
+    const DISPLAYCONFIG_VIDEO_SIGNAL_INFO& signalInfo,
+    uint64_t maxPipelineRate
+    ) noexcept;
+
+/// Validates a DISPLAYCONFIG_VIDEO_SIGNAL_INFO for IDDCX_TARGET_MODE / IDDCX_PATH (requires
+/// vSyncFreqDivider == 1 for 1:1 desktop updates and exact match with an advertised MVP video mode).
+bool
+ValidateTargetModeVideoSignalInfo(
     const DISPLAYCONFIG_VIDEO_SIGNAL_INFO& signalInfo,
     uint64_t maxPipelineRate
     ) noexcept;
@@ -87,9 +98,16 @@ AreEquivalentVideoModes(
     const VideoModeSpec& rhs
     ) noexcept;
 
-/// Populates a DISPLAYCONFIG_VIDEO_SIGNAL_INFO from a validated VideoModeSpec.
+/// Populates a DISPLAYCONFIG_VIDEO_SIGNAL_INFO for IDDCX_MONITOR_MODE (vSyncFreqDivider = 0).
 bool
-FillDisplayConfigVideoSignalInfo(
+FillMonitorModeVideoSignalInfo(
+    const VideoModeSpec& spec,
+    DISPLAYCONFIG_VIDEO_SIGNAL_INFO& outSignalInfo
+    ) noexcept;
+
+/// Populates a DISPLAYCONFIG_VIDEO_SIGNAL_INFO for IDDCX_TARGET_MODE (vSyncFreqDivider = 1).
+bool
+FillTargetModeVideoSignalInfo(
     const VideoModeSpec& spec,
     DISPLAYCONFIG_VIDEO_SIGNAL_INFO& outSignalInfo
     ) noexcept;

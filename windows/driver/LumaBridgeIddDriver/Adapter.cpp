@@ -724,6 +724,11 @@ LumaBridgeEvtAdapterCommitModes(
         return STATUS_INVALID_PARAMETER;
     }
 
+    if (pInArgs->PathCount > lumabridge::driver::kMaxMonitorsSupported)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     if (pInArgs->PathCount > 0 && pInArgs->pPaths == nullptr)
     {
         return STATUS_INVALID_PARAMETER;
@@ -732,9 +737,14 @@ LumaBridgeEvtAdapterCommitModes(
     for (UINT i = 0; i < pInArgs->PathCount; ++i)
     {
         const IDDCX_PATH& path = pInArgs->pPaths[i];
+        if (path.MonitorObject == nullptr)
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+
         if ((path.Flags & IDDCX_PATH_FLAGS_ACTIVE) != 0)
         {
-            if (!lumabridge::driver::ValidateDisplayConfigVideoSignalInfo(
+            if (!lumabridge::driver::ValidateTargetModeVideoSignalInfo(
                     path.TargetVideoSignalInfo,
                     lumabridge::driver::kMaxDisplayPipelineRate))
             {
@@ -742,7 +752,7 @@ LumaBridgeEvtAdapterCommitModes(
                     DriverDiagnosticStage::AdapterCommitModes,
                     STATUS_INVALID_PARAMETER,
                     AdapterLifecycleState::AdapterReady,
-                    "EvtIddCxAdapterCommitModes rejected unsupported or invalid active path mode");
+                    "EvtIddCxAdapterCommitModes rejected unsupported, unadvertised, or invalid active path mode");
                 return STATUS_INVALID_PARAMETER;
             }
         }
@@ -804,7 +814,8 @@ LumaBridgeEvtParseMonitorDescription(
     pOutArgs->MonitorModeBufferOutputCount = 0;
     pOutArgs->PreferredMonitorModeIdx = NO_PREFERRED_MODE;
 
-    if (pInArgs->MonitorModeBufferInputCount > 0 && pInArgs->pMonitorModes == nullptr)
+    if ((pInArgs->MonitorModeBufferInputCount > 0 && pInArgs->pMonitorModes == nullptr) ||
+        (pInArgs->MonitorDescription.DataSize > 0 && pInArgs->MonitorDescription.pData == nullptr))
     {
         return STATUS_INVALID_PARAMETER;
     }
@@ -863,7 +874,7 @@ LumaBridgeEvtMonitorGetDefaultDescriptionModes(
             dst = {};
             dst.Size = sizeof(IDDCX_MONITOR_MODE);
             dst.Origin = IDDCX_MONITOR_MODE_ORIGIN_DRIVER;
-            if (!lumabridge::driver::FillDisplayConfigVideoSignalInfo(
+            if (!lumabridge::driver::FillMonitorModeVideoSignalInfo(
                     modes[i],
                     dst.MonitorVideoSignalInfo))
             {
@@ -922,7 +933,7 @@ LumaBridgeEvtMonitorQueryTargetModes(
             dst = {};
             dst.Size = sizeof(IDDCX_TARGET_MODE);
             dst.RequiredBandwidth = modes[i].RequiredBandwidth;
-            if (!lumabridge::driver::FillDisplayConfigVideoSignalInfo(
+            if (!lumabridge::driver::FillTargetModeVideoSignalInfo(
                     modes[i],
                     dst.TargetVideoSignalInfo.targetVideoSignalInfo))
             {

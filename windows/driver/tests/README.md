@@ -29,18 +29,20 @@
 4. `ReleasePackageArtifactsValidAndConsistent` — repete a verificacao integral para o pacote `Release|x64`;
 5. `NegativeTamperedAndInconsistentPackagesRejected` — testes negativos cobrindo adulteracao de `.dll` e `.inf`, catalogo corrompido, catalogo inconsistente entre configuracoes e artefato ausente.
 
-`MonitorModesTests.cpp` executa **10 testes unitarios deterministicos** sobre `MonitorModes.h` / `MonitorModes.cpp`:
+`MonitorModesTests.cpp` executa **12 testes unitarios deterministicos** sobre `MonitorModes.h` / `MonitorModes.cpp`:
 
 1. `Validate720p60Mode` — valida timings CTA-861 VIC 4 (`1280x720@60Hz`, `1650x750` total, `74.25 MHz`);
 2. `Validate1080p60Mode` — valida timings CTA-861 VIC 16 (`1920x1080@60Hz`, `2200x1125` total, `148.50 MHz`);
 3. `PreferredModeIs1080p60` — confirma `1920x1080@60Hz` como modo preferencial;
-4. `FrequencyAndPixelRateCalculations` — verifica consistencia de `pixelRate`, `hSyncFreq`, `vSyncFreq` e `vSyncFreqDivider == 0` em `DISPLAYCONFIG_VIDEO_SIGNAL_INFO`;
+4. `FrequencyAndPixelRateCalculations` — verifica consistencia de `pixelRate`, `hSyncFreq`, `vSyncFreq` e divisores em `IDDCX_MONITOR_MODE` (`0`) e `IDDCX_TARGET_MODE` (`1`);
 5. `RejectsInvalidAndUnsupportedResolutions` — rejeita dimensoes nulas, `active > total` e resolucoes nao habilitadas no MVP;
-6. `RejectsInvalidRefreshRatesAndScanlineOrdering` — rejeita taxas != 60 Hz, denominadores nulos, modo entrelacado e `vSyncFreqDivider != 0`;
+6. `RejectsInvalidRefreshRatesAndScanlineOrdering` — rejeita taxas != 60 Hz, denominadores nulos, modo entrelacado e divisores invalidos;
 7. `EnforcesAdapterPipelineBandwidthLimit` — valida filtragem por `maxPipelineRate`;
 8. `NegotiateModeBufferCountQueryAndInsufficientBuffer` — valida consulta preliminar (`OutputCount = 2`), `STATUS_BUFFER_TOO_SMALL`, `STATUS_INVALID_PARAMETER` e copia completa;
-9. `RejectsArithmeticOverflowInTimingAndBandwidth` — valida protecao contra overflow em `SafeMultiplyU64`/`SafeMultiply3U64` e `ValidateDisplayConfigVideoSignalInfo`;
-10. `SupportedModesContainNoDuplicates` — confirma ausencia de modos equivalentes duplicados.
+9. `RejectsArithmeticOverflowInTimingAndBandwidth` — valida protecao contra overflow em `SafeMultiplyU64`/`SafeMultiply3U64` e `ValidateTargetModeVideoSignalInfo`;
+10. `SupportedModesContainNoDuplicates` — confirma ausencia de modos equivalentes duplicados;
+11. `MonitorAndTargetModesEnforceDistinctVSyncDividers` — regressao confirmando `vSyncFreqDivider == 0` exclusivo de monitor modes e `vSyncFreqDivider == 1` exclusivo de target modes/commit;
+12. `CommitValidationRejectsUnadvertisedTimingsWithMatchingActiveResolution` — regressao rejeitando timings nao anunciados mesmo para resolucoes 1080p60 validas.
 
 ## Fronteira com validacao em runtime WDF/IddCx
 

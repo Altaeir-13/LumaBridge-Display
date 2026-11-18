@@ -11,8 +11,8 @@ O driver `LumaBridgeIddDriver` (UMDF 2.31 / IddCx 1.4+) adota a estrategia de **
 - O monitor virtual nao depende de um bloco EDID sintetico fixo de 128 bytes.
 - `EvtIddCxMonitorGetDefaultDescriptionModes` fornece os modos padrao do monitor com `IDDCX_MONITOR_MODE_ORIGIN_DRIVER` e sinaliza o modo preferencial.
 - `EvtIddCxMonitorQueryTargetModes` expoe os modos de destino (`IDDCX_TARGET_MODE`) suportados pelo pipeline do adaptador dentro de `kMaxDisplayPipelineRate`.
-- `EvtIddCxParseMonitorDescription` valida argumentos de entrada (`STATUS_INVALID_PARAMETER` para ponteiros nulos ou buffer nulo com contagem > 0) e recusa explicitamente o parsing com `STATUS_NOT_SUPPORTED` nesta etapa do MVP.
-- `EvtIddCxAdapterCommitModes` valida o estado do ciclo de vida do adaptador e verifica que todo path ativo (`IDDCX_PATH_FLAGS_ACTIVE`) utilize um `DISPLAYCONFIG_VIDEO_SIGNAL_INFO` valido e compativel com os modos MVP.
+- `EvtIddCxParseMonitorDescription` valida argumentos de entrada (`STATUS_INVALID_PARAMETER` para ponteiros nulos, buffer nulo com contagem > 0 ou `DataSize > 0` com `pData == nullptr`) e recusa explicitamente o parsing com `STATUS_NOT_SUPPORTED` nesta etapa do MVP.
+- `EvtIddCxAdapterCommitModes` valida o estado do ciclo de vida do adaptador, o limite de paths (`PathCount <= kMaxMonitorsSupported`), `MonitorObject != nullptr` e verifica que todo path ativo (`IDDCX_PATH_FLAGS_ACTIVE`) utilize um `DISPLAYCONFIG_VIDEO_SIGNAL_INFO` com `vSyncFreqDivider == 1` (atualizacao 1:1) e correspondencia exata de todos os timings com um modo anunciado pelo driver.
 
 ## 2. Decisao sobre EDID
 
@@ -45,30 +45,35 @@ No modulo `windows/driver/LumaBridgeIddDriver/MonitorModes.h` / `MonitorModes.cp
 
 Mapeamento para estruturas IddCx 1.4 em `Adapter.cpp`:
 
-- `IDDCX_MONITOR_MODE`: `Size = sizeof(IDDCX_MONITOR_MODE)`, `Origin = IDDCX_MONITOR_MODE_ORIGIN_DRIVER`, `MonitorVideoSignalInfo` preenchido via `FillDisplayConfigVideoSignalInfo`.
-- `IDDCX_TARGET_MODE`: `Size = sizeof(IDDCX_TARGET_MODE)`, `TargetVideoSignalInfo.targetVideoSignalInfo` preenchido via `FillDisplayConfigVideoSignalInfo`, `RequiredBandwidth = ActiveWidth * ActiveHeight * 60`.
+- `IDDCX_MONITOR_MODE`: `Size = sizeof(IDDCX_MONITOR_MODE)`, `Origin = IDDCX_MONITOR_MODE_ORIGIN_DRIVER`, `MonitorVideoSignalInfo` preenchido via `FillMonitorModeVideoSignalInfo` (`AdditionalSignalInfo.vSyncFreqDivider = 0`, conforme contrato de modo de monitor no IddCx).
+- `IDDCX_TARGET_MODE`: `Size = sizeof(IDDCX_TARGET_MODE)`, `TargetVideoSignalInfo.targetVideoSignalInfo` preenchido via `FillTargetModeVideoSignalInfo` (`AdditionalSignalInfo.vSyncFreqDivider = 1` para atualizacao 1:1 do desktop; divisor `0` e proibido em target modes e `IDDCX_PATH`), `RequiredBandwidth = ActiveWidth * ActiveHeight * 60`.
 
 ## 5. Calculos e timings
 
-As relacoes matematicas verificadas em tempo de validacao (`ValidateVideoModeSpec` / `ValidateDisplayConfigVideoSignalInfo`) garantem consistencia exata sem overflow em `uint64_t` (`SafeMultiplyU64` / `SafeMultiply3U64`):
+As relacoes matematicas verificadas em tempo de validacao (`ValidateVideoModeSpec`, `ValidateMonitorModeVideoSignalInfo` e `ValidateTargetModeVideoSignalInfo`) garantem consistencia exata sem overflow em `uint64_t` (`SafeMultiplyU64` / `SafeMultiply3U64`) e correspondencia estrita com os modos anunciados:
 
 - `0 < ActiveWidth <= TotalWidth` e `0 < ActiveHeight <= TotalHeight`
 - `VSyncDenominator > 0`, `HSyncDenominator > 0` e `VSyncNumerator / VSyncDenominator == 60`
-- `AdditionalSignalInfo.vSyncFreqDivider == 0` (contrato obrigatorio IddCx 1.4 para `IDDCX_MONITOR_MODE` e `IDDCX_TARGET_MODE`)
+- `AdditionalSignalInfo.vSyncFreqDivider == 0` para `IDDCX_MONITOR_MODE` e `AdditionalSignalInfo.vSyncFreqDivider == 1` para `IDDCX_TARGET_MODE` / `IDDCX_PATH` ativo em `CommitModes`
 - `AdditionalSignalInfo.videoStandard == 255` (`D3DKMDT_VSS_OTHER`)
 - `PixelRateHz == TotalWidth * TotalHeight * 60`
 - `HSyncFreq == TotalHeight * 60`
 - `RequiredBandwidth == ActiveWidth * ActiveHeight * 60 <= maxPipelineRate`
+- Correspondencia exata (`MatchesExactModeTiming`) com um modo retornado por `GetSupportedMvpVideoModes(maxPipelineRate, ...)` (rejeitando timings arbitrarios mesmo para resolucoes 720p/1080p)
 - Deduplicacao garantida por `AreEquivalentVideoModes` antes de expor a tabela de modos.
+
+### Compatibilidade UMDF / IddCx com Windows 11 21H2+
+
+- Conforme `WindowsDriver.UserMode.LateEvaluation.props` (WDK `10.0.28000.0`), `UMDF 2.31` tem suporte a partir do Windows 10 2004 (`19041`, `_NT_TARGET_VERSION_WIN10_VB`) e `UMDF_MINIMUM_VERSION_REQUIRED=25` (`2.25`). No Windows 11 21H2 (`22000`, plataforma minima declarada em `LumaBridgeIddDriver.inf`), o sistema inbox fornece UMDF `2.33` e `IddCx 1.6+`, plenamente retrocompativeis com `UMDF 2.31` / `IddCx 1.4` (`IddCx0102`).
 
 ## 6. Contratos dos callbacks IddCx
 
 | Callback | Comportamento implementado |
 |---|---|
-| `EvtIddCxParseMonitorDescription` | Valida ponteiros/buffer (`STATUS_INVALID_PARAMETER`), zera saidas (`OutputCount = 0`, `PreferredMonitorModeIdx = NO_PREFERRED_MODE`) e retorna `STATUS_NOT_SUPPORTED`. |
-| `EvtIddCxMonitorGetDefaultDescriptionModes` | Valida `MonitorObject`/`pInArgs`/`pOutArgs`. Em consulta preliminar (`pDefaultMonitorModes == nullptr` ou `InputCount == 0`), retorna `STATUS_SUCCESS` com `DefaultMonitorModeBufferOutputCount = 2` e `PreferredMonitorModeIdx = 1`. Em buffer menor que 2, retorna `STATUS_BUFFER_TOO_SMALL` sem gravar no buffer. Em buffer >= 2, preenche os 2 modos `IDDCX_MONITOR_MODE` e retorna `STATUS_SUCCESS`. |
-| `EvtIddCxMonitorQueryTargetModes` | Valida `MonitorObject`/`pInArgs`/`pOutArgs`. Segue a mesma semantica de consulta preliminar (`STATUS_SUCCESS` com `OutputCount = 2`), buffer insuficiente (`STATUS_BUFFER_TOO_SMALL`) e preenchimento completo (`IDDCX_TARGET_MODE` com `RequiredBandwidth`). |
-| `EvtIddCxAdapterCommitModes` | Valida parametros e estado do adaptador via `TransitionOnCommitModes`; para cada `IDDCX_PATH` com `IDDCX_PATH_FLAGS_ACTIVE`, valida `TargetVideoSignalInfo` contra `ValidateDisplayConfigVideoSignalInfo` e `kMaxDisplayPipelineRate`, retornando `STATUS_INVALID_PARAMETER` se invalido. |
+| `EvtIddCxParseMonitorDescription` | Valida ponteiros, buffer e `MonitorDescription` (`STATUS_INVALID_PARAMETER`), zera saidas (`OutputCount = 0`, `PreferredMonitorModeIdx = NO_PREFERRED_MODE`) e retorna `STATUS_NOT_SUPPORTED`. |
+| `EvtIddCxMonitorGetDefaultDescriptionModes` | Valida `MonitorObject`/`pInArgs`/`pOutArgs`. Em consulta preliminar (`InputCount == 0`), retorna `STATUS_SUCCESS` com `DefaultMonitorModeBufferOutputCount = 2` e `PreferredMonitorModeIdx = 1`. Em buffer `> 0` e `< 2`, retorna `STATUS_BUFFER_TOO_SMALL` com `OutputCount = 2` e `PreferredMonitorModeIdx = NO_PREFERRED_MODE` sem gravar no buffer. Em buffer `>= 2`, preenche os 2 modos `IDDCX_MONITOR_MODE` com `vSyncFreqDivider = 0` e retorna `STATUS_SUCCESS`. |
+| `EvtIddCxMonitorQueryTargetModes` | Valida `MonitorObject`/`pInArgs`/`pOutArgs`. Segue a mesma semantica de consulta preliminar (`STATUS_SUCCESS` com `OutputCount = 2`), buffer insuficiente (`STATUS_BUFFER_TOO_SMALL`) e preenchimento completo (`IDDCX_TARGET_MODE` com `vSyncFreqDivider = 1` e `RequiredBandwidth`). |
+| `EvtIddCxAdapterCommitModes` | Valida `PathCount <= kMaxMonitorsSupported`, `MonitorObject != nullptr` e estado do adaptador via `TransitionOnCommitModes`; para cada `IDDCX_PATH` com `IDDCX_PATH_FLAGS_ACTIVE`, exige `ValidateTargetModeVideoSignalInfo` (`vSyncFreqDivider == 1` e timings identicos a um modo anunciado dentro de `kMaxDisplayPipelineRate`), retornando `STATUS_INVALID_PARAMETER` se invalido. |
 
 ## 7. Limitacoes e seguranca do monitor virtual
 
@@ -77,7 +82,7 @@ As relacoes matematicas verificadas em tempo de validacao (`ValidateVideoModeSpe
 
 ## 8. Resultados dos testes
 
-- `MonitorModesTests.exe`: **10 testes unitarios deterministicos** aprovados (`0` falhas), cobrindo 720p60, 1080p60, modo preferencial, calculos de frequencia/pixel rate, resolucoes/frequencias invalidas, limite de banda do adaptador, consulta preliminar de quantidade, buffer insuficiente, overflow aritmetico e ausencia de duplicatas.
+- `MonitorModesTests.exe`: **12 testes unitarios deterministicos** aprovados (`0` falhas), cobrindo 720p60, 1080p60, modo preferencial, calculos de frequencia/pixel rate, separacao de `vSyncFreqDivider` (`0` vs `1`), rejeicao de timings nao anunciados no commit, resolucoes/frequencias invalidas, limite de banda do adaptador, consulta preliminar de quantidade, buffer insuficiente, overflow aritmetico e ausencia de duplicatas.
 - `AdapterLifecycleTests.exe`: **16 testes unitarios** aprovados (`0` falhas).
 - `DriverPackageValidationTests.exe`: **5 testes de empacotamento** aprovados (`0` falhas).
 - `MSBuild` `Debug|x64` e `Release|x64`: **0 erros, 0 warnings** (incluindo `StampInf`, `InfVerif`, `Inf2Cat` e `DrvCat`).

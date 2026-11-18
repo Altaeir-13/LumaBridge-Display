@@ -36,6 +36,8 @@ constexpr VideoModeSpec kMode1080p60{
     DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE,
     true};
 
+constexpr uint32_t kVideoStandardOther = 255; // D3DKMDT_VSS_OTHER
+
 bool
 IsSupportedMvpResolution(
     uint32_t width,
@@ -44,6 +46,129 @@ IsSupportedMvpResolution(
 {
     return (width == 1280U && height == 720U) ||
            (width == 1920U && height == 1080U);
+}
+
+bool
+MatchesExactModeTiming(
+    const VideoModeSpec& lhs,
+    const VideoModeSpec& rhs
+    ) noexcept
+{
+    return lhs.ActiveWidth == rhs.ActiveWidth &&
+           lhs.ActiveHeight == rhs.ActiveHeight &&
+           lhs.TotalWidth == rhs.TotalWidth &&
+           lhs.TotalHeight == rhs.TotalHeight &&
+           lhs.VSyncNumerator == rhs.VSyncNumerator &&
+           lhs.VSyncDenominator == rhs.VSyncDenominator &&
+           lhs.HSyncNumerator == rhs.HSyncNumerator &&
+           lhs.HSyncDenominator == rhs.HSyncDenominator &&
+           lhs.PixelRateHz == rhs.PixelRateHz &&
+           lhs.RequiredBandwidth == rhs.RequiredBandwidth &&
+           lhs.ScanlineOrdering == rhs.ScanlineOrdering;
+}
+
+bool
+MatchesAdvertisedMvpVideoMode(
+    const VideoModeSpec& candidate,
+    uint64_t maxPipelineRate
+    ) noexcept
+{
+    VideoModeSpec advertised[kMaxSupportedVideoModes]{};
+    uint32_t count = 0;
+    uint32_t preferredIdx = kNoPreferredModeIndex;
+    if (!GetSupportedMvpVideoModes(maxPipelineRate, advertised, count, preferredIdx))
+    {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        if (MatchesExactModeTiming(advertised[i], candidate))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool
+ValidateSignalInfoForDivider(
+    const DISPLAYCONFIG_VIDEO_SIGNAL_INFO& signalInfo,
+    uint32_t expectedVSyncDivider,
+    uint64_t maxPipelineRate
+    ) noexcept
+{
+    if (signalInfo.vSyncFreq.Denominator == 0 || signalInfo.hSyncFreq.Denominator == 0)
+    {
+        return false;
+    }
+
+    if (signalInfo.AdditionalSignalInfo.vSyncFreqDivider != expectedVSyncDivider)
+    {
+        return false;
+    }
+
+    if (signalInfo.AdditionalSignalInfo.videoStandard != kVideoStandardOther)
+    {
+        return false;
+    }
+
+    const uint64_t refreshHz =
+        static_cast<uint64_t>(signalInfo.vSyncFreq.Numerator) / signalInfo.vSyncFreq.Denominator;
+
+    uint64_t requiredBandwidth = 0;
+    if (!SafeMultiply3U64(
+            signalInfo.activeSize.cx,
+            signalInfo.activeSize.cy,
+            refreshHz,
+            requiredBandwidth))
+    {
+        return false;
+    }
+
+    VideoModeSpec spec{};
+    spec.ActiveWidth = signalInfo.activeSize.cx;
+    spec.ActiveHeight = signalInfo.activeSize.cy;
+    spec.TotalWidth = signalInfo.totalSize.cx;
+    spec.TotalHeight = signalInfo.totalSize.cy;
+    spec.VSyncNumerator = signalInfo.vSyncFreq.Numerator;
+    spec.VSyncDenominator = signalInfo.vSyncFreq.Denominator;
+    spec.HSyncNumerator = signalInfo.hSyncFreq.Numerator;
+    spec.HSyncDenominator = signalInfo.hSyncFreq.Denominator;
+    spec.PixelRateHz = signalInfo.pixelRate;
+    spec.RequiredBandwidth = requiredBandwidth;
+    spec.ScanlineOrdering = signalInfo.scanLineOrdering;
+
+    return ValidateVideoModeSpec(spec, maxPipelineRate) &&
+           MatchesAdvertisedMvpVideoMode(spec, maxPipelineRate);
+}
+
+bool
+FillSignalInfoWithDivider(
+    const VideoModeSpec& spec,
+    uint32_t vSyncDivider,
+    DISPLAYCONFIG_VIDEO_SIGNAL_INFO& outSignalInfo
+    ) noexcept
+{
+    if (!ValidateVideoModeSpec(spec, (std::numeric_limits<uint64_t>::max)()))
+    {
+        return false;
+    }
+
+    outSignalInfo = {};
+    outSignalInfo.pixelRate = spec.PixelRateHz;
+    outSignalInfo.hSyncFreq.Numerator = spec.HSyncNumerator;
+    outSignalInfo.hSyncFreq.Denominator = spec.HSyncDenominator;
+    outSignalInfo.vSyncFreq.Numerator = spec.VSyncNumerator;
+    outSignalInfo.vSyncFreq.Denominator = spec.VSyncDenominator;
+    outSignalInfo.activeSize.cx = spec.ActiveWidth;
+    outSignalInfo.activeSize.cy = spec.ActiveHeight;
+    outSignalInfo.totalSize.cx = spec.TotalWidth;
+    outSignalInfo.totalSize.cy = spec.TotalHeight;
+    outSignalInfo.AdditionalSignalInfo.videoStandard = kVideoStandardOther;
+    outSignalInfo.AdditionalSignalInfo.vSyncFreqDivider = vSyncDivider;
+    outSignalInfo.scanLineOrdering = spec.ScanlineOrdering;
+    return true;
 }
 
 } // namespace
@@ -167,48 +292,21 @@ ValidateVideoModeSpec(
 }
 
 bool
-ValidateDisplayConfigVideoSignalInfo(
+ValidateMonitorModeVideoSignalInfo(
     const DISPLAYCONFIG_VIDEO_SIGNAL_INFO& signalInfo,
     uint64_t maxPipelineRate
     ) noexcept
 {
-    if (signalInfo.vSyncFreq.Denominator == 0 || signalInfo.hSyncFreq.Denominator == 0)
-    {
-        return false;
-    }
+    return ValidateSignalInfoForDivider(signalInfo, kMonitorModeVSyncDivider, maxPipelineRate);
+}
 
-    if (signalInfo.AdditionalSignalInfo.vSyncFreqDivider != 0)
-    {
-        return false;
-    }
-
-    const uint64_t refreshHz =
-        static_cast<uint64_t>(signalInfo.vSyncFreq.Numerator) / signalInfo.vSyncFreq.Denominator;
-
-    uint64_t requiredBandwidth = 0;
-    if (!SafeMultiply3U64(
-            signalInfo.activeSize.cx,
-            signalInfo.activeSize.cy,
-            refreshHz,
-            requiredBandwidth))
-    {
-        return false;
-    }
-
-    VideoModeSpec spec{};
-    spec.ActiveWidth = signalInfo.activeSize.cx;
-    spec.ActiveHeight = signalInfo.activeSize.cy;
-    spec.TotalWidth = signalInfo.totalSize.cx;
-    spec.TotalHeight = signalInfo.totalSize.cy;
-    spec.VSyncNumerator = signalInfo.vSyncFreq.Numerator;
-    spec.VSyncDenominator = signalInfo.vSyncFreq.Denominator;
-    spec.HSyncNumerator = signalInfo.hSyncFreq.Numerator;
-    spec.HSyncDenominator = signalInfo.hSyncFreq.Denominator;
-    spec.PixelRateHz = signalInfo.pixelRate;
-    spec.RequiredBandwidth = requiredBandwidth;
-    spec.ScanlineOrdering = signalInfo.scanLineOrdering;
-
-    return ValidateVideoModeSpec(spec, maxPipelineRate);
+bool
+ValidateTargetModeVideoSignalInfo(
+    const DISPLAYCONFIG_VIDEO_SIGNAL_INFO& signalInfo,
+    uint64_t maxPipelineRate
+    ) noexcept
+{
+    return ValidateSignalInfoForDivider(signalInfo, kTargetModeVSyncDivider, maxPipelineRate);
 }
 
 bool
@@ -231,30 +329,21 @@ AreEquivalentVideoModes(
 }
 
 bool
-FillDisplayConfigVideoSignalInfo(
+FillMonitorModeVideoSignalInfo(
     const VideoModeSpec& spec,
     DISPLAYCONFIG_VIDEO_SIGNAL_INFO& outSignalInfo
     ) noexcept
 {
-    if (!ValidateVideoModeSpec(spec, (std::numeric_limits<uint64_t>::max)()))
-    {
-        return false;
-    }
+    return FillSignalInfoWithDivider(spec, kMonitorModeVSyncDivider, outSignalInfo);
+}
 
-    outSignalInfo = {};
-    outSignalInfo.pixelRate = spec.PixelRateHz;
-    outSignalInfo.hSyncFreq.Numerator = spec.HSyncNumerator;
-    outSignalInfo.hSyncFreq.Denominator = spec.HSyncDenominator;
-    outSignalInfo.vSyncFreq.Numerator = spec.VSyncNumerator;
-    outSignalInfo.vSyncFreq.Denominator = spec.VSyncDenominator;
-    outSignalInfo.activeSize.cx = spec.ActiveWidth;
-    outSignalInfo.activeSize.cy = spec.ActiveHeight;
-    outSignalInfo.totalSize.cx = spec.TotalWidth;
-    outSignalInfo.totalSize.cy = spec.TotalHeight;
-    outSignalInfo.AdditionalSignalInfo.videoStandard = 255; // D3DKMDT_VSS_OTHER
-    outSignalInfo.AdditionalSignalInfo.vSyncFreqDivider = 0;
-    outSignalInfo.scanLineOrdering = spec.ScanlineOrdering;
-    return true;
+bool
+FillTargetModeVideoSignalInfo(
+    const VideoModeSpec& spec,
+    DISPLAYCONFIG_VIDEO_SIGNAL_INFO& outSignalInfo
+    ) noexcept
+{
+    return FillSignalInfoWithDivider(spec, kTargetModeVSyncDivider, outSignalInfo);
 }
 
 bool
@@ -327,18 +416,19 @@ NegotiateModeBuffer(
         return result;
     }
 
-    result.OutputCount = supportedCount;
-    result.PreferredIndex = preferredIndex;
-
-    // Preliminary count query: IddCx passes NULL buffer or InputCount == 0.
-    if (!hasOutputBuffer || inputCount == 0)
+    // Preliminary count query: IddCx passes InputCount == 0 (with or without a NULL buffer).
+    if (inputCount == 0)
     {
+        result.OutputCount = supportedCount;
+        result.PreferredIndex = preferredIndex;
         result.Status = STATUS_SUCCESS;
         return result;
     }
 
     if (inputCount < supportedCount)
     {
+        result.OutputCount = supportedCount;
+        result.PreferredIndex = kNoPreferredModeIndex;
         result.Status = STATUS_BUFFER_TOO_SMALL;
         return result;
     }
@@ -348,6 +438,8 @@ NegotiateModeBuffer(
         outModes[i] = supportedModes[i];
     }
 
+    result.OutputCount = supportedCount;
+    result.PreferredIndex = preferredIndex;
     result.Status = STATUS_SUCCESS;
     return result;
 }

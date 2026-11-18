@@ -55,7 +55,7 @@ TestValidate720p60Mode()
     uint32_t count = 0;
     uint32_t preferredIdx = kNoPreferredModeIndex;
 
-    EXPECT_TRUE(GetSupportedMvpVideoModes(kDefaultMaxDisplayPipelineRate, modes, count, preferredIdx));
+    EXPECT_TRUE(GetSupportedMvpVideoModes(kMaxDisplayPipelineRate, modes, count, preferredIdx));
     EXPECT_EQ(count, static_cast<uint32_t>(2));
 
     const VideoModeSpec& m = modes[0];
@@ -71,7 +71,7 @@ TestValidate720p60Mode()
     EXPECT_EQ(m.RequiredBandwidth, 1280ULL * 720ULL * 60ULL);
     EXPECT_EQ(m.ScanlineOrdering, DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE);
     EXPECT_TRUE(!m.IsPreferred);
-    EXPECT_TRUE(ValidateVideoModeSpec(m, kDefaultMaxDisplayPipelineRate));
+    EXPECT_TRUE(ValidateVideoModeSpec(m, kMaxDisplayPipelineRate));
 }
 
 void
@@ -81,7 +81,7 @@ TestValidate1080p60Mode()
     uint32_t count = 0;
     uint32_t preferredIdx = kNoPreferredModeIndex;
 
-    EXPECT_TRUE(GetSupportedMvpVideoModes(kDefaultMaxDisplayPipelineRate, modes, count, preferredIdx));
+    EXPECT_TRUE(GetSupportedMvpVideoModes(kMaxDisplayPipelineRate, modes, count, preferredIdx));
     EXPECT_EQ(count, static_cast<uint32_t>(2));
 
     const VideoModeSpec& m = modes[1];
@@ -97,7 +97,7 @@ TestValidate1080p60Mode()
     EXPECT_EQ(m.RequiredBandwidth, 1920ULL * 1080ULL * 60ULL);
     EXPECT_EQ(m.ScanlineOrdering, DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE);
     EXPECT_TRUE(m.IsPreferred);
-    EXPECT_TRUE(ValidateVideoModeSpec(m, kDefaultMaxDisplayPipelineRate));
+    EXPECT_TRUE(ValidateVideoModeSpec(m, kMaxDisplayPipelineRate));
 }
 
 void
@@ -107,7 +107,7 @@ TestPreferredModeIs1080p60()
     uint32_t count = 0;
     uint32_t preferredIdx = kNoPreferredModeIndex;
 
-    EXPECT_TRUE(GetSupportedMvpVideoModes(kDefaultMaxDisplayPipelineRate, modes, count, preferredIdx));
+    EXPECT_TRUE(GetSupportedMvpVideoModes(kMaxDisplayPipelineRate, modes, count, preferredIdx));
     EXPECT_EQ(preferredIdx, static_cast<uint32_t>(1));
     EXPECT_EQ(modes[preferredIdx].ActiveWidth, static_cast<uint32_t>(1920));
     EXPECT_EQ(modes[preferredIdx].ActiveHeight, static_cast<uint32_t>(1080));
@@ -117,25 +117,31 @@ void
 TestFrequencyAndPixelRateCalculations()
 {
     VideoModeSpec spec = MakeValid1080p60Spec();
-    DISPLAYCONFIG_VIDEO_SIGNAL_INFO signalInfo{};
-    EXPECT_TRUE(FillDisplayConfigVideoSignalInfo(spec, signalInfo));
-    EXPECT_EQ(signalInfo.pixelRate, 2200ULL * 1125ULL * 60ULL);
-    EXPECT_EQ(signalInfo.hSyncFreq.Numerator, static_cast<UINT32>(1125U * 60U));
-    EXPECT_EQ(signalInfo.hSyncFreq.Denominator, static_cast<UINT32>(1U));
-    EXPECT_EQ(signalInfo.vSyncFreq.Numerator, static_cast<UINT32>(60U));
-    EXPECT_EQ(signalInfo.vSyncFreq.Denominator, static_cast<UINT32>(1U));
-    EXPECT_EQ(signalInfo.AdditionalSignalInfo.vSyncFreqDivider, static_cast<UINT32>(0U));
-    EXPECT_TRUE(ValidateDisplayConfigVideoSignalInfo(signalInfo, kDefaultMaxDisplayPipelineRate));
+
+    DISPLAYCONFIG_VIDEO_SIGNAL_INFO monitorSignalInfo{};
+    EXPECT_TRUE(FillMonitorModeVideoSignalInfo(spec, monitorSignalInfo));
+    EXPECT_EQ(monitorSignalInfo.pixelRate, 2200ULL * 1125ULL * 60ULL);
+    EXPECT_EQ(monitorSignalInfo.hSyncFreq.Numerator, static_cast<UINT32>(1125U * 60U));
+    EXPECT_EQ(monitorSignalInfo.hSyncFreq.Denominator, static_cast<UINT32>(1U));
+    EXPECT_EQ(monitorSignalInfo.vSyncFreq.Numerator, static_cast<UINT32>(60U));
+    EXPECT_EQ(monitorSignalInfo.vSyncFreq.Denominator, static_cast<UINT32>(1U));
+    EXPECT_EQ(monitorSignalInfo.AdditionalSignalInfo.vSyncFreqDivider, static_cast<UINT32>(0U));
+    EXPECT_TRUE(ValidateMonitorModeVideoSignalInfo(monitorSignalInfo, kMaxDisplayPipelineRate));
+
+    DISPLAYCONFIG_VIDEO_SIGNAL_INFO targetSignalInfo{};
+    EXPECT_TRUE(FillTargetModeVideoSignalInfo(spec, targetSignalInfo));
+    EXPECT_EQ(targetSignalInfo.AdditionalSignalInfo.vSyncFreqDivider, static_cast<UINT32>(1U));
+    EXPECT_TRUE(ValidateTargetModeVideoSignalInfo(targetSignalInfo, kMaxDisplayPipelineRate));
 
     // Corrupt pixelRate so it no longer matches totalWidth * totalHeight * refreshHz.
     VideoModeSpec badPixelRate = spec;
     badPixelRate.PixelRateHz += 1;
-    EXPECT_TRUE(!ValidateVideoModeSpec(badPixelRate, kDefaultMaxDisplayPipelineRate));
+    EXPECT_TRUE(!ValidateVideoModeSpec(badPixelRate, kMaxDisplayPipelineRate));
 
     // Corrupt hSyncFreq so it no longer matches totalHeight * refreshHz.
     VideoModeSpec badHSync = spec;
     badHSync.HSyncNumerator += 1;
-    EXPECT_TRUE(!ValidateVideoModeSpec(badHSync, kDefaultMaxDisplayPipelineRate));
+    EXPECT_TRUE(!ValidateVideoModeSpec(badHSync, kMaxDisplayPipelineRate));
 }
 
 void
@@ -147,24 +153,24 @@ TestRejectsInvalidAndUnsupportedResolutions()
     {
         VideoModeSpec bad = spec;
         bad.ActiveWidth = 0;
-        EXPECT_TRUE(!ValidateVideoModeSpec(bad, kDefaultMaxDisplayPipelineRate));
+        EXPECT_TRUE(!ValidateVideoModeSpec(bad, kMaxDisplayPipelineRate));
     }
     {
         VideoModeSpec bad = spec;
         bad.ActiveHeight = 0;
-        EXPECT_TRUE(!ValidateVideoModeSpec(bad, kDefaultMaxDisplayPipelineRate));
+        EXPECT_TRUE(!ValidateVideoModeSpec(bad, kMaxDisplayPipelineRate));
     }
 
     // Active dimensions exceeding total dimensions.
     {
         VideoModeSpec bad = spec;
         bad.TotalWidth = bad.ActiveWidth - 1;
-        EXPECT_TRUE(!ValidateVideoModeSpec(bad, kDefaultMaxDisplayPipelineRate));
+        EXPECT_TRUE(!ValidateVideoModeSpec(bad, kMaxDisplayPipelineRate));
     }
     {
         VideoModeSpec bad = spec;
         bad.TotalHeight = bad.ActiveHeight - 1;
-        EXPECT_TRUE(!ValidateVideoModeSpec(bad, kDefaultMaxDisplayPipelineRate));
+        EXPECT_TRUE(!ValidateVideoModeSpec(bad, kMaxDisplayPipelineRate));
     }
 
     // Unsupported resolution (2560x1440 is intentionally deferred out of MVP required modes).
@@ -177,7 +183,7 @@ TestRejectsInvalidAndUnsupportedResolutions()
         bad.HSyncNumerator = 1481 * 60;
         bad.PixelRateHz = 2720ULL * 1481ULL * 60ULL;
         bad.RequiredBandwidth = 2560ULL * 1440ULL * 60ULL;
-        EXPECT_TRUE(!ValidateVideoModeSpec(bad, kDefaultMaxDisplayPipelineRate));
+        EXPECT_TRUE(!ValidateVideoModeSpec(bad, kMaxDisplayPipelineRate));
     }
 }
 
@@ -195,29 +201,34 @@ TestRejectsInvalidRefreshRatesAndScanlineOrdering()
         bad.HSyncNumerator = bad.TotalHeight * badHz;
         bad.PixelRateHz = static_cast<uint64_t>(bad.TotalWidth) * bad.TotalHeight * badHz;
         bad.RequiredBandwidth = static_cast<uint64_t>(bad.ActiveWidth) * bad.ActiveHeight * badHz;
-        EXPECT_TRUE(!ValidateVideoModeSpec(bad, kDefaultMaxDisplayPipelineRate));
+        EXPECT_TRUE(!ValidateVideoModeSpec(bad, kMaxDisplayPipelineRate));
     }
 
     // Zero denominator rejected.
     {
         VideoModeSpec bad = spec;
         bad.VSyncDenominator = 0;
-        EXPECT_TRUE(!ValidateVideoModeSpec(bad, kDefaultMaxDisplayPipelineRate));
+        EXPECT_TRUE(!ValidateVideoModeSpec(bad, kMaxDisplayPipelineRate));
     }
 
     // Interlaced scanline ordering rejected.
     {
         VideoModeSpec bad = spec;
         bad.ScanlineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_INTERLACED;
-        EXPECT_TRUE(!ValidateVideoModeSpec(bad, kDefaultMaxDisplayPipelineRate));
+        EXPECT_TRUE(!ValidateVideoModeSpec(bad, kMaxDisplayPipelineRate));
     }
 
-    // Non-zero vSyncFreqDivider in DISPLAYCONFIG_VIDEO_SIGNAL_INFO rejected.
+    // Non-zero vSyncFreqDivider in IDDCX_MONITOR_MODE rejected; divider != 1 in IDDCX_TARGET_MODE rejected.
     {
-        DISPLAYCONFIG_VIDEO_SIGNAL_INFO signalInfo{};
-        EXPECT_TRUE(FillDisplayConfigVideoSignalInfo(spec, signalInfo));
-        signalInfo.AdditionalSignalInfo.vSyncFreqDivider = 1;
-        EXPECT_TRUE(!ValidateDisplayConfigVideoSignalInfo(signalInfo, kDefaultMaxDisplayPipelineRate));
+        DISPLAYCONFIG_VIDEO_SIGNAL_INFO monitorSignalInfo{};
+        EXPECT_TRUE(FillMonitorModeVideoSignalInfo(spec, monitorSignalInfo));
+        monitorSignalInfo.AdditionalSignalInfo.vSyncFreqDivider = 1;
+        EXPECT_TRUE(!ValidateMonitorModeVideoSignalInfo(monitorSignalInfo, kMaxDisplayPipelineRate));
+
+        DISPLAYCONFIG_VIDEO_SIGNAL_INFO targetSignalInfo{};
+        EXPECT_TRUE(FillTargetModeVideoSignalInfo(spec, targetSignalInfo));
+        targetSignalInfo.AdditionalSignalInfo.vSyncFreqDivider = 2;
+        EXPECT_TRUE(!ValidateTargetModeVideoSignalInfo(targetSignalInfo, kMaxDisplayPipelineRate));
     }
 }
 
@@ -253,7 +264,7 @@ TestNegotiateModeBufferCountQueryAndInsufficientBuffer()
 {
     // Preliminary count query with nullptr buffer and 0 input count.
     {
-        const auto res = NegotiateModeBuffer(0, false, kDefaultMaxDisplayPipelineRate, nullptr);
+        const auto res = NegotiateModeBuffer(0, false, kMaxDisplayPipelineRate, nullptr);
         EXPECT_EQ(res.Status, STATUS_SUCCESS);
         EXPECT_EQ(res.OutputCount, static_cast<uint32_t>(2));
         EXPECT_EQ(res.PreferredIndex, static_cast<uint32_t>(1));
@@ -262,7 +273,7 @@ TestNegotiateModeBufferCountQueryAndInsufficientBuffer()
     // Preliminary count query with non-null buffer but 0 input count.
     {
         VideoModeSpec modes[kMaxSupportedVideoModes]{};
-        const auto res = NegotiateModeBuffer(0, true, kDefaultMaxDisplayPipelineRate, modes);
+        const auto res = NegotiateModeBuffer(0, true, kMaxDisplayPipelineRate, modes);
         EXPECT_EQ(res.Status, STATUS_SUCCESS);
         EXPECT_EQ(res.OutputCount, static_cast<uint32_t>(2));
         EXPECT_EQ(res.PreferredIndex, static_cast<uint32_t>(1));
@@ -272,22 +283,25 @@ TestNegotiateModeBufferCountQueryAndInsufficientBuffer()
     {
         VideoModeSpec modes[kMaxSupportedVideoModes]{};
         modes[0].ActiveWidth = 0xDEADBEEFU;
-        const auto res = NegotiateModeBuffer(1, true, kDefaultMaxDisplayPipelineRate, modes);
+        const auto res = NegotiateModeBuffer(1, true, kMaxDisplayPipelineRate, modes);
         EXPECT_EQ(res.Status, STATUS_BUFFER_TOO_SMALL);
         EXPECT_EQ(res.OutputCount, static_cast<uint32_t>(2));
+        EXPECT_EQ(res.PreferredIndex, kNoPreferredModeIndex);
         EXPECT_EQ(modes[0].ActiveWidth, static_cast<uint32_t>(0xDEADBEEFU));
     }
 
     // Non-zero input count with nullptr buffer must return STATUS_INVALID_PARAMETER.
     {
-        const auto res = NegotiateModeBuffer(2, false, kDefaultMaxDisplayPipelineRate, nullptr);
+        const auto res = NegotiateModeBuffer(2, false, kMaxDisplayPipelineRate, nullptr);
         EXPECT_EQ(res.Status, STATUS_INVALID_PARAMETER);
+        EXPECT_EQ(res.OutputCount, static_cast<uint32_t>(0));
+        EXPECT_EQ(res.PreferredIndex, kNoPreferredModeIndex);
     }
 
     // Exact buffer size (2) succeeds and populates modes.
     {
         VideoModeSpec modes[kMaxSupportedVideoModes]{};
-        const auto res = NegotiateModeBuffer(2, true, kDefaultMaxDisplayPipelineRate, modes);
+        const auto res = NegotiateModeBuffer(2, true, kMaxDisplayPipelineRate, modes);
         EXPECT_EQ(res.Status, STATUS_SUCCESS);
         EXPECT_EQ(res.OutputCount, static_cast<uint32_t>(2));
         EXPECT_EQ(res.PreferredIndex, static_cast<uint32_t>(1));
@@ -315,8 +329,10 @@ TestRejectsArithmeticOverflowInTimingAndBandwidth()
     overflowSignal.vSyncFreq.Denominator = 1;
     overflowSignal.hSyncFreq.Numerator = 67500;
     overflowSignal.hSyncFreq.Denominator = 1;
+    overflowSignal.AdditionalSignalInfo.videoStandard = 255;
+    overflowSignal.AdditionalSignalInfo.vSyncFreqDivider = 1;
     overflowSignal.scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
-    EXPECT_TRUE(!ValidateDisplayConfigVideoSignalInfo(overflowSignal, u64Max));
+    EXPECT_TRUE(!ValidateTargetModeVideoSignalInfo(overflowSignal, u64Max));
 }
 
 void
@@ -326,7 +342,7 @@ TestSupportedModesContainNoDuplicates()
     uint32_t count = 0;
     uint32_t preferredIdx = kNoPreferredModeIndex;
 
-    EXPECT_TRUE(GetSupportedMvpVideoModes(kDefaultMaxDisplayPipelineRate, modes, count, preferredIdx));
+    EXPECT_TRUE(GetSupportedMvpVideoModes(kMaxDisplayPipelineRate, modes, count, preferredIdx));
     EXPECT_EQ(count, static_cast<uint32_t>(2));
 
     for (uint32_t i = 0; i < count; ++i)
@@ -336,6 +352,59 @@ TestSupportedModesContainNoDuplicates()
             EXPECT_TRUE(!AreEquivalentVideoModes(modes[i], modes[j]));
         }
     }
+}
+
+void
+TestMonitorAndTargetModesEnforceDistinctVSyncDividers()
+{
+    VideoModeSpec modes[kMaxSupportedVideoModes]{};
+    uint32_t count = 0;
+    uint32_t preferredIdx = kNoPreferredModeIndex;
+    EXPECT_TRUE(GetSupportedMvpVideoModes(kMaxDisplayPipelineRate, modes, count, preferredIdx));
+    EXPECT_EQ(count, static_cast<uint32_t>(2));
+
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        DISPLAYCONFIG_VIDEO_SIGNAL_INFO monitorSignal{};
+        EXPECT_TRUE(FillMonitorModeVideoSignalInfo(modes[i], monitorSignal));
+        EXPECT_EQ(monitorSignal.AdditionalSignalInfo.vSyncFreqDivider, static_cast<UINT32>(0U));
+        EXPECT_TRUE(ValidateMonitorModeVideoSignalInfo(monitorSignal, kMaxDisplayPipelineRate));
+        EXPECT_TRUE(!ValidateTargetModeVideoSignalInfo(monitorSignal, kMaxDisplayPipelineRate));
+
+        DISPLAYCONFIG_VIDEO_SIGNAL_INFO targetSignal{};
+        EXPECT_TRUE(FillTargetModeVideoSignalInfo(modes[i], targetSignal));
+        EXPECT_EQ(targetSignal.AdditionalSignalInfo.vSyncFreqDivider, static_cast<UINT32>(1U));
+        EXPECT_TRUE(ValidateTargetModeVideoSignalInfo(targetSignal, kMaxDisplayPipelineRate));
+        EXPECT_TRUE(!ValidateMonitorModeVideoSignalInfo(targetSignal, kMaxDisplayPipelineRate));
+    }
+}
+
+void
+TestCommitValidationRejectsUnadvertisedTimingsWithMatchingActiveResolution()
+{
+    // Active resolution matches 1080p60, but total timings (2000x1100) do not match CTA-861 VIC 16 (2200x1125).
+    VideoModeSpec unadvertised{};
+    unadvertised.ActiveWidth = 1920;
+    unadvertised.ActiveHeight = 1080;
+    unadvertised.TotalWidth = 2000;
+    unadvertised.TotalHeight = 1100;
+    unadvertised.VSyncNumerator = 60;
+    unadvertised.VSyncDenominator = 1;
+    unadvertised.HSyncNumerator = 1100U * 60U;
+    unadvertised.HSyncDenominator = 1;
+    unadvertised.PixelRateHz = 2000ULL * 1100ULL * 60ULL;
+    unadvertised.RequiredBandwidth = 1920ULL * 1080ULL * 60ULL;
+    unadvertised.ScanlineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
+
+    EXPECT_TRUE(ValidateVideoModeSpec(unadvertised, kMaxDisplayPipelineRate));
+
+    DISPLAYCONFIG_VIDEO_SIGNAL_INFO targetSignal{};
+    EXPECT_TRUE(FillTargetModeVideoSignalInfo(unadvertised, targetSignal));
+    EXPECT_TRUE(!ValidateTargetModeVideoSignalInfo(targetSignal, kMaxDisplayPipelineRate));
+
+    DISPLAYCONFIG_VIDEO_SIGNAL_INFO monitorSignal{};
+    EXPECT_TRUE(FillMonitorModeVideoSignalInfo(unadvertised, monitorSignal));
+    EXPECT_TRUE(!ValidateMonitorModeVideoSignalInfo(monitorSignal, kMaxDisplayPipelineRate));
 }
 
 template <typename Fn>
@@ -373,6 +442,8 @@ main()
     RunTest("NegotiateModeBufferCountQueryAndInsufficientBuffer", TestNegotiateModeBufferCountQueryAndInsufficientBuffer);
     RunTest("RejectsArithmeticOverflowInTimingAndBandwidth", TestRejectsArithmeticOverflowInTimingAndBandwidth);
     RunTest("SupportedModesContainNoDuplicates", TestSupportedModesContainNoDuplicates);
+    RunTest("MonitorAndTargetModesEnforceDistinctVSyncDividers", TestMonitorAndTargetModesEnforceDistinctVSyncDividers);
+    RunTest("CommitValidationRejectsUnadvertisedTimingsWithMatchingActiveResolution", TestCommitValidationRejectsUnadvertisedTimingsWithMatchingActiveResolution);
 
     std::printf("Summary: %d tests run, %d assertion failures.\n", g_TestsRun, g_TestsFailed);
     return (g_TestsFailed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
