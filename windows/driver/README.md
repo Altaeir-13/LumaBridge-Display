@@ -19,7 +19,9 @@ Incluido agora:
 - modulo `MonitorModes.*` com especificacao canonica CTA-861 dos modos SDR progressivos (`1280x720@60` e `1920x1080@60` preferencial), separacao explicita de `vSyncFreqDivider` (`0` para `IDDCX_MONITOR_MODE`, `1` para `IDDCX_TARGET_MODE` e paths ativos), validacao de timings/pixel rate sem overflow, correspondencia exata com modos anunciados, deduplicacao, limite unico `kMaxDisplayPipelineRate` e negociacao de buffers;
 - callbacks IddCx de modos implementados em `Adapter.cpp`: `LumaBridgeEvtParseMonitorDescription` (recusa EDID com `STATUS_NOT_SUPPORTED` conforme estrategia `IDDCX_MONITOR_DESCRIPTION_TYPE_UNCONFIGURED`), `LumaBridgeEvtMonitorGetDefaultDescriptionModes`, `LumaBridgeEvtMonitorQueryTargetModes` e validacao estrita de paths ativos em `LumaBridgeEvtAdapterCommitModes`;
 - pipeline minimo de swapchain Direct3D 11 / DXGI em `SwapChainProcessor.*` e `Adapter.cpp`: selecao de adaptador por `RenderAdapterLuid` (`EnumAdapterByLuid`), criacao de `ID3D11Device` com `D3D11_CREATE_DEVICE_BGRA_SUPPORT`, `IddCxSwapChainSetDevice`, `IddCxSwapChainReleaseAndAcquireBuffer`, `IddCxSwapChainFinishedProcessingFrame`, estados explicitos (`Ready`, `Active`, `Suspended`, `Stopping`, `Stopped`, `Faulted`), circuit breaker contra loops de recriacao, tratamento distinto de erros transitorios e permanentes, worker thread dedicada com cancelamento cooperativo sem busy-wait, protecao contra reentrancia, RAII (`ScopedWin32Handle`, `ComPtr::Attach`), transferencia estrita de ownership (sem chamar `WdfObjectDelete` em recusas `STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN`), `DeviceSwapChainHost` refcounted, acesso a `MonitorContext` sincronizado por `g_AdapterInitGate` e metricas sem armazenar pixels do desktop;
-- callbacks `LumaBridgeEvtMonitorAssignSwapChain` e `LumaBridgeEvtMonitorUnassignSwapChain` integrados ao `SwapChainProcessor` (`OnSuspend`/`OnResume`/`Shutdown` coordenados em `D0Exit`/`D0Entry` e cleanups); nenhum monitor virtual e criado ou anunciado (`IddCxMonitorCreate` / `IddCxMonitorArrival` nao sao chamados nesta etapa);
+- callbacks `LumaBridgeEvtMonitorAssignSwapChain` e `LumaBridgeEvtMonitorUnassignSwapChain` integrados ao `SwapChainProcessor` (`OnSuspend`/`OnResume`/`Shutdown` coordenados em `D0Exit`/`D0Entry` e cleanups);
+- modulo `VirtualMonitor.*` (`VirtualMonitorManager` + `IddCxVirtualMonitorBackend`) implementando `IddCxMonitorCreate`, `IddCxMonitorArrival` e `IddCxMonitorDeparture` para 1 monitor virtual MVP (`ConnectorIndex = 0`, `ContainerId` persistente, configuracao sem EDID via `IDDCX_MONITOR_DESCRIPTION_TYPE_EDID` com `DataSize = 0`), tratamento de falhas parciais sem monitores orfaos, prevencao de duplicidade, recriacao segura apos desconexao e **ativacao controlada desabilitada por padrao** (`EnableVirtualMonitor` `REG_DWORD = 1` na chave do dispositivo para habilitar);
+- 10 testes unitarios deterministicos do ciclo de vida do monitor virtual em `windows/driver/tests/VirtualMonitorLifecycleTests.cpp`;
 - 13 testes unitarios deterministicos do ciclo de vida da swapchain (independentes de GPU fisica) em `windows/driver/tests/SwapChainLifecycleTests.cpp`;
 - 12 testes unitarios deterministicos de modos de video e negociacao de buffers em `windows/driver/tests/MonitorModesTests.cpp`;
 - supressao de `C4471` restrita ao bloco de includes WDK em `Driver.h`;
@@ -30,11 +32,10 @@ Incluido agora:
 
 Fora do escopo atual (issues dedicadas):
 
-- criacao e chegada/saida de monitor virtual (`IddCxMonitorCreate`, `IddCxMonitorArrival`, `IddCxMonitorDeparture`);
 - exposicao de `2560x1440@60` (avaliado, nao obrigatorio no MVP inicial) e modos HDR/VRR;
 - copia de staging/leitura de pixels, encoder NVENC, protocolo e streaming para o cliente Linux;
 - habilitacao de mitigacao Spectre apos instalacao das libs MSVC Spectre (ver issue #20);
-- assinatura de teste, instalacao controlada e execucao em runtime real dentro de `WUDFHost.exe`.
+- execucao efetiva de assinatura de teste, instalacao controlada e validacao em runtime no `WUDFHost.exe` (procedimento e plano documentados em `docs/setup/windows-idd-functional-validation.md`).
 
 ## Estrutura
 
@@ -56,6 +57,8 @@ windows/
       MonitorModes.cpp
       SwapChainProcessor.h
       SwapChainProcessor.cpp
+      VirtualMonitor.h
+      VirtualMonitor.cpp
       Trace.h
       LumaBridgeIddDriver.inf
     tests/
@@ -64,6 +67,7 @@ windows/
       DriverPackageValidationTests.cpp
       MonitorModesTests.cpp
       SwapChainLifecycleTests.cpp
+      VirtualMonitorLifecycleTests.cpp
 ```
 
 ## Requisitos
@@ -128,6 +132,9 @@ windows\driver\x64\Debug\MonitorModesTests.exe
 
 cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\SwapChainLifecycleTests.cpp windows\driver\LumaBridgeIddDriver\SwapChainProcessor.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\SwapChainLifecycleTests.exe
 windows\driver\x64\Debug\SwapChainLifecycleTests.exe
+
+cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\VirtualMonitorLifecycleTests.cpp windows\driver\LumaBridgeIddDriver\VirtualMonitor.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\VirtualMonitorLifecycleTests.exe
+windows\driver\x64\Debug\VirtualMonitorLifecycleTests.exe
 ```
 
 Artefatos locais esperados (ignorados por `windows/driver/.gitignore`):
@@ -156,7 +163,6 @@ Validacao direta de INF com `InfVerif` e detalhes de assinatura/recuperacao esta
 
 ## Proximos passos
 
-1. Reativar mitigacao Spectre apos instalacao das libs MSVC Spectre (issue #20).
-2. Implementar criacao, chegada e remocao controlada do monitor virtual (`IddCxMonitorCreate`, `IddCxMonitorArrival`, `IddCxMonitorDeparture`) conectando `LumaBridgeMonitorContext` ao pipeline de modos e swapchain.
+1. Instalar libs MSVC Spectre (`14.51.36231`) em prompt elevado, reativar `Driver_SpectreMitigation=true` e encerrar a issue #20.
+2. Executar o plano de validacao funcional controlado (`docs/setup/windows-idd-functional-validation.md`) com assinatura de teste e `EnableVirtualMonitor = 1`.
 3. Implementar extracao/encaminhamento de frames para `lumabridge-host` e encoder NVENC.
-4. Executar estrategia controlada de assinatura de teste e validacao em runtime no Windows (`WUDFHost.exe`).

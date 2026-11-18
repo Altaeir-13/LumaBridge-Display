@@ -60,6 +60,19 @@
 12. `SuspendAndShutdownPreventLateOrPostTeardownAssignments` — bloqueio de atribuicoes durante `Suspended` (ate `OnResume()`) e bloqueio permanente apos `Shutdown()` (`Stopped`);
 13. `ReentrantUnassignDuringDeleteDoesNotDeadlockOrDoubleDelete` — prevencao de deadlock e dupla delecao quando `DeleteSwapChainObject` aciona `UnassignSwapChain` reentrantemente na thread do caller ou da worker thread.
 
+`VirtualMonitorLifecycleTests.cpp` executa **10 testes unitarios deterministicos** sobre `VirtualMonitor.h` / `VirtualMonitor.cpp` (independentes de WUDFHost/GPU via mock de `IVirtualMonitorBackend`):
+
+1. `DisabledByDefaultSkipsMonitorCreationAndArrival` — confirma que o monitor permanece desabilitado por padrao sem chamar `IddCxMonitorCreate` ou `IddCxMonitorArrival`;
+2. `ControlledActivationCreatesAndArrivesSingleMonitorWithPersistentIdentity` — valida criacao e chegada com `ConnectorIndex = 0` e `ContainerId` persistente;
+3. `DuplicateArrivalRequestIsPreventedWhileMonitorIsActive` — impede criacao/chegada duplicada enquanto monitor esta ativo;
+4. `CreateMonitorFailureTransitionsToFaultedWithoutOrphanHandle` — trata falha em `IddCxMonitorCreate` sem handle orfao;
+5. `PartialInitFailureOnArrivalDeletesUnarrivedMonitorObject` — exclui objeto `IDDCX_MONITOR` via `DeleteUnarrivedMonitorObject` se `IddCxMonitorArrival` falhar;
+6. `SafeDepartureStopsSwapChainAndAllowsCleanRecreation` — garante parada da swapchain antes de `IddCxMonitorDeparture` e recriacao limpa subsequente;
+7. `DepartureIsIdempotentWhenMonitorNotActive` — garante idempotencia de `DepartMonitor()`;
+8. `DisablingActivationAfterDeparturePreventsSubsequentArrival` — impede nova chegada apos desativacao;
+9. `NotifyMonitorObjectCleanedUpResetsActiveHandleSafely` — limpa handle ativo no cleanup WDF do monitor;
+10. `RejectsNullAdapterHandleWhenEnabled` — rejeita adaptador nulo com `STATUS_INVALID_PARAMETER`.
+
 ## Fronteira com validacao em runtime WDF/IddCx
 
 Estes testes validam exclusivamente a logica deterministica de transicoes de estado/associacao e a integridade estatica dos artefatos empacotados (`.dll`, `.inf`, `.cat`), sem substituir `InfVerif`, `Inf2Cat` nem execucao real em runtime dentro de `WUDFHost.exe` ou instalacao PnP. A execucao real do driver depende de assinatura de teste controlada, enumeracao de dispositivo, monitor virtual e processamento de modos/swapchain.
@@ -80,4 +93,7 @@ windows\driver\x64\Debug\MonitorModesTests.exe
 
 cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\SwapChainLifecycleTests.cpp windows\driver\LumaBridgeIddDriver\SwapChainProcessor.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\SwapChainLifecycleTests.exe
 windows\driver\x64\Debug\SwapChainLifecycleTests.exe
+
+cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\VirtualMonitorLifecycleTests.cpp windows\driver\LumaBridgeIddDriver\VirtualMonitor.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\VirtualMonitorLifecycleTests.exe
+windows\driver\x64\Debug\VirtualMonitorLifecycleTests.exe
 ```

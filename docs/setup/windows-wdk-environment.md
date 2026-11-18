@@ -200,3 +200,30 @@ Esta issue nao realizou:
 - Instalador.
 - Assinatura de driver.
 - Alteracao direta em `main`.
+
+## 10. Atualizacao — Bibliotecas MSVC Spectre (Issue #20)
+
+A verificacao do catalogo do Visual Studio BuildTools (`C:\ProgramData\Microsoft\VisualStudio\Packages\_Instances\00d6571e\catalog.json`, versao `18.7.11925.98`, toolset `MSVC 14.51.36231`) confirmou que o subdiretorio `lib\spectre` nao esta instalado localmente.
+
+Componentes exatos correspondentes ao toolset ativo:
+
+- `Microsoft.VisualStudio.Component.VC.14.51.x86.x64.Spectre` (bibliotecas MSVC v14.51 com mitigacao Spectre para x86/x64)
+- `Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre` (runtimes VC++ x86/x64 com mitigacao Spectre)
+
+Comando para instalacao em **Prompt/PowerShell como Administrador** (nao executavel sem elevacao administrativa):
+
+```bat
+"C:\Program Files (x86)\Microsoft Visual Studio\Installer\setup.exe" modify ^
+  --installPath "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools" ^
+  --add Microsoft.VisualStudio.Component.VC.14.51.x86.x64.Spectre ^
+  --add Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre ^
+  --passive --norestart
+```
+
+Apos a instalacao, confirmar a presenca das bibliotecas com:
+
+```powershell
+Get-ChildItem "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.51.36231\lib\spectre\x64"
+```
+
+Somente apos essa confirmacao deve-se alterar `<Driver_SpectreMitigation>true</Driver_SpectreMitigation>` em `windows/driver/LumaBridgeIddDriver/LumaBridgeIddDriver.vcxproj`, executar rebuild `Debug|x64` e `Release|x64` e encerrar a issue #20.
