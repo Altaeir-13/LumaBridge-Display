@@ -37,8 +37,8 @@
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <None Include="LumaBridgeIddDriver.inf">
+    <Inf Include="LumaBridgeIddDriver.inf">
       <Filter>Driver Package</Filter>
-    </None>
+    </Inf>
   </ItemGroup>
 </Project>

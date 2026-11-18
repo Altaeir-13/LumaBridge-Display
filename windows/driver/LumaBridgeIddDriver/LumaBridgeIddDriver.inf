@@ -1,45 +1,72 @@
+;
+; LumaBridgeIddDriver.inf
+;
+; INF package definition for the LumaBridge Indirect Display Driver (UMDF 2 / IddCx 1.4+).
+;
+
 [Version]
-Signature="$WINDOWS NT$"
-Class=Display
-ClassGuid={4d36e968-e325-11ce-bfc1-08002be10318}
-Provider=%ManufacturerName%
-DriverVer=07/01/2026,0.0.1.0
-CatalogFile=LumaBridgeIddDriver.cat
-PnpLockdown=1
+Signature = "$WINDOWS NT$"
+Class = Display
+ClassGuid = {4d36e968-e325-11ce-bfc1-08002be10318}
+ClassVer = 2.0
+Provider = %ManufacturerName%
+CatalogFile = LumaBridgeIddDriver.cat
+DriverVer = 07/01/2026,0.1.0.0
+PnpLockdown = 1
 
 [Manufacturer]
-%ManufacturerName%=Standard,NTamd64
+%ManufacturerName% = Standard,NT$ARCH$.10.0...22000
 
-[Standard.NTamd64]
-%LumaBridgeDeviceName%=LumaBridge_Install, Root\LumaBridgeIddDriver
+[Standard.NT$ARCH$.10.0...22000]
+%LumaBridgeDeviceName% = LumaBridge_Install, Root\LumaBridgeIddDriver
 
-[LumaBridge_Install.NT]
-CopyFiles=UMDriverCopy
+[SourceDisksNames]
+1 = %DiskName%
 
-[LumaBridge_Install.NT.Services]
-AddService=WUDFRd,0x000001fa,WUDFRD_ServiceInstall
-
-[LumaBridge_Install.NT.Wdf]
-UmdfService=LumaBridgeIddDriver,LumaBridge_UMDF_Service
-
-[LumaBridge_UMDF_Service]
-UmdfLibraryVersion=2.31.0
-ServiceBinary=%13%\LumaBridgeIddDriver.dll
-
-[WUDFRD_ServiceInstall]
-DisplayName=%WUDFRDDisplayName%
-ServiceType=1
-StartType=3
-ErrorControl=1
-ServiceBinary=%12%\WUDFRd.sys
+[SourceDisksFiles]
+LumaBridgeIddDriver.dll = 1
 
 [DestinationDirs]
-UMDriverCopy=13
+UMDriverCopy = 13
 
 [UMDriverCopy]
-LumaBridgeIddDriver.dll
+LumaBridgeIddDriver.dll,,,0x00000100 ; COPYFLG_NOPRUNE
+
+[LumaBridge_Install.NT]
+CopyFiles = UMDriverCopy
+Include = wudfrd.inf
+Needs = WUDFRD.NT
+
+[LumaBridge_Install.NT.hw]
+AddReg = LumaBridge_HardwareDeviceSettings
+Include = wudfrd.inf
+Needs = WUDFRD.NT.HW
+
+[LumaBridge_Install.NT.Services]
+Include = wudfrd.inf
+Needs = WUDFRD.NT.Services
+
+[LumaBridge_Install.NT.Wdf]
+UmdfService = LumaBridgeIddDriver,LumaBridge_UMDF_Service
+UmdfServiceOrder = LumaBridgeIddDriver
+UmdfKernelModeClientPolicy = AllowKernelModeClients
+UmdfHostProcessSharing = ProcessSharingDisabled
+
+[LumaBridge_UMDF_Service]
+UmdfLibraryVersion = $UMDFVERSION$
+ServiceBinary = %13%\LumaBridgeIddDriver.dll
+UmdfExtensions = IddCx0102
+
+[LumaBridge_HardwareDeviceSettings]
+HKR,, "UpperFilters", %REG_MULTI_SZ%, "IndirectKmd"
+HKR, "WUDF", "DeviceGroupId", %REG_SZ%, "LumaBridgeIddGroup"
 
 [Strings]
-ManufacturerName="LumaBridge"
-LumaBridgeDeviceName="LumaBridge Indirect Display Adapter"
-WUDFRDDisplayName="Windows Driver Foundation - User-mode Driver Framework Reflector"
+; Non-localizable
+REG_MULTI_SZ = 0x00010000
+REG_SZ = 0x00000000
+
+; Localizable
+ManufacturerName = "LumaBridge"
+LumaBridgeDeviceName = "LumaBridge Indirect Display Adapter"
+DiskName = "LumaBridge Indirect Display Driver Installation Media"
