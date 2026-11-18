@@ -26,10 +26,12 @@
     <ConfigurationType>DynamicLibrary</ConfigurationType>
     <DriverType>UMDF</DriverType>
     <UMDF_VERSION_MAJOR>2</UMDF_VERSION_MAJOR>
-    <UMDF_VERSION_MINOR>35</UMDF_VERSION_MINOR>
+    <UMDF_VERSION_MINOR>31</UMDF_VERSION_MINOR>
+    <UMDF_MINIMUM_VERSION_REQUIRED>25</UMDF_MINIMUM_VERSION_REQUIRED>
     <IndirectDisplayDriver>true</IndirectDisplayDriver>
     <IDDCX_VERSION_MAJOR>1</IDDCX_VERSION_MAJOR>
     <IDDCX_VERSION_MINOR>4</IDDCX_VERSION_MINOR>
+    <IDDCX_MINIMUM_VERSION_REQUIRED>4</IDDCX_MINIMUM_VERSION_REQUIRED>
     <Driver_SpectreMitigation>false</Driver_SpectreMitigation>
     <EnableTestSign>false</EnableTestSign>
     <SignMode>Off</SignMode>
@@ -41,10 +43,12 @@
     <ConfigurationType>DynamicLibrary</ConfigurationType>
     <DriverType>UMDF</DriverType>
     <UMDF_VERSION_MAJOR>2</UMDF_VERSION_MAJOR>
-    <UMDF_VERSION_MINOR>35</UMDF_VERSION_MINOR>
+    <UMDF_VERSION_MINOR>31</UMDF_VERSION_MINOR>
+    <UMDF_MINIMUM_VERSION_REQUIRED>25</UMDF_MINIMUM_VERSION_REQUIRED>
     <IndirectDisplayDriver>true</IndirectDisplayDriver>
     <IDDCX_VERSION_MAJOR>1</IDDCX_VERSION_MAJOR>
     <IDDCX_VERSION_MINOR>4</IDDCX_VERSION_MINOR>
+    <IDDCX_MINIMUM_VERSION_REQUIRED>4</IDDCX_MINIMUM_VERSION_REQUIRED>
     <Driver_SpectreMitigation>false</Driver_SpectreMitigation>
     <EnableTestSign>false</EnableTestSign>
     <SignMode>Off</SignMode>
@@ -77,8 +81,7 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
-      <PreprocessorDefinitions>IDDCX_VERSION_MAJOR=1;IDDCX_VERSION_MINOR=4;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <DisableSpecificWarnings>4471;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+      <PreprocessorDefinitions>IDDCX_VERSION_MAJOR=$(IDDCX_VERSION_MAJOR);IDDCX_VERSION_MINOR=$(IDDCX_VERSION_MINOR);IDDCX_MINIMUM_VERSION_REQUIRED=$(IDDCX_MINIMUM_VERSION_REQUIRED);%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -91,8 +94,7 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
-      <PreprocessorDefinitions>IDDCX_VERSION_MAJOR=1;IDDCX_VERSION_MINOR=4;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <DisableSpecificWarnings>4471;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+      <PreprocessorDefinitions>IDDCX_VERSION_MAJOR=$(IDDCX_VERSION_MAJOR);IDDCX_VERSION_MINOR=$(IDDCX_VERSION_MINOR);IDDCX_MINIMUM_VERSION_REQUIRED=$(IDDCX_MINIMUM_VERSION_REQUIRED);%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -100,10 +102,14 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="Adapter.cpp" />
     <ClCompile Include="Driver.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="Adapter.h" />
+    <ClInclude Include="AdapterStateMachine.h" />
     <ClInclude Include="Driver.h" />
+    <ClInclude Include="Trace.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="LumaBridgeIddDriver.inf" />

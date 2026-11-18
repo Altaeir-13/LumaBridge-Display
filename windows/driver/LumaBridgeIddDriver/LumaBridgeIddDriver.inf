@@ -23,7 +23,7 @@ AddService=WUDFRd,0x000001fa,WUDFRD_ServiceInstall
 UmdfService=LumaBridgeIddDriver,LumaBridge_UMDF_Service
 
 [LumaBridge_UMDF_Service]
-UmdfLibraryVersion=2.35.0
+UmdfLibraryVersion=2.31.0
 ServiceBinary=%13%\LumaBridgeIddDriver.dll
 
 [WUDFRD_ServiceInstall]
@@ -41,5 +41,5 @@ LumaBridgeIddDriver.dll
 
 [Strings]
 ManufacturerName="LumaBridge"
-LumaBridgeDeviceName="LumaBridge IDD Driver Build Foundation"
+LumaBridgeDeviceName="LumaBridge Indirect Display Adapter"
 WUDFRDDisplayName="Windows Driver Foundation - User-mode Driver Framework Reflector"
