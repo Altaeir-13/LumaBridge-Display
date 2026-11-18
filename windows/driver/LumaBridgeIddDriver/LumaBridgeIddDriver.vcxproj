@@ -35,6 +35,9 @@
     <Driver_SpectreMitigation>false</Driver_SpectreMitigation>
     <EnableTestSign>false</EnableTestSign>
     <SignMode>Off</SignMode>
+    <EnableInf2cat>true</EnableInf2cat>
+    <Inf2CatUseLocalTime>true</Inf2CatUseLocalTime>
+    <Inf2CatWindowsVersionList>10_19H1_X64</Inf2CatWindowsVersionList>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
     <TargetVersion>Windows10</TargetVersion>
@@ -52,6 +55,9 @@
     <Driver_SpectreMitigation>false</Driver_SpectreMitigation>
     <EnableTestSign>false</EnableTestSign>
     <SignMode>Off</SignMode>
+    <EnableInf2cat>true</EnableInf2cat>
+    <Inf2CatUseLocalTime>true</Inf2CatUseLocalTime>
+    <Inf2CatWindowsVersionList>10_19H1_X64</Inf2CatWindowsVersionList>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings" />
@@ -65,13 +71,15 @@
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <OutDir>$(SolutionDir)$(Platform)\$(Configuration)\</OutDir>
-    <IntDir>$(SolutionDir)$(Platform)\$(Configuration)\$(ProjectName)\</IntDir>
+    <IntDir>$(SolutionDir)$(Platform)\$(Configuration)\obj\$(ProjectName)\</IntDir>
+    <PackageDir>$(OutDir)$(ProjectName)\</PackageDir>
     <GenerateManifest>false</GenerateManifest>
     <EmbedManifest>false</EmbedManifest>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <OutDir>$(SolutionDir)$(Platform)\$(Configuration)\</OutDir>
-    <IntDir>$(SolutionDir)$(Platform)\$(Configuration)\$(ProjectName)\</IntDir>
+    <IntDir>$(SolutionDir)$(Platform)\$(Configuration)\obj\$(ProjectName)\</IntDir>
+    <PackageDir>$(OutDir)$(ProjectName)\</PackageDir>
     <GenerateManifest>false</GenerateManifest>
     <EmbedManifest>false</EmbedManifest>
   </PropertyGroup>
@@ -112,8 +120,14 @@
     <ClInclude Include="Trace.h" />
   </ItemGroup>
   <ItemGroup>
-    <None Include="LumaBridgeIddDriver.inf" />
+    <Inf Include="LumaBridgeIddDriver.inf" />
+  </ItemGroup>
+  <ItemGroup>
+    <FilesToPackage Include="$(TargetPath)" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="CopyCatalogToOutDir" AfterTargets="DrvCat" Condition="Exists('$(PackageDir)$(TargetName).cat')">
+    <Copy SkipUnchangedFiles="true" SourceFiles="$(PackageDir)$(TargetName).cat" DestinationFolder="$(OutDir)" />
+  </Target>
   <ImportGroup Label="ExtensionTargets" />
 </Project>
