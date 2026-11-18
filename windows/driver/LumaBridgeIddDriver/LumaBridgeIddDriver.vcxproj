@@ -116,6 +116,7 @@
     <ClCompile Include="Driver.cpp" />
     <ClCompile Include="MonitorModes.cpp" />
     <ClCompile Include="SwapChainProcessor.cpp" />
+    <ClCompile Include="VirtualMonitor.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Adapter.h" />
@@ -124,6 +125,7 @@
     <ClInclude Include="MonitorModes.h" />
     <ClInclude Include="SwapChainProcessor.h" />
     <ClInclude Include="Trace.h" />
+    <ClInclude Include="VirtualMonitor.h" />
   </ItemGroup>
   <ItemGroup>
     <Inf Include="LumaBridgeIddDriver.inf" />
