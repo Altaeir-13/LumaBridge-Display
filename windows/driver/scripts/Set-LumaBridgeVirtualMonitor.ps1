@@ -1,7 +1,8 @@
 <#
 .SYNOPSIS
-    Dynamically locates the active Root\LumaBridgeIddDriver PnP instance and safely
-    enables or disables the MVP virtual monitor (EnableVirtualMonitor = 1 or 0).
+    Dynamically locates the active Root\LumaBridgeIddDriver PnP instance via
+    DEVPKEY_Device_HardwareIds and safely enables or disables the MVP virtual monitor
+    (EnableVirtualMonitor = 1 or 0) with rollback on partial activation failure.
 #>
 [CmdletBinding()]
 param(
@@ -21,7 +22,11 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-Import-Module (Join-Path -Path $PSScriptRoot -ChildPath 'LumaBridgeDriverCommon.psm1') -Force
+$commonModulePath = (Resolve-Path -LiteralPath (Join-Path -Path $PSScriptRoot -ChildPath 'LumaBridgeDriverCommon.psm1')).Path
+$loadedCommon = Get-Module -Name 'LumaBridgeDriverCommon'
+if ($null -eq $loadedCommon -or $loadedCommon.Path -ine $commonModulePath) {
+    Import-Module $commonModulePath -Force
+}
 
 $constants = Get-LumaBridgeDriverConstants
 $null = Assert-LumaBridgeAdministrator -OperationName ("{0} LumaBridge Virtual Monitor" -f $Action) -DryRun:$DryRun
@@ -63,7 +68,7 @@ $targetRegPath = if ($null -ne $target) {
     $target.DeviceParametersPath
 }
 else {
-    "HKLM:\SYSTEM\CurrentControlSet\Enum\$targetInstanceId\Device Parameters"
+    Get-LumaBridgeDeviceParametersRegistryPath -InstanceId $targetInstanceId
 }
 
 $confirmMsg = "Set {0}={1} at '{2}'{3}" -f `
@@ -82,21 +87,61 @@ if (-not (Confirm-LumaBridgeAction -PromptMessage $confirmMsg -DryRun:$DryRun -F
     return
 }
 
-if (-not (Test-Path -LiteralPath $targetRegPath)) {
-    New-Item -Path $targetRegPath -Force | Out-Null
+try {
+    Set-LumaBridgeDeviceEnableVirtualMonitor -DeviceParametersPath $targetRegPath -Value $desiredValue
+
+    if (-not $NoRestart) {
+        $null = Invoke-LumaBridgeExternalCommand -FilePath 'pnputil.exe' -Arguments @('/restart-device', $targetInstanceId)
+    }
+
+    $updated = @(Get-LumaBridgePnpInstances) | Where-Object { $_.InstanceId -ieq $targetInstanceId } | Select-Object -First 1
+    if ($null -eq $updated) {
+        throw ("PnP instance '{0}' could not be found after setting {1}={2}." -f $targetInstanceId, $constants.RegistryValueEnableMon, $desiredValue)
+    }
+
+    if ([int]$updated.EnableVirtualMonitor -ne $desiredValue) {
+        throw ("Expected {0}={1} on '{2}', observed '{3}'." -f $constants.RegistryValueEnableMon, $desiredValue, $targetInstanceId, $updated.EnableVirtualMonitor)
+    }
+
+    if (-not $NoRestart) {
+        $hasProblem = ($null -ne $updated.ProblemCode -and [int]$updated.ProblemCode -ne 0)
+        if ($updated.Status -ine 'OK' -or $hasProblem) {
+            throw ("Device '{0}' entered unhealthy state after restart (Status='{1}', ProblemCode={2})." -f $targetInstanceId, $updated.Status, $updated.ProblemCode)
+        }
+    }
+
+    [pscustomobject]@{
+        Action               = $Action
+        InstanceId           = $targetInstanceId
+        EnableVirtualMonitor = $desiredValue
+        DeviceRestarted      = (-not $NoRestart)
+        CurrentDeviceState   = $updated
+    }
 }
+catch {
+    $primaryError = $_.Exception.Message
+    if ($Action -eq 'Enable') {
+        $rollbackNotes = New-Object System.Collections.Generic.List[string]
+        try {
+            Set-LumaBridgeDeviceEnableVirtualMonitor -DeviceParametersPath $targetRegPath -Value 0
+            $rollbackNotes.Add('Reverted EnableVirtualMonitor=0')
+        }
+        catch {
+            $rollbackNotes.Add(("Failed reverting EnableVirtualMonitor=0: {0}" -f $_.Exception.Message))
+        }
 
-New-ItemProperty -LiteralPath $targetRegPath -Name $constants.RegistryValueEnableMon -PropertyType DWord -Value $desiredValue -Force | Out-Null
+        if (-not $NoRestart) {
+            try {
+                $null = Invoke-LumaBridgeExternalCommand -FilePath 'pnputil.exe' -Arguments @('/restart-device', $targetInstanceId)
+                $rollbackNotes.Add(("Restarted device '{0}'" -f $targetInstanceId))
+            }
+            catch {
+                $rollbackNotes.Add(("Failed restarting device '{0}': {1}" -f $targetInstanceId, $_.Exception.Message))
+            }
+        }
 
-if (-not $NoRestart) {
-    $null = Invoke-LumaBridgeExternalCommand -FilePath 'pnputil.exe' -Arguments @('/restart-device', $targetInstanceId)
-}
+        throw ("Virtual monitor activation failed: {0}. Rollback: {1}." -f $primaryError, ($rollbackNotes -join '; '))
+    }
 
-$updated = @(Get-LumaBridgePnpInstances) | Where-Object { $_.InstanceId -ieq $targetInstanceId } | Select-Object -First 1
-[pscustomobject]@{
-    Action               = $Action
-    InstanceId           = $targetInstanceId
-    EnableVirtualMonitor = $desiredValue
-    DeviceRestarted      = (-not $NoRestart)
-    CurrentDeviceState   = $updated
+    throw
 }

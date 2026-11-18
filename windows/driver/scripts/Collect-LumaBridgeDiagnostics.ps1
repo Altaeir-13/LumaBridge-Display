@@ -1,8 +1,8 @@
 <#
 .SYNOPSIS
-    Collects read-only host/driver diagnostics, PnP state, WUDFHost.exe resource usage,
-    Windows Event Logs, and optional [LB-DRIVER] / [LB-DRIVER] [METRICS] trace summaries
-    without capturing or storing desktop pixel content.
+    Collects read-only host/driver diagnostics, PnP state, LumaBridge-associated WUDFHost.exe
+    resource usage, Windows Event Logs, and optional [LB-DRIVER] / [LB-DRIVER] [METRICS]
+    trace summaries without capturing or storing desktop pixel content.
 #>
 [CmdletBinding()]
 param(
@@ -22,7 +22,11 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-Import-Module (Join-Path -Path $PSScriptRoot -ChildPath 'LumaBridgeDriverCommon.psm1') -Force
+$commonModulePath = (Resolve-Path -LiteralPath (Join-Path -Path $PSScriptRoot -ChildPath 'LumaBridgeDriverCommon.psm1')).Path
+$loadedCommon = Get-Module -Name 'LumaBridgeDriverCommon'
+if ($null -eq $loadedCommon -or $loadedCommon.Path -ine $commonModulePath) {
+    Import-Module $commonModulePath -Force
+}
 
 $prereqScript = Join-Path -Path $PSScriptRoot -ChildPath 'Test-LumaBridgePrerequisites.ps1'
 
@@ -39,7 +43,7 @@ if ([string]::IsNullOrWhiteSpace($OutputDir)) {
 
 if ($DryRun) {
     $prereqPreview = & $prereqScript -Configuration $Configuration
-    Write-Host ("[DRY-RUN] Would collect PnP instances, Driver Store state, WUDFHost.exe memory/handle stats, Event Logs ({0}m window){1}" -f `
+    Write-Host ("[DRY-RUN] Would collect PnP instances, Driver Store state, LumaBridge-associated WUDFHost.exe memory/handle stats, Event Logs ({0}m window){1}" -f `
         $EventLookbackMinutes, `
         $(if ([string]::IsNullOrWhiteSpace($DebugLogPath)) { '' } else { (", and parse trace log '{0}'" -f $DebugLogPath) })) -ForegroundColor Cyan
     Write-Host ("[DRY-RUN] Would write JSON/Markdown reports under '{0}'" -f $OutputDir) -ForegroundColor Cyan
@@ -52,23 +56,6 @@ if ($DryRun) {
 
 $prereq = & $prereqScript -Configuration $Configuration
 $cutoffTime = (Get-Date).AddMinutes(-1 * $EventLookbackMinutes)
-
-$wudfProcesses = @(Get-Process -Name 'WUDFHost' -ErrorAction SilentlyContinue | ForEach-Object {
-    $startUtc = $null
-    try { $startUtc = $_.StartTime.ToUniversalTime().ToString('o') } catch { $startUtc = $null }
-    $cpuSec = $null
-    try { $cpuSec = [Math]::Round($_.TotalProcessorTime.TotalSeconds, 3) } catch { $cpuSec = $null }
-
-    [pscustomobject]@{
-        Id                  = $_.Id
-        StartTimeUtc        = $startUtc
-        WorkingSetMB        = [Math]::Round($_.WorkingSet64 / 1MB, 2)
-        PrivateMemoryMB     = [Math]::Round($_.PrivateMemorySize64 / 1MB, 2)
-        HandleCount         = $_.HandleCount
-        ThreadCount         = $_.Threads.Count
-        TotalProcessorSec   = $cpuSec
-    }
-})
 
 $collectedEvents = New-Object System.Collections.Generic.List[object]
 $logSpecs = @(
@@ -86,11 +73,13 @@ foreach ($spec in $logSpecs) {
         } | Select-Object -First 40
 
         foreach ($ev in $events) {
+            $evPid = if ($ev.PSObject.Properties.Name -contains 'ProcessId') { $ev.ProcessId } else { $null }
             $collectedEvents.Add([pscustomobject]@{
                 LogName      = $spec.LogName
                 TimeCreated  = $ev.TimeCreated.ToUniversalTime().ToString('o')
                 LevelDisplay = $ev.LevelDisplayName
                 Id           = $ev.Id
+                ProcessId    = $evPid
                 ProviderName = $ev.ProviderName
                 Message      = if ($null -ne $ev.Message) { ($ev.Message -replace '\r?\n', ' ').Trim() } else { '' }
             })
@@ -102,6 +91,7 @@ foreach ($spec in $logSpecs) {
             TimeCreated  = (Get-Date).ToUniversalTime().ToString('o')
             LevelDisplay = 'Info'
             Id           = 0
+            ProcessId    = $null
             ProviderName = 'LumaBridgeDiagnostics'
             Message      = ("Log query skipped or returned no events: {0}" -f $_.Exception.Message)
         })
@@ -132,16 +122,26 @@ if (-not [string]::IsNullOrWhiteSpace($DebugLogPath)) {
     }
 }
 
+$wudfProcesses = @(Get-LumaBridgeWudfHostProcesses `
+    -PnpInstances @($prereq.PnpInstances) `
+    -RecentEvents @($collectedEvents.ToArray()) `
+    -DebugTraceLines @($parsedDriverEvents.ToArray()))
+
+$lumaBridgeWudfProcesses = @($wudfProcesses | Where-Object { $_.IsLumaBridgeHost })
+$primaryLumaBridgeWudf = if ($lumaBridgeWudfProcesses.Count -gt 0) { $lumaBridgeWudfProcesses[0] } else { $null }
+
 $summary = [pscustomobject]@{
-    GeneratedAtUtc       = (Get-Date).ToUniversalTime().ToString('o')
-    Configuration        = $Configuration
-    CaptureScope         = 'Metadata, states, FPS/timing counters, resource usage, and logs only (no desktop pixel content)'
-    Prerequisites        = $prereq
-    WudfHostProcesses    = $wudfProcesses
-    RecentEvents         = @($collectedEvents.ToArray())
-    DriverTraceLineCount = $parsedDriverEvents.Count
-    DriverMetricsSamples = @($parsedMetrics.ToArray())
-    LatestMetricsSample  = if ($parsedMetrics.Count -gt 0) { $parsedMetrics[$parsedMetrics.Count - 1] } else { $null }
+    GeneratedAtUtc           = (Get-Date).ToUniversalTime().ToString('o')
+    Configuration            = $Configuration
+    CaptureScope             = 'Metadata, states, FPS/timing counters, resource usage, and logs only (no desktop pixel content)'
+    Prerequisites            = $prereq
+    LumaBridgeWudfHostProcess = $primaryLumaBridgeWudf
+    LumaBridgeWudfHostProcesses = $lumaBridgeWudfProcesses
+    WudfHostProcesses        = $wudfProcesses
+    RecentEvents             = @($collectedEvents.ToArray())
+    DriverTraceLineCount     = $parsedDriverEvents.Count
+    DriverMetricsSamples     = @($parsedMetrics.ToArray())
+    LatestMetricsSample      = if ($parsedMetrics.Count -gt 0) { $parsedMetrics[$parsedMetrics.Count - 1] } else { $null }
 }
 
 if (-not (Test-Path -LiteralPath $OutputDir)) {
@@ -153,6 +153,14 @@ $mdPath = Join-Path -Path $OutputDir -ChildPath 'diagnostics-summary.md'
 
 $summary | ConvertTo-Json -Depth 8 | Out-File -LiteralPath $jsonPath -Encoding utf8
 
+$wudfLine = if ($null -ne $primaryLumaBridgeWudf) {
+    "- LumaBridge WUDFHost.exe: PID ``{0}`` (Method=``{1}``, WorkingSet=``{2} MB``, Private=``{3} MB``, Handles=``{4}``)" -f `
+        $primaryLumaBridgeWudf.Id, $primaryLumaBridgeWudf.AssociationMethod, $primaryLumaBridgeWudf.WorkingSetMB, $primaryLumaBridgeWudf.PrivateMemoryMB, $primaryLumaBridgeWudf.HandleCount
+}
+else {
+    "- LumaBridge WUDFHost.exe: ``Not identified / Not loaded`` (Total system WUDFHost processes: ``{0}``)" -f $wudfProcesses.Count
+}
+
 $mdLines = @(
     '# LumaBridge IDD Driver Diagnostics Report',
     '',
@@ -160,7 +168,8 @@ $mdLines = @(
     ("- Configuration: ``{0}``" -f $Configuration),
     ("- Windows Build: ``{0}.{1}`` (Supported Win11: ``{2}``)" -f $prereq.HostOs.CurrentBuildNumber, $prereq.HostOs.UBR, $prereq.HostOs.IsSupportedWindows11),
     ("- TestSigning: ``{0}`` | SecureBoot: ``{1}``" -f $prereq.SecurityState.TestSigning, $prereq.SecurityState.SecureBoot),
-    ("- PnP Instances: ``{0}`` | DriverStore Packages: ``{1}`` | WUDFHost Processes: ``{2}``" -f $prereq.PnpInstances.Count, $prereq.DriverStorePackages.Count, $wudfProcesses.Count),
+    ("- PnP Instances: ``{0}`` | DriverStore Packages: ``{1}`` | LumaBridge WUDFHost Matches: ``{2}`` / Total ``{3}``" -f $prereq.PnpInstances.Count, $prereq.DriverStorePackages.Count, $lumaBridgeWudfProcesses.Count, $wudfProcesses.Count),
+    $wudfLine,
     ("- Parsed Driver Trace Lines: ``{0}`` | Metrics Snapshots: ``{1}``" -f $parsedDriverEvents.Count, $parsedMetrics.Count),
     '',
     'See ``diagnostics-summary.json`` in this folder for full structured output.'
@@ -168,8 +177,8 @@ $mdLines = @(
 $mdLines | Out-File -LiteralPath $mdPath -Encoding utf8
 
 [pscustomobject]@{
-    OutputDir         = $OutputDir
-    JsonReportPath    = $jsonPath
+    OutputDir          = $OutputDir
+    JsonReportPath     = $jsonPath
     MarkdownReportPath = $mdPath
-    Summary           = $summary
+    Summary            = $summary
 }

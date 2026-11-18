@@ -16,7 +16,11 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-Import-Module (Join-Path -Path $PSScriptRoot -ChildPath 'LumaBridgeDriverCommon.psm1') -Force
+$commonModulePath = (Resolve-Path -LiteralPath (Join-Path -Path $PSScriptRoot -ChildPath 'LumaBridgeDriverCommon.psm1')).Path
+$loadedCommon = Get-Module -Name 'LumaBridgeDriverCommon'
+if ($null -eq $loadedCommon -or $loadedCommon.Path -ine $commonModulePath) {
+    Import-Module $commonModulePath -Force
+}
 
 $constants = Get-LumaBridgeDriverConstants
 $isAdmin = Test-LumaBridgeIsAdministrator
@@ -29,44 +33,9 @@ $ubr = if ($null -ne $osReg.UBR) { [int]$osReg.UBR } else { 0 }
 $displayVersion = if (-not [string]::IsNullOrWhiteSpace($osReg.DisplayVersion)) { $osReg.DisplayVersion } else { $osReg.ReleaseId }
 $isSupportedWindows11 = ($is64BitOs -and $buildNumber -ge $constants.MinimumWindows11Build)
 
-$secureBootState = 'Unknown'
-if (Get-Command -Name 'Confirm-SecureBootUEFI' -ErrorAction SilentlyContinue) {
-    try {
-        $sb = Confirm-SecureBootUEFI -ErrorAction Stop
-        $secureBootState = if ($sb) { 'Enabled' } else { 'Disabled' }
-    }
-    catch [System.UnauthorizedAccessException] {
-        $secureBootState = 'RequiresAdministrator'
-    }
-    catch {
-        $secureBootState = 'UnsupportedOrLegacyBios'
-    }
-}
-
-$testSigningState = 'Unknown'
-try {
-    $bcdLines = & bcdedit.exe /enum '{current}' 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        $tsLine = $bcdLines | Where-Object { $_ -match '^\s*testsigning\s+' } | Select-Object -First 1
-        if ($null -ne $tsLine) {
-            if ($tsLine -match '\s+(Yes|Sim|On)\s*$') {
-                $testSigningState = 'Enabled'
-            }
-            else {
-                $testSigningState = 'Disabled'
-            }
-        }
-        else {
-            $testSigningState = 'Disabled'
-        }
-    }
-    else {
-        $testSigningState = 'RequiresAdministrator'
-    }
-}
-catch {
-    $testSigningState = 'RequiresAdministrator'
-}
+$securityState = Get-LumaBridgeHostSecurityState
+$secureBootState = $securityState.SecureBoot
+$testSigningState = $securityState.TestSigning
 
 $wudfCandidates = @(
     (Join-Path -Path $env:SystemRoot -ChildPath 'System32\Drivers\UMDF\WUDFx02000.dll'),
@@ -111,38 +80,38 @@ $pnpInstances = @(Get-LumaBridgePnpInstances)
 $driverStoreEntries = @(Get-LumaBridgeDriverStorePackages)
 
 $report = [pscustomobject]@{
-    TimestampUtc               = (Get-Date).ToUniversalTime().ToString('o')
-    Configuration              = $Configuration
-    IsAdministrator            = $isAdmin
-    HostOs                     = [pscustomobject]@{
-        ProductName            = $osReg.ProductName
-        DisplayVersion         = $displayVersion
-        CurrentBuildNumber     = $buildNumber
-        UBR                    = $ubr
-        Is64BitOs              = $is64BitOs
-        IsSupportedWindows11   = $isSupportedWindows11
+    TimestampUtc              = (Get-Date).ToUniversalTime().ToString('o')
+    Configuration             = $Configuration
+    IsAdministrator           = $isAdmin
+    HostOs                    = [pscustomobject]@{
+        ProductName          = $osReg.ProductName
+        DisplayVersion       = $displayVersion
+        CurrentBuildNumber   = $buildNumber
+        UBR                  = $ubr
+        Is64BitOs            = $is64BitOs
+        IsSupportedWindows11 = $isSupportedWindows11
     }
-    SecurityState              = [pscustomobject]@{
-        SecureBoot             = $secureBootState
-        TestSigning            = $testSigningState
+    SecurityState             = [pscustomobject]@{
+        SecureBoot  = $secureBootState
+        TestSigning = $testSigningState
     }
-    RuntimeComponents          = [pscustomobject]@{
-        WUDFx02000Path         = $wudfPath
-        WUDFx02000Version      = $wudfVersion
-        IddCxPath              = $iddCxPath
-        IddCxVersion           = $iddCxVersion
+    RuntimeComponents         = [pscustomobject]@{
+        WUDFx02000Path    = $wudfPath
+        WUDFx02000Version = $wudfVersion
+        IddCxPath         = $iddCxPath
+        IddCxVersion      = $iddCxVersion
     }
-    WdkTools                   = [pscustomobject]@{
-        SignToolPath           = $signtoolPath
-        DevconPath             = $devconPath
-        Inf2CatPath            = $inf2catPath
+    WdkTools                  = [pscustomobject]@{
+        SignToolPath = $signtoolPath
+        DevconPath   = $devconPath
+        Inf2CatPath  = $inf2catPath
     }
-    BuildPackage               = $buildArtifacts
-    StagingPackage             = $stagingArtifacts
-    PnpInstances               = $pnpInstances
-    DriverStorePackages        = $driverStoreEntries
-    ReadyForTestSignStaging    = ($isSupportedWindows11 -and $buildArtifacts.AllFilesPresent -and ($null -ne $signtoolPath) -and ($null -ne $inf2catPath))
-    ReadyForControlledInstall  = ($isSupportedWindows11 -and ($null -ne $stagingArtifacts) -and $stagingArtifacts.IsCryptographicallyValid -and ($testSigningState -eq 'Enabled') -and ($null -ne $devconPath))
+    BuildPackage              = $buildArtifacts
+    StagingPackage            = $stagingArtifacts
+    PnpInstances              = $pnpInstances
+    DriverStorePackages       = $driverStoreEntries
+    ReadyForTestSignStaging   = ($isSupportedWindows11 -and $buildArtifacts.AllFilesPresent -and ($null -ne $signtoolPath) -and ($null -ne $inf2catPath))
+    ReadyForControlledInstall = ($isSupportedWindows11 -and ($null -ne $stagingArtifacts) -and $stagingArtifacts.IsCryptographicallyValid -and ($testSigningState -eq 'Enabled') -and ($null -ne $devconPath))
 }
 
 if ($AsJson) {

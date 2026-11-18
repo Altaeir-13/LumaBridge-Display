@@ -28,7 +28,8 @@ Incluido agora:
 - 16 testes unitarios deterministicos da maquina de estados e associacao multi-dispositivo em `windows/driver/tests/AdapterLifecycleTests.cpp` (escopo puramente de logica de estado/associacao, distinto de testes em runtime real WDF/IddCx);
 - pacote INF estruturado (`LumaBridgeIddDriver.inf`) com `Include = wudfrd.inf`, `UmdfExtensions = IddCx0102`, `UpperFilters = IndirectKmd`, `ClassVer = 2.0`, `DeviceGroupId`, `UmdfHostProcessSharing = ProcessSharingDisabled` e decoracao `NT$ARCH$.10.0...22000` (politica explicita de suporte exclusivo ao Windows 11 x64), integrado ao `.vcxproj` com `StampInf`, `InfVerif`, `Inf2Cat` (`10_CO_X64;10_NI_X64;10_GE_X64`, cobrindo Windows 11 21H2, 22H2/23H2 e 24H2/25H2+) e `DrvCat` (mantendo `SignMode=Off` e `EnableTestSign=false`, gerando `.dll`, `.inf` e `.cat` nao assinados em `$(PackageDir)` e `$(OutDir)` — ver `docs/setup/windows-idd-driver-packaging.md`);
 - 5 testes automatizados de consistencia estatica e integridade criptografica de catalogo (`CryptCAT*`, `CryptCATAdminCalcHashFromFileHandle2`, `CryptQueryObject`, `WinVerifyTrust` e cenarios negativos) em `windows/driver/tests/DriverPackageValidationTests.cpp`;
-- ferramenta automatizada em `windows/driver/scripts/` (`LumaBridgeDriverCommon.psm1`, `Test-LumaBridgePrerequisites.ps1`, `Invoke-LumaBridgePackageSigning.ps1`, `Install-LumaBridgeDriver.ps1`, `Set-LumaBridgeVirtualMonitor.ps1`, `Collect-LumaBridgeDiagnostics.ps1`, `Uninstall-LumaBridgeDriver.ps1`) com `-DryRun`, lookup PnP dinamico, verificacao criptografica, coleta de diagnosticos sem pixels e rollback seguro (ver `docs/setup/windows-idd-functional-validation.md`);
+- ferramenta automatizada em `windows/driver/scripts/` (`LumaBridgeDriverCommon.psm1`, `Test-LumaBridgePrerequisites.ps1`, `Invoke-LumaBridgePackageSigning.ps1`, `Install-LumaBridgeDriver.ps1`, `Set-LumaBridgeVirtualMonitor.ps1`, `Collect-LumaBridgeDiagnostics.ps1`, `Uninstall-LumaBridgeDriver.ps1`) com `-DryRun`, lookup PnP exclusivo por `DEVPKEY_Device_HardwareIds`, identificacao estruturada XML do Driver Store, verificacao criptografica INF+DLL+CAT e correspondencia de certificados, staging isolado/limpo, confirmacao do driver vinculado, rollback de falhas parciais, desinstalacao sem `/force` padrao, remocao de certificados somente por thumbprint com confirmacao explicita e identificacao do `WUDFHost.exe` associado ao LumaBridge (ver `docs/setup/windows-idd-functional-validation.md`);
+- 18 testes automatizados PowerShell em `windows/driver/tests/LumaBridgeFunctionalToolingTests.ps1` cobrindo cenarios positivos e negativos (adulteracao de INF/DLL/CAT, falha de assinatura, divergencia de certificados, staging isolado, `DEVPKEY_Device_HardwareIds`, XML Driver Store, duplicidade, instalacao repetida, rollback de instalacao/ativacao, desinstalacao e correlacao `WUDFHost.exe`);
 - `.gitignore` local para artefatos de build.
 
 Fora do escopo atual (issues dedicadas):
@@ -69,6 +70,7 @@ windows/
       MonitorModesTests.cpp
       SwapChainLifecycleTests.cpp
       VirtualMonitorLifecycleTests.cpp
+      LumaBridgeFunctionalToolingTests.ps1
     scripts/
       LumaBridgeDriverCommon.psm1
       Test-LumaBridgePrerequisites.ps1
@@ -144,6 +146,12 @@ windows\driver\x64\Debug\SwapChainLifecycleTests.exe
 
 cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\VirtualMonitorLifecycleTests.cpp windows\driver\LumaBridgeIddDriver\VirtualMonitor.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\VirtualMonitorLifecycleTests.exe
 windows\driver\x64\Debug\VirtualMonitorLifecycleTests.exe
+```
+
+Testes automatizados PowerShell dos scripts operacionais (`windows/driver/scripts/`):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File windows\driver\tests\LumaBridgeFunctionalToolingTests.ps1
 ```
 
 Artefatos locais esperados (ignorados por `windows/driver/.gitignore`):
