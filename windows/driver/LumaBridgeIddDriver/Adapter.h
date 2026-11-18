@@ -23,6 +23,7 @@ struct DeviceContext
     WDFDEVICE WdfDevice{nullptr};
     IDDCX_ADAPTER AdapterObject{nullptr};
     ULONG IddCxRuntimeVersion{0};
+    bool IsCleanedUp{false};
     AdapterLifecycleTracker Lifecycle{};
 };
 
@@ -31,6 +32,7 @@ struct AdapterContext
 {
     WDFDEVICE WdfDevice{nullptr};
     IDDCX_ADAPTER AdapterObject{nullptr};
+    bool IsCleanedUp{false};
 };
 
 } // namespace lumabridge::driver

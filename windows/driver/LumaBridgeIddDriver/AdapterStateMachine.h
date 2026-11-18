@@ -65,6 +65,45 @@ struct AdapterLifecycleTracker
     bool HasAdapterHandle{false};
     bool AdapterInitCompleted{false};
     bool IsInD0{false};
+    bool IsCleanedUp{false};
+};
+
+/// Serializes the unbound window of IddCxAdapterInitAsync across multiple WDFDEVICE instances
+/// so concurrent device initializations can never cross-bind AdapterObject handles.
+struct InFlightAdapterBindingSlot
+{
+    void* InFlightDevice{nullptr};
+
+    bool TryAcquire(void* device) noexcept
+    {
+        if (device == nullptr || InFlightDevice != nullptr)
+        {
+            return false;
+        }
+        InFlightDevice = device;
+        return true;
+    }
+
+    void Release(void* device) noexcept
+    {
+        if (InFlightDevice == device)
+        {
+            InFlightDevice = nullptr;
+        }
+    }
+
+    void* ResolveAdapterDevice(void* existingAdapterDevice, void* explicitDevice) const noexcept
+    {
+        if (existingAdapterDevice != nullptr)
+        {
+            return existingAdapterDevice;
+        }
+        if (explicitDevice != nullptr)
+        {
+            return explicitDevice;
+        }
+        return InFlightDevice;
+    }
 };
 
 /// Returns true only when status represents completion without error and is not STATUS_PENDING.
@@ -106,6 +145,7 @@ TransitionOnDeviceConfigured(
 {
     tracker.LastStage = DriverDiagnosticStage::DeviceInitConfig;
     tracker.State = AdapterLifecycleState::DeviceConfigured;
+    tracker.IsCleanedUp = false;
 }
 
 /// Transitions state after IddCxDeviceInitialize completes during EvtDeviceAdd.
@@ -135,6 +175,12 @@ TransitionOnD0EntryBegin(
     ) noexcept
 {
     tracker.LastStage = DriverDiagnosticStage::DeviceD0Entry;
+
+    if (tracker.IsCleanedUp)
+    {
+        RecordDiagnosticFailure(tracker, DriverDiagnosticStage::DeviceD0Entry, STATUS_INVALID_DEVICE_STATE);
+        return {D0EntryAction::FailInvalidState, STATUS_INVALID_DEVICE_STATE};
+    }
 
     if (tracker.State == AdapterLifecycleState::AdapterFailed)
     {
@@ -180,6 +226,11 @@ TransitionOnAdapterInitAsyncSubmitted(
     bool hasValidHandle
     ) noexcept
 {
+    if (tracker.IsCleanedUp || tracker.State == AdapterLifecycleState::Uninitialized)
+    {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
     tracker.LastStage = DriverDiagnosticStage::AdapterInitAsync;
 
     if (!IsSucceededNonPendingStatus(callStatus) || !hasValidHandle)
@@ -219,6 +270,16 @@ TransitionOnAdapterInitFinished(
     NTSTATUS initStatus
     ) noexcept
 {
+    const bool canCompletePendingInit =
+        !tracker.IsCleanedUp &&
+        !tracker.AdapterInitCompleted &&
+        (tracker.State == AdapterLifecycleState::AdapterInitPending ||
+         (tracker.State == AdapterLifecycleState::DeviceStopped && tracker.HasAdapterHandle));
+    if (!canCompletePendingInit)
+    {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
     tracker.LastStage = DriverDiagnosticStage::AdapterInitFinished;
     tracker.HasAdapterHandle = true;
     tracker.AdapterInitCompleted = true;
@@ -239,15 +300,26 @@ TransitionOnAdapterInitFinished(
     return STATUS_SUCCESS;
 }
 
-/// Records the latest committed display path count reported by IddCx.
-inline void
+/// Records the latest committed display path count reported by IddCx when the adapter is active.
+inline NTSTATUS
 TransitionOnCommitModes(
     AdapterLifecycleTracker& tracker,
     UINT32 pathCount
     ) noexcept
 {
+    if (tracker.IsCleanedUp ||
+        !tracker.HasAdapterHandle ||
+        !tracker.AdapterInitCompleted ||
+        tracker.State == AdapterLifecycleState::Uninitialized ||
+        tracker.State == AdapterLifecycleState::DeviceConfigured ||
+        tracker.State == AdapterLifecycleState::AdapterFailed)
+    {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
     tracker.LastStage = DriverDiagnosticStage::AdapterCommitModes;
     tracker.CommittedPathCount = pathCount;
+    return STATUS_SUCCESS;
 }
 
 /// Transitions state on D0 exit without clobbering AdapterFailed or Uninitialized states.
@@ -277,6 +349,7 @@ TransitionOnAdapterCleanup(
     tracker.HasAdapterHandle = false;
     tracker.AdapterInitCompleted = false;
     tracker.IsInD0 = false;
+    tracker.IsCleanedUp = true;
 
     if (tracker.State != AdapterLifecycleState::AdapterFailed &&
         tracker.State != AdapterLifecycleState::Uninitialized)
@@ -295,6 +368,7 @@ TransitionOnDeviceCleanup(
     tracker.HasAdapterHandle = false;
     tracker.AdapterInitCompleted = false;
     tracker.IsInD0 = false;
+    tracker.IsCleanedUp = true;
     tracker.State = AdapterLifecycleState::Uninitialized;
 }
 
