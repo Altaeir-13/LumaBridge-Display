@@ -18,6 +18,21 @@ typedef LONG NTSTATUS;
 
 namespace lumabridge::driver {
 
+inline constexpr uint32_t kMaxConsecutiveTransientErrors = 3;
+inline constexpr DWORD kTransientRetryBackoffMs = 2;
+inline constexpr uint32_t kMaxConsecutiveSwapChainFailures = 5;
+
+/// Explicit lifecycle states for SwapChainProcessor availability, suspension, teardown, and fault gating.
+enum class SwapChainProcessorState : uint32_t
+{
+    Ready = 0,
+    Active,
+    Suspended,
+    Stopping,
+    Stopped,
+    Faulted,
+};
+
 /// Per-frame metadata extracted from IDDCX_METADATA without copying desktop pixel contents.
 struct SwapChainFrameMetadata
 {
@@ -29,21 +44,27 @@ struct SwapChainFrameMetadata
     bool HasValidSurface{false};
 };
 
-/// Atomic/synchronized snapshot of swapchain lifecycle and frame-processing metrics.
+/// Synchronized snapshot of swapchain lifecycle, errors, circuit breaker, and frame-processing metrics.
 struct SwapChainMetricsSnapshot
 {
+    uint64_t AssignAttempts{0};
+    uint64_t AssignCount{0};
+    uint64_t AbandonedAssignCount{0};
+    uint64_t UnassignCount{0};
     uint64_t FramesAcquired{0};
     uint64_t FramesProcessed{0};
     uint64_t FramesDropped{0};
     uint64_t EmptyAcquireWaits{0};
+    uint64_t TransientErrors{0};
     uint64_t DeviceRemovedErrors{0};
     uint64_t FatalErrors{0};
-    uint64_t AssignCount{0};
-    uint64_t UnassignCount{0};
+    uint64_t CircuitBreakerRejections{0};
     uint64_t SwapChainDeletedCount{0};
+    uint32_t ConsecutiveFailures{0};
     uint32_t LastPresentationFrameNumber{0};
     HRESULT LastErrorHResult{S_OK};
     LUID ActiveRenderAdapterLuid{0, 0};
+    SwapChainProcessorState State{SwapChainProcessorState::Ready};
     bool IsActive{false};
 };
 
@@ -72,13 +93,13 @@ public:
         void* swapChainHandle
         ) noexcept = 0;
 
-    /// Deletes the driver-owned WDF/IddCx swapchain object exactly once after worker exit.
+    /// Deletes the driver-owned WDF/IddCx swapchain object exactly once after ownership transfer.
     virtual void DeleteSwapChainObject(
         void* swapChainHandle
         ) noexcept = 0;
 };
 
-/// RAII wrapper for driver-owned Win32 handles (e.g., internal stop event and worker thread).
+/// RAII wrapper for driver-owned Win32 handles (e.g., internal events and worker thread).
 class ScopedWin32Handle final
 {
 public:
@@ -153,19 +174,28 @@ public:
     SwapChainProcessor& operator=(const SwapChainProcessor&) = delete;
 
     /// Assigns a new swapchain, binds D3D11/DXGI via backend, and starts the worker thread.
-    /// Replaces any previously active swapchain cleanly. On failure, deletes driver-owned
-    /// swapChainHandle (if non-null) and returns STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN.
+    /// Pre-ownership failures return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN WITHOUT
+    /// deleting swapChainHandle (OS/IddCx retains ownership on callback failure).
     NTSTATUS AssignSwapChain(
         void* swapChainHandle,
         HANDLE nextSurfaceAvailableEvent,
         LUID renderAdapterLuid
         ) noexcept;
 
-    /// Cooperatively stops the worker thread, joins it, and deletes the active swapchain once.
-    /// Idempotent and safe under concurrent calls.
+    /// Cooperatively stops the worker thread, joins it, and deletes the driver-owned swapchain once.
+    /// Idempotent and reentrancy-safe.
     NTSTATUS UnassignSwapChain() noexcept;
 
-    /// Returns a thread-safe snapshot of swapchain processing metrics.
+    /// Suspends swapchain processing (D0Exit) and rejects new assignments until OnResume().
+    NTSTATUS OnSuspend() noexcept;
+
+    /// Resumes swapchain processing (D0Entry), resetting transient Faulted circuit breaker if not stopped.
+    NTSTATUS OnResume() noexcept;
+
+    /// Permanently tears down the processor (Stopping -> Stopped), rejecting all future assignments.
+    NTSTATUS Shutdown() noexcept;
+
+    /// Returns a thread-safe snapshot of swapchain processing metrics and state.
     SwapChainMetricsSnapshot GetMetricsSnapshot() const noexcept;
 
 private:
@@ -175,6 +205,7 @@ private:
         void* SwapChainHandle{nullptr};
         HANDLE NextSurfaceAvailableEvent{nullptr};
         HANDLE StopEvent{nullptr};
+        HANDLE StartGateEvent{nullptr};
     };
 
     static DWORD WINAPI WorkerThreadProc(LPVOID context) noexcept;
@@ -182,20 +213,28 @@ private:
     void WorkerLoop(
         void* swapChainHandle,
         HANDLE nextSurfaceAvailableEvent,
-        HANDLE stopEvent
+        HANDLE stopEvent,
+        HANDLE startGateEvent
         ) noexcept;
 
+    bool IsReentrantLifecycleCall() const noexcept;
     void StopAndCleanupActiveSessionLocked() noexcept;
-    void RecordAssignmentErrorLocked(HRESULT hr) noexcept;
+    void RecordPreOwnershipFailureLocked(HRESULT hr, bool countFailureAgainstBreaker) noexcept;
+    void RecordWaitOrSyncFailureLocked(HRESULT hr) noexcept;
 
     ISwapChainBackend* m_backend{nullptr};
 
     SRWLOCK m_lifecycleLock{SRWLOCK_INIT};
     mutable SRWLOCK m_metricsLock{SRWLOCK_INIT};
 
+    volatile LONG m_lifecycleLockOwnerThreadId{0};
+    volatile LONG m_workerThreadId{0};
+    volatile LONG m_shutdownRequested{0};
+
     void* m_activeSwapChain{nullptr};
     HANDLE m_nextSurfaceAvailableEvent{nullptr}; // Owned by OS/IddCx; never closed by driver.
     ScopedWin32Handle m_stopEvent{};
+    ScopedWin32Handle m_startGateEvent{};
     ScopedWin32Handle m_workerThread{};
     WorkerRunParams m_workerParams{};
     SwapChainMetricsSnapshot m_metrics{};

@@ -31,9 +31,11 @@ Nesta entrega:
 - **`hNextSurfaceAvailable` (auto-reset event):** pertence exclusivamente ao SO/IddCx; o driver **nunca** chama `CloseHandle` sobre esse handle.
 - **`m_stopEvent` e `m_workerThread`:** encapsulados em `ScopedWin32Handle` (RAII), fechados deterministicamente no encerramento.
 - **`hSwapChain` (`IDDCX_SWAPCHAIN`):**
-  - Se `AssignSwapChain` falhar na validacao, em `InitializeDeviceAndBindSwapChain` ou na criacao da thread, o driver chama `DeleteSwapChainObject(hSwapChain)` uma unica vez e retorna `STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN`.
-  - Se a worker thread encerrar espontaneamente (ex.: `DXGI_ERROR_DEVICE_REMOVED`, `DXGI_ERROR_DEVICE_RESET` ou falha em `IddCxSwapChainFinishedProcessingFrame`), o epilogo de `WorkerLoop` limpa `m_activeSwapChain` sob `m_metricsLock` e executa `DeleteSwapChainObject` fora do lock exatamente uma vez, sinalizando ao SO que a swapchain anterior nao esta mais ativa.
-  - Em `UnassignSwapChain` / `StopAndCleanupActiveSessionLocked` (tambem acionado em `LumaBridgeStopAdapter`, `LumaBridgeEvtAdapterContextCleanup`, `LumaBridgeEvtMonitorContextCleanup` e `LumaBridgeEvtDeviceContextCleanup`), o driver sinaliza `m_stopEvent`, aguarda `WaitForSingleObject(m_workerThread, INFINITE)` fora de `m_metricsLock` e deleta `hSwapChain` somente se a worker thread ainda nao o tiver feito.
+  - **Falhas anteriores a transferencia de ownership:** quando `AssignSwapChain` recusa a atribuicao antes da criacao bem-sucedida da worker thread (argumentos invalidos, estado `Suspended`/`Stopping`/`Stopped`, circuit breaker em `Faulted`, falha em `InitializeDeviceAndBindSwapChain`, `CreateEventW` ou `CreateThread`), o driver **nao** chama `WdfObjectDelete(hSwapChain)`, pois ao retornar `STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN` o proprio SO/IddCx retem o ownership e libera o objeto recusado.
+  - **Pos-transferencia de ownership:** apos `AssignSwapChain` retornar `STATUS_SUCCESS`, `hSwapChain` passa a pertencer exclusivamente ao `SwapChainProcessor`. Se a worker thread encerrar espontaneamente (ex.: `DXGI_ERROR_DEVICE_REMOVED`, `DXGI_ERROR_DEVICE_RESET` ou limite de falhas transitorias), o epilogo de `WorkerLoop` limpa `m_activeSwapChain` sob `m_metricsLock` e executa `DeleteSwapChainObject` fora do lock exatamente uma vez.
+  - Em `UnassignSwapChain` / `OnSuspend` / `Shutdown`, o driver verifica o retorno de `SetEvent(m_stopEvent)` e `WaitForSingleObject(m_workerThread, INFINITE)` fora de `m_metricsLock`; os recursos compartilhados e `hSwapChain` so sao liberados se o retorno `WAIT_OBJECT_0` confirmar a conclusao da worker thread.
+- **Estados explicitos, reentrancia e protecao de contexto:** `SwapChainProcessorState` (`Ready`, `Active`, `Suspended`, `Stopping`, `Stopped`, `Faulted`) impede novas atribuicoes em `Suspended` (`D0Exit`) e apos inicio do teardown (`Shutdown` em `AdapterContextCleanup`/`DeviceContextCleanup`). Rastreamento de `m_lifecycleLockOwnerThreadId` e `m_workerThreadId` evita deadlock por reentrancia em callbacks WDF/IddCx. Todos os acessos a `MonitorContext` em `Adapter.cpp` sao protegidos por `g_AdapterInitGate`.
+- **Circuit breaker e falhas transitorias vs permanentes:** erros transitorios (`DXGI_ERROR_WAS_STILL_DRAWING`, `ERROR_BUSY`) realizam ate `kMaxConsecutiveTransientErrors = 3` tentativas com backoff de `kTransientRetryBackoffMs = 2 ms` via `WaitForSingleObject(stopEvent, ...)` antes de escalar. `kMaxConsecutiveSwapChainFailures = 5` falhas consecutivas acionam `SwapChainProcessorState::Faulted`, evitando loops ilimitados de recriacao ate `OnResume()`.
 - **Hierarquia fixa de locks:** `g_AdapterInitGate` -> `DeviceContext::StateLock` -> `SwapChainProcessor::m_lifecycleLock` -> `SwapChainProcessor::m_metricsLock`. A worker thread adquire **apenas** `m_metricsLock` (lock folha) por microssegundos ao atualizar contadores escalares, tornando impossivel ocorrer deadlock durante `WaitForSingleObject(m_workerThread, INFINITE)`.
 - **Protecao contra use-after-free:** `DeviceSwapChainHost` utiliza contagem de referencias atomica (`AddRef`/`Release` via `InterlockedIncrement`/`InterlockedDecrement`) para permanecer valido caso um callback concorra com `LumaBridgeEvtDeviceContextCleanup`.
 
@@ -41,16 +43,16 @@ Nesta entrega:
 
 `SwapChainMetricsSnapshot` contabiliza sem armazenar nenhum dado visual do desktop:
 
+- `AssignAttempts`, `AssignCount`, `AbandonedAssignCount`, `UnassignCount`, `SwapChainDeletedCount`
 - `FramesAcquired`, `FramesProcessed`, `FramesDropped`
 - `EmptyAcquireWaits` (`E_PENDING` aguardando `hNextSurfaceAvailable`)
-- `DeviceRemovedErrors` (`DXGI_ERROR_DEVICE_REMOVED` / `DXGI_ERROR_DEVICE_RESET`)
-- `FatalErrors`, `LastErrorHResult`
-- `AssignCount`, `UnassignCount`, `SwapChainDeletedCount`
-- `LastPresentationFrameNumber`, `ActiveRenderAdapterLuid`, `IsActive`
+- `TransientErrors`, `DeviceRemovedErrors` (`DXGI_ERROR_DEVICE_REMOVED` / `DXGI_ERROR_DEVICE_RESET`), `FatalErrors`
+- `CircuitBreakerRejections`, `ConsecutiveFailures`, `LastErrorHResult`
+- `LastPresentationFrameNumber`, `ActiveRenderAdapterLuid`, `State`, `IsActive`
 
 ## 5. Resultados dos testes e pendencias
 
-- `SwapChainLifecycleTests.exe`: **9 testes unitarios deterministicos** aprovados (`0` falhas), sem depender de GPU fisica.
+- `SwapChainLifecycleTests.exe`: **13 testes unitarios deterministicos** aprovados (`0` falhas), sem depender de GPU fisica.
 - `MonitorModesTests.exe`: **12/12** aprovados; `AdapterLifecycleTests.exe`: **16/16** aprovados; `DriverPackageValidationTests.exe`: **5/5** aprovados.
 - `MSBuild` `Debug|x64` e `Release|x64`: **0 erros, 0 warnings**.
 - **Pendencia Spectre (issue #20):** `Driver_SpectreMitigation=false` permanece registrado porque as bibliotecas MSVC Spectre (`lib\spectre`) continuam ausentes no Build Tools local; deve ser resolvido antes da assinatura/instalacao em maquina pessoal.

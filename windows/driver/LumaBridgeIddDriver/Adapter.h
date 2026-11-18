@@ -45,6 +45,8 @@ struct AdapterContext
 struct MonitorContext
 {
     WDFDEVICE WdfDevice{nullptr};
+    UINT32 ConnectorIndex{0};
+    bool IsCleanedUp{false};
 };
 
 } // namespace lumabridge::driver

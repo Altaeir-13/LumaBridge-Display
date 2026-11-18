@@ -44,17 +44,21 @@
 11. `MonitorAndTargetModesEnforceDistinctVSyncDividers` — regressao confirmando `vSyncFreqDivider == 0` exclusivo de monitor modes e `vSyncFreqDivider == 1` exclusivo de target modes/commit;
 12. `CommitValidationRejectsUnadvertisedTimingsWithMatchingActiveResolution` — regressao rejeitando timings nao anunciados mesmo para resolucoes 1080p60 validas.
 
-`SwapChainLifecycleTests.cpp` executa **9 testes unitarios deterministicos** sobre `SwapChainProcessor.h` / `SwapChainProcessor.cpp` (independentes de GPU fisica via mock de `ISwapChainBackend`):
+`SwapChainLifecycleTests.cpp` executa **13 testes unitarios deterministicos** sobre `SwapChainProcessor.h` / `SwapChainProcessor.cpp` (independentes de GPU fisica via mock de `ISwapChainBackend`):
 
-1. `AssignProcessFramesAndUnassignLifecycle` — atribuicao, processamento de frames, metricas, desatribuicao e preservacao do handle `hNextSurfaceAvailable`;
+1. `AssignProcessFramesAndUnassignLifecycle` — atribuicao, processamento de frames, invariantes de metricas, desatribuicao e preservacao do handle `hNextSurfaceAvailable`;
 2. `PendingAcquireWaitsOnSurfaceEventWithoutBusyWaiting` — retorno `E_PENDING` aguardando evento do SO sem busy-wait;
-3. `InitializationFailureAbandonsSwapChainAndDeletesHandleOnce` — falha de inicializacao D3D11 retornando `STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN` e deletando `hSwapChain` uma unica vez;
-4. `DeviceRemovedStopsWorkerAndRecordsMetric` — encerramento espontaneo em `DXGI_ERROR_DEVICE_REMOVED` com delecao no epilogo e ausencia de dupla liberacao em `UnassignSwapChain`;
+3. `InitializationFailureAbandonsSwapChainWithoutDeletingCallerHandle` — falha pre-ownership retornando `STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN` sem chamar `DeleteSwapChainObject` (SO retem ownership);
+4. `DeviceRemovedStopsWorkerAndDeletesOwnedSwapChainOnce` — encerramento espontaneo em `DXGI_ERROR_DEVICE_REMOVED` com delecao unica no epilogo e ausencia de dupla liberacao em `UnassignSwapChain`;
 5. `FinishFrameFailureStopsWorkerAndCountsDroppedFrame` — contabilizacao de frame descartado e erro fatal quando `FinishProcessingFrame` falha;
 6. `InvalidSurfaceCountsAsDroppedFrame` — frame sem superficie valida incrementando `FramesDropped`;
 7. `RepeatedAssignReplacesPreviousSwapChainCleanly` — substituicao limpa de swapchain em `AssignSwapChain` repetido;
 8. `ConcurrentUnassignIsIdempotentAndFreeOfRaces` — chamadas concorrentes a `UnassignSwapChain` sem race nem dupla delecao;
-9. `RejectsNullHandlesWithAbandonSwapChainStatus` — rejeicao de handles nulos com abandono seguro.
+9. `RejectsNullHandlesWithoutDeletingUnownedSwapChain` — rejeicao de handles nulos com abandono seguro sem deletar handle nao transferido;
+10. `TransientErrorsRetryAndRecoverBeforeEscalating` — recuperacao de erros transitorios abaixo de `kMaxConsecutiveTransientErrors` e escalonamento ao atingir o limite;
+11. `CircuitBreakerStopsUnboundedSwapChainRecreationLoops` — estado `Faulted` apos `kMaxConsecutiveSwapChainFailures` falhas consecutivas bloqueando recriacoes ilimitadas ate `OnResume()`;
+12. `SuspendAndShutdownPreventLateOrPostTeardownAssignments` — bloqueio de atribuicoes durante `Suspended` (ate `OnResume()`) e bloqueio permanente apos `Shutdown()` (`Stopped`);
+13. `ReentrantUnassignDuringDeleteDoesNotDeadlockOrDoubleDelete` — prevencao de deadlock e dupla delecao quando `DeleteSwapChainObject` aciona `UnassignSwapChain` reentrantemente na thread do caller ou da worker thread.
 
 ## Fronteira com validacao em runtime WDF/IddCx
 

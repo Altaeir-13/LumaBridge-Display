@@ -4,6 +4,42 @@ namespace lumabridge::driver {
 
 namespace {
 
+class OwnedLifecycleLockGuard final
+{
+public:
+    OwnedLifecycleLockGuard(SRWLOCK* lock, volatile LONG* ownerThreadId) noexcept
+        : m_lock(lock), m_ownerThreadId(ownerThreadId)
+    {
+        if (m_lock != nullptr)
+        {
+            AcquireSRWLockExclusive(m_lock);
+            if (m_ownerThreadId != nullptr)
+            {
+                InterlockedExchange(m_ownerThreadId, static_cast<LONG>(GetCurrentThreadId()));
+            }
+        }
+    }
+
+    ~OwnedLifecycleLockGuard()
+    {
+        if (m_ownerThreadId != nullptr)
+        {
+            InterlockedExchange(m_ownerThreadId, 0);
+        }
+        if (m_lock != nullptr)
+        {
+            ReleaseSRWLockExclusive(m_lock);
+        }
+    }
+
+    OwnedLifecycleLockGuard(const OwnedLifecycleLockGuard&) = delete;
+    OwnedLifecycleLockGuard& operator=(const OwnedLifecycleLockGuard&) = delete;
+
+private:
+    SRWLOCK* m_lock;
+    volatile LONG* m_ownerThreadId;
+};
+
 class ExclusiveSrwLock final
 {
 public:
@@ -66,6 +102,22 @@ IsDeviceRemovedOrResetError(
     return hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET;
 }
 
+bool
+IsTransientFrameError(
+    HRESULT hr
+    ) noexcept
+{
+    return hr == DXGI_ERROR_WAS_STILL_DRAWING ||
+           hr == HRESULT_FROM_WIN32(ERROR_BUSY);
+}
+
+HRESULT
+LastWin32ErrorAsHResult() noexcept
+{
+    const DWORD err = GetLastError();
+    return (err != ERROR_SUCCESS) ? HRESULT_FROM_WIN32(err) : E_FAIL;
+}
+
 } // namespace
 
 SwapChainProcessor::SwapChainProcessor(
@@ -77,7 +129,15 @@ SwapChainProcessor::SwapChainProcessor(
 
 SwapChainProcessor::~SwapChainProcessor()
 {
-    (void)UnassignSwapChain();
+    (void)Shutdown();
+}
+
+bool
+SwapChainProcessor::IsReentrantLifecycleCall() const noexcept
+{
+    const LONG currentTid = static_cast<LONG>(GetCurrentThreadId());
+    return InterlockedCompareExchange(const_cast<volatile LONG*>(&m_lifecycleLockOwnerThreadId), 0, 0) == currentTid ||
+           InterlockedCompareExchange(const_cast<volatile LONG*>(&m_workerThreadId), 0, 0) == currentTid;
 }
 
 NTSTATUS
@@ -87,23 +147,59 @@ SwapChainProcessor::AssignSwapChain(
     LUID renderAdapterLuid
     ) noexcept
 {
-    ExclusiveSrwLock lifecycleGuard(&m_lifecycleLock);
+    if (IsReentrantLifecycleCall() || InterlockedCompareExchange(&m_shutdownRequested, 0, 0) != 0)
+    {
+        ExclusiveSrwLock metricsGuard(&m_metricsLock);
+        ++m_metrics.AssignAttempts;
+        ++m_metrics.AbandonedAssignCount;
+        return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
+    }
+
+    OwnedLifecycleLockGuard lifecycleGuard(&m_lifecycleLock, &m_lifecycleLockOwnerThreadId);
+
+    {
+        ExclusiveSrwLock metricsGuard(&m_metricsLock);
+        ++m_metrics.AssignAttempts;
+    }
 
     // Ensure any previous swapchain and worker thread are completely torn down first.
     StopAndCleanupActiveSessionLocked();
 
+    {
+        ExclusiveSrwLock metricsGuard(&m_metricsLock);
+        if (InterlockedCompareExchange(&m_shutdownRequested, 0, 0) != 0 ||
+            m_metrics.State == SwapChainProcessorState::Stopping ||
+            m_metrics.State == SwapChainProcessorState::Stopped)
+        {
+            m_metrics.State = SwapChainProcessorState::Stopped;
+            ++m_metrics.AbandonedAssignCount;
+            return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
+        }
+
+        if (m_metrics.State == SwapChainProcessorState::Suspended)
+        {
+            ++m_metrics.AbandonedAssignCount;
+            return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
+        }
+
+        if (m_metrics.State == SwapChainProcessorState::Faulted ||
+            m_metrics.ConsecutiveFailures >= kMaxConsecutiveSwapChainFailures)
+        {
+            m_metrics.State = SwapChainProcessorState::Faulted;
+            ++m_metrics.AbandonedAssignCount;
+            ++m_metrics.CircuitBreakerRejections;
+            return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
+        }
+    }
+
+    // Pre-ownership validation: IddCx retains ownership of swapChainHandle when
+    // EvtIddCxMonitorAssignSwapChain returns STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN.
     if (m_backend == nullptr ||
         swapChainHandle == nullptr ||
         nextSurfaceAvailableEvent == nullptr ||
         nextSurfaceAvailableEvent == INVALID_HANDLE_VALUE)
     {
-        if (m_backend != nullptr && swapChainHandle != nullptr)
-        {
-            m_backend->DeleteSwapChainObject(swapChainHandle);
-            ExclusiveSrwLock metricsGuard(&m_metricsLock);
-            ++m_metrics.SwapChainDeletedCount;
-        }
-        RecordAssignmentErrorLocked(E_INVALIDARG);
+        RecordPreOwnershipFailureLocked(E_INVALIDARG, true);
         return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
     }
 
@@ -112,26 +208,21 @@ SwapChainProcessor::AssignSwapChain(
         renderAdapterLuid);
     if (FAILED(initHr))
     {
-        m_backend->DeleteSwapChainObject(swapChainHandle);
-        {
-            ExclusiveSrwLock metricsGuard(&m_metricsLock);
-            ++m_metrics.SwapChainDeletedCount;
-        }
-        RecordAssignmentErrorLocked(initHr);
+        RecordPreOwnershipFailureLocked(initHr, true);
         return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
     }
 
     ScopedWin32Handle stopEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr));
     if (!stopEvent.IsValid())
     {
-        const DWORD err = GetLastError();
-        const HRESULT hr = (err != ERROR_SUCCESS) ? HRESULT_FROM_WIN32(err) : E_FAIL;
-        m_backend->DeleteSwapChainObject(swapChainHandle);
-        {
-            ExclusiveSrwLock metricsGuard(&m_metricsLock);
-            ++m_metrics.SwapChainDeletedCount;
-        }
-        RecordAssignmentErrorLocked(hr);
+        RecordPreOwnershipFailureLocked(LastWin32ErrorAsHResult(), true);
+        return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
+    }
+
+    ScopedWin32Handle startGateEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    if (!startGateEvent.IsValid())
+    {
+        RecordPreOwnershipFailureLocked(LastWin32ErrorAsHResult(), true);
         return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
     }
 
@@ -139,43 +230,68 @@ SwapChainProcessor::AssignSwapChain(
         this,
         swapChainHandle,
         nextSurfaceAvailableEvent,
-        stopEvent.Get()};
+        stopEvent.Get(),
+        startGateEvent.Get()};
 
-    m_activeSwapChain = swapChainHandle;
-    m_nextSurfaceAvailableEvent = nextSurfaceAvailableEvent;
-    m_stopEvent = static_cast<ScopedWin32Handle&&>(stopEvent);
-
-    {
-        ExclusiveSrwLock metricsGuard(&m_metricsLock);
-        ++m_metrics.AssignCount;
-        m_metrics.ActiveRenderAdapterLuid = renderAdapterLuid;
-        m_metrics.IsActive = true;
-    }
-
+    DWORD createdThreadId = 0;
     ScopedWin32Handle workerThread(CreateThread(
         nullptr,
         0,
         &SwapChainProcessor::WorkerThreadProc,
         &m_workerParams,
         0,
-        nullptr));
+        &createdThreadId));
     if (!workerThread.IsValid())
     {
-        const DWORD err = GetLastError();
-        const HRESULT hr = (err != ERROR_SUCCESS) ? HRESULT_FROM_WIN32(err) : E_FAIL;
-        StopAndCleanupActiveSessionLocked();
-        RecordAssignmentErrorLocked(hr);
+        m_workerParams = {};
+        RecordPreOwnershipFailureLocked(LastWin32ErrorAsHResult(), true);
         return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
     }
 
-    m_workerThread = static_cast<ScopedWin32Handle&&>(workerThread);
+    // Ownership of swapChainHandle is now committed to SwapChainProcessor.
+    {
+        ExclusiveSrwLock metricsGuard(&m_metricsLock);
+        m_activeSwapChain = swapChainHandle;
+        m_nextSurfaceAvailableEvent = nextSurfaceAvailableEvent;
+        m_stopEvent = static_cast<ScopedWin32Handle&&>(stopEvent);
+        m_startGateEvent = static_cast<ScopedWin32Handle&&>(startGateEvent);
+        m_workerThread = static_cast<ScopedWin32Handle&&>(workerThread);
+        InterlockedExchange(&m_workerThreadId, static_cast<LONG>(createdThreadId));
+
+        ++m_metrics.AssignCount;
+        m_metrics.ActiveRenderAdapterLuid = renderAdapterLuid;
+        m_metrics.IsActive = true;
+        m_metrics.State = SwapChainProcessorState::Active;
+    }
+
+    if (SetEvent(m_startGateEvent.Get()) == FALSE)
+    {
+        const HRESULT hr = LastWin32ErrorAsHResult();
+        StopAndCleanupActiveSessionLocked();
+        ExclusiveSrwLock metricsGuard(&m_metricsLock);
+        ++m_metrics.FatalErrors;
+        m_metrics.LastErrorHResult = hr;
+        return STATUS_SUCCESS;
+    }
+
     return STATUS_SUCCESS;
 }
 
 NTSTATUS
 SwapChainProcessor::UnassignSwapChain() noexcept
 {
-    ExclusiveSrwLock lifecycleGuard(&m_lifecycleLock);
+    if (IsReentrantLifecycleCall())
+    {
+        // Reentrant call from inside DeleteSwapChainObject or worker thread:
+        // signal cooperative stop if an active stop event exists without re-acquiring m_lifecycleLock.
+        if (m_stopEvent.IsValid())
+        {
+            (void)SetEvent(m_stopEvent.Get());
+        }
+        return STATUS_SUCCESS;
+    }
+
+    OwnedLifecycleLockGuard lifecycleGuard(&m_lifecycleLock, &m_lifecycleLockOwnerThreadId);
 
     {
         ExclusiveSrwLock metricsGuard(&m_metricsLock);
@@ -183,6 +299,113 @@ SwapChainProcessor::UnassignSwapChain() noexcept
     }
 
     StopAndCleanupActiveSessionLocked();
+
+    {
+        ExclusiveSrwLock metricsGuard(&m_metricsLock);
+        if (InterlockedCompareExchange(&m_shutdownRequested, 0, 0) != 0)
+        {
+            m_metrics.State = SwapChainProcessorState::Stopped;
+        }
+        else if (m_metrics.State == SwapChainProcessorState::Active)
+        {
+            m_metrics.State = SwapChainProcessorState::Ready;
+        }
+    }
+
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS
+SwapChainProcessor::OnSuspend() noexcept
+{
+    if (IsReentrantLifecycleCall())
+    {
+        if (m_stopEvent.IsValid())
+        {
+            (void)SetEvent(m_stopEvent.Get());
+        }
+        return STATUS_SUCCESS;
+    }
+
+    OwnedLifecycleLockGuard lifecycleGuard(&m_lifecycleLock, &m_lifecycleLockOwnerThreadId);
+
+    StopAndCleanupActiveSessionLocked();
+
+    {
+        ExclusiveSrwLock metricsGuard(&m_metricsLock);
+        if (InterlockedCompareExchange(&m_shutdownRequested, 0, 0) != 0 ||
+            m_metrics.State == SwapChainProcessorState::Stopping ||
+            m_metrics.State == SwapChainProcessorState::Stopped)
+        {
+            m_metrics.State = SwapChainProcessorState::Stopped;
+        }
+        else
+        {
+            m_metrics.State = SwapChainProcessorState::Suspended;
+        }
+    }
+
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS
+SwapChainProcessor::OnResume() noexcept
+{
+    if (IsReentrantLifecycleCall())
+    {
+        return STATUS_SUCCESS;
+    }
+
+    OwnedLifecycleLockGuard lifecycleGuard(&m_lifecycleLock, &m_lifecycleLockOwnerThreadId);
+    ExclusiveSrwLock metricsGuard(&m_metricsLock);
+
+    if (InterlockedCompareExchange(&m_shutdownRequested, 0, 0) != 0 ||
+        m_metrics.State == SwapChainProcessorState::Stopping ||
+        m_metrics.State == SwapChainProcessorState::Stopped)
+    {
+        m_metrics.State = SwapChainProcessorState::Stopped;
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    if (m_metrics.State == SwapChainProcessorState::Suspended ||
+        m_metrics.State == SwapChainProcessorState::Faulted ||
+        m_metrics.State == SwapChainProcessorState::Ready)
+    {
+        m_metrics.ConsecutiveFailures = 0;
+        m_metrics.State = SwapChainProcessorState::Ready;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS
+SwapChainProcessor::Shutdown() noexcept
+{
+    InterlockedExchange(&m_shutdownRequested, 1);
+
+    if (IsReentrantLifecycleCall())
+    {
+        if (m_stopEvent.IsValid())
+        {
+            (void)SetEvent(m_stopEvent.Get());
+        }
+        return STATUS_SUCCESS;
+    }
+
+    OwnedLifecycleLockGuard lifecycleGuard(&m_lifecycleLock, &m_lifecycleLockOwnerThreadId);
+
+    {
+        ExclusiveSrwLock metricsGuard(&m_metricsLock);
+        m_metrics.State = SwapChainProcessorState::Stopping;
+    }
+
+    StopAndCleanupActiveSessionLocked();
+
+    {
+        ExclusiveSrwLock metricsGuard(&m_metricsLock);
+        m_metrics.State = SwapChainProcessorState::Stopped;
+    }
+
     return STATUS_SUCCESS;
 }
 
@@ -207,7 +430,8 @@ SwapChainProcessor::WorkerThreadProc(
     params->Processor->WorkerLoop(
         params->SwapChainHandle,
         params->NextSurfaceAvailableEvent,
-        params->StopEvent);
+        params->StopEvent,
+        params->StartGateEvent);
     return 0;
 }
 
@@ -215,21 +439,49 @@ void
 SwapChainProcessor::WorkerLoop(
     void* swapChainHandle,
     HANDLE nextSurfaceAvailableEvent,
-    HANDLE stopEvent
+    HANDLE stopEvent,
+    HANDLE startGateEvent
     ) noexcept
 {
     if (m_backend == nullptr ||
         swapChainHandle == nullptr ||
         nextSurfaceAvailableEvent == nullptr ||
-        stopEvent == nullptr)
+        stopEvent == nullptr ||
+        startGateEvent == nullptr)
     {
         return;
     }
 
-    const HANDLE waitHandles[2] = {nextSurfaceAvailableEvent, stopEvent};
-
-    while (WaitForSingleObject(stopEvent, 0) != WAIT_OBJECT_0)
+    const HANDLE gateHandles[2] = {startGateEvent, stopEvent};
+    const DWORD gateWait = WaitForMultipleObjects(2, gateHandles, FALSE, INFINITE);
+    if (gateWait != WAIT_OBJECT_0)
     {
+        if (gateWait == WAIT_FAILED)
+        {
+            RecordWaitOrSyncFailureLocked(LastWin32ErrorAsHResult());
+        }
+        return;
+    }
+
+    const HANDLE waitHandles[2] = {nextSurfaceAvailableEvent, stopEvent};
+    uint32_t consecutiveTransientErrors = 0;
+    bool processedAnyFrameInSession = false;
+    bool exitedDueToPermanentFailure = false;
+
+    for (;;)
+    {
+        const DWORD stopCheck = WaitForSingleObject(stopEvent, 0);
+        if (stopCheck == WAIT_OBJECT_0)
+        {
+            break;
+        }
+        if (stopCheck == WAIT_FAILED)
+        {
+            RecordWaitOrSyncFailureLocked(LastWin32ErrorAsHResult());
+            exitedDueToPermanentFailure = true;
+            break;
+        }
+
         SwapChainFrameMetadata frameMeta{};
         const HRESULT acquireHr = m_backend->ReleaseAndAcquireBuffer(swapChainHandle, frameMeta);
 
@@ -243,30 +495,59 @@ SwapChainProcessor::WorkerLoop(
             const DWORD waitResult = WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
             if (waitResult == WAIT_OBJECT_0)
             {
-                // Re-check stopEvent explicitly in case both events were signaled simultaneously.
-                if (WaitForSingleObject(stopEvent, 0) == WAIT_OBJECT_0)
-                {
-                    break;
-                }
                 continue;
             }
+            if (waitResult == WAIT_OBJECT_0 + 1)
+            {
+                break;
+            }
 
-            // Stop signaled (WAIT_OBJECT_0 + 1) or invalid handle wait failure.
+            RecordWaitOrSyncFailureLocked(LastWin32ErrorAsHResult());
+            exitedDueToPermanentFailure = true;
             break;
         }
 
         if (FAILED(acquireHr))
         {
-            ExclusiveSrwLock metricsGuard(&m_metricsLock);
-            if (IsDeviceRemovedOrResetError(acquireHr))
+            if (IsTransientFrameError(acquireHr))
             {
-                ++m_metrics.DeviceRemovedErrors;
+                ++consecutiveTransientErrors;
+                {
+                    ExclusiveSrwLock metricsGuard(&m_metricsLock);
+                    ++m_metrics.TransientErrors;
+                    m_metrics.LastErrorHResult = acquireHr;
+                }
+
+                if (consecutiveTransientErrors < kMaxConsecutiveTransientErrors)
+                {
+                    const DWORD backoffWait = WaitForSingleObject(stopEvent, kTransientRetryBackoffMs);
+                    if (backoffWait == WAIT_TIMEOUT)
+                    {
+                        continue;
+                    }
+                    if (backoffWait == WAIT_OBJECT_0)
+                    {
+                        break;
+                    }
+                    RecordWaitOrSyncFailureLocked(LastWin32ErrorAsHResult());
+                    exitedDueToPermanentFailure = true;
+                    break;
+                }
             }
-            else
+
             {
-                ++m_metrics.FatalErrors;
+                ExclusiveSrwLock metricsGuard(&m_metricsLock);
+                if (IsDeviceRemovedOrResetError(acquireHr))
+                {
+                    ++m_metrics.DeviceRemovedErrors;
+                }
+                else
+                {
+                    ++m_metrics.FatalErrors;
+                }
+                m_metrics.LastErrorHResult = acquireHr;
             }
-            m_metrics.LastErrorHResult = acquireHr;
+            exitedDueToPermanentFailure = true;
             break;
         }
 
@@ -282,33 +563,69 @@ SwapChainProcessor::WorkerLoop(
         const HRESULT finishHr = m_backend->FinishProcessingFrame(swapChainHandle);
         if (FAILED(finishHr))
         {
-            ExclusiveSrwLock metricsGuard(&m_metricsLock);
-            if (frameMeta.HasValidSurface)
+            if (IsTransientFrameError(finishHr))
             {
-                ++m_metrics.FramesDropped;
+                ++consecutiveTransientErrors;
+                {
+                    ExclusiveSrwLock metricsGuard(&m_metricsLock);
+                    if (frameMeta.HasValidSurface)
+                    {
+                        ++m_metrics.FramesDropped;
+                    }
+                    ++m_metrics.TransientErrors;
+                    m_metrics.LastErrorHResult = finishHr;
+                }
+
+                if (consecutiveTransientErrors < kMaxConsecutiveTransientErrors)
+                {
+                    const DWORD backoffWait = WaitForSingleObject(stopEvent, kTransientRetryBackoffMs);
+                    if (backoffWait == WAIT_TIMEOUT)
+                    {
+                        continue;
+                    }
+                    if (backoffWait == WAIT_OBJECT_0)
+                    {
+                        break;
+                    }
+                    RecordWaitOrSyncFailureLocked(LastWin32ErrorAsHResult());
+                    exitedDueToPermanentFailure = true;
+                    break;
+                }
             }
-            if (IsDeviceRemovedOrResetError(finishHr))
+
             {
-                ++m_metrics.DeviceRemovedErrors;
+                ExclusiveSrwLock metricsGuard(&m_metricsLock);
+                if (frameMeta.HasValidSurface)
+                {
+                    ++m_metrics.FramesDropped;
+                }
+                if (IsDeviceRemovedOrResetError(finishHr))
+                {
+                    ++m_metrics.DeviceRemovedErrors;
+                }
+                else
+                {
+                    ++m_metrics.FatalErrors;
+                }
+                m_metrics.LastErrorHResult = finishHr;
             }
-            else
-            {
-                ++m_metrics.FatalErrors;
-            }
-            m_metrics.LastErrorHResult = finishHr;
+            exitedDueToPermanentFailure = true;
             break;
         }
 
         if (frameMeta.HasValidSurface)
         {
+            consecutiveTransientErrors = 0;
+            processedAnyFrameInSession = true;
             ExclusiveSrwLock metricsGuard(&m_metricsLock);
             ++m_metrics.FramesProcessed;
+            m_metrics.ConsecutiveFailures = 0;
             m_metrics.LastPresentationFrameNumber = frameMeta.PresentationFrameNumber;
         }
     }
 
-    // IddCx contract: delete the swapchain object when the worker exits (including spontaneous
-    // errors such as DXGI_ERROR_DEVICE_REMOVED) so the OS is notified to re-evaluate/re-create.
+    // IddCx contract: delete the owned swapchain object when the worker exits spontaneously
+    // or during teardown, releasing it exactly once.
     void* swapChainToDelete = nullptr;
     {
         ExclusiveSrwLock metricsGuard(&m_metricsLock);
@@ -319,6 +636,23 @@ SwapChainProcessor::WorkerLoop(
             m_metrics.IsActive = false;
             m_metrics.ActiveRenderAdapterLuid = LUID{0, 0};
             ++m_metrics.SwapChainDeletedCount;
+
+            if (exitedDueToPermanentFailure && !processedAnyFrameInSession)
+            {
+                ++m_metrics.ConsecutiveFailures;
+            }
+
+            if (m_metrics.State == SwapChainProcessorState::Active)
+            {
+                if (m_metrics.ConsecutiveFailures >= kMaxConsecutiveSwapChainFailures)
+                {
+                    m_metrics.State = SwapChainProcessorState::Faulted;
+                }
+                else
+                {
+                    m_metrics.State = SwapChainProcessorState::Ready;
+                }
+            }
         }
     }
 
@@ -333,16 +667,28 @@ SwapChainProcessor::StopAndCleanupActiveSessionLocked() noexcept
 {
     if (m_stopEvent.IsValid())
     {
-        (void)SetEvent(m_stopEvent.Get());
+        if (SetEvent(m_stopEvent.Get()) == FALSE)
+        {
+            RecordWaitOrSyncFailureLocked(LastWin32ErrorAsHResult());
+        }
     }
 
     if (m_workerThread.IsValid())
     {
-        (void)WaitForSingleObject(m_workerThread.Get(), INFINITE);
+        const DWORD joinResult = WaitForSingleObject(m_workerThread.Get(), INFINITE);
+        if (joinResult != WAIT_OBJECT_0)
+        {
+            // Thread termination was not confirmed: do NOT release shared event handles or
+            // delete m_activeSwapChain while the thread may still be touching them.
+            RecordWaitOrSyncFailureLocked(LastWin32ErrorAsHResult());
+            return;
+        }
+        InterlockedExchange(&m_workerThreadId, 0);
         m_workerThread.Reset();
     }
 
     m_stopEvent.Reset();
+    m_startGateEvent.Reset();
 
     void* swapChainToDelete = nullptr;
     {
@@ -370,11 +716,13 @@ SwapChainProcessor::StopAndCleanupActiveSessionLocked() noexcept
 }
 
 void
-SwapChainProcessor::RecordAssignmentErrorLocked(
-    HRESULT hr
+SwapChainProcessor::RecordPreOwnershipFailureLocked(
+    HRESULT hr,
+    bool countFailureAgainstBreaker
     ) noexcept
 {
     ExclusiveSrwLock metricsGuard(&m_metricsLock);
+    ++m_metrics.AbandonedAssignCount;
     if (IsDeviceRemovedOrResetError(hr))
     {
         ++m_metrics.DeviceRemovedErrors;
@@ -383,6 +731,28 @@ SwapChainProcessor::RecordAssignmentErrorLocked(
     {
         ++m_metrics.FatalErrors;
     }
+    m_metrics.LastErrorHResult = hr;
+
+    if (countFailureAgainstBreaker)
+    {
+        ++m_metrics.ConsecutiveFailures;
+        if (m_metrics.ConsecutiveFailures >= kMaxConsecutiveSwapChainFailures &&
+            m_metrics.State != SwapChainProcessorState::Stopping &&
+            m_metrics.State != SwapChainProcessorState::Stopped &&
+            m_metrics.State != SwapChainProcessorState::Suspended)
+        {
+            m_metrics.State = SwapChainProcessorState::Faulted;
+        }
+    }
+}
+
+void
+SwapChainProcessor::RecordWaitOrSyncFailureLocked(
+    HRESULT hr
+    ) noexcept
+{
+    ExclusiveSrwLock metricsGuard(&m_metricsLock);
+    ++m_metrics.FatalErrors;
     m_metrics.LastErrorHResult = hr;
 }
 
