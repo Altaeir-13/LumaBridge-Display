@@ -31,6 +31,9 @@ enum class DriverDiagnosticStage : UINT32
     DeviceD0Exit,
     AdapterContextCleanup,
     DeviceContextCleanup,
+    MonitorParseDescription,
+    MonitorGetDefaultDescriptionModes,
+    MonitorQueryTargetModes,
     MonitorCallbackStub,
 };
 

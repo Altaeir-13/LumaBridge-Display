@@ -724,9 +724,38 @@ LumaBridgeEvtAdapterCommitModes(
         return STATUS_INVALID_PARAMETER;
     }
 
+    if (pInArgs->PathCount > lumabridge::driver::kMaxMonitorsSupported)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     if (pInArgs->PathCount > 0 && pInArgs->pPaths == nullptr)
     {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    for (UINT i = 0; i < pInArgs->PathCount; ++i)
+    {
+        const IDDCX_PATH& path = pInArgs->pPaths[i];
+        if (path.MonitorObject == nullptr)
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        if ((path.Flags & IDDCX_PATH_FLAGS_ACTIVE) != 0)
+        {
+            if (!lumabridge::driver::ValidateTargetModeVideoSignalInfo(
+                    path.TargetVideoSignalInfo,
+                    lumabridge::driver::kMaxDisplayPipelineRate))
+            {
+                LumaBridgeTraceWarn(
+                    DriverDiagnosticStage::AdapterCommitModes,
+                    STATUS_INVALID_PARAMETER,
+                    AdapterLifecycleState::AdapterReady,
+                    "EvtIddCxAdapterCommitModes rejected unsupported, unadvertised, or invalid active path mode");
+                return STATUS_INVALID_PARAMETER;
+            }
+        }
     }
 
     NTSTATUS commitStatus = STATUS_INVALID_DEVICE_STATE;
@@ -785,11 +814,19 @@ LumaBridgeEvtParseMonitorDescription(
     pOutArgs->MonitorModeBufferOutputCount = 0;
     pOutArgs->PreferredMonitorModeIdx = NO_PREFERRED_MODE;
 
-    LumaBridgeTraceWarn(
-        DriverDiagnosticStage::MonitorCallbackStub,
+    if ((pInArgs->MonitorModeBufferInputCount > 0 && pInArgs->pMonitorModes == nullptr) ||
+        (pInArgs->MonitorDescription.DataSize > 0 && pInArgs->MonitorDescription.pData == nullptr))
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    // MVP uses driver-supplied default description modes (IDDCX_MONITOR_DESCRIPTION_TYPE_UNCONFIGURED)
+    // rather than synthetic EDID parsing.
+    LumaBridgeTraceInfo(
+        DriverDiagnosticStage::MonitorParseDescription,
         STATUS_NOT_SUPPORTED,
         AdapterLifecycleState::AdapterReady,
-        "EvtIddCxParseMonitorDescription stub invoked before monitor support");
+        "EvtIddCxParseMonitorDescription declined; MVP uses driver default description modes");
     return STATUS_NOT_SUPPORTED;
 }
 
@@ -801,9 +838,7 @@ LumaBridgeEvtMonitorGetDefaultDescriptionModes(
     IDARG_OUT_GETDEFAULTDESCRIPTIONMODES* pOutArgs
     )
 {
-    UNREFERENCED_PARAMETER(MonitorObject);
-
-    if (pInArgs == nullptr || pOutArgs == nullptr)
+    if (MonitorObject == nullptr || pInArgs == nullptr || pOutArgs == nullptr)
     {
         return STATUS_INVALID_PARAMETER;
     }
@@ -811,12 +846,49 @@ LumaBridgeEvtMonitorGetDefaultDescriptionModes(
     pOutArgs->DefaultMonitorModeBufferOutputCount = 0;
     pOutArgs->PreferredMonitorModeIdx = NO_PREFERRED_MODE;
 
-    LumaBridgeTraceWarn(
-        DriverDiagnosticStage::MonitorCallbackStub,
-        STATUS_NOT_SUPPORTED,
+    lumabridge::driver::VideoModeSpec modes[lumabridge::driver::kMaxSupportedVideoModes]{};
+    const auto negotiation = lumabridge::driver::NegotiateModeBuffer(
+        pInArgs->DefaultMonitorModeBufferInputCount,
+        pInArgs->pDefaultMonitorModes != nullptr,
+        lumabridge::driver::kMaxDisplayPipelineRate,
+        modes);
+
+    pOutArgs->DefaultMonitorModeBufferOutputCount = negotiation.OutputCount;
+    pOutArgs->PreferredMonitorModeIdx = negotiation.PreferredIndex;
+
+    if (!NT_SUCCESS(negotiation.Status))
+    {
+        LumaBridgeTraceWarn(
+            DriverDiagnosticStage::MonitorGetDefaultDescriptionModes,
+            negotiation.Status,
+            AdapterLifecycleState::AdapterReady,
+            "EvtIddCxMonitorGetDefaultDescriptionModes failed or buffer too small");
+        return negotiation.Status;
+    }
+
+    if (pInArgs->pDefaultMonitorModes != nullptr && pInArgs->DefaultMonitorModeBufferInputCount > 0)
+    {
+        for (UINT i = 0; i < negotiation.OutputCount; ++i)
+        {
+            IDDCX_MONITOR_MODE& dst = pInArgs->pDefaultMonitorModes[i];
+            dst = {};
+            dst.Size = sizeof(IDDCX_MONITOR_MODE);
+            dst.Origin = IDDCX_MONITOR_MODE_ORIGIN_DRIVER;
+            if (!lumabridge::driver::FillMonitorModeVideoSignalInfo(
+                    modes[i],
+                    dst.MonitorVideoSignalInfo))
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+        }
+    }
+
+    LumaBridgeTraceInfo(
+        DriverDiagnosticStage::MonitorGetDefaultDescriptionModes,
+        STATUS_SUCCESS,
         AdapterLifecycleState::AdapterReady,
-        "EvtIddCxMonitorGetDefaultDescriptionModes stub invoked before monitor support");
-    return STATUS_NOT_SUPPORTED;
+        "EvtIddCxMonitorGetDefaultDescriptionModes completed");
+    return STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_
@@ -827,21 +899,55 @@ LumaBridgeEvtMonitorQueryTargetModes(
     IDARG_OUT_QUERYTARGETMODES* pOutArgs
     )
 {
-    UNREFERENCED_PARAMETER(MonitorObject);
-
-    if (pInArgs == nullptr || pOutArgs == nullptr)
+    if (MonitorObject == nullptr || pInArgs == nullptr || pOutArgs == nullptr)
     {
         return STATUS_INVALID_PARAMETER;
     }
 
     pOutArgs->TargetModeBufferOutputCount = 0;
 
-    LumaBridgeTraceWarn(
-        DriverDiagnosticStage::MonitorCallbackStub,
-        STATUS_NOT_SUPPORTED,
+    lumabridge::driver::VideoModeSpec modes[lumabridge::driver::kMaxSupportedVideoModes]{};
+    const auto negotiation = lumabridge::driver::NegotiateModeBuffer(
+        pInArgs->TargetModeBufferInputCount,
+        pInArgs->pTargetModes != nullptr,
+        lumabridge::driver::kMaxDisplayPipelineRate,
+        modes);
+
+    pOutArgs->TargetModeBufferOutputCount = negotiation.OutputCount;
+
+    if (!NT_SUCCESS(negotiation.Status))
+    {
+        LumaBridgeTraceWarn(
+            DriverDiagnosticStage::MonitorQueryTargetModes,
+            negotiation.Status,
+            AdapterLifecycleState::AdapterReady,
+            "EvtIddCxMonitorQueryTargetModes failed or buffer too small");
+        return negotiation.Status;
+    }
+
+    if (pInArgs->pTargetModes != nullptr && pInArgs->TargetModeBufferInputCount > 0)
+    {
+        for (UINT i = 0; i < negotiation.OutputCount; ++i)
+        {
+            IDDCX_TARGET_MODE& dst = pInArgs->pTargetModes[i];
+            dst = {};
+            dst.Size = sizeof(IDDCX_TARGET_MODE);
+            dst.RequiredBandwidth = modes[i].RequiredBandwidth;
+            if (!lumabridge::driver::FillTargetModeVideoSignalInfo(
+                    modes[i],
+                    dst.TargetVideoSignalInfo.targetVideoSignalInfo))
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+        }
+    }
+
+    LumaBridgeTraceInfo(
+        DriverDiagnosticStage::MonitorQueryTargetModes,
+        STATUS_SUCCESS,
         AdapterLifecycleState::AdapterReady,
-        "EvtIddCxMonitorQueryTargetModes stub invoked before video mode support");
-    return STATUS_NOT_SUPPORTED;
+        "EvtIddCxMonitorQueryTargetModes completed");
+    return STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_
