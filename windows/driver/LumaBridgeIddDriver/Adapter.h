@@ -2,6 +2,7 @@
 
 #include "Driver.h"
 #include "AdapterStateMachine.h"
+#include "MonitorModes.h"
 #include "Trace.h"
 
 namespace lumabridge::driver {
