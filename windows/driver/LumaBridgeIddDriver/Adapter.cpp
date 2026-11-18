@@ -207,11 +207,147 @@ private:
     ComPtr<ID3D11DeviceContext> m_d3dContext;
 };
 
-/// Reference-counted per-WDFDEVICE swapchain host safe across concurrent cleanup and callbacks.
+/// IddCx implementation of IVirtualMonitorBackend for single-monitor MVP lifecycle.
+class IddCxVirtualMonitorBackend final : public IVirtualMonitorBackend
+{
+public:
+    IddCxVirtualMonitorBackend(
+        WDFDEVICE wdfDevice,
+        SwapChainProcessor* swapChainProcessor
+        ) noexcept
+        : m_wdfDevice(wdfDevice),
+          m_swapChainProcessor(swapChainProcessor)
+    {
+    }
+
+    NTSTATUS CreateMonitor(
+        void* adapterHandle,
+        uint32_t connectorIndex,
+        const GUID& containerId,
+        void*& outMonitorHandle
+        ) noexcept override
+    {
+        outMonitorHandle = nullptr;
+        if (adapterHandle == nullptr || m_wdfDevice == nullptr)
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        WDF_OBJECT_ATTRIBUTES monitorAttributes{};
+        WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&monitorAttributes, LumaBridgeMonitorContext);
+        monitorAttributes.EvtCleanupCallback = LumaBridgeEvtMonitorContextCleanup;
+
+        IDDCX_MONITOR_INFO monitorInfo{};
+        monitorInfo.Size = IDD_STRUCTURE_SIZE(IDDCX_MONITOR_INFO);
+        monitorInfo.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED;
+        monitorInfo.ConnectorIndex = connectorIndex;
+        monitorInfo.MonitorContainerId = containerId;
+        monitorInfo.MonitorDescription.Size = IDD_STRUCTURE_SIZE(IDDCX_MONITOR_DESCRIPTION);
+        monitorInfo.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
+        monitorInfo.MonitorDescription.DataSize = 0;
+        monitorInfo.MonitorDescription.pData = nullptr;
+
+        IDARG_IN_MONITORCREATE inArgs{};
+        inArgs.ObjectAttributes = &monitorAttributes;
+        inArgs.pMonitorInfo = &monitorInfo;
+
+        IDARG_OUT_MONITORCREATE outArgs{};
+        const NTSTATUS status = IddCxMonitorCreate(
+            static_cast<IDDCX_ADAPTER>(adapterHandle),
+            &inArgs,
+            &outArgs);
+        if (!NT_SUCCESS(status) || outArgs.MonitorObject == nullptr)
+        {
+            return NT_SUCCESS(status) ? STATUS_UNSUCCESSFUL : status;
+        }
+
+        auto* monitorContext = LumaBridgeGetMonitorContext(outArgs.MonitorObject);
+        if (monitorContext != nullptr)
+        {
+            monitorContext->WdfDevice = m_wdfDevice;
+            monitorContext->ConnectorIndex = connectorIndex;
+            monitorContext->IsCleanedUp = false;
+        }
+
+        outMonitorHandle = outArgs.MonitorObject;
+        return STATUS_SUCCESS;
+    }
+
+    NTSTATUS ArriveMonitor(
+        void* monitorHandle,
+        LUID& outOsAdapterLuid,
+        uint32_t& outOsTargetId
+        ) noexcept override
+    {
+        outOsAdapterLuid = LUID{0, 0};
+        outOsTargetId = 0;
+        if (monitorHandle == nullptr)
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        IDARG_OUT_MONITORARRIVAL outArgs{};
+        const NTSTATUS status = IddCxMonitorArrival(
+            static_cast<IDDCX_MONITOR>(monitorHandle),
+            &outArgs);
+        if (NT_SUCCESS(status))
+        {
+            outOsAdapterLuid = outArgs.OsAdapterLuid;
+            outOsTargetId = outArgs.OsTargetId;
+        }
+        return status;
+    }
+
+    NTSTATUS DepartMonitor(
+        void* monitorHandle
+        ) noexcept override
+    {
+        if (monitorHandle == nullptr)
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        return IddCxMonitorDeparture(static_cast<IDDCX_MONITOR>(monitorHandle));
+    }
+
+    void DeleteUnarrivedMonitorObject(
+        void* monitorHandle
+        ) noexcept override
+    {
+        if (monitorHandle != nullptr)
+        {
+            WdfObjectDelete(static_cast<IDDCX_MONITOR>(monitorHandle));
+        }
+    }
+
+    void StopMonitorSwapChain(
+        void* monitorHandle
+        ) noexcept override
+    {
+        UNREFERENCED_PARAMETER(monitorHandle);
+        if (m_swapChainProcessor != nullptr)
+        {
+            (void)m_swapChainProcessor->UnassignSwapChain();
+        }
+    }
+
+private:
+    WDFDEVICE m_wdfDevice{nullptr};
+    SwapChainProcessor* m_swapChainProcessor{nullptr};
+};
+
+/// Reference-counted per-WDFDEVICE swapchain and virtual monitor host safe across concurrent cleanup and callbacks.
 struct DeviceSwapChainHost final
 {
+    explicit DeviceSwapChainHost(WDFDEVICE wdfDevice) noexcept
+        : MonitorBackend(wdfDevice, &Processor)
+    {
+    }
+
     D3d11IddCxSwapChainBackend Backend{};
     SwapChainProcessor Processor{&Backend};
+    IddCxVirtualMonitorBackend MonitorBackend;
+    VirtualMonitorManager MonitorManager{&MonitorBackend};
     volatile LONG RefCount{1};
 
     void AddRef() noexcept
@@ -428,6 +564,41 @@ AcquireSwapChainHostForMonitor(
     return AcquireSwapChainHostForDevice(device, allowDuringCleanup);
 }
 
+bool
+LumaBridgeQueryVirtualMonitorActivationEnabled(
+    WDFDEVICE Device
+    ) noexcept
+{
+    if (Device == nullptr)
+    {
+        return lumabridge::driver::kDefaultVirtualMonitorActivationEnabled;
+    }
+
+    WDFKEY hardwareKey = nullptr;
+    const NTSTATUS openStatus = WdfDeviceOpenRegistryKey(
+        Device,
+        PLUGPLAY_REGKEY_DEVICE,
+        KEY_READ,
+        WDF_NO_OBJECT_ATTRIBUTES,
+        &hardwareKey);
+    if (!NT_SUCCESS(openStatus) || hardwareKey == nullptr)
+    {
+        return lumabridge::driver::kDefaultVirtualMonitorActivationEnabled;
+    }
+
+    DECLARE_CONST_UNICODE_STRING(enableValueName, L"EnableVirtualMonitor");
+    ULONG enableValue = 0;
+    const NTSTATUS queryStatus = WdfRegistryQueryULong(hardwareKey, &enableValueName, &enableValue);
+    WdfRegistryClose(hardwareKey);
+
+    if (!NT_SUCCESS(queryStatus))
+    {
+        return lumabridge::driver::kDefaultVirtualMonitorActivationEnabled;
+    }
+
+    return enableValue == 1UL;
+}
+
 } // namespace
 
 _Use_decl_annotations_
@@ -506,7 +677,7 @@ LumaBridgeInitializeDeviceContext(
     InitializeSRWLock(&deviceContext->StateLock);
     deviceContext->WdfDevice = Device;
     deviceContext->AdapterObject = nullptr;
-    deviceContext->SwapChainHost = new (std::nothrow) lumabridge::driver::DeviceSwapChainHost();
+    deviceContext->SwapChainHost = new (std::nothrow) lumabridge::driver::DeviceSwapChainHost(Device);
     deviceContext->IddCxRuntimeVersion = 0;
     deviceContext->IsCleanedUp = false;
     deviceContext->Lifecycle = lumabridge::driver::AdapterLifecycleTracker{};
@@ -616,9 +787,21 @@ LumaBridgeStartAdapter(
     case D0EntryAction::ResumeReady:
     {
         const ScopedSwapChainHostRef host = AcquireSwapChainHostForDevice(Device);
+        IDDCX_ADAPTER adapterHandle = nullptr;
+        {
+            ExclusiveLockGuard gateLock(&g_AdapterInitGate);
+            ExclusiveLockGuard stateLock(&deviceContext->StateLock);
+            adapterHandle = deviceContext->AdapterObject;
+        }
         if (host.Get() != nullptr)
         {
             (void)host.Get()->Processor.OnResume();
+            if (adapterHandle != nullptr)
+            {
+                const bool enabled = LumaBridgeQueryVirtualMonitorActivationEnabled(Device);
+                host.Get()->MonitorManager.SetActivationEnabled(enabled);
+                (void)host.Get()->MonitorManager.EnsureMonitorArrived(adapterHandle);
+            }
         }
         LumaBridgeTraceInfo(
             DriverDiagnosticStage::DeviceD0Entry,
@@ -844,6 +1027,7 @@ LumaBridgeStopAdapter(
         const ScopedSwapChainHostRef host = AcquireSwapChainHostForDevice(Device, true);
         if (host.Get() != nullptr)
         {
+            (void)host.Get()->MonitorManager.DepartMonitor();
             (void)host.Get()->Processor.OnSuspend();
         }
     }
@@ -919,6 +1103,7 @@ LumaBridgeEvtDeviceContextCleanup(
 
     if (detachedHost != nullptr)
     {
+        (void)detachedHost->MonitorManager.DepartMonitor();
         (void)detachedHost->Processor.Shutdown();
         detachedHost->Release();
     }
@@ -982,6 +1167,7 @@ LumaBridgeEvtAdapterContextCleanup(
         const ScopedSwapChainHostRef host = AcquireSwapChainHostForDevice(deviceToStop, true);
         if (host.Get() != nullptr)
         {
+            (void)host.Get()->MonitorManager.DepartMonitor();
             (void)host.Get()->Processor.Shutdown();
         }
     }
@@ -1022,8 +1208,15 @@ LumaBridgeEvtMonitorContextCleanup(
         if (host.Get() != nullptr)
         {
             (void)host.Get()->Processor.UnassignSwapChain();
+            host.Get()->MonitorManager.NotifyMonitorObjectCleanedUp(Object);
         }
     }
+
+    LumaBridgeTraceInfo(
+        DriverDiagnosticStage::MonitorContextCleanup,
+        STATUS_SUCCESS,
+        AdapterLifecycleState::Uninitialized,
+        "IddCx monitor context cleaned up");
 }
 
 _Use_decl_annotations_
@@ -1127,7 +1320,42 @@ LumaBridgeEvtAdapterInitFinished(
         resultingState,
         "EvtIddCxAdapterInitFinished succeeded");
 
-    // Monitor creation and arrival are intentionally deferred to a dedicated issue.
+    if (resultingState == AdapterLifecycleState::AdapterReady)
+    {
+        const ScopedSwapChainHostRef host = AcquireSwapChainHostForDevice(wdfDevice);
+        if (host.Get() != nullptr)
+        {
+            const bool activationEnabled = LumaBridgeQueryVirtualMonitorActivationEnabled(wdfDevice);
+            host.Get()->MonitorManager.SetActivationEnabled(activationEnabled);
+            const NTSTATUS monitorStatus = host.Get()->MonitorManager.EnsureMonitorArrived(AdapterObject);
+            if (!NT_SUCCESS(monitorStatus))
+            {
+                LumaBridgeTraceError(
+                    DriverDiagnosticStage::MonitorArrival,
+                    monitorStatus,
+                    resultingState,
+                    "Controlled virtual monitor creation or arrival failed");
+                return monitorStatus;
+            }
+            if (activationEnabled)
+            {
+                LumaBridgeTraceInfo(
+                    DriverDiagnosticStage::MonitorArrival,
+                    STATUS_SUCCESS,
+                    resultingState,
+                    "Controlled virtual monitor arrived");
+            }
+            else
+            {
+                LumaBridgeTraceInfo(
+                    DriverDiagnosticStage::MonitorArrival,
+                    STATUS_SUCCESS,
+                    resultingState,
+                    "Virtual monitor activation is disabled by default; skipping IddCxMonitorCreate/Arrival");
+            }
+        }
+    }
+
     return STATUS_SUCCESS;
 }
 

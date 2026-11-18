@@ -74,6 +74,14 @@ DriverDiagnosticStageToString(
         return "MonitorGetDefaultDescriptionModes";
     case DriverDiagnosticStage::MonitorQueryTargetModes:
         return "MonitorQueryTargetModes";
+    case DriverDiagnosticStage::MonitorCreate:
+        return "MonitorCreate";
+    case DriverDiagnosticStage::MonitorArrival:
+        return "MonitorArrival";
+    case DriverDiagnosticStage::MonitorDeparture:
+        return "MonitorDeparture";
+    case DriverDiagnosticStage::MonitorContextCleanup:
+        return "MonitorContextCleanup";
     case DriverDiagnosticStage::MonitorAssignSwapChain:
         return "MonitorAssignSwapChain";
     case DriverDiagnosticStage::MonitorUnassignSwapChain:
