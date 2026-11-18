@@ -754,6 +754,86 @@ TestReentrantUnassignDuringDeleteDoesNotDeadlockOrDoubleDelete()
     }
 }
 
+void
+TestStaleMonitorUnassignDoesNotStopNewMonitorSwapChain()
+{
+    MockSwapChainBackend backend;
+    SwapChainProcessor processor(&backend);
+    ScopedWin32Handle surfaceEvent(CreateEventW(nullptr, FALSE, FALSE, nullptr));
+    EXPECT_TRUE(surfaceEvent.IsValid());
+
+    void* const oldMonitor = reinterpret_cast<void*>(0xE100);
+    void* const newMonitor = reinterpret_cast<void*>(0xE200);
+    void* const firstSwapChain = reinterpret_cast<void*>(0xF100);
+    void* const secondSwapChain = reinterpret_cast<void*>(0xF200);
+
+    EXPECT_EQ(
+        processor.AssignSwapChain(firstSwapChain, surfaceEvent.Get(), LUID{13, 0}, oldMonitor),
+        STATUS_SUCCESS);
+    EXPECT_TRUE(backend.WaitForActivityCount(2));
+
+    // Replacing with a swapchain owned by newMonitor deletes firstSwapChain once.
+    EXPECT_EQ(
+        processor.AssignSwapChain(secondSwapChain, surfaceEvent.Get(), LUID{13, 0}, newMonitor),
+        STATUS_SUCCESS);
+    EXPECT_EQ(backend.DeletedHandles().size(), static_cast<size_t>(1));
+    EXPECT_EQ(backend.DeletedHandles()[0], firstSwapChain);
+
+    // Late UnassignSwapChainForMonitor(oldMonitor) must be ignored and keep newMonitor active.
+    EXPECT_EQ(processor.UnassignSwapChainForMonitor(oldMonitor), STATUS_SUCCESS);
+    const auto midMetrics = processor.GetMetricsSnapshot();
+    EXPECT_TRUE(midMetrics.IsActive);
+    EXPECT_EQ(midMetrics.State, SwapChainProcessorState::Active);
+    EXPECT_EQ(midMetrics.StaleMonitorUnassignIgnoredCount, static_cast<uint64_t>(1));
+    EXPECT_EQ(backend.DeletedHandles().size(), static_cast<size_t>(1));
+
+    // Null handle rejected safely without touching active swapchain.
+    EXPECT_EQ(processor.UnassignSwapChainForMonitor(nullptr), STATUS_INVALID_PARAMETER);
+    EXPECT_TRUE(processor.GetMetricsSnapshot().IsActive);
+
+    // Unassigning the actual owner monitor stops and deletes secondSwapChain cleanly.
+    EXPECT_EQ(processor.UnassignSwapChainForMonitor(newMonitor), STATUS_SUCCESS);
+    const auto endMetrics = processor.GetMetricsSnapshot();
+    EXPECT_TRUE(!endMetrics.IsActive);
+    EXPECT_EQ(backend.DeletedHandles().size(), static_cast<size_t>(2));
+    EXPECT_EQ(backend.DeletedHandles()[1], secondSwapChain);
+}
+
+void
+TestFrameTimingAndFpsMetricsRecordedWithoutStoringPixels()
+{
+    MockSwapChainBackend backend;
+    SwapChainProcessor processor(&backend);
+    ScopedWin32Handle surfaceEvent(CreateEventW(nullptr, FALSE, FALSE, nullptr));
+    EXPECT_TRUE(surfaceEvent.IsValid());
+
+    backend.EnqueueAcquireAction({S_OK, MakeValidFrameMeta(41)});
+    backend.EnqueueAcquireAction({S_OK, MakeValidFrameMeta(42)});
+    backend.EnqueueAcquireAction({S_OK, MakeValidFrameMeta(43)});
+    backend.EnqueueAcquireAction({E_PENDING, {}});
+
+    void* const monitor = reinterpret_cast<void*>(0xE300);
+    void* const swapChain = reinterpret_cast<void*>(0xF300);
+    EXPECT_EQ(
+        processor.AssignSwapChain(swapChain, surfaceEvent.Get(), LUID{14, 0}, monitor),
+        STATUS_SUCCESS);
+
+    // init (1) + 3 * (acquire + finish) (6) + 1 E_PENDING (1) = 8 calls.
+    EXPECT_TRUE(backend.WaitForActivityCount(8));
+
+    const auto metrics = processor.GetMetricsSnapshot();
+    EXPECT_TRUE(metrics.IsActive);
+    EXPECT_EQ(metrics.FramesAcquired, static_cast<uint64_t>(3));
+    EXPECT_EQ(metrics.FramesProcessed, static_cast<uint64_t>(3));
+    EXPECT_EQ(metrics.FramesDropped, static_cast<uint64_t>(0));
+    EXPECT_TRUE(metrics.AcquireFps > 0.0);
+    EXPECT_TRUE(metrics.ProcessFps > 0.0);
+    EXPECT_TRUE(metrics.AvgFrameProcessingTimeUs <= metrics.MaxFrameProcessingTimeUs);
+    EXPECT_TRUE(metrics.TotalFrameProcessingTimeUs >= metrics.LastFrameProcessingTimeUs);
+
+    EXPECT_EQ(processor.UnassignSwapChainForMonitor(monitor), STATUS_SUCCESS);
+}
+
 template <typename Fn>
 void
 RunTest(
@@ -792,6 +872,8 @@ main()
     RunTest("CircuitBreakerStopsUnboundedSwapChainRecreationLoops", TestCircuitBreakerStopsUnboundedSwapChainRecreationLoops);
     RunTest("SuspendAndShutdownPreventLateOrPostTeardownAssignments", TestSuspendAndShutdownPreventLateOrPostTeardownAssignments);
     RunTest("ReentrantUnassignDuringDeleteDoesNotDeadlockOrDoubleDelete", TestReentrantUnassignDuringDeleteDoesNotDeadlockOrDoubleDelete);
+    RunTest("StaleMonitorUnassignDoesNotStopNewMonitorSwapChain", TestStaleMonitorUnassignDoesNotStopNewMonitorSwapChain);
+    RunTest("FrameTimingAndFpsMetricsRecordedWithoutStoringPixels", TestFrameTimingAndFpsMetricsRecordedWithoutStoringPixels);
 
     std::printf("Summary: %d tests run, %d assertion failures.\n", g_TestsRun, g_TestsFailed);
     return (g_TestsFailed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
