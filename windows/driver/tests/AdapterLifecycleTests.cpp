@@ -245,7 +245,7 @@ TestSuspendResumeAndCommitModes()
     EXPECT_EQ(TransitionOnAdapterInitFinished(tracker, STATUS_SUCCESS), STATUS_SUCCESS);
     EXPECT_EQ(tracker.State, AdapterLifecycleState::AdapterReady);
 
-    TransitionOnCommitModes(tracker, 1);
+    EXPECT_EQ(TransitionOnCommitModes(tracker, 1), STATUS_SUCCESS);
     EXPECT_EQ(tracker.CommittedPathCount, 1u);
 
     TransitionOnD0Exit(tracker);
@@ -277,6 +277,175 @@ TestCleanupResetsHandlesAndState()
     TransitionOnDeviceCleanup(tracker);
     EXPECT_EQ(tracker.State, AdapterLifecycleState::Uninitialized);
     EXPECT_EQ(tracker.LastStage, DriverDiagnosticStage::DeviceContextCleanup);
+}
+
+void
+TestConcurrentMultiDeviceAssociationIsolation()
+{
+    int deviceAToken = 1;
+    int deviceBToken = 2;
+    void* const deviceA = &deviceAToken;
+    void* const deviceB = &deviceBToken;
+
+    InFlightAdapterBindingSlot slot{};
+    EXPECT_TRUE(slot.TryAcquire(deviceA));
+    EXPECT_TRUE(!slot.TryAcquire(deviceB));
+    EXPECT_TRUE(!slot.TryAcquire(nullptr));
+
+    // Adapter A early async callback before IddCxAdapterInitAsync returns resolves deterministically to device A.
+    void* adapterABoundDevice = slot.ResolveAdapterDevice(nullptr, nullptr);
+    EXPECT_EQ(adapterABoundDevice, deviceA);
+
+    // Explicitly releasing by a non-owner device must not clear device A's slot.
+    slot.Release(deviceB);
+    EXPECT_EQ(slot.InFlightDevice, deviceA);
+
+    // Once device A completes submission and releases the slot, device B may enter its init window.
+    slot.Release(deviceA);
+    EXPECT_EQ(slot.InFlightDevice, static_cast<void*>(nullptr));
+    EXPECT_TRUE(slot.TryAcquire(deviceB));
+
+    // Subsequent callbacks for already-bound Adapter A keep device A despite device B occupying the slot.
+    EXPECT_EQ(slot.ResolveAdapterDevice(adapterABoundDevice, nullptr), deviceA);
+    EXPECT_EQ(slot.ResolveAdapterDevice(nullptr, nullptr), deviceB);
+
+    slot.Release(deviceB);
+    EXPECT_EQ(slot.InFlightDevice, static_cast<void*>(nullptr));
+}
+
+void
+TestCleanupDuringPendingInitialization()
+{
+    AdapterLifecycleTracker tracker{};
+    TransitionOnDeviceConfigured(tracker);
+    TransitionOnDeviceInitialized(tracker, STATUS_SUCCESS);
+    EXPECT_EQ(TransitionOnD0EntryBegin(tracker).Action, D0EntryAction::StartAsyncInit);
+    EXPECT_EQ(TransitionOnAdapterInitAsyncSubmitted(tracker, STATUS_SUCCESS, true), STATUS_SUCCESS);
+    EXPECT_EQ(tracker.State, AdapterLifecycleState::AdapterInitPending);
+    EXPECT_TRUE(tracker.HasAdapterHandle);
+
+    TransitionOnAdapterCleanup(tracker);
+    EXPECT_TRUE(!tracker.HasAdapterHandle);
+    EXPECT_TRUE(!tracker.AdapterInitCompleted);
+    EXPECT_TRUE(tracker.IsCleanedUp);
+    EXPECT_EQ(tracker.State, AdapterLifecycleState::DeviceStopped);
+
+    TransitionOnDeviceCleanup(tracker);
+    EXPECT_TRUE(!tracker.HasAdapterHandle);
+    EXPECT_TRUE(!tracker.AdapterInitCompleted);
+    EXPECT_TRUE(tracker.IsCleanedUp);
+    EXPECT_EQ(tracker.State, AdapterLifecycleState::Uninitialized);
+
+    const auto postCleanupD0 = TransitionOnD0EntryBegin(tracker);
+    EXPECT_EQ(postCleanupD0.Action, D0EntryAction::FailInvalidState);
+    EXPECT_EQ(postCleanupD0.Status, STATUS_INVALID_DEVICE_STATE);
+}
+
+void
+TestLateAsyncInitFinishedAfterCleanupIsRejected()
+{
+    // Case 1: Late async completion after device cleanup must not resurrect Uninitialized state.
+    {
+        AdapterLifecycleTracker tracker{};
+        TransitionOnDeviceConfigured(tracker);
+        TransitionOnDeviceInitialized(tracker, STATUS_SUCCESS);
+        EXPECT_EQ(TransitionOnD0EntryBegin(tracker).Action, D0EntryAction::StartAsyncInit);
+        EXPECT_EQ(TransitionOnAdapterInitAsyncSubmitted(tracker, STATUS_SUCCESS, true), STATUS_SUCCESS);
+
+        TransitionOnDeviceCleanup(tracker);
+        EXPECT_EQ(tracker.State, AdapterLifecycleState::Uninitialized);
+
+        EXPECT_EQ(TransitionOnAdapterInitFinished(tracker, STATUS_SUCCESS), STATUS_INVALID_DEVICE_STATE);
+        EXPECT_EQ(tracker.State, AdapterLifecycleState::Uninitialized);
+        EXPECT_TRUE(!tracker.HasAdapterHandle);
+        EXPECT_TRUE(!tracker.AdapterInitCompleted);
+
+        EXPECT_EQ(TransitionOnAdapterInitFinished(tracker, STATUS_UNSUCCESSFUL), STATUS_INVALID_DEVICE_STATE);
+        EXPECT_EQ(tracker.State, AdapterLifecycleState::Uninitialized);
+        EXPECT_TRUE(!tracker.HasAdapterHandle);
+    }
+
+    // Case 2: Late async completion after adapter cleanup must not resurrect handles or flip to AdapterReady.
+    {
+        AdapterLifecycleTracker tracker{};
+        TransitionOnDeviceConfigured(tracker);
+        TransitionOnDeviceInitialized(tracker, STATUS_SUCCESS);
+        EXPECT_EQ(TransitionOnD0EntryBegin(tracker).Action, D0EntryAction::StartAsyncInit);
+        EXPECT_EQ(TransitionOnAdapterInitAsyncSubmitted(tracker, STATUS_SUCCESS, true), STATUS_SUCCESS);
+
+        TransitionOnAdapterCleanup(tracker);
+        EXPECT_EQ(tracker.State, AdapterLifecycleState::DeviceStopped);
+
+        EXPECT_EQ(TransitionOnAdapterInitFinished(tracker, STATUS_SUCCESS), STATUS_INVALID_DEVICE_STATE);
+        EXPECT_EQ(tracker.State, AdapterLifecycleState::DeviceStopped);
+        EXPECT_TRUE(!tracker.HasAdapterHandle);
+        EXPECT_TRUE(!tracker.AdapterInitCompleted);
+    }
+
+    // Case 3: Late sync submission return after device cleanup must not mutate Uninitialized state.
+    {
+        AdapterLifecycleTracker tracker{};
+        TransitionOnDeviceConfigured(tracker);
+        TransitionOnDeviceInitialized(tracker, STATUS_SUCCESS);
+        EXPECT_EQ(TransitionOnD0EntryBegin(tracker).Action, D0EntryAction::StartAsyncInit);
+
+        TransitionOnDeviceCleanup(tracker);
+        EXPECT_EQ(TransitionOnAdapterInitAsyncSubmitted(tracker, STATUS_SUCCESS, true), STATUS_INVALID_DEVICE_STATE);
+        EXPECT_EQ(tracker.State, AdapterLifecycleState::Uninitialized);
+        EXPECT_TRUE(!tracker.HasAdapterHandle);
+    }
+
+    // Case 4: Duplicate EvtIddCxAdapterInitFinished after already reaching AdapterReady or AdapterFailed is rejected.
+    {
+        AdapterLifecycleTracker tracker{};
+        TransitionOnDeviceConfigured(tracker);
+        TransitionOnDeviceInitialized(tracker, STATUS_SUCCESS);
+        EXPECT_EQ(TransitionOnD0EntryBegin(tracker).Action, D0EntryAction::StartAsyncInit);
+        EXPECT_EQ(TransitionOnAdapterInitAsyncSubmitted(tracker, STATUS_SUCCESS, true), STATUS_SUCCESS);
+        EXPECT_EQ(TransitionOnAdapterInitFinished(tracker, STATUS_UNSUCCESSFUL), STATUS_UNSUCCESSFUL);
+        EXPECT_EQ(tracker.State, AdapterLifecycleState::AdapterFailed);
+
+        EXPECT_EQ(TransitionOnAdapterInitFinished(tracker, STATUS_SUCCESS), STATUS_INVALID_DEVICE_STATE);
+        EXPECT_EQ(tracker.State, AdapterLifecycleState::AdapterFailed);
+    }
+}
+
+void
+TestLateCommitModesAfterFailureOrCleanupIsRejected()
+{
+    // CommitModes after async failure must fail without modifying CommittedPathCount.
+    {
+        AdapterLifecycleTracker tracker{};
+        TransitionOnDeviceConfigured(tracker);
+        TransitionOnDeviceInitialized(tracker, STATUS_SUCCESS);
+        EXPECT_EQ(TransitionOnD0EntryBegin(tracker).Action, D0EntryAction::StartAsyncInit);
+        EXPECT_EQ(TransitionOnAdapterInitAsyncSubmitted(tracker, STATUS_SUCCESS, true), STATUS_SUCCESS);
+        EXPECT_EQ(TransitionOnAdapterInitFinished(tracker, STATUS_SUCCESS), STATUS_SUCCESS);
+        EXPECT_EQ(TransitionOnCommitModes(tracker, 2), STATUS_SUCCESS);
+        EXPECT_EQ(tracker.CommittedPathCount, 2u);
+
+        TransitionOnAdapterCleanup(tracker);
+        EXPECT_EQ(TransitionOnCommitModes(tracker, 5), STATUS_INVALID_DEVICE_STATE);
+        EXPECT_EQ(tracker.CommittedPathCount, 2u);
+
+        TransitionOnDeviceCleanup(tracker);
+        EXPECT_EQ(TransitionOnCommitModes(tracker, 9), STATUS_INVALID_DEVICE_STATE);
+        EXPECT_EQ(tracker.CommittedPathCount, 2u);
+    }
+
+    // CommitModes in AdapterFailed must be rejected.
+    {
+        AdapterLifecycleTracker tracker{};
+        TransitionOnDeviceConfigured(tracker);
+        TransitionOnDeviceInitialized(tracker, STATUS_SUCCESS);
+        EXPECT_EQ(TransitionOnD0EntryBegin(tracker).Action, D0EntryAction::StartAsyncInit);
+        EXPECT_EQ(TransitionOnAdapterInitAsyncSubmitted(tracker, STATUS_SUCCESS, true), STATUS_SUCCESS);
+        EXPECT_EQ(TransitionOnAdapterInitFinished(tracker, STATUS_UNSUCCESSFUL), STATUS_UNSUCCESSFUL);
+        EXPECT_EQ(tracker.State, AdapterLifecycleState::AdapterFailed);
+
+        EXPECT_EQ(TransitionOnCommitModes(tracker, 1), STATUS_INVALID_DEVICE_STATE);
+        EXPECT_EQ(tracker.CommittedPathCount, 0u);
+    }
 }
 
 template <typename Fn>
@@ -315,6 +484,10 @@ main()
     RunTest("PendingStatusRejectedAsInitFinishedResult", TestPendingStatusRejectedAsInitFinishedResult);
     RunTest("SuspendResumeAndCommitModes", TestSuspendResumeAndCommitModes);
     RunTest("CleanupResetsHandlesAndState", TestCleanupResetsHandlesAndState);
+    RunTest("ConcurrentMultiDeviceAssociationIsolation", TestConcurrentMultiDeviceAssociationIsolation);
+    RunTest("CleanupDuringPendingInitialization", TestCleanupDuringPendingInitialization);
+    RunTest("LateAsyncInitFinishedAfterCleanupIsRejected", TestLateAsyncInitFinishedAfterCleanupIsRejected);
+    RunTest("LateCommitModesAfterFailureOrCleanupIsRejected", TestLateCommitModesAfterFailureOrCleanupIsRejected);
 
     std::printf("Summary: %d tests run, %d assertion failures.\n", g_TestsRun, g_TestsFailed);
     return (g_TestsFailed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
