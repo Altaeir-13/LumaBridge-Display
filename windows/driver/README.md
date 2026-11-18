@@ -4,19 +4,21 @@
 
 `windows/driver` e o modulo responsavel pelo driver virtual Indirect Display (`IddCx`) do LumaBridge Display no Windows.
 
-Nesta etapa, o modulo implementa a inicializacao do dispositivo WDF/IddCx e a criacao assincrona do adaptador de display indireto (`IDDCX_ADAPTER`). A enumeracao de monitor virtual, a exposicao de modos de video e o processamento de swapchain serao entregues nas proximas issues incrementais.
+Nesta etapa, o modulo implementa a inicializacao do dispositivo WDF/IddCx e a criacao assincrona do adaptador de display indireto (`IDDCX_ADAPTER`) com maquina de estados explicita, sincronizacao entre callbacks assincronos e diagnostico UMDF `[LB-DRIVER]`. A enumeracao de monitor virtual, a exposicao de modos de video e o processamento de swapchain serao entregues nas proximas issues incrementais.
 
 ## Escopo atual
 
 Incluido agora:
 
 - solucao Visual Studio/MSBuild (`Debug|x64` e `Release|x64`);
-- projeto WDK UMDF x64 compatibilizado com Windows 11 host (`UMDF 2.31`, minimo `2.25`, `IddCx 1.4`);
+- projeto WDK UMDF x64 compatibilizado com Windows 11 host (`UMDF 2.31`, minimo `2.25`, `IddCx 1.4`, minimo `4`);
 - entrada `DriverEntry`, configuracao `WDF_DRIVER_CONFIG_INIT`, `WdfDriverCreate` e `LumaBridgeEvtDriverUnload`;
-- `LumaBridgeEvtDeviceAdd` com callbacks PnP/Power (`EvtDeviceD0Entry`, `EvtDeviceD0Exit`), `IddCxDeviceInitConfig`, criacao de `WDFDEVICE` com `DeviceContext` e `IddCxDeviceInitialize`;
-- modulo `Adapter.*` com `LumaBridgeStartAdapter` (`IddCxGetVersion` e `IddCxAdapterInitAsync` com `AdapterContext`), `LumaBridgeStopAdapter`, `LumaBridgeEvtAdapterInitFinished`, `LumaBridgeEvtAdapterCommitModes` e cleanup deterministico de contextos;
-- stubs controlados (`STATUS_NOT_IMPLEMENTED`) para callbacks de monitor e swapchain na tabela `IDD_CX_CLIENT_CONFIG`;
+- `LumaBridgeEvtDeviceAdd` com callbacks PnP/Power (`EvtDeviceD0Entry`, `EvtDeviceD0Exit`), `IddCxDeviceInitConfig`, criacao de `WDFDEVICE` com `LumaBridgeDeviceContext` e `IddCxDeviceInitialize`;
+- modulo `Adapter.*` e `AdapterStateMachine.h` com estados deterministicos, sincronizacao (`g_AdapterInitGate` -> `DeviceContext::StateLock`), `IddCxGetVersion`, `IddCxAdapterInitAsync` (`LumaBridgeAdapterContext`), `LumaBridgeEvtAdapterInitFinished` (com `WdfDeviceSetFailed` em falha assincrona), `LumaBridgeEvtAdapterCommitModes` e limpeza deterministica de contextos;
+- tracing UMDF estruturado em `Trace.h` com prefixo `[LB-DRIVER]` via `OutputDebugStringA` e registro de estagio/erro em memoria;
+- stubs seguros para callbacks ainda nao implementados: `LumaBridgeEvtMonitorAssignSwapChain` retorna `STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN` (contrato IddCx 1.4+ para evitar bugcheck) e `LumaBridgeEvtMonitorUnassignSwapChain` retorna `STATUS_SUCCESS`; callbacks de descricao/modos retornam `STATUS_NOT_SUPPORTED`;
 - supressao de `C4471` restrita ao bloco de includes WDK em `Driver.h`;
+- testes unitarios deterministicos da maquina de estados em `windows/driver/tests/AdapterLifecycleTests.cpp`;
 - INF minimo de desenvolvimento (`LumaBridgeIddDriver.inf`);
 - `.gitignore` local para artefatos de build.
 
@@ -45,7 +47,12 @@ windows/
       Driver.cpp
       Adapter.h
       Adapter.cpp
+      AdapterStateMachine.h
+      Trace.h
       LumaBridgeIddDriver.inf
+    tests/
+      README.md
+      AdapterLifecycleTests.cpp
 ```
 
 ## Requisitos
@@ -56,11 +63,11 @@ Ambiente validado em `docs/setup/windows-wdk-environment.md`:
 - MSVC `14.51.36231`;
 - Windows SDK / WDK `10.0.28000.0`;
 - `WindowsUserModeDriver10.0`;
-- UMDF `2.31` com `UMDF_MINIMUM_VERSION_REQUIRED=25` (alinhado ao host Windows 11 build `26300` / `WUDFx02000.dll` `10.0.26100.9818`);
-- IddCx `1.4` com `IDDCX_MINIMUM_VERSION_REQUIRED=4`;
+- UMDF `2.31` com `UMDF_MINIMUM_VERSION_REQUIRED=25` (validado contra `WUDFx02000.dll` `10.0.26100.9818` no host Windows 11 build `26300`, que expoe versao `2.35` / `287` funcoes);
+- IddCx `1.4` com `IDDCX_MINIMUM_VERSION_REQUIRED=4` (validado contra `IddCx.dll` `10.0.26100.9818` no host, que expoe versao `1.12` / `42` funcoes);
 - Developer Command Prompt ou Developer PowerShell com ambiente do Visual Studio carregado.
 
-## Ciclo de vida implementado
+## Ciclo de vida e modelo de concorrencia
 
 ```text
 DriverEntry
@@ -71,24 +78,40 @@ DriverEntry
        -> WdfDeviceCreate (LumaBridgeDeviceContext + EvtCleanupCallback)
        -> LumaBridgeInitializeDeviceContext (IddCxDeviceInitialize)
   -> LumaBridgeEvtDeviceD0Entry
-       -> LumaBridgeStartAdapter (IddCxGetVersion + IddCxAdapterInitAsync + LumaBridgeAdapterContext)
+       -> LumaBridgeStartAdapter (TransitionOnD0EntryBegin -> IddCxGetVersion + IddCxAdapterInitAsync)
   -> LumaBridgeEvtAdapterInitFinished
-       -> AdapterReady ou AdapterFailed
+       -> AdapterReady (se em D0) / DeviceStopped (se saiu de D0) / AdapterFailed + WdfDeviceSetFailed
 ```
 
-## Como abrir e buildar
+Regras de sincronizacao e ownership:
 
-Comandos validados em `Debug|x64` e `Release|x64`:
+- Ordem fixa de locks: `g_AdapterInitGate` -> `DeviceContext::StateLock` (nunca invertida).
+- `IddCxAdapterInitAsync` e `WdfDeviceSetFailed` sao sempre executados **sem** locks mantidos, evitando deadlock em callbacks sincronos ou reentrantes.
+- Se `EvtIddCxAdapterInitFinished` executar antes de `IddCxAdapterInitAsync` retornar, `g_AdapterInitGate` vincula `AdapterContext->WdfDevice` via `g_InFlightInitDevice` e preserva o estado final da conclusao.
+- `DeviceStopped` nunca sobrescreve `AdapterFailed`, e `STATUS_PENDING` nunca e tratado como conclusao bem-sucedida (`IsSucceededNonPendingStatus`).
+- Em destruicao do dispositivo, `LumaBridgeEvtDeviceContextCleanup` desconecta `AdapterContext->WdfDevice = nullptr` enquanto o objeto filho ainda existe.
+
+## Como buildar e testar
+
+Builds do driver (`Debug|x64` e `Release|x64`):
 
 ```bat
 msbuild windows\driver\LumaBridgeIddDriver.sln /t:Rebuild /p:Configuration=Debug /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0.28000.0 /v:minimal
 msbuild windows\driver\LumaBridgeIddDriver.sln /t:Rebuild /p:Configuration=Release /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0.28000.0 /v:minimal
 ```
 
+Testes unitarios deterministicos da maquina de estados:
+
+```bat
+cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\AdapterLifecycleTests.cpp /Fowindows\driver\x64\Debug\AdapterLifecycleTests.obj /Fe:windows\driver\x64\Debug\AdapterLifecycleTests.exe
+windows\driver\x64\Debug\AdapterLifecycleTests.exe
+```
+
 Artefatos locais esperados (ignorados por `windows/driver/.gitignore`):
 
 ```text
 windows/driver/x64/Debug/LumaBridgeIddDriver.dll
+windows/driver/x64/Debug/AdapterLifecycleTests.exe
 windows/driver/x64/Release/LumaBridgeIddDriver.dll
 ```
 
@@ -96,14 +119,15 @@ Observacao: `Inf2Cat` e `DrvCat` permanecem ignorados enquanto o INF esta declar
 
 ## Decisoes de build e dividas tecnicas
 
-- **Compatibilidade UMDF/IddCx com o SO alvo:** O WDK `10.0.28000.0` usa UMDF `2.35` por padrao, mas o Windows 11 host (`OsBuildNumber = 26300`, `WUDFx02000.dll` `10.0.26100.9818`) registra servicos UMDF entre `2.15` e `2.31`. O projeto foi ajustado para `UMDF_VERSION_MINOR=31` com `UMDF_MINIMUM_VERSION_REQUIRED=25` (e `UmdfLibraryVersion=2.31.0` no INF), mantendo `IddCx 1.4` (`IDDCX_MINIMUM_VERSION_REQUIRED=4`).
-- **Supressao escopada de `C4471`:** O warning `C4471` emitido por `wudfwdm.h` (`typedef enum _DEVICE_RELATION_TYPE`) passou a ser suprimido apenas ao redor de `#include <wdf.h>` e `#include <IddCx.h>` em `Driver.h` (`#pragma warning(push/disable/pop)`), removendo `<DisableSpecificWarnings>4471` do `.vcxproj`.
+- **Compatibilidade UMDF/IddCx com o SO alvo:** O driver usa `UMDF_VERSION_MINOR=31`, `UMDF_MINIMUM_VERSION_REQUIRED=25` e `IDDCX_VERSION_MAJOR=1`, `IDDCX_VERSION_MINOR=4`, `IDDCX_MINIMUM_VERSION_REQUIRED=4`. Todas as funcoes usadas estao dentro de `WDF_ALWAYS_AVAILABLE_FUNCTION_COUNT` (`268`) e `IDD_ALWAYS_AVAILABLE_FUNCTION_COUNT` (`23`), garantindo compatibilidade binaria em Windows 10 1903+ e Windows 11.
+- **Supressao escopada de `C4471`:** O warning `C4471` emitido por `wudfwdm.h` (`typedef enum _DEVICE_RELATION_TYPE`) e suprimido apenas ao redor de `#include <wdf.h>` e `#include <IddCx.h>` em `Driver.h`.
 - **Mitigacao Spectre (issue #20):** `Driver_SpectreMitigation=false` permanece temporariamente porque as bibliotecas MSVC Spectre (`lib\spectre`) nao estao instaladas no Build Tools local.
 - **Empacotamento INF e assinatura (issue #21):** `EnableTestSign=false` e `SignMode=Off` mantem assinatura e empacotamento fora deste escopo ate a validacao dedicada do INF.
 
 ## Proximos passos
 
-1. Validar pacote INF (`IndirectKmd`, `UmdfExtensions = IddCx0102`, `StampInf`, `InfVerif`, `Inf2Cat`) e estrategia segura de assinatura de teste (issue #21).
-2. Implementar criacao, chegada e remocao do monitor virtual (`IddCxMonitorCreate`, `IddCxMonitorArrival`, `IddCxMonitorDeparture`).
-3. Expor modos de video (`1280x720@60`, `1920x1080@60`, `2560x1440@60`) em `EvtIddCxMonitorGetDefaultDescriptionModes` e `EvtIddCxMonitorQueryTargetModes`.
-4. Implementar processamento de swapchain Direct3D 11 e contrato de entrega de frames para `lumabridge-host`.
+1. Validar pacote INF (`IndirectKmd`, `UmdfExtensions = IddCx0102`, `StampInf`, `InfVerif`, `Inf2Cat`) e resolver issue #21.
+2. Reativar mitigacao Spectre apos instalacao das libs MSVC Spectre (issue #20).
+3. Implementar criacao, chegada e remocao do monitor virtual (`IddCxMonitorCreate`, `IddCxMonitorArrival`, `IddCxMonitorDeparture`).
+4. Expor modos de video (`1280x720@60`, `1920x1080@60`, `2560x1440@60`) em `EvtIddCxMonitorGetDefaultDescriptionModes` e `EvtIddCxMonitorQueryTargetModes`.
+5. Implementar processamento de swapchain Direct3D 11 e contrato de entrega de frames para `lumabridge-host`.
