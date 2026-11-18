@@ -8,6 +8,7 @@ namespace lumabridge::driver {
 
 inline constexpr UINT kMaxMonitorsSupported = 1;
 inline constexpr UINT64 kMaxDisplayPipelineRate = 2560ULL * 1440ULL * 60ULL;
+inline constexpr DWORD kAdapterInitSlotWaitTimeoutMs = 5000;
 inline constexpr UINT kEndpointMajorVersion = 0;
 inline constexpr UINT kEndpointMinorVersion = 1;
 inline constexpr UINT kEndpointBuildVersion = 0;
@@ -33,6 +34,7 @@ struct AdapterContext
     WDFDEVICE WdfDevice{nullptr};
     IDDCX_ADAPTER AdapterObject{nullptr};
     bool IsCleanedUp{false};
+    bool HasBoundDevice{false};
 };
 
 } // namespace lumabridge::driver

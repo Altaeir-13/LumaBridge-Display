@@ -65,8 +65,21 @@ LumaBridgeBindAdapterAndResolveDeviceLocked(
 
     if (adapterContext->WdfDevice == nullptr)
     {
+        if (ExplicitDevice == nullptr &&
+            g_InFlightInitSlot.InFlightDevice != nullptr &&
+            g_InFlightInitSlot.InFlightDeviceCleanedUp &&
+            !adapterContext->HasBoundDevice)
+        {
+            adapterContext->IsCleanedUp = true;
+            adapterContext->HasBoundDevice = true;
+            return nullptr;
+        }
+
         const WDFDEVICE candidateDevice = static_cast<WDFDEVICE>(
-            g_InFlightInitSlot.ResolveAdapterDevice(adapterContext->WdfDevice, ExplicitDevice));
+            g_InFlightInitSlot.ResolveAdapterDevice(
+                adapterContext->WdfDevice,
+                adapterContext->HasBoundDevice || adapterContext->IsCleanedUp,
+                ExplicitDevice));
         if (candidateDevice == nullptr)
         {
             return nullptr;
@@ -81,6 +94,7 @@ LumaBridgeBindAdapterAndResolveDeviceLocked(
         }
 
         adapterContext->WdfDevice = candidateDevice;
+        adapterContext->HasBoundDevice = true;
         if (candidateContext->AdapterObject == nullptr)
         {
             candidateContext->AdapterObject = AdapterObject;
@@ -92,6 +106,8 @@ LumaBridgeBindAdapterAndResolveDeviceLocked(
     if (boundContext == nullptr || boundContext->IsCleanedUp)
     {
         adapterContext->WdfDevice = nullptr;
+        adapterContext->IsCleanedUp = true;
+        adapterContext->HasBoundDevice = true;
         return nullptr;
     }
 
@@ -322,12 +338,15 @@ LumaBridgeStartAdapter(
     adapterInitIn.ObjectAttributes = &adapterAttributes;
 
     bool acquiredSlot = false;
+    NTSTATUS slotStatus = STATUS_INVALID_DEVICE_STATE;
+    const ULONGLONG waitDeadlineTick = GetTickCount64() + lumabridge::driver::kAdapterInitSlotWaitTimeoutMs;
     {
         ExclusiveLockGuard gateLock(&g_AdapterInitGate);
         while (!acquiredSlot)
         {
             if (deviceContext->IsCleanedUp)
             {
+                slotStatus = STATUS_INVALID_DEVICE_STATE;
                 break;
             }
 
@@ -335,6 +354,7 @@ LumaBridgeStartAdapter(
                 ExclusiveLockGuard stateLock(&deviceContext->StateLock);
                 if (deviceContext->Lifecycle.IsCleanedUp)
                 {
+                    slotStatus = STATUS_INVALID_DEVICE_STATE;
                     break;
                 }
             }
@@ -345,8 +365,21 @@ LumaBridgeStartAdapter(
                 break;
             }
 
-            if (!SleepConditionVariableSRW(&g_AdapterInitSlotCv, &g_AdapterInitGate, INFINITE, 0))
+            const ULONGLONG nowTick = GetTickCount64();
+            if (nowTick >= waitDeadlineTick)
             {
+                slotStatus = STATUS_IO_TIMEOUT;
+                break;
+            }
+
+            const ULONGLONG remainingTick = waitDeadlineTick - nowTick;
+            const DWORD remainingMs = (remainingTick > lumabridge::driver::kAdapterInitSlotWaitTimeoutMs)
+                ? lumabridge::driver::kAdapterInitSlotWaitTimeoutMs
+                : static_cast<DWORD>(remainingTick);
+
+            if (!SleepConditionVariableSRW(&g_AdapterInitSlotCv, &g_AdapterInitGate, remainingMs, 0))
+            {
+                slotStatus = STATUS_IO_TIMEOUT;
                 break;
             }
         }
@@ -354,12 +387,25 @@ LumaBridgeStartAdapter(
 
     if (!acquiredSlot)
     {
+        AdapterLifecycleState abortedState = AdapterLifecycleState::Uninitialized;
+        {
+            ExclusiveLockGuard stateLock(&deviceContext->StateLock);
+            if (!deviceContext->Lifecycle.IsCleanedUp)
+            {
+                (void)lumabridge::driver::TransitionOnAdapterInitAsyncSubmitted(
+                    deviceContext->Lifecycle,
+                    slotStatus,
+                    false);
+            }
+            abortedState = deviceContext->Lifecycle.State;
+        }
+
         LumaBridgeTraceWarn(
             DriverDiagnosticStage::AdapterInitAsync,
-            STATUS_INVALID_DEVICE_STATE,
-            AdapterLifecycleState::Uninitialized,
-            "Aborted IddCxAdapterInitAsync because device context was cleaned up or slot acquisition failed");
-        return STATUS_INVALID_DEVICE_STATE;
+            slotStatus,
+            abortedState,
+            "Aborted IddCxAdapterInitAsync due to cleanup or bounded slot wait timeout");
+        return slotStatus;
     }
 
     // Do not hold g_AdapterInitGate or StateLock across IddCxAdapterInitAsync to prevent
@@ -373,14 +419,29 @@ LumaBridgeStartAdapter(
     {
         ExclusiveLockGuard gateLock(&g_AdapterInitGate);
         const bool hasValidHandle = NT_SUCCESS(initStatus) && (adapterInitOut.AdapterObject != nullptr);
-        if (hasValidHandle && !deviceContext->IsCleanedUp)
+        const bool deviceCleanedUp = deviceContext->IsCleanedUp || g_InFlightInitSlot.InFlightDeviceCleanedUp;
+        if (hasValidHandle)
         {
-            (void)LumaBridgeBindAdapterAndResolveDeviceLocked(adapterInitOut.AdapterObject, Device);
+            if (deviceCleanedUp)
+            {
+                auto* adapterContext = LumaBridgeGetAdapterContext(adapterInitOut.AdapterObject);
+                if (adapterContext != nullptr)
+                {
+                    adapterContext->AdapterObject = adapterInitOut.AdapterObject;
+                    adapterContext->WdfDevice = nullptr;
+                    adapterContext->HasBoundDevice = true;
+                    adapterContext->IsCleanedUp = true;
+                }
+            }
+            else
+            {
+                (void)LumaBridgeBindAdapterAndResolveDeviceLocked(adapterInitOut.AdapterObject, Device);
+            }
         }
         g_InFlightInitSlot.Release(Device);
 
         ExclusiveLockGuard stateLock(&deviceContext->StateLock);
-        if (hasValidHandle && !deviceContext->IsCleanedUp && !deviceContext->Lifecycle.IsCleanedUp)
+        if (hasValidHandle && !deviceCleanedUp && !deviceContext->Lifecycle.IsCleanedUp)
         {
             deviceContext->AdapterObject = adapterInitOut.AdapterObject;
         }
@@ -455,7 +516,7 @@ LumaBridgeEvtDeviceContextCleanup(
     const WDFDEVICE device = static_cast<WDFDEVICE>(Object);
     {
         ExclusiveLockGuard gateLock(&g_AdapterInitGate);
-        g_InFlightInitSlot.Release(device);
+        g_InFlightInitSlot.MarkDeviceCleanedUp(device);
 
         auto* deviceContext = LumaBridgeGetDeviceContext(device);
         if (deviceContext != nullptr)
@@ -471,14 +532,16 @@ LumaBridgeEvtDeviceContextCleanup(
                 lumabridge::driver::TransitionOnDeviceCleanup(deviceContext->Lifecycle);
             }
 
-            // Parent WDFDEVICE cleanup runs before child IDDCX_ADAPTER cleanup; sever back-pointer
-            // while AdapterObject is still alive so AdapterContextCleanup never touches a dead WDFDEVICE.
+            // Parent WDFDEVICE cleanup runs before child IDDCX_ADAPTER cleanup; poison AdapterContext
+            // while AdapterObject is still alive so late callbacks or AdapterContextCleanup cannot bind elsewhere.
             if (adapter != nullptr)
             {
                 auto* adapterContext = LumaBridgeGetAdapterContext(adapter);
                 if (adapterContext != nullptr)
                 {
                     adapterContext->WdfDevice = nullptr;
+                    adapterContext->IsCleanedUp = true;
+                    adapterContext->HasBoundDevice = true;
                 }
             }
         }
@@ -514,7 +577,7 @@ LumaBridgeEvtAdapterContextCleanup(
 
             if (wdfDevice != nullptr)
             {
-                g_InFlightInitSlot.Release(wdfDevice);
+                g_InFlightInitSlot.MarkDeviceCleanedUp(wdfDevice);
                 auto* deviceContext = LumaBridgeGetDeviceContext(wdfDevice);
                 if (deviceContext != nullptr)
                 {
@@ -530,6 +593,7 @@ LumaBridgeEvtAdapterContextCleanup(
             }
 
             adapterContext->IsCleanedUp = true;
+            adapterContext->HasBoundDevice = true;
             adapterContext->AdapterObject = nullptr;
             adapterContext->WdfDevice = nullptr;
         }

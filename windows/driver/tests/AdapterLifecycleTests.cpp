@@ -293,7 +293,7 @@ TestConcurrentMultiDeviceAssociationIsolation()
     EXPECT_TRUE(!slot.TryAcquire(nullptr));
 
     // Adapter A early async callback before IddCxAdapterInitAsync returns resolves deterministically to device A.
-    void* adapterABoundDevice = slot.ResolveAdapterDevice(nullptr, nullptr);
+    void* adapterABoundDevice = slot.ResolveAdapterDevice(nullptr, false, nullptr);
     EXPECT_EQ(adapterABoundDevice, deviceA);
 
     // Explicitly releasing by a non-owner device must not clear device A's slot.
@@ -306,11 +306,46 @@ TestConcurrentMultiDeviceAssociationIsolation()
     EXPECT_TRUE(slot.TryAcquire(deviceB));
 
     // Subsequent callbacks for already-bound Adapter A keep device A despite device B occupying the slot.
-    EXPECT_EQ(slot.ResolveAdapterDevice(adapterABoundDevice, nullptr), deviceA);
-    EXPECT_EQ(slot.ResolveAdapterDevice(nullptr, nullptr), deviceB);
+    EXPECT_EQ(slot.ResolveAdapterDevice(adapterABoundDevice, true, nullptr), deviceA);
+    EXPECT_EQ(slot.ResolveAdapterDevice(nullptr, false, nullptr), deviceB);
 
     slot.Release(deviceB);
     EXPECT_EQ(slot.InFlightDevice, static_cast<void*>(nullptr));
+}
+
+void
+TestCleanupDuringInFlightInitPreventsCrossDeviceLateCallbackBinding()
+{
+    int deviceAToken = 10;
+    int deviceBToken = 20;
+    void* const deviceA = &deviceAToken;
+    void* const deviceB = &deviceBToken;
+
+    InFlightAdapterBindingSlot slot{};
+    EXPECT_TRUE(slot.TryAcquire(deviceA));
+
+    // Cleanup of Device A marks the slot as cleaned up WITHOUT releasing it prematurely:
+    // Device B still cannot take the slot while IddCxAdapterInitAsync(Device A) has not returned,
+    // and any callback for an unbound adapter sees InFlightDeviceCleanedUp and resolves to nullptr.
+    slot.MarkDeviceCleanedUp(deviceA);
+    EXPECT_TRUE(slot.InFlightDeviceCleanedUp);
+    EXPECT_TRUE(!slot.TryAcquire(deviceB));
+    EXPECT_EQ(slot.ResolveAdapterDevice(nullptr, false, nullptr), static_cast<void*>(nullptr));
+
+    // After IddCxAdapterInitAsync(Device A) returns on Thread A, Adapter A is poisoned as bound/cleaned up
+    // and only then is the slot released so Device B can acquire it cleanly.
+    const bool adapterAWasCleanedUp = true;
+    slot.Release(deviceA);
+    EXPECT_EQ(slot.InFlightDevice, static_cast<void*>(nullptr));
+    EXPECT_TRUE(!slot.InFlightDeviceCleanedUp);
+
+    EXPECT_TRUE(slot.TryAcquire(deviceB));
+
+    // Even while Device B holds the slot, a late callback for Adapter A cannot bind to Device B.
+    EXPECT_EQ(slot.ResolveAdapterDevice(nullptr, adapterAWasCleanedUp, nullptr), static_cast<void*>(nullptr));
+    EXPECT_EQ(slot.ResolveAdapterDevice(nullptr, false, nullptr), deviceB);
+
+    slot.Release(deviceB);
 }
 
 void
@@ -485,6 +520,9 @@ main()
     RunTest("SuspendResumeAndCommitModes", TestSuspendResumeAndCommitModes);
     RunTest("CleanupResetsHandlesAndState", TestCleanupResetsHandlesAndState);
     RunTest("ConcurrentMultiDeviceAssociationIsolation", TestConcurrentMultiDeviceAssociationIsolation);
+    RunTest(
+        "CleanupDuringInFlightInitPreventsCrossDeviceLateCallbackBinding",
+        TestCleanupDuringInFlightInitPreventsCrossDeviceLateCallbackBinding);
     RunTest("CleanupDuringPendingInitialization", TestCleanupDuringPendingInitialization);
     RunTest("LateAsyncInitFinishedAfterCleanupIsRejected", TestLateAsyncInitFinishedAfterCleanupIsRejected);
     RunTest("LateCommitModesAfterFailureOrCleanupIsRejected", TestLateCommitModesAfterFailureOrCleanupIsRejected);

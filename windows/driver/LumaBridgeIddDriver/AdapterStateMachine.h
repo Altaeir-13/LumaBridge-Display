@@ -69,10 +69,11 @@ struct AdapterLifecycleTracker
 };
 
 /// Serializes the unbound window of IddCxAdapterInitAsync across multiple WDFDEVICE instances
-/// so concurrent device initializations can never cross-bind AdapterObject handles.
+/// so concurrent device initializations and cleanups can never cross-bind AdapterObject handles.
 struct InFlightAdapterBindingSlot
 {
     void* InFlightDevice{nullptr};
+    bool InFlightDeviceCleanedUp{false};
 
     bool TryAcquire(void* device) noexcept
     {
@@ -81,7 +82,16 @@ struct InFlightAdapterBindingSlot
             return false;
         }
         InFlightDevice = device;
+        InFlightDeviceCleanedUp = false;
         return true;
+    }
+
+    void MarkDeviceCleanedUp(void* device) noexcept
+    {
+        if (InFlightDevice == device && device != nullptr)
+        {
+            InFlightDeviceCleanedUp = true;
+        }
     }
 
     void Release(void* device) noexcept
@@ -89,18 +99,31 @@ struct InFlightAdapterBindingSlot
         if (InFlightDevice == device)
         {
             InFlightDevice = nullptr;
+            InFlightDeviceCleanedUp = false;
         }
     }
 
-    void* ResolveAdapterDevice(void* existingAdapterDevice, void* explicitDevice) const noexcept
+    void* ResolveAdapterDevice(
+        void* existingAdapterDevice,
+        bool adapterWasBoundOrCleanedUp,
+        void* explicitDevice
+        ) const noexcept
     {
         if (existingAdapterDevice != nullptr)
         {
             return existingAdapterDevice;
         }
+        if (adapterWasBoundOrCleanedUp)
+        {
+            return nullptr;
+        }
         if (explicitDevice != nullptr)
         {
             return explicitDevice;
+        }
+        if (InFlightDeviceCleanedUp)
+        {
+            return nullptr;
         }
         return InFlightDevice;
     }

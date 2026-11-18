@@ -18,7 +18,7 @@ Incluido agora:
 - tracing UMDF estruturado em `Trace.h` com prefixo `[LB-DRIVER]` via `OutputDebugStringA` e registro de estagio/erro em memoria;
 - stubs defensivos para callbacks ainda nao implementados: `LumaBridgeEvtMonitorAssignSwapChain` retorna `STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN` apenas como protecao de contrato IddCx 1.4+ contra bugcheck (nao e implementacao funcional de swapchain, pois o Windows pode solicitar repetidamente nova swapchain se houver monitor ativo; por isso nenhum monitor virtual e criado ou anunciado ate a implementacao do pipeline de modos e swapchain) e `LumaBridgeEvtMonitorUnassignSwapChain` retorna `STATUS_SUCCESS`; callbacks de descricao/modos retornam `STATUS_NOT_SUPPORTED`;
 - supressao de `C4471` restrita ao bloco de includes WDK em `Driver.h`;
-- 15 testes unitarios deterministicos da maquina de estados e associacao multi-dispositivo em `windows/driver/tests/AdapterLifecycleTests.cpp` (escopo puramente de logica de estado/associacao, distinto de testes em runtime real WDF/IddCx);
+- 16 testes unitarios deterministicos da maquina de estados e associacao multi-dispositivo em `windows/driver/tests/AdapterLifecycleTests.cpp` (escopo puramente de logica de estado/associacao, distinto de testes em runtime real WDF/IddCx);
 - INF minimo de desenvolvimento (`LumaBridgeIddDriver.inf`);
 - `.gitignore` local para artefatos de build.
 
@@ -87,10 +87,11 @@ Regras de sincronizacao e ownership:
 
 - Ordem fixa de locks: `g_AdapterInitGate` -> `DeviceContext::StateLock` (nunca invertida).
 - `IddCxAdapterInitAsync` e `WdfDeviceSetFailed` sao sempre executados **sem** locks mantidos, evitando deadlock em callbacks sincronos ou reentrantes.
-- `InFlightAdapterBindingSlot` + `g_AdapterInitSlotCv` (sob `g_AdapterInitGate`) serializam a janela sem vinculo de `IddCxAdapterInitAsync` entre multiplos `WDFDEVICE` no processo host, garantindo que inicializacoes concorrentes nunca associem um `IDDCX_ADAPTER` ao dispositivo errado; callbacks tardios apos cleanup (`IsCleanedUp`) ou em estado `AdapterFailed`/`Uninitialized` sao rejeitados sem corromper o estado encerrado.
+- `InFlightAdapterBindingSlot` + `g_AdapterInitSlotCv` (sob `g_AdapterInitGate`) serializam a janela sem vinculo de `IddCxAdapterInitAsync` entre multiplos `WDFDEVICE` no processo host com espera limitada (`kAdapterInitSlotWaitTimeoutMs = 5000 ms`, falhando com `STATUS_IO_TIMEOUT` e transicionando para `AdapterFailed` em timeout para respeitar os limites de timeout PnP/Power do reflector UMDF).
+- Em cleanup durante inicializacao em voo, `LumaBridgeEvtDeviceContextCleanup` e `LumaBridgeEvtAdapterContextCleanup` apenas sinalizam `MarkDeviceCleanedUp` (sem liberar o slot antes do retorno de `IddCxAdapterInitAsync`) e marcam `AdapterContext->IsCleanedUp = true` + `HasBoundDevice = true`, garantindo que callbacks tardios do adaptador antigo sejam rejeitados com `nullptr` e nunca se vinculem cruzadamente a outro dispositivo `B`.
 - Antes de liberar os locks para chamar `WdfDeviceSetFailed`, `LumaBridgeEvtAdapterInitFinished` retem referencia publica via `WdfObjectReference`/`WdfObjectDereference` para garantir validade do handle `WDFDEVICE` ate o retorno da chamada.
 - `DeviceStopped` nunca sobrescreve `AdapterFailed`, e `STATUS_PENDING` nunca e tratado como conclusao bem-sucedida (`IsSucceededNonPendingStatus`).
-- Em destruicao do dispositivo, `LumaBridgeEvtDeviceContextCleanup` marca `IsCleanedUp`, libera eventual slot em voo e desconecta `AdapterContext->WdfDevice = nullptr` enquanto o objeto filho ainda existe; o mesmo contrato se aplica de forma simetrica no cleanup do adaptador.
+- Em destruicao do dispositivo ou adaptador, os ponteiros cruzados (`WdfDevice` / `AdapterObject`) e `IsCleanedUp` sao atualizados simetricamente sob `g_AdapterInitGate`.
 - Garantia de compatibilidade com o SO apoia-se exclusivamente nos contratos publicos e documentados do WDF/IddCx, nunca em offsets internos de DLLs do Windows.
 
 ## Como buildar e testar
