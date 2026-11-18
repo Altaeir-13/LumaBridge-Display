@@ -18,7 +18,9 @@ Incluido agora:
 - tracing UMDF estruturado em `Trace.h` com prefixo `[LB-DRIVER]` via `OutputDebugStringA` e registro de estagio/erro em memoria;
 - modulo `MonitorModes.*` com especificacao canonica CTA-861 dos modos SDR progressivos (`1280x720@60` e `1920x1080@60` preferencial), separacao explicita de `vSyncFreqDivider` (`0` para `IDDCX_MONITOR_MODE`, `1` para `IDDCX_TARGET_MODE` e paths ativos), validacao de timings/pixel rate sem overflow, correspondencia exata com modos anunciados, deduplicacao, limite unico `kMaxDisplayPipelineRate` e negociacao de buffers;
 - callbacks IddCx de modos implementados em `Adapter.cpp`: `LumaBridgeEvtParseMonitorDescription` (recusa EDID com `STATUS_NOT_SUPPORTED` conforme estrategia `IDDCX_MONITOR_DESCRIPTION_TYPE_UNCONFIGURED`), `LumaBridgeEvtMonitorGetDefaultDescriptionModes`, `LumaBridgeEvtMonitorQueryTargetModes` e validacao estrita de paths ativos em `LumaBridgeEvtAdapterCommitModes`;
-- stub defensivo para swapchain ainda nao implementado: `LumaBridgeEvtMonitorAssignSwapChain` retorna `STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN` apenas como protecao de contrato IddCx 1.4+ contra bugcheck e `LumaBridgeEvtMonitorUnassignSwapChain` retorna `STATUS_SUCCESS`; nenhum monitor virtual e criado ou anunciado (`IddCxMonitorCreate` / `IddCxMonitorArrival` nao sao chamados) ate a implementacao do pipeline de swapchain;
+- pipeline minimo de swapchain Direct3D 11 / DXGI em `SwapChainProcessor.*` e `Adapter.cpp`: selecao de adaptador por `RenderAdapterLuid` (`EnumAdapterByLuid`), criacao de `ID3D11Device` com `D3D11_CREATE_DEVICE_BGRA_SUPPORT`, `IddCxSwapChainSetDevice`, `IddCxSwapChainReleaseAndAcquireBuffer`, `IddCxSwapChainFinishedProcessingFrame`, estados explicitos (`Ready`, `Active`, `Suspended`, `Stopping`, `Stopped`, `Faulted`), circuit breaker contra loops de recriacao, tratamento distinto de erros transitorios e permanentes, worker thread dedicada com cancelamento cooperativo sem busy-wait, protecao contra reentrancia, RAII (`ScopedWin32Handle`, `ComPtr::Attach`), transferencia estrita de ownership (sem chamar `WdfObjectDelete` em recusas `STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN`), `DeviceSwapChainHost` refcounted, acesso a `MonitorContext` sincronizado por `g_AdapterInitGate` e metricas sem armazenar pixels do desktop;
+- callbacks `LumaBridgeEvtMonitorAssignSwapChain` e `LumaBridgeEvtMonitorUnassignSwapChain` integrados ao `SwapChainProcessor` (`OnSuspend`/`OnResume`/`Shutdown` coordenados em `D0Exit`/`D0Entry` e cleanups); nenhum monitor virtual e criado ou anunciado (`IddCxMonitorCreate` / `IddCxMonitorArrival` nao sao chamados nesta etapa);
+- 13 testes unitarios deterministicos do ciclo de vida da swapchain (independentes de GPU fisica) em `windows/driver/tests/SwapChainLifecycleTests.cpp`;
 - 12 testes unitarios deterministicos de modos de video e negociacao de buffers em `windows/driver/tests/MonitorModesTests.cpp`;
 - supressao de `C4471` restrita ao bloco de includes WDK em `Driver.h`;
 - 16 testes unitarios deterministicos da maquina de estados e associacao multi-dispositivo em `windows/driver/tests/AdapterLifecycleTests.cpp` (escopo puramente de logica de estado/associacao, distinto de testes em runtime real WDF/IddCx);
@@ -29,11 +31,10 @@ Incluido agora:
 Fora do escopo atual (issues dedicadas):
 
 - criacao e chegada/saida de monitor virtual (`IddCxMonitorCreate`, `IddCxMonitorArrival`, `IddCxMonitorDeparture`);
-- exposicao de modos de video (`720p60`, `1080p60`, `1440p60`);
-- processamento de swapchain e recursos Direct3D 11;
+- exposicao de `2560x1440@60` (avaliado, nao obrigatorio no MVP inicial) e modos HDR/VRR;
+- copia de staging/leitura de pixels, encoder NVENC, protocolo e streaming para o cliente Linux;
 - habilitacao de mitigacao Spectre apos instalacao das libs MSVC Spectre (ver issue #20);
-- assinatura de teste, instalacao controlada e execucao em runtime real dentro de `WUDFHost.exe`;
-- host, client, protocolo, streaming ou NVENC.
+- assinatura de teste, instalacao controlada e execucao em runtime real dentro de `WUDFHost.exe`.
 
 ## Estrutura
 
@@ -53,6 +54,8 @@ windows/
       AdapterStateMachine.h
       MonitorModes.h
       MonitorModes.cpp
+      SwapChainProcessor.h
+      SwapChainProcessor.cpp
       Trace.h
       LumaBridgeIddDriver.inf
     tests/
@@ -60,6 +63,7 @@ windows/
       AdapterLifecycleTests.cpp
       DriverPackageValidationTests.cpp
       MonitorModesTests.cpp
+      SwapChainLifecycleTests.cpp
 ```
 
 ## Requisitos
@@ -121,6 +125,9 @@ windows\driver\x64\Debug\DriverPackageValidationTests.exe
 
 cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\MonitorModesTests.cpp windows\driver\LumaBridgeIddDriver\MonitorModes.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\MonitorModesTests.exe
 windows\driver\x64\Debug\MonitorModesTests.exe
+
+cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\SwapChainLifecycleTests.cpp windows\driver\LumaBridgeIddDriver\SwapChainProcessor.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\SwapChainLifecycleTests.exe
+windows\driver\x64\Debug\SwapChainLifecycleTests.exe
 ```
 
 Artefatos locais esperados (ignorados por `windows/driver/.gitignore`):
@@ -150,7 +157,6 @@ Validacao direta de INF com `InfVerif` e detalhes de assinatura/recuperacao esta
 ## Proximos passos
 
 1. Reativar mitigacao Spectre apos instalacao das libs MSVC Spectre (issue #20).
-2. Implementar criacao, chegada e remocao do monitor virtual (`IddCxMonitorCreate`, `IddCxMonitorArrival`, `IddCxMonitorDeparture`).
-3. Expor modos de video (`1280x720@60`, `1920x1080@60`, `2560x1440@60`) em `EvtIddCxMonitorGetDefaultDescriptionModes` e `EvtIddCxMonitorQueryTargetModes`.
-4. Implementar processamento de swapchain Direct3D 11 e contrato de entrega de frames para `lumabridge-host`.
-5. Executar estrategia controlada de assinatura de teste e validacao em runtime no Windows (`WUDFHost.exe`).
+2. Implementar criacao, chegada e remocao controlada do monitor virtual (`IddCxMonitorCreate`, `IddCxMonitorArrival`, `IddCxMonitorDeparture`) conectando `LumaBridgeMonitorContext` ao pipeline de modos e swapchain.
+3. Implementar extracao/encaminhamento de frames para `lumabridge-host` e encoder NVENC.
+4. Executar estrategia controlada de assinatura de teste e validacao em runtime no Windows (`WUDFHost.exe`).

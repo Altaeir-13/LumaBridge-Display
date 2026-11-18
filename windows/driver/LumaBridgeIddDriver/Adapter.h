@@ -3,9 +3,12 @@
 #include "Driver.h"
 #include "AdapterStateMachine.h"
 #include "MonitorModes.h"
+#include "SwapChainProcessor.h"
 #include "Trace.h"
 
 namespace lumabridge::driver {
+
+struct DeviceSwapChainHost;
 
 inline constexpr UINT kMaxMonitorsSupported = 1;
 inline constexpr DWORD kAdapterInitSlotWaitTimeoutMs = 5000;
@@ -23,6 +26,7 @@ struct DeviceContext
     SRWLOCK StateLock{SRWLOCK_INIT};
     WDFDEVICE WdfDevice{nullptr};
     IDDCX_ADAPTER AdapterObject{nullptr};
+    DeviceSwapChainHost* SwapChainHost{nullptr};
     ULONG IddCxRuntimeVersion{0};
     bool IsCleanedUp{false};
     AdapterLifecycleTracker Lifecycle{};
@@ -37,13 +41,23 @@ struct AdapterContext
     bool HasBoundDevice{false};
 };
 
+/// Per-IDDCX_MONITOR context linking back to the parent WDFDEVICE swapchain host.
+struct MonitorContext
+{
+    WDFDEVICE WdfDevice{nullptr};
+    UINT32 ConnectorIndex{0};
+    bool IsCleanedUp{false};
+};
+
 } // namespace lumabridge::driver
 
 using LumaBridgeDeviceContext = lumabridge::driver::DeviceContext;
 using LumaBridgeAdapterContext = lumabridge::driver::AdapterContext;
+using LumaBridgeMonitorContext = lumabridge::driver::MonitorContext;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(LumaBridgeDeviceContext, LumaBridgeGetDeviceContext)
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(LumaBridgeAdapterContext, LumaBridgeGetAdapterContext)
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(LumaBridgeMonitorContext, LumaBridgeGetMonitorContext)
 
 /// Configures WDFDEVICE_INIT with IddCx callbacks prior to WdfDeviceCreate.
 _Must_inspect_result_
@@ -74,6 +88,7 @@ LumaBridgeStopAdapter(
 
 EVT_WDF_OBJECT_CONTEXT_CLEANUP LumaBridgeEvtDeviceContextCleanup;
 EVT_WDF_OBJECT_CONTEXT_CLEANUP LumaBridgeEvtAdapterContextCleanup;
+EVT_WDF_OBJECT_CONTEXT_CLEANUP LumaBridgeEvtMonitorContextCleanup;
 
 EVT_IDD_CX_ADAPTER_INIT_FINISHED LumaBridgeEvtAdapterInitFinished;
 EVT_IDD_CX_ADAPTER_COMMIT_MODES LumaBridgeEvtAdapterCommitModes;

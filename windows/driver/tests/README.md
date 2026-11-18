@@ -44,6 +44,22 @@
 11. `MonitorAndTargetModesEnforceDistinctVSyncDividers` — regressao confirmando `vSyncFreqDivider == 0` exclusivo de monitor modes e `vSyncFreqDivider == 1` exclusivo de target modes/commit;
 12. `CommitValidationRejectsUnadvertisedTimingsWithMatchingActiveResolution` — regressao rejeitando timings nao anunciados mesmo para resolucoes 1080p60 validas.
 
+`SwapChainLifecycleTests.cpp` executa **13 testes unitarios deterministicos** sobre `SwapChainProcessor.h` / `SwapChainProcessor.cpp` (independentes de GPU fisica via mock de `ISwapChainBackend`):
+
+1. `AssignProcessFramesAndUnassignLifecycle` — atribuicao, processamento de frames, invariantes de metricas, desatribuicao e preservacao do handle `hNextSurfaceAvailable`;
+2. `PendingAcquireWaitsOnSurfaceEventWithoutBusyWaiting` — retorno `E_PENDING` aguardando evento do SO sem busy-wait;
+3. `InitializationFailureAbandonsSwapChainWithoutDeletingCallerHandle` — falha pre-ownership retornando `STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN` sem chamar `DeleteSwapChainObject` (SO retem ownership);
+4. `DeviceRemovedStopsWorkerAndDeletesOwnedSwapChainOnce` — encerramento espontaneo em `DXGI_ERROR_DEVICE_REMOVED` com delecao unica no epilogo e ausencia de dupla liberacao em `UnassignSwapChain`;
+5. `FinishFrameFailureStopsWorkerAndCountsDroppedFrame` — contabilizacao de frame descartado e erro fatal quando `FinishProcessingFrame` falha;
+6. `InvalidSurfaceCountsAsDroppedFrame` — frame sem superficie valida incrementando `FramesDropped`;
+7. `RepeatedAssignReplacesPreviousSwapChainCleanly` — substituicao limpa de swapchain em `AssignSwapChain` repetido;
+8. `ConcurrentUnassignIsIdempotentAndFreeOfRaces` — chamadas concorrentes a `UnassignSwapChain` sem race nem dupla delecao;
+9. `RejectsNullHandlesWithoutDeletingUnownedSwapChain` — rejeicao de handles nulos com abandono seguro sem deletar handle nao transferido;
+10. `TransientErrorsRetryAndRecoverBeforeEscalating` — recuperacao de erros transitorios abaixo de `kMaxConsecutiveTransientErrors` e escalonamento ao atingir o limite;
+11. `CircuitBreakerStopsUnboundedSwapChainRecreationLoops` — estado `Faulted` apos `kMaxConsecutiveSwapChainFailures` falhas consecutivas bloqueando recriacoes ilimitadas ate `OnResume()`;
+12. `SuspendAndShutdownPreventLateOrPostTeardownAssignments` — bloqueio de atribuicoes durante `Suspended` (ate `OnResume()`) e bloqueio permanente apos `Shutdown()` (`Stopped`);
+13. `ReentrantUnassignDuringDeleteDoesNotDeadlockOrDoubleDelete` — prevencao de deadlock e dupla delecao quando `DeleteSwapChainObject` aciona `UnassignSwapChain` reentrantemente na thread do caller ou da worker thread.
+
 ## Fronteira com validacao em runtime WDF/IddCx
 
 Estes testes validam exclusivamente a logica deterministica de transicoes de estado/associacao e a integridade estatica dos artefatos empacotados (`.dll`, `.inf`, `.cat`), sem substituir `InfVerif`, `Inf2Cat` nem execucao real em runtime dentro de `WUDFHost.exe` ou instalacao PnP. A execucao real do driver depende de assinatura de teste controlada, enumeracao de dispositivo, monitor virtual e processamento de modos/swapchain.
@@ -61,4 +77,7 @@ windows\driver\x64\Debug\DriverPackageValidationTests.exe
 
 cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\MonitorModesTests.cpp windows\driver\LumaBridgeIddDriver\MonitorModes.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\MonitorModesTests.exe
 windows\driver\x64\Debug\MonitorModesTests.exe
+
+cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\SwapChainLifecycleTests.cpp windows\driver\LumaBridgeIddDriver\SwapChainProcessor.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\SwapChainLifecycleTests.exe
+windows\driver\x64\Debug\SwapChainLifecycleTests.exe
 ```

@@ -1,11 +1,234 @@
 #include "Adapter.h"
 
+#include <d3d11.h>
+#include <dxgi1_4.h>
+#include <wrl/client.h>
+
+#include <new>
+
+using Microsoft::WRL::ComPtr;
 using lumabridge::driver::AdapterLifecycleState;
 using lumabridge::driver::D0EntryAction;
 using lumabridge::driver::DriverDiagnosticStage;
 using lumabridge::driver::LumaBridgeTraceError;
 using lumabridge::driver::LumaBridgeTraceInfo;
 using lumabridge::driver::LumaBridgeTraceWarn;
+
+namespace lumabridge::driver {
+
+/// D3D11/DXGI/IddCx implementation of ISwapChainBackend for UMDF runtime execution.
+class D3d11IddCxSwapChainBackend final : public ISwapChainBackend
+{
+public:
+    HRESULT InitializeDeviceAndBindSwapChain(
+        void* swapChainHandle,
+        LUID renderAdapterLuid
+        ) noexcept override
+    {
+        if (swapChainHandle == nullptr)
+        {
+            return E_INVALIDARG;
+        }
+
+        ComPtr<IDXGIFactory4> dxgiFactory;
+        HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&dxgiFactory));
+        if (FAILED(hr))
+        {
+            return hr;
+        }
+
+        ComPtr<IDXGIAdapter1> dxgiAdapter;
+        hr = dxgiFactory->EnumAdapterByLuid(renderAdapterLuid, IID_PPV_ARGS(&dxgiAdapter));
+        if (FAILED(hr))
+        {
+            return hr;
+        }
+
+        static constexpr D3D_FEATURE_LEVEL kFeatureLevels[] = {
+            D3D_FEATURE_LEVEL_11_1,
+            D3D_FEATURE_LEVEL_11_0,
+            D3D_FEATURE_LEVEL_10_1,
+            D3D_FEATURE_LEVEL_10_0};
+
+        ComPtr<ID3D11Device> d3dDevice;
+        ComPtr<ID3D11DeviceContext> d3dContext;
+        D3D_FEATURE_LEVEL selectedLevel = D3D_FEATURE_LEVEL_11_0;
+        hr = D3D11CreateDevice(
+            dxgiAdapter.Get(),
+            D3D_DRIVER_TYPE_UNKNOWN,
+            nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            kFeatureLevels,
+            ARRAYSIZE(kFeatureLevels),
+            D3D11_SDK_VERSION,
+            &d3dDevice,
+            &selectedLevel,
+            &d3dContext);
+        if (FAILED(hr))
+        {
+            return hr;
+        }
+
+        ComPtr<IDXGIDevice> dxgiDevice;
+        hr = d3dDevice.As(&dxgiDevice);
+        if (FAILED(hr))
+        {
+            return hr;
+        }
+
+        IDARG_IN_SWAPCHAINSETDEVICE setDeviceArgs{};
+        setDeviceArgs.pDevice = dxgiDevice.Get();
+        hr = IddCxSwapChainSetDevice(
+            static_cast<IDDCX_SWAPCHAIN>(swapChainHandle),
+            &setDeviceArgs);
+        if (FAILED(hr))
+        {
+            return hr;
+        }
+
+        {
+            ExclusiveLockGuard deviceGuard(&m_deviceLock);
+            m_boundSwapChainHandle = swapChainHandle;
+            m_d3dDevice = d3dDevice;
+            m_d3dContext = d3dContext;
+        }
+        return S_OK;
+    }
+
+    HRESULT ReleaseAndAcquireBuffer(
+        void* swapChainHandle,
+        SwapChainFrameMetadata& outMetadata
+        ) noexcept override
+    {
+        outMetadata = {};
+        if (swapChainHandle == nullptr)
+        {
+            return E_INVALIDARG;
+        }
+
+        IDARG_OUT_RELEASEANDACQUIREBUFFER bufferOut{};
+        const HRESULT hr = IddCxSwapChainReleaseAndAcquireBuffer(
+            static_cast<IDDCX_SWAPCHAIN>(swapChainHandle),
+            &bufferOut);
+        if (FAILED(hr))
+        {
+            return hr;
+        }
+
+        // Adopt the OS-AddRef'd surface pointer without adding an extra COM reference so
+        // ComPtr releases it automatically before the next acquire or frame completion.
+        ComPtr<IDXGIResource> surface;
+        surface.Attach(bufferOut.MetaData.pSurface);
+
+        bool hasValidSurface = false;
+        if (surface != nullptr)
+        {
+            ComPtr<ID3D11Texture2D> texture;
+            if (SUCCEEDED(surface.As(&texture)) && texture != nullptr)
+            {
+                D3D11_TEXTURE2D_DESC desc{};
+                texture->GetDesc(&desc);
+                hasValidSurface = (desc.Width > 0 && desc.Height > 0);
+            }
+        }
+
+        outMetadata.PresentationFrameNumber = bufferOut.MetaData.PresentationFrameNumber;
+        outMetadata.DirtyRectCount = bufferOut.MetaData.DirtyRectCount;
+        outMetadata.MoveRegionCount = bufferOut.MetaData.MoveRegionCount;
+        outMetadata.HwProtectedSurface = (bufferOut.MetaData.HwProtectedSurface != FALSE);
+        outMetadata.PresentDisplayQPCTime = bufferOut.MetaData.PresentDisplayQPCTime;
+        outMetadata.HasValidSurface = hasValidSurface;
+        return S_OK;
+    }
+
+    HRESULT FinishProcessingFrame(
+        void* swapChainHandle
+        ) noexcept override
+    {
+        if (swapChainHandle == nullptr)
+        {
+            return E_INVALIDARG;
+        }
+
+        return IddCxSwapChainFinishedProcessingFrame(
+            static_cast<IDDCX_SWAPCHAIN>(swapChainHandle));
+    }
+
+    void DeleteSwapChainObject(
+        void* swapChainHandle
+        ) noexcept override
+    {
+        {
+            ExclusiveLockGuard deviceGuard(&m_deviceLock);
+            if (m_boundSwapChainHandle == swapChainHandle)
+            {
+                m_boundSwapChainHandle = nullptr;
+                m_d3dContext.Reset();
+                m_d3dDevice.Reset();
+            }
+        }
+        if (swapChainHandle != nullptr)
+        {
+            WdfObjectDelete(static_cast<IDDCX_SWAPCHAIN>(swapChainHandle));
+        }
+    }
+
+private:
+    class ExclusiveLockGuard final
+    {
+    public:
+        explicit ExclusiveLockGuard(SRWLOCK* lock) noexcept
+            : m_lock(lock)
+        {
+            if (m_lock != nullptr)
+            {
+                AcquireSRWLockExclusive(m_lock);
+            }
+        }
+
+        ~ExclusiveLockGuard()
+        {
+            if (m_lock != nullptr)
+            {
+                ReleaseSRWLockExclusive(m_lock);
+            }
+        }
+
+        ExclusiveLockGuard(const ExclusiveLockGuard&) = delete;
+        ExclusiveLockGuard& operator=(const ExclusiveLockGuard&) = delete;
+
+    private:
+        SRWLOCK* m_lock;
+    };
+
+    SRWLOCK m_deviceLock{SRWLOCK_INIT};
+    void* m_boundSwapChainHandle{nullptr};
+    ComPtr<ID3D11Device> m_d3dDevice;
+    ComPtr<ID3D11DeviceContext> m_d3dContext;
+};
+
+/// Reference-counted per-WDFDEVICE swapchain host safe across concurrent cleanup and callbacks.
+struct DeviceSwapChainHost final
+{
+    D3d11IddCxSwapChainBackend Backend{};
+    SwapChainProcessor Processor{&Backend};
+    volatile LONG RefCount{1};
+
+    void AddRef() noexcept
+    {
+        InterlockedIncrement(&RefCount);
+    }
+
+    void Release() noexcept
+    {
+        if (InterlockedDecrement(&RefCount) == 0)
+        {
+            delete this;
+        }
+    }
+};
+
+} // namespace lumabridge::driver
 
 namespace {
 
@@ -114,6 +337,97 @@ LumaBridgeBindAdapterAndResolveDeviceLocked(
     return adapterContext->WdfDevice;
 }
 
+class ScopedSwapChainHostRef final
+{
+public:
+    ScopedSwapChainHostRef() noexcept = default;
+
+    explicit ScopedSwapChainHostRef(lumabridge::driver::DeviceSwapChainHost* host) noexcept
+        : m_host(host)
+    {
+    }
+
+    ~ScopedSwapChainHostRef()
+    {
+        if (m_host != nullptr)
+        {
+            m_host->Release();
+        }
+    }
+
+    ScopedSwapChainHostRef(const ScopedSwapChainHostRef&) = delete;
+    ScopedSwapChainHostRef& operator=(const ScopedSwapChainHostRef&) = delete;
+
+    lumabridge::driver::DeviceSwapChainHost* Get() const noexcept
+    {
+        return m_host;
+    }
+
+private:
+    lumabridge::driver::DeviceSwapChainHost* m_host{nullptr};
+};
+
+ScopedSwapChainHostRef
+AcquireSwapChainHostForDevice(
+    WDFDEVICE Device,
+    bool allowDuringCleanup = false
+    ) noexcept
+{
+    if (Device == nullptr)
+    {
+        return {};
+    }
+
+    ExclusiveLockGuard gateLock(&g_AdapterInitGate);
+    auto* deviceContext = LumaBridgeGetDeviceContext(Device);
+    if (deviceContext == nullptr)
+    {
+        return {};
+    }
+
+    ExclusiveLockGuard stateLock(&deviceContext->StateLock);
+    if (!allowDuringCleanup &&
+        (deviceContext->IsCleanedUp || deviceContext->Lifecycle.IsCleanedUp))
+    {
+        return {};
+    }
+
+    if (deviceContext->SwapChainHost == nullptr)
+    {
+        return {};
+    }
+
+    deviceContext->SwapChainHost->AddRef();
+    return ScopedSwapChainHostRef(deviceContext->SwapChainHost);
+}
+
+ScopedSwapChainHostRef
+AcquireSwapChainHostForMonitor(
+    IDDCX_MONITOR MonitorObject,
+    bool allowDuringCleanup = false
+    ) noexcept
+{
+    if (MonitorObject == nullptr)
+    {
+        return {};
+    }
+
+    WDFDEVICE device = nullptr;
+    {
+        ExclusiveLockGuard gateLock(&g_AdapterInitGate);
+        auto* monitorContext = LumaBridgeGetMonitorContext(MonitorObject);
+        if (monitorContext == nullptr ||
+            (!allowDuringCleanup && monitorContext->IsCleanedUp) ||
+            monitorContext->WdfDevice == nullptr)
+        {
+            return {};
+        }
+        device = monitorContext->WdfDevice;
+    }
+
+    return AcquireSwapChainHostForDevice(device, allowDuringCleanup);
+}
+
 } // namespace
 
 _Use_decl_annotations_
@@ -192,17 +506,40 @@ LumaBridgeInitializeDeviceContext(
     InitializeSRWLock(&deviceContext->StateLock);
     deviceContext->WdfDevice = Device;
     deviceContext->AdapterObject = nullptr;
+    deviceContext->SwapChainHost = new (std::nothrow) lumabridge::driver::DeviceSwapChainHost();
     deviceContext->IddCxRuntimeVersion = 0;
     deviceContext->IsCleanedUp = false;
     deviceContext->Lifecycle = lumabridge::driver::AdapterLifecycleTracker{};
     lumabridge::driver::TransitionOnDeviceConfigured(deviceContext->Lifecycle);
 
+    if (deviceContext->SwapChainHost == nullptr)
+    {
+        LumaBridgeTraceError(
+            DriverDiagnosticStage::IddCxDeviceInitialize,
+            STATUS_INSUFFICIENT_RESOURCES,
+            deviceContext->Lifecycle.State,
+            "Failed to allocate DeviceSwapChainHost");
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
     const NTSTATUS status = IddCxDeviceInitialize(Device);
     AdapterLifecycleState resultingState = AdapterLifecycleState::Uninitialized;
+    lumabridge::driver::DeviceSwapChainHost* failedHost = nullptr;
     {
         ExclusiveLockGuard lock(&deviceContext->StateLock);
         lumabridge::driver::TransitionOnDeviceInitialized(deviceContext->Lifecycle, status);
         resultingState = deviceContext->Lifecycle.State;
+        if (!NT_SUCCESS(status))
+        {
+            failedHost = deviceContext->SwapChainHost;
+            deviceContext->SwapChainHost = nullptr;
+        }
+    }
+
+    if (failedHost != nullptr)
+    {
+        (void)failedHost->Processor.Shutdown();
+        failedHost->Release();
     }
 
     if (!NT_SUCCESS(status))
@@ -277,23 +614,44 @@ LumaBridgeStartAdapter(
         return entryAction.Status;
 
     case D0EntryAction::ResumeReady:
+    {
+        const ScopedSwapChainHostRef host = AcquireSwapChainHostForDevice(Device);
+        if (host.Get() != nullptr)
+        {
+            (void)host.Get()->Processor.OnResume();
+        }
         LumaBridgeTraceInfo(
             DriverDiagnosticStage::DeviceD0Entry,
             STATUS_SUCCESS,
             currentState,
             "Resumed existing IddCx adapter on D0 entry");
         return STATUS_SUCCESS;
+    }
 
     case D0EntryAction::WaitPendingInit:
+    {
+        const ScopedSwapChainHostRef host = AcquireSwapChainHostForDevice(Device);
+        if (host.Get() != nullptr)
+        {
+            (void)host.Get()->Processor.OnResume();
+        }
         LumaBridgeTraceInfo(
             DriverDiagnosticStage::DeviceD0Entry,
             STATUS_SUCCESS,
             currentState,
             "D0 entry completed while prior IddCxAdapterInitAsync remains pending");
         return STATUS_SUCCESS;
+    }
 
     case D0EntryAction::StartAsyncInit:
+    {
+        const ScopedSwapChainHostRef host = AcquireSwapChainHostForDevice(Device);
+        if (host.Get() != nullptr)
+        {
+            (void)host.Get()->Processor.OnResume();
+        }
         break;
+    }
     }
 
     IDARG_OUT_GETVERSION versionOut{};
@@ -482,6 +840,14 @@ LumaBridgeStopAdapter(
         return;
     }
 
+    {
+        const ScopedSwapChainHostRef host = AcquireSwapChainHostForDevice(Device, true);
+        if (host.Get() != nullptr)
+        {
+            (void)host.Get()->Processor.OnSuspend();
+        }
+    }
+
     auto* deviceContext = LumaBridgeGetDeviceContext(Device);
     if (deviceContext == nullptr)
     {
@@ -514,6 +880,7 @@ LumaBridgeEvtDeviceContextCleanup(
     }
 
     const WDFDEVICE device = static_cast<WDFDEVICE>(Object);
+    lumabridge::driver::DeviceSwapChainHost* detachedHost = nullptr;
     {
         ExclusiveLockGuard gateLock(&g_AdapterInitGate);
         g_InFlightInitSlot.MarkDeviceCleanedUp(device);
@@ -527,6 +894,8 @@ LumaBridgeEvtDeviceContextCleanup(
             {
                 ExclusiveLockGuard stateLock(&deviceContext->StateLock);
                 adapter = deviceContext->AdapterObject;
+                detachedHost = deviceContext->SwapChainHost;
+                deviceContext->SwapChainHost = nullptr;
                 deviceContext->AdapterObject = nullptr;
                 deviceContext->WdfDevice = nullptr;
                 lumabridge::driver::TransitionOnDeviceCleanup(deviceContext->Lifecycle);
@@ -548,6 +917,12 @@ LumaBridgeEvtDeviceContextCleanup(
     }
     WakeAllConditionVariable(&g_AdapterInitSlotCv);
 
+    if (detachedHost != nullptr)
+    {
+        (void)detachedHost->Processor.Shutdown();
+        detachedHost->Release();
+    }
+
     LumaBridgeTraceInfo(
         DriverDiagnosticStage::DeviceContextCleanup,
         STATUS_SUCCESS,
@@ -567,6 +942,7 @@ LumaBridgeEvtAdapterContextCleanup(
     }
 
     AdapterLifecycleState resultingState = AdapterLifecycleState::Uninitialized;
+    WDFDEVICE deviceToStop = nullptr;
     {
         ExclusiveLockGuard gateLock(&g_AdapterInitGate);
         auto* adapterContext = LumaBridgeGetAdapterContext(Object);
@@ -574,6 +950,7 @@ LumaBridgeEvtAdapterContextCleanup(
         {
             const WDFDEVICE wdfDevice = adapterContext->WdfDevice;
             const IDDCX_ADAPTER adapter = adapterContext->AdapterObject;
+            deviceToStop = wdfDevice;
 
             if (wdfDevice != nullptr)
             {
@@ -600,11 +977,53 @@ LumaBridgeEvtAdapterContextCleanup(
     }
     WakeAllConditionVariable(&g_AdapterInitSlotCv);
 
+    if (deviceToStop != nullptr)
+    {
+        const ScopedSwapChainHostRef host = AcquireSwapChainHostForDevice(deviceToStop, true);
+        if (host.Get() != nullptr)
+        {
+            (void)host.Get()->Processor.Shutdown();
+        }
+    }
+
     LumaBridgeTraceInfo(
         DriverDiagnosticStage::AdapterContextCleanup,
         STATUS_SUCCESS,
         resultingState,
         "IddCx adapter context cleaned up");
+}
+
+_Use_decl_annotations_
+VOID
+LumaBridgeEvtMonitorContextCleanup(
+    WDFOBJECT Object
+    )
+{
+    if (Object == nullptr)
+    {
+        return;
+    }
+
+    WDFDEVICE device = nullptr;
+    {
+        ExclusiveLockGuard gateLock(&g_AdapterInitGate);
+        auto* monitorContext = LumaBridgeGetMonitorContext(Object);
+        if (monitorContext != nullptr)
+        {
+            monitorContext->IsCleanedUp = true;
+            device = monitorContext->WdfDevice;
+            monitorContext->WdfDevice = nullptr;
+        }
+    }
+
+    if (device != nullptr)
+    {
+        const ScopedSwapChainHostRef host = AcquireSwapChainHostForDevice(device, true);
+        if (host.Get() != nullptr)
+        {
+            (void)host.Get()->Processor.UnassignSwapChain();
+        }
+    }
 }
 
 _Use_decl_annotations_
@@ -957,22 +1376,51 @@ LumaBridgeEvtMonitorAssignSwapChain(
     const IDARG_IN_SETSWAPCHAIN* pInArgs
     )
 {
-    UNREFERENCED_PARAMETER(MonitorObject);
-    UNREFERENCED_PARAMETER(pInArgs);
+    // IddCx contract: when EvtIddCxMonitorAssignSwapChain returns
+    // STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN, the OS/IddCx retains ownership of
+    // pInArgs->hSwapChain and cleans it up. Never call WdfObjectDelete on pre-ownership refusal.
+    if (MonitorObject == nullptr || pInArgs == nullptr)
+    {
+        LumaBridgeTraceError(
+            DriverDiagnosticStage::MonitorAssignSwapChain,
+            STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN,
+            AdapterLifecycleState::AdapterReady,
+            "EvtIddCxMonitorAssignSwapChain rejected null MonitorObject or pInArgs");
+        return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
+    }
 
-    LumaBridgeTraceWarn(
-        DriverDiagnosticStage::MonitorCallbackStub,
-        STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN,
+    const ScopedSwapChainHostRef host = AcquireSwapChainHostForMonitor(MonitorObject);
+    if (host.Get() == nullptr)
+    {
+        LumaBridgeTraceWarn(
+            DriverDiagnosticStage::MonitorAssignSwapChain,
+            STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN,
+            AdapterLifecycleState::DeviceStopped,
+            "EvtIddCxMonitorAssignSwapChain abandoned swapchain because monitor device host is unavailable");
+        return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
+    }
+
+    const NTSTATUS status = host.Get()->Processor.AssignSwapChain(
+        pInArgs->hSwapChain,
+        pInArgs->hNextSurfaceAvailable,
+        pInArgs->RenderAdapterLuid);
+
+    if (!NT_SUCCESS(status))
+    {
+        LumaBridgeTraceWarn(
+            DriverDiagnosticStage::MonitorAssignSwapChain,
+            status,
+            AdapterLifecycleState::AdapterReady,
+            "EvtIddCxMonitorAssignSwapChain abandoned swapchain after backend/worker setup failure");
+        return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
+    }
+
+    LumaBridgeTraceInfo(
+        DriverDiagnosticStage::MonitorAssignSwapChain,
+        STATUS_SUCCESS,
         AdapterLifecycleState::AdapterReady,
-        "EvtIddCxMonitorAssignSwapChain stub abandoning swapchain until swapchain pipeline is implemented");
-
-    // IddCx 1.4+ contract: returning any failure NTSTATUS other than
-    // STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN causes IddCx to bugcheck the UMDF driver.
-    // Note: this return value is strictly a defensive contract guard and NOT a functional
-    // swapchain implementation, because Windows may repeatedly request a new swapchain if a
-    // monitor were active. No virtual monitor (IddCxMonitorCreate / IddCxMonitorArrival) may
-    // be announced until mode negotiation and swapchain frame processing are implemented.
-    return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
+        "EvtIddCxMonitorAssignSwapChain started D3D11 swapchain processor");
+    return STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_
@@ -981,12 +1429,21 @@ LumaBridgeEvtMonitorUnassignSwapChain(
     IDDCX_MONITOR MonitorObject
     )
 {
-    UNREFERENCED_PARAMETER(MonitorObject);
+    if (MonitorObject == nullptr)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    const ScopedSwapChainHostRef host = AcquireSwapChainHostForMonitor(MonitorObject, true);
+    if (host.Get() != nullptr)
+    {
+        (void)host.Get()->Processor.UnassignSwapChain();
+    }
 
     LumaBridgeTraceInfo(
-        DriverDiagnosticStage::MonitorCallbackStub,
+        DriverDiagnosticStage::MonitorUnassignSwapChain,
         STATUS_SUCCESS,
         AdapterLifecycleState::AdapterReady,
-        "EvtIddCxMonitorUnassignSwapChain no-op stub completed");
+        "EvtIddCxMonitorUnassignSwapChain stopped swapchain processor");
     return STATUS_SUCCESS;
 }
