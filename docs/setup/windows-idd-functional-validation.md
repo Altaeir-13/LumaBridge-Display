@@ -3,7 +3,46 @@
 Data: 2026-11-18
 Escopo: Preparacao documental para assinatura de teste, instalacao controlada, ativacao do monitor virtual e validacao funcional do `LumaBridgeIddDriver`.
 
-> **Aviso de seguranca e governanca:** Nenhum comando abaixo deve ser executado automaticamente sem autorizacao explicita. Nao altere configuracoes de seguranca permanentemente nem desative o watchdog do IddCx. **Prerequisito obrigatorio antes da primeira instalacao em maquina pessoal:** concluir a issue #20 (instalacao das libs MSVC Spectre, reativar `Driver_SpectreMitigation=true` e recompilar).
+> **Aviso de seguranca e governanca:** Nenhum comando abaixo deve ser executado automaticamente sem autorizacao explicita. Nao altere configuracoes de seguranca permanentemente nem desative o watchdog do IddCx. A issue #20 (Spectre Mitigation via `<Driver_SpectreMitigation>Spectre</Driver_SpectreMitigation>` e `MSVC\14.51.36231\lib\spectre\x64`) ja foi resolvida; o repositorio permanece com `SignMode=Off` para o build padrao e toda preparacao de assinatura/instalacao utiliza copias em staging fora do Git via `windows/driver/scripts/` com suporte obrigatorio a `-DryRun`.
+
+## 0. Scripts automatizados (`windows/driver/scripts/`)
+
+Os seguintes scripts modulares automatizam o ciclo de preparacao, diagnostico e rollback com verificacao de privilegios administrativos, tratamento estrito de erros e confirmacao explicita (`-DryRun` / `-Force`):
+
+| Script | Responsabilidade | Privilegio Admin |
+|---|---|---|
+| `LumaBridgeDriverCommon.psm1` | Modulo compartilhado (Hardware ID `Root\LumaBridgeIddDriver`, descoberta WDK, lookup PnP exclusivo por `DEVPKEY_Device_HardwareIds`, Driver Store via XML invariante de idioma, verificacao criptografica INF+DLL+CAT + correspondencia de certificados, correlacao `WUDFHost.exe`) | N/A |
+| `Test-LumaBridgePrerequisites.ps1` | Diagnostico somente leitura de Windows 11 x64, Secure Boot e Test Signing (com fallback via registro sem elevacao), UMDF/IddCx e artefatos | Nao |
+| `Invoke-LumaBridgePackageSigning.ps1` | Valida isolamento e limpa staging fora do repo antes do `Inf2Cat`, gera/reutiliza certificado de teste, assina `.dll`, regenera/assina `.cat`, verifica integridade INF+DLL+CAT e confirma hashes originais intactos | Somente com `-TrustCertificate` |
+| `Install-LumaBridgeDriver.ps1` | Valida pre-requisitos e assinaturas (inclusive com `-AllowUntrustedChain`, sem aceitar arquivos adulterados), desabilita/reinicia monitor antes de atualizar dispositivo existente, confirma driver vinculado e executa rollback em falhas parciais | Sim (exceto `-DryRun`) |
+| `Set-LumaBridgeVirtualMonitor.ps1` | Localiza dinamicamente a instancia PnP via `DEVPKEY_Device_HardwareIds`, ajusta `EnableVirtualMonitor` (`1`/`0`), reinicia o dispositivo e executa rollback para `0` em falha parcial de ativacao | Sim (exceto `-DryRun`) |
+| `Collect-LumaBridgeDiagnostics.ps1` | Coleta estado PnP, Driver Store, `WUDFHost.exe` especificamente correlacionado ao LumaBridge (`LumaBridgeWudfHostProcess`), eventos Windows e metricas `[LB-DRIVER] [METRICS]` em JSON/Markdown (sem pixels da tela) | Nao |
+| `Uninstall-LumaBridgeDriver.ps1` | Desativa monitor, remove instancias PnP, limpa `oemXX.inf` do Driver Store sem `/force` por padrao (opt-in via `-ForceDriverStoreDelete`) e remove certificado somente por `-CertificateThumbprint` + `-ConfirmCertificateRemoval` | Sim (exceto `-DryRun`) |
+
+Fluxo recomendado de simulacao antes da execucao real:
+
+```powershell
+# 1. Diagnostico somente leitura
+.\windows\driver\scripts\Test-LumaBridgePrerequisites.ps1 -Configuration Release
+
+# 2. Previa Dry Run completa sem alterar o sistema
+.\windows\driver\scripts\Invoke-LumaBridgePackageSigning.ps1 -Configuration Release -CreateTestCertificateIfMissing -DryRun
+.\windows\driver\scripts\Install-LumaBridgeDriver.ps1 -Configuration Release -DryRun
+.\windows\driver\scripts\Set-LumaBridgeVirtualMonitor.ps1 -Action Enable -DryRun
+.\windows\driver\scripts\Collect-LumaBridgeDiagnostics.ps1 -Configuration Release -DryRun
+.\windows\driver\scripts\Uninstall-LumaBridgeDriver.ps1 -RemoveTestCertificate -CertificateThumbprint "<THUMBPRINT_SHA1_40_HEX>" -DryRun
+```
+
+Fluxo controlado real em Prompt/PowerShell **como Administrador** (apos `bcdedit /set testsigning on` + reboot manuais caso necessario):
+
+```powershell
+$signResult = .\windows\driver\scripts\Invoke-LumaBridgePackageSigning.ps1 -Configuration Release -CreateTestCertificateIfMissing -TrustCertificate
+.\windows\driver\scripts\Install-LumaBridgeDriver.ps1 -Configuration Release
+.\windows\driver\scripts\Set-LumaBridgeVirtualMonitor.ps1 -Action Enable
+.\windows\driver\scripts\Collect-LumaBridgeDiagnostics.ps1 -Configuration Release
+# Rollback completo ao finalizar (remocao de certificado exige thumbprint explicito e -ConfirmCertificateRemoval):
+.\windows\driver\scripts\Uninstall-LumaBridgeDriver.ps1 -RemoveTestCertificate -CertificateThumbprint $signResult.CertificateThumbprint -ConfirmCertificateRemoval
+```
 
 ## 1. Prerequisitos do ambiente de teste
 
@@ -69,12 +108,12 @@ REM 1. Opcionalmente voltar EnableVirtualMonitor para 0 antes de remover
 REM 2. Remover instancia do dispositivo raiz
 pnputil /remove-device "ROOT\DISPLAY\<instance-id>"
 
-REM 3. Identificar o oemXX.inf correspondente e remover do Driver Store
-pnputil /enum-drivers
-pnputil /delete-driver oemXX.inf /uninstall /force
+REM 3. Identificar o oemXX.inf correspondente (XML invariante de idioma) e remover do Driver Store sem /force por padrao
+pnputil /enum-drivers /format xml
+pnputil /delete-driver oemXX.inf /uninstall
 ```
 
-Remover os certificados temporarios de teste das stores `Root` e `TrustedPublisher` (`certutil -delstore`) e restaurar `testsigning off` caso tenha sido alterado em VM.
+Remover os certificados temporarios de teste das stores `CurrentUser\My`, `LocalMachine\Root` e `LocalMachine\TrustedPublisher` **somente por thumbprint SHA-1 exato** (`certutil -delstore <Store> <Thumbprint>`) e restaurar `testsigning off` caso tenha sido alterado em VM.
 
 ## 5. Plano de testes funcionais (9 cenarios)
 

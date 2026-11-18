@@ -80,6 +80,27 @@
 14. `ReentrantBackendCallbacksDoNotDeadlockOrLeakReferences` — garante ausencia de deadlock e balanco exato de referencias em callbacks reentrantes;
 15. `DerivedContainerIdsAreUniqueAndRfc4122ValidPerInstance` — confirma `ContainerId` deterministico, unico por instancia/conector e valido segundo RFC 4122.
 
+`LumaBridgeFunctionalToolingTests.ps1` executa **18 testes automatizados PowerShell** com mocks isolados e assinaturas efemeras em diretorio temporario sobre `windows/driver/scripts/`:
+
+1. `PackageSigningAndCryptographicVerificationPositive` — valida assinatura em staging isolado, hashes SIP de `.dll` e `.inf` no `.cat`, assinatura PKCS#7 e correspondencia de certificados preservando hashes originais de build;
+2. `InfTamperingRejectedEvenWithAllowUntrustedChain` — comprova bloqueio de `.inf` adulterado inclusive com `-AllowUntrustedChain`;
+3. `DllTamperingRejectedEvenWithAllowUntrustedChain` — comprova bloqueio de `.dll` adulterada (`HashMismatch`) inclusive com `-AllowUntrustedChain`;
+4. `UnsignedTamperedCatAndExpiredCertRejected` — rejeita pacote sem assinatura, `.cat` adulterado e certificado expirado mesmo com `-AllowUntrustedChain`;
+5. `SignerCertificateMismatchRejected` — rejeita divergencia de thumbprint entre `.dll`, `.cat` e `LumaBridgeTest.cer`;
+6. `IsolatedCleanStagingRejectsRepoPathsAndCleansResiduals` — rejeita staging dentro do repositorio/build e limpa residuos antes do `Inf2Cat`;
+7. `PnpIdentificationUsesEffectiveDevpkeyHardwareIdsOnly` — garante lookup exclusivo via `DEVPKEY_Device_HardwareIds` rejeitando falsos positivos por `FriendlyName`;
+8. `DriverStoreXmlParsingIsLocaleIndependent` — valida parsing estruturado de `pnputil /enum-drivers /format xml` independente de idioma;
+9. `DuplicateDevicesBlockedByInstallAndMonitorScripts` — garante bloqueio na presenca de dispositivos duplicados;
+10. `FreshInstallSucceedsAndConfirmsDriverBinding` — valida instalacao nova, `EnableVirtualMonitor = 0` e confirmacao de vinculo do driver;
+11. `RepeatedInstallDisablesMonitorBeforeUpdate` — confirma desabilitacao (`EnableVirtualMonitor = 0`) e restart do dispositivo antes da atualizacao;
+12. `PartialFreshInstallFailureTriggersRollback` — valida rollback automatico removendo dispositivo parcial e `oemXX.inf` recem-adicionado;
+13. `PartialUpdateFailureTriggersRollback` — valida rollback automatico em falha de atualizacao mantendo estado anterior seguro;
+14. `VirtualMonitorEnablePartialFailureTriggersRollback` — valida reversao para `EnableVirtualMonitor = 0` e restart em falha de ativacao;
+15. `UninstallOmitsForceByDefaultAndSupportsOptInForce` — garante ausencia de `/force` por padrao e suporte opt-in a `-ForceDriverStoreDelete`;
+16. `UninstallCertificateRemovalRequiresThumbprintAndConfirmation` — exige thumbprint SHA-1 valido e confirmacao dedicada (`-ConfirmCertificateRemoval`);
+17. `DiagnosticsIdentifiesLumaBridgeWudfHostProcess` — valida correlacao exata do processo `WUDFHost.exe` associado ao LumaBridge;
+18. `AllScriptsDryRunDoNotMutateSystemState` — confirma execucao limpa de `-DryRun` em todos os scripts sem efeitos colaterais.
+
 ## Fronteira com validacao em runtime WDF/IddCx
 
 Estes testes validam exclusivamente a logica deterministica de transicoes de estado/associacao e a integridade estatica dos artefatos empacotados (`.dll`, `.inf`, `.cat`), sem substituir `InfVerif`, `Inf2Cat` nem execucao real em runtime dentro de `WUDFHost.exe` ou instalacao PnP. A execucao real do driver depende de assinatura de teste controlada, enumeracao de dispositivo, monitor virtual e processamento de modos/swapchain.
@@ -103,4 +124,10 @@ windows\driver\x64\Debug\SwapChainLifecycleTests.exe
 
 cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\VirtualMonitorLifecycleTests.cpp windows\driver\LumaBridgeIddDriver\VirtualMonitor.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\VirtualMonitorLifecycleTests.exe
 windows\driver\x64\Debug\VirtualMonitorLifecycleTests.exe
+```
+
+Suíte PowerShell:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File windows\driver\tests\LumaBridgeFunctionalToolingTests.ps1
 ```
