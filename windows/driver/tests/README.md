@@ -44,6 +44,18 @@
 11. `MonitorAndTargetModesEnforceDistinctVSyncDividers` — regressao confirmando `vSyncFreqDivider == 0` exclusivo de monitor modes e `vSyncFreqDivider == 1` exclusivo de target modes/commit;
 12. `CommitValidationRejectsUnadvertisedTimingsWithMatchingActiveResolution` — regressao rejeitando timings nao anunciados mesmo para resolucoes 1080p60 validas.
 
+`SwapChainLifecycleTests.cpp` executa **9 testes unitarios deterministicos** sobre `SwapChainProcessor.h` / `SwapChainProcessor.cpp` (independentes de GPU fisica via mock de `ISwapChainBackend`):
+
+1. `AssignProcessFramesAndUnassignLifecycle` — atribuicao, processamento de frames, metricas, desatribuicao e preservacao do handle `hNextSurfaceAvailable`;
+2. `PendingAcquireWaitsOnSurfaceEventWithoutBusyWaiting` — retorno `E_PENDING` aguardando evento do SO sem busy-wait;
+3. `InitializationFailureAbandonsSwapChainAndDeletesHandleOnce` — falha de inicializacao D3D11 retornando `STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN` e deletando `hSwapChain` uma unica vez;
+4. `DeviceRemovedStopsWorkerAndRecordsMetric` — encerramento espontaneo em `DXGI_ERROR_DEVICE_REMOVED` com delecao no epilogo e ausencia de dupla liberacao em `UnassignSwapChain`;
+5. `FinishFrameFailureStopsWorkerAndCountsDroppedFrame` — contabilizacao de frame descartado e erro fatal quando `FinishProcessingFrame` falha;
+6. `InvalidSurfaceCountsAsDroppedFrame` — frame sem superficie valida incrementando `FramesDropped`;
+7. `RepeatedAssignReplacesPreviousSwapChainCleanly` — substituicao limpa de swapchain em `AssignSwapChain` repetido;
+8. `ConcurrentUnassignIsIdempotentAndFreeOfRaces` — chamadas concorrentes a `UnassignSwapChain` sem race nem dupla delecao;
+9. `RejectsNullHandlesWithAbandonSwapChainStatus` — rejeicao de handles nulos com abandono seguro.
+
 ## Fronteira com validacao em runtime WDF/IddCx
 
 Estes testes validam exclusivamente a logica deterministica de transicoes de estado/associacao e a integridade estatica dos artefatos empacotados (`.dll`, `.inf`, `.cat`), sem substituir `InfVerif`, `Inf2Cat` nem execucao real em runtime dentro de `WUDFHost.exe` ou instalacao PnP. A execucao real do driver depende de assinatura de teste controlada, enumeracao de dispositivo, monitor virtual e processamento de modos/swapchain.
@@ -61,4 +73,7 @@ windows\driver\x64\Debug\DriverPackageValidationTests.exe
 
 cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\MonitorModesTests.cpp windows\driver\LumaBridgeIddDriver\MonitorModes.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\MonitorModesTests.exe
 windows\driver\x64\Debug\MonitorModesTests.exe
+
+cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\SwapChainLifecycleTests.cpp windows\driver\LumaBridgeIddDriver\SwapChainProcessor.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\SwapChainLifecycleTests.exe
+windows\driver\x64\Debug\SwapChainLifecycleTests.exe
 ```
