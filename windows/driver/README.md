@@ -19,7 +19,8 @@ Incluido agora:
 - stubs defensivos para callbacks ainda nao implementados: `LumaBridgeEvtMonitorAssignSwapChain` retorna `STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN` apenas como protecao de contrato IddCx 1.4+ contra bugcheck (nao e implementacao funcional de swapchain, pois o Windows pode solicitar repetidamente nova swapchain se houver monitor ativo; por isso nenhum monitor virtual e criado ou anunciado ate a implementacao do pipeline de modos e swapchain) e `LumaBridgeEvtMonitorUnassignSwapChain` retorna `STATUS_SUCCESS`; callbacks de descricao/modos retornam `STATUS_NOT_SUPPORTED`;
 - supressao de `C4471` restrita ao bloco de includes WDK em `Driver.h`;
 - 16 testes unitarios deterministicos da maquina de estados e associacao multi-dispositivo em `windows/driver/tests/AdapterLifecycleTests.cpp` (escopo puramente de logica de estado/associacao, distinto de testes em runtime real WDF/IddCx);
-- INF minimo de desenvolvimento (`LumaBridgeIddDriver.inf`);
+- pacote INF estruturado (`LumaBridgeIddDriver.inf`) com `Include = wudfrd.inf`, `UmdfExtensions = IddCx0102`, `UpperFilters = IndirectKmd`, `ClassVer = 2.0`, `DeviceGroupId`, `UmdfHostProcessSharing = ProcessSharingDisabled` e decoracao `NT$ARCH$.10.0...18362`, integrado ao `.vcxproj` com `StampInf`, `InfVerif`, `Inf2Cat` (`10_19H1_X64`) e `DrvCat` (mantendo `SignMode=Off` e `EnableTestSign=false`, gerando `.dll`, `.inf` e `.cat` nao assinados em `$(PackageDir)` e `$(OutDir)` — ver `docs/setup/windows-idd-driver-packaging.md`);
+- 4 testes automatizados de consistencia estatica do pacote INF/CAT/DLL em `windows/driver/tests/DriverPackageValidationTests.cpp`;
 - `.gitignore` local para artefatos de build.
 
 Fora do escopo atual (issues dedicadas):
@@ -27,9 +28,8 @@ Fora do escopo atual (issues dedicadas):
 - criacao e chegada/saida de monitor virtual (`IddCxMonitorCreate`, `IddCxMonitorArrival`, `IddCxMonitorDeparture`);
 - exposicao de modos de video (`720p60`, `1080p60`, `1440p60`);
 - processamento de swapchain e recursos Direct3D 11;
-- validacao completa do pacote INF (`IndirectKmd`, `UmdfExtensions`, `StampInf`, `InfVerif`, `Inf2Cat` — ver issue #21);
 - habilitacao de mitigacao Spectre apos instalacao das libs MSVC Spectre (ver issue #20);
-- estrategia de assinatura de teste e instalacao controlada;
+- assinatura de teste, instalacao controlada e execucao em runtime real dentro de `WUDFHost.exe`;
 - host, client, protocolo, streaming ou NVENC.
 
 ## Estrutura
@@ -53,6 +53,7 @@ windows/
     tests/
       README.md
       AdapterLifecycleTests.cpp
+      DriverPackageValidationTests.cpp
 ```
 
 ## Requisitos
@@ -103,34 +104,44 @@ msbuild windows\driver\LumaBridgeIddDriver.sln /t:Rebuild /p:Configuration=Debug
 msbuild windows\driver\LumaBridgeIddDriver.sln /t:Rebuild /p:Configuration=Release /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0.28000.0 /v:minimal
 ```
 
-Testes unitarios deterministicos de maquina de estados e associacao multi-dispositivo (escopo isolado, sem substituir validacao futura em runtime real WDF/`WUDFHost.exe`):
+Testes unitarios deterministicos de maquina de estados e associacao multi-dispositivo (escopo isolado, sem substituir validacao futura em runtime real WDF/`WUDFHost.exe`) e validacao estatica dos pacotes `Debug|x64` e `Release|x64`:
 
 ```bat
 cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\AdapterLifecycleTests.cpp /Fowindows\driver\x64\Debug\AdapterLifecycleTests.obj /Fe:windows\driver\x64\Debug\AdapterLifecycleTests.exe
 windows\driver\x64\Debug\AdapterLifecycleTests.exe
+
+cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\DriverPackageValidationTests.cpp /Fowindows\driver\x64\Debug\DriverPackageValidationTests.obj /Fe:windows\driver\x64\Debug\DriverPackageValidationTests.exe
+windows\driver\x64\Debug\DriverPackageValidationTests.exe
 ```
 
 Artefatos locais esperados (ignorados por `windows/driver/.gitignore`):
 
 ```text
 windows/driver/x64/Debug/LumaBridgeIddDriver.dll
+windows/driver/x64/Debug/LumaBridgeIddDriver.inf
+windows/driver/x64/Debug/LumaBridgeIddDriver.cat
+windows/driver/x64/Debug/LumaBridgeIddDriver/LumaBridgeIddDriver.{dll,inf} + lumabridgeidddriver.cat
 windows/driver/x64/Debug/AdapterLifecycleTests.exe
+windows/driver/x64/Debug/DriverPackageValidationTests.exe
 windows/driver/x64/Release/LumaBridgeIddDriver.dll
+windows/driver/x64/Release/LumaBridgeIddDriver.inf
+windows/driver/x64/Release/LumaBridgeIddDriver.cat
+windows/driver/x64/Release/LumaBridgeIddDriver/LumaBridgeIddDriver.{dll,inf} + lumabridgeidddriver.cat
 ```
 
-Observacao: `Inf2Cat` e `DrvCat` permanecem ignorados enquanto o INF esta declarado como `<None>` no `.vcxproj` (escopo separado na issue #21).
+Validacao direta de INF com `InfVerif` e detalhes de assinatura/recuperacao estao documentados em `docs/setup/windows-idd-driver-packaging.md`.
 
 ## Decisoes de build e dividas tecnicas
 
-- **Compatibilidade UMDF/IddCx com o SO alvo:** O driver usa `UMDF_VERSION_MINOR=31`, `UMDF_MINIMUM_VERSION_REQUIRED=25` e `IDDCX_VERSION_MAJOR=1`, `IDDCX_VERSION_MINOR=4`, `IDDCX_MINIMUM_VERSION_REQUIRED=4`. Todas as funcoes usadas estao dentro de `WDF_ALWAYS_AVAILABLE_FUNCTION_COUNT` (`268`) e `IDD_ALWAYS_AVAILABLE_FUNCTION_COUNT` (`23`), garantindo compatibilidade binaria em Windows 10 1903+ e Windows 11.
+- **Compatibilidade UMDF/IddCx com o SO alvo:** O driver usa `UMDF_VERSION_MINOR=31`, `UMDF_MINIMUM_VERSION_REQUIRED=25` e `IDDCX_VERSION_MAJOR=1`, `IDDCX_VERSION_MINOR=4`, `IDDCX_MINIMUM_VERSION_REQUIRED=4`, com pacote INF direcionado a `NTamd64.10.0...18362` e catalogo `10_19H1_X64`. Todas as funcoes usadas estao dentro de `WDF_ALWAYS_AVAILABLE_FUNCTION_COUNT` (`268`) e `IDD_ALWAYS_AVAILABLE_FUNCTION_COUNT` (`23`), garantindo compatibilidade binaria em Windows 10 1903+ e Windows 11.
 - **Supressao escopada de `C4471`:** O warning `C4471` emitido por `wudfwdm.h` (`typedef enum _DEVICE_RELATION_TYPE`) e suprimido apenas ao redor de `#include <wdf.h>` e `#include <IddCx.h>` em `Driver.h`.
 - **Mitigacao Spectre (issue #20):** `Driver_SpectreMitigation=false` permanece temporariamente porque as bibliotecas MSVC Spectre (`lib\spectre`) nao estao instaladas no Build Tools local.
-- **Empacotamento INF e assinatura (issue #21):** `EnableTestSign=false` e `SignMode=Off` mantem assinatura e empacotamento fora deste escopo ate a validacao dedicada do INF.
+- **Catalogo ativo sem assinatura automatica (issue #21):** `EnableInf2cat=true` gera e valida o `.cat` no build enquanto `EnableTestSign=false` e `SignMode=Off` mantem assinatura digital e alteracao de certificados fora do build padrao ate uma etapa controlada dedicada.
 
 ## Proximos passos
 
-1. Validar pacote INF (`IndirectKmd`, `UmdfExtensions = IddCx0102`, `StampInf`, `InfVerif`, `Inf2Cat`) e resolver issue #21.
-2. Reativar mitigacao Spectre apos instalacao das libs MSVC Spectre (issue #20).
-3. Implementar criacao, chegada e remocao do monitor virtual (`IddCxMonitorCreate`, `IddCxMonitorArrival`, `IddCxMonitorDeparture`).
-4. Expor modos de video (`1280x720@60`, `1920x1080@60`, `2560x1440@60`) em `EvtIddCxMonitorGetDefaultDescriptionModes` e `EvtIddCxMonitorQueryTargetModes`.
-5. Implementar processamento de swapchain Direct3D 11 e contrato de entrega de frames para `lumabridge-host`.
+1. Reativar mitigacao Spectre apos instalacao das libs MSVC Spectre (issue #20).
+2. Implementar criacao, chegada e remocao do monitor virtual (`IddCxMonitorCreate`, `IddCxMonitorArrival`, `IddCxMonitorDeparture`).
+3. Expor modos de video (`1280x720@60`, `1920x1080@60`, `2560x1440@60`) em `EvtIddCxMonitorGetDefaultDescriptionModes` e `EvtIddCxMonitorQueryTargetModes`.
+4. Implementar processamento de swapchain Direct3D 11 e contrato de entrega de frames para `lumabridge-host`.
+5. Executar estrategia controlada de assinatura de teste e validacao em runtime no Windows (`WUDFHost.exe`).
