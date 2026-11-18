@@ -68,6 +68,16 @@ DriverDiagnosticStageToString(
         return "AdapterContextCleanup";
     case DriverDiagnosticStage::DeviceContextCleanup:
         return "DeviceContextCleanup";
+    case DriverDiagnosticStage::MonitorParseDescription:
+        return "MonitorParseDescription";
+    case DriverDiagnosticStage::MonitorGetDefaultDescriptionModes:
+        return "MonitorGetDefaultDescriptionModes";
+    case DriverDiagnosticStage::MonitorQueryTargetModes:
+        return "MonitorQueryTargetModes";
+    case DriverDiagnosticStage::MonitorAssignSwapChain:
+        return "MonitorAssignSwapChain";
+    case DriverDiagnosticStage::MonitorUnassignSwapChain:
+        return "MonitorUnassignSwapChain";
     case DriverDiagnosticStage::MonitorCallbackStub:
         return "MonitorCallbackStub";
     default:

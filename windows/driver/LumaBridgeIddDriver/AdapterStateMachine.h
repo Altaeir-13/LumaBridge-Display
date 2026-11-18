@@ -34,6 +34,8 @@ enum class DriverDiagnosticStage : UINT32
     MonitorParseDescription,
     MonitorGetDefaultDescriptionModes,
     MonitorQueryTargetModes,
+    MonitorAssignSwapChain,
+    MonitorUnassignSwapChain,
     MonitorCallbackStub,
 };
 
