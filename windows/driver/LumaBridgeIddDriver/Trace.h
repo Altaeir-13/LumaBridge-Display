@@ -3,6 +3,15 @@
 #include <stdio.h>
 #include "AdapterStateMachine.h"
 
+#if defined(LUMABRIDGE_ENABLE_TRACELOGGING)
+#pragma warning(push)
+#pragma warning(disable : 4201)
+#include <TraceLoggingProvider.h>
+#pragma warning(pop)
+
+TRACELOGGING_DECLARE_PROVIDER(g_LumaBridgeTraceProvider);
+#endif
+
 namespace lumabridge::driver {
 
 /// Returns a concise ASCII name for an AdapterLifecycleState value.
@@ -32,89 +41,159 @@ AdapterLifecycleStateToString(
     }
 }
 
+struct StageNameEntry
+{
+    DriverDiagnosticStage Stage;
+    const char* Ascii;
+    const wchar_t* Wide;
+};
+
+inline const StageNameEntry&
+FindDiagnosticStageEntry(
+    DriverDiagnosticStage stage
+    ) noexcept
+{
+    static constexpr StageNameEntry kStageNames[] = {
+        {DriverDiagnosticStage::None, "None", L"None"},
+        {DriverDiagnosticStage::DriverEntry, "DriverEntry", L"DriverEntry"},
+        {DriverDiagnosticStage::DriverUnload, "DriverUnload", L"DriverUnload"},
+        {DriverDiagnosticStage::DeviceAdd, "DeviceAdd", L"DeviceAdd"},
+        {DriverDiagnosticStage::DeviceInitConfig, "DeviceInitConfig", L"DeviceInitConfig"},
+        {DriverDiagnosticStage::WdfDeviceCreate, "WdfDeviceCreate", L"WdfDeviceCreate"},
+        {DriverDiagnosticStage::IddCxDeviceInitialize, "IddCxDeviceInitialize", L"IddCxDeviceInitialize"},
+        {DriverDiagnosticStage::DeviceD0Entry, "DeviceD0Entry", L"DeviceD0Entry"},
+        {DriverDiagnosticStage::AdapterInitAsync, "AdapterInitAsync", L"AdapterInitAsync"},
+        {DriverDiagnosticStage::AdapterInitFinished, "AdapterInitFinished", L"AdapterInitFinished"},
+        {DriverDiagnosticStage::AdapterCommitModes, "AdapterCommitModes", L"AdapterCommitModes"},
+        {DriverDiagnosticStage::DeviceD0Exit, "DeviceD0Exit", L"DeviceD0Exit"},
+        {DriverDiagnosticStage::AdapterContextCleanup, "AdapterContextCleanup", L"AdapterContextCleanup"},
+        {DriverDiagnosticStage::DeviceContextCleanup, "DeviceContextCleanup", L"DeviceContextCleanup"},
+        {DriverDiagnosticStage::MonitorParseDescription, "MonitorParseDescription", L"MonitorParseDescription"},
+        {DriverDiagnosticStage::MonitorGetDefaultDescriptionModes, "MonitorGetDefaultDescriptionModes", L"MonitorGetDefaultDescriptionModes"},
+        {DriverDiagnosticStage::MonitorQueryTargetModes, "MonitorQueryTargetModes", L"MonitorQueryTargetModes"},
+        {DriverDiagnosticStage::MonitorCreate, "MonitorCreate", L"MonitorCreate"},
+        {DriverDiagnosticStage::MonitorArrival, "MonitorArrival", L"MonitorArrival"},
+        {DriverDiagnosticStage::MonitorDeparture, "MonitorDeparture", L"MonitorDeparture"},
+        {DriverDiagnosticStage::MonitorContextCleanup, "MonitorContextCleanup", L"MonitorContextCleanup"},
+        {DriverDiagnosticStage::MonitorAssignSwapChain, "MonitorAssignSwapChain", L"MonitorAssignSwapChain"},
+        {DriverDiagnosticStage::MonitorUnassignSwapChain, "MonitorUnassignSwapChain", L"MonitorUnassignSwapChain"},
+        {DriverDiagnosticStage::MonitorCallbackStub, "MonitorCallbackStub", L"MonitorCallbackStub"},
+        {DriverDiagnosticStage::DllProcessAttach, "DllProcessAttach", L"DllProcessAttach"},
+        {DriverDiagnosticStage::IddCxGetVersion, "IddCxGetVersion", L"IddCxGetVersion"},
+        {DriverDiagnosticStage::WdfDeviceSetFailed, "WdfDeviceSetFailed", L"WdfDeviceSetFailed"},
+    };
+    static constexpr StageNameEntry kUnknownStage{DriverDiagnosticStage::None, "Unknown", L"Unknown"};
+
+    for (const auto& entry : kStageNames)
+    {
+        if (entry.Stage == stage)
+        {
+            return entry;
+        }
+    }
+    return kUnknownStage;
+}
+
 /// Returns a concise ASCII name for a DriverDiagnosticStage value.
 inline const char*
 DriverDiagnosticStageToString(
     DriverDiagnosticStage stage
     ) noexcept
 {
-    switch (stage)
-    {
-    case DriverDiagnosticStage::None:
-        return "None";
-    case DriverDiagnosticStage::DriverEntry:
-        return "DriverEntry";
-    case DriverDiagnosticStage::DriverUnload:
-        return "DriverUnload";
-    case DriverDiagnosticStage::DeviceAdd:
-        return "DeviceAdd";
-    case DriverDiagnosticStage::DeviceInitConfig:
-        return "DeviceInitConfig";
-    case DriverDiagnosticStage::WdfDeviceCreate:
-        return "WdfDeviceCreate";
-    case DriverDiagnosticStage::IddCxDeviceInitialize:
-        return "IddCxDeviceInitialize";
-    case DriverDiagnosticStage::DeviceD0Entry:
-        return "DeviceD0Entry";
-    case DriverDiagnosticStage::AdapterInitAsync:
-        return "AdapterInitAsync";
-    case DriverDiagnosticStage::AdapterInitFinished:
-        return "AdapterInitFinished";
-    case DriverDiagnosticStage::AdapterCommitModes:
-        return "AdapterCommitModes";
-    case DriverDiagnosticStage::DeviceD0Exit:
-        return "DeviceD0Exit";
-    case DriverDiagnosticStage::AdapterContextCleanup:
-        return "AdapterContextCleanup";
-    case DriverDiagnosticStage::DeviceContextCleanup:
-        return "DeviceContextCleanup";
-    case DriverDiagnosticStage::MonitorParseDescription:
-        return "MonitorParseDescription";
-    case DriverDiagnosticStage::MonitorGetDefaultDescriptionModes:
-        return "MonitorGetDefaultDescriptionModes";
-    case DriverDiagnosticStage::MonitorQueryTargetModes:
-        return "MonitorQueryTargetModes";
-    case DriverDiagnosticStage::MonitorCreate:
-        return "MonitorCreate";
-    case DriverDiagnosticStage::MonitorArrival:
-        return "MonitorArrival";
-    case DriverDiagnosticStage::MonitorDeparture:
-        return "MonitorDeparture";
-    case DriverDiagnosticStage::MonitorContextCleanup:
-        return "MonitorContextCleanup";
-    case DriverDiagnosticStage::MonitorAssignSwapChain:
-        return "MonitorAssignSwapChain";
-    case DriverDiagnosticStage::MonitorUnassignSwapChain:
-        return "MonitorUnassignSwapChain";
-    case DriverDiagnosticStage::MonitorCallbackStub:
-        return "MonitorCallbackStub";
-    default:
-        return "Unknown";
-    }
+    return FindDiagnosticStageEntry(stage).Ascii;
 }
 
-/// Emits a structured UMDF diagnostic line using the [LB-DRIVER] log convention.
+/// Returns a concise wide-string name for a DriverDiagnosticStage value.
+inline const wchar_t*
+DriverDiagnosticStageToWideString(
+    DriverDiagnosticStage stage
+    ) noexcept
+{
+    return FindDiagnosticStageEntry(stage).Wide;
+}
+
+#if defined(LUMABRIDGE_ENABLE_TRACELOGGING)
+template <UCHAR TraceLevel>
+inline void
+LumaBridgeWriteStageEtwEvent(
+    const char* safeLevel,
+    DWORD processId,
+    DWORD threadId,
+    const char* safeStage,
+    NTSTATUS status,
+    const char* safeState,
+    const char* safeLastOk,
+    const char* safeMessage
+    ) noexcept
+{
+    TraceLoggingWrite(
+        g_LumaBridgeTraceProvider,
+        "DriverStage",
+        TraceLoggingLevel(TraceLevel),
+        TraceLoggingString(safeLevel, "Level"),
+        TraceLoggingUInt32(processId, "ProcessId"),
+        TraceLoggingUInt32(threadId, "ThreadId"),
+        TraceLoggingString(safeStage, "Stage"),
+        TraceLoggingNTStatus(status, "Status"),
+        TraceLoggingString(safeState, "LifecycleState"),
+        TraceLoggingString(safeLastOk, "LastSuccessfulStage"),
+        TraceLoggingString(safeMessage, "Message"));
+}
+#endif
+
+/// Emits a structured UMDF diagnostic line using the [LB-DRIVER] log convention
+/// and, when enabled, mirrors the stage event to ETW TraceLogging.
 inline void
 LumaBridgeTraceEmit(
     const char* level,
     DriverDiagnosticStage stage,
     NTSTATUS status,
     AdapterLifecycleState state,
-    const char* message
+    const char* message,
+    DriverDiagnosticStage lastSuccessfulStage = DriverDiagnosticStage::None
     ) noexcept
 {
-    char buffer[256]{};
+    const DWORD processId = GetCurrentProcessId();
+    const DWORD threadId = GetCurrentThreadId();
+    const char* safeLevel = (level != nullptr) ? level : "INFO";
+    const char* safeStage = DriverDiagnosticStageToString(stage);
+    const char* safeState = AdapterLifecycleStateToString(state);
+    const char* safeLastOk = DriverDiagnosticStageToString(lastSuccessfulStage);
+    const char* safeMessage = (message != nullptr) ? message : "";
+
+    char buffer[512]{};
     _snprintf_s(
         buffer,
         sizeof(buffer),
         _TRUNCATE,
-        "[LB-DRIVER] [%s] stage=%s status=0x%08lX state=%s msg=\"%s\"\n",
-        (level != nullptr) ? level : "INFO",
-        DriverDiagnosticStageToString(stage),
+        "[LB-DRIVER] [%s] pid=%lu tid=%lu stage=%s status=0x%08lX state=%s lastOk=%s msg=\"%s\"\n",
+        safeLevel,
+        static_cast<unsigned long>(processId),
+        static_cast<unsigned long>(threadId),
+        safeStage,
         static_cast<unsigned long>(status),
-        AdapterLifecycleStateToString(state),
-        (message != nullptr) ? message : "");
+        safeState,
+        safeLastOk,
+        safeMessage);
     OutputDebugStringA(buffer);
+
+#if defined(LUMABRIDGE_ENABLE_TRACELOGGING)
+    if (safeLevel[0] == 'E')
+    {
+        LumaBridgeWriteStageEtwEvent<2U>(
+            safeLevel, processId, threadId, safeStage, status, safeState, safeLastOk, safeMessage);
+    }
+    else if (safeLevel[0] == 'W')
+    {
+        LumaBridgeWriteStageEtwEvent<3U>(
+            safeLevel, processId, threadId, safeStage, status, safeState, safeLastOk, safeMessage);
+    }
+    else
+    {
+        LumaBridgeWriteStageEtwEvent<4U>(
+            safeLevel, processId, threadId, safeStage, status, safeState, safeLastOk, safeMessage);
+    }
+#endif
 }
 
 inline void
@@ -122,10 +201,11 @@ LumaBridgeTraceInfo(
     DriverDiagnosticStage stage,
     NTSTATUS status,
     AdapterLifecycleState state,
-    const char* message
+    const char* message,
+    DriverDiagnosticStage lastSuccessfulStage = DriverDiagnosticStage::None
     ) noexcept
 {
-    LumaBridgeTraceEmit("INFO", stage, status, state, message);
+    LumaBridgeTraceEmit("INFO", stage, status, state, message, lastSuccessfulStage);
 }
 
 inline void
@@ -133,10 +213,11 @@ LumaBridgeTraceWarn(
     DriverDiagnosticStage stage,
     NTSTATUS status,
     AdapterLifecycleState state,
-    const char* message
+    const char* message,
+    DriverDiagnosticStage lastSuccessfulStage = DriverDiagnosticStage::None
     ) noexcept
 {
-    LumaBridgeTraceEmit("WARN", stage, status, state, message);
+    LumaBridgeTraceEmit("WARN", stage, status, state, message, lastSuccessfulStage);
 }
 
 inline void
@@ -144,10 +225,11 @@ LumaBridgeTraceError(
     DriverDiagnosticStage stage,
     NTSTATUS status,
     AdapterLifecycleState state,
-    const char* message
+    const char* message,
+    DriverDiagnosticStage lastSuccessfulStage = DriverDiagnosticStage::None
     ) noexcept
 {
-    LumaBridgeTraceEmit("ERROR", stage, status, state, message);
+    LumaBridgeTraceEmit("ERROR", stage, status, state, message, lastSuccessfulStage);
 }
 
 /// Emits a structured runtime metrics snapshot using the [LB-DRIVER] [METRICS] convention

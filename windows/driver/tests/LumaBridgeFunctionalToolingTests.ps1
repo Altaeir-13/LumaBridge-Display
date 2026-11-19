@@ -833,6 +833,11 @@ Invoke-UnitTest -Name 'PartialFreshInstallFailureTriggersRollback' -TestBody {
         'Get-LumaBridgeHostSecurityState' = { [CmdletBinding()] param() return [pscustomobject]@{ SecureBoot = 'Disabled'; TestSigning = 'Enabled' } }
         'Get-LumaBridgePnpInstances' = $getInstancesMock
         'Get-LumaBridgeDriverStorePackages' = $getPackagesMock
+        'Get-WinEvent' = { [CmdletBinding()] param([hashtable]$FilterHashtable, [int]$MaxEvents) return @() }
+        'Get-LumaBridgeEventChannelStatus' = { [CmdletBinding()] param([string[]]$ChannelNames) return @() }
+        'Get-LumaBridgeDiagnosticEvents' = { [CmdletBinding()] param([int]$LookbackMinutes, [string[]]$InstanceIds, [string[]]$PublishedInfNames, [object[]]$ChannelStatus) return @() }
+        'Get-LumaBridgeSetupApiLogExcerpt' = { [CmdletBinding()] param([string]$SetupApiLogPath, [string[]]$InstanceIds, [string[]]$PublishedInfNames, [int]$MaxMatchedSections) return [pscustomobject]@{ LogPath = $SetupApiLogPath; Exists = $false; AccessDenied = $false; Error = ''; MatchedSectionCount = 0; WdfSchemaWarnings = @(); DeviceStartProblemLines = @(); Sections = @(); RawExcerptText = '' } }
+        'Get-LumaBridgeCrashDumpInventory' = { [CmdletBinding()] param([int]$LookbackMinutes) return [pscustomobject]@{ LookbackMinutes = $LookbackMinutes; Locations = @(); Files = @(); TotalFoundCount = 0 } }
         'Set-LumaBridgeDeviceEnableVirtualMonitor' = { [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value) }
         'Invoke-LumaBridgeExternalCommand' = {
             [CmdletBinding()] param([string]$FilePath, [string[]]$Arguments = @(), [switch]$DryRun)
@@ -857,8 +862,9 @@ Invoke-UnitTest -Name 'PartialFreshInstallFailureTriggersRollback' -TestBody {
         'Get-LumaBridgePnpInstances' = $getInstancesMock
         'Get-LumaBridgeDriverStorePackages' = $getPackagesMock
     } -Body {
+        $diagDir = Join-Path $caseDir 'rb_fresh_diag'
         Assert-Throws {
-            & (Join-Path $scriptsDir 'Install-LumaBridgeDriver.ps1') -Configuration Release -StagingDir $pkgDir -AllowUntrustedChain -Force
+            & (Join-Path $scriptsDir 'Install-LumaBridgeDriver.ps1') -Configuration Release -StagingDir $pkgDir -AllowUntrustedChain -DiagnosticsOutputDir $diagDir -Force
         } -ExpectedPattern 'Rollback:.*Removed partial PnP instance.*Deleted newly staged package' -Message 'Fresh install failure must trigger full rollback'
 
         Assert-Equal $global:LbTestState['RbFresh'].HasDevice $false 'Partial PnP device must be removed by rollback'
@@ -922,6 +928,11 @@ Invoke-UnitTest -Name 'PartialUpdateFailureTriggersRollback' -TestBody {
         'Get-LumaBridgeHostSecurityState' = { [CmdletBinding()] param() return [pscustomobject]@{ SecureBoot = 'Disabled'; TestSigning = 'Enabled' } }
         'Get-LumaBridgePnpInstances' = $getInstancesMock
         'Get-LumaBridgeDriverStorePackages' = $getPackagesMock
+        'Get-WinEvent' = { [CmdletBinding()] param([hashtable]$FilterHashtable, [int]$MaxEvents) return @() }
+        'Get-LumaBridgeEventChannelStatus' = { [CmdletBinding()] param([string[]]$ChannelNames) return @() }
+        'Get-LumaBridgeDiagnosticEvents' = { [CmdletBinding()] param([int]$LookbackMinutes, [string[]]$InstanceIds, [string[]]$PublishedInfNames, [object[]]$ChannelStatus) return @() }
+        'Get-LumaBridgeSetupApiLogExcerpt' = { [CmdletBinding()] param([string]$SetupApiLogPath, [string[]]$InstanceIds, [string[]]$PublishedInfNames, [int]$MaxMatchedSections) return [pscustomobject]@{ LogPath = $SetupApiLogPath; Exists = $false; AccessDenied = $false; Error = ''; MatchedSectionCount = 0; WdfSchemaWarnings = @(); DeviceStartProblemLines = @(); Sections = @(); RawExcerptText = '' } }
+        'Get-LumaBridgeCrashDumpInventory' = { [CmdletBinding()] param([int]$LookbackMinutes) return [pscustomobject]@{ LookbackMinutes = $LookbackMinutes; Locations = @(); Files = @(); TotalFoundCount = 0 } }
         'Set-LumaBridgeDeviceEnableVirtualMonitor' = { [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value) }
         'Invoke-LumaBridgeExternalCommand' = {
             [CmdletBinding()] param([string]$FilePath, [string[]]$Arguments = @(), [switch]$DryRun)
@@ -941,8 +952,9 @@ Invoke-UnitTest -Name 'PartialUpdateFailureTriggersRollback' -TestBody {
         'Get-LumaBridgePnpInstances' = $getInstancesMock
         'Get-LumaBridgeDriverStorePackages' = $getPackagesMock
     } -Body {
+        $diagDir = Join-Path $caseDir 'rb_upd_diag'
         Assert-Throws {
-            & (Join-Path $scriptsDir 'Install-LumaBridgeDriver.ps1') -Configuration Release -StagingDir $pkgDir -AllowUntrustedChain -Force
+            & (Join-Path $scriptsDir 'Install-LumaBridgeDriver.ps1') -Configuration Release -StagingDir $pkgDir -AllowUntrustedChain -DiagnosticsOutputDir $diagDir -Force
         } -ExpectedPattern "Driver binding verification failed.*Deleted failed update package 'oem99\.inf'.*Restarted device" -Message 'Update binding failure must roll back new OEM package and restart device'
 
         Assert-Equal $global:LbTestState['RbUpd'].HasNewPkg $false 'Failed update package oem99.inf must be deleted'
@@ -1176,6 +1188,10 @@ Invoke-UnitTest -Name 'DiagnosticsIdentifiesLumaBridgeWudfHostProcess' -TestBody
         'Get-LumaBridgePnpInstances' = { [CmdletBinding()] param([string]$HardwareId) return $global:LbTestState['DiagPnp'] }
         'Get-LumaBridgeDriverStorePackages' = { [CmdletBinding()] param([string]$InfFilter) return @() }
         'Get-WinEvent' = { [CmdletBinding()] param([hashtable]$FilterHashtable, [int]$MaxEvents) return @() }
+        'Get-LumaBridgeEventChannelStatus' = { [CmdletBinding()] param([string[]]$ChannelNames) return @() }
+        'Get-LumaBridgeDiagnosticEvents' = { [CmdletBinding()] param([int]$LookbackMinutes, [string[]]$InstanceIds, [string[]]$PublishedInfNames, [object[]]$ChannelStatus) return @() }
+        'Get-LumaBridgeSetupApiLogExcerpt' = { [CmdletBinding()] param([string]$SetupApiLogPath, [string[]]$InstanceIds, [string[]]$PublishedInfNames, [int]$MaxMatchedSections) return [pscustomobject]@{ LogPath = $SetupApiLogPath; Exists = $false; AccessDenied = $false; Error = ''; MatchedSectionCount = 0; WdfSchemaWarnings = @(); DeviceStartProblemLines = @(); Sections = @(); RawExcerptText = '' } }
+        'Get-LumaBridgeCrashDumpInventory' = { [CmdletBinding()] param([int]$LookbackMinutes) return [pscustomobject]@{ LookbackMinutes = $LookbackMinutes; Locations = @(); Files = @(); TotalFoundCount = 0 } }
     } -ModuleMocks @{
         'Get-LumaBridgePnpInstances' = { [CmdletBinding()] param([string]$HardwareId) return $global:LbTestState['DiagPnp'] }
         'Get-LumaBridgeDriverStorePackages' = { [CmdletBinding()] param([string]$InfFilter) return @() }
@@ -1222,7 +1238,433 @@ Invoke-UnitTest -Name 'AllScriptsDryRunDoNotMutateSystemState' -TestBody {
     Assert-True ($diagDry.DryRun -eq $true) 'Collect diagnostics DryRun returns DryRun=true'
     Assert-Equal (Test-Path -LiteralPath (Join-Path $caseDir 'dry_diag')) $false 'Diagnostics DryRun must not create OutputDir'
 
+    $etwDryDir = Join-Path $caseDir 'dry_etw'
+    $etwStartDry = & (Join-Path $scriptsDir 'Invoke-LumaBridgeEtwTrace.ps1') -Action Start -OutputDir $etwDryDir -DryRun
+    Assert-True ($etwStartDry.DryRun -eq $true) 'ETW Start DryRun returns DryRun=true'
+    Assert-Equal (Test-Path -LiteralPath $etwDryDir) $false 'ETW Start DryRun must not create OutputDir'
+    $etwStopDry = & (Join-Path $scriptsDir 'Invoke-LumaBridgeEtwTrace.ps1') -Action Stop -OutputDir $etwDryDir -DryRun
+    Assert-True ($etwStopDry.DryRun -eq $true) 'ETW Stop DryRun returns DryRun=true'
+    $etwStatusDry = & (Join-Path $scriptsDir 'Invoke-LumaBridgeEtwTrace.ps1') -Action Status -OutputDir $etwDryDir -DryRun
+    Assert-True ($etwStatusDry.DryRun -eq $true) 'ETW Status DryRun returns DryRun=true'
+    Assert-True (@($etwStatusDry.EventChannels).Count -ge 1) 'ETW Status queries channel status metadata'
+
     & (Join-Path $scriptsDir 'Uninstall-LumaBridgeDriver.ps1') -RemoveTestCertificate -CertificateThumbprint '00112233445566778899AABBCCDDEEFF00112233' -DryRun | Out-Null
+}
+
+# 19. PnP ProblemStatus (0xC000009E), UpperFilters, and Diag* startup breadcrumbs are collected and surfaced
+Invoke-UnitTest -Name 'PnpProblemStatusAndStartupBreadcrumbsCollected' -TestBody {
+    param($caseDir)
+    Assert-Equal (Format-LumaBridgeNtStatusHex -StatusValue -1073741666) '0xC000009E' 'Signed INT32 NTSTATUS formats as 0xC000009E'
+    Assert-Equal (Format-LumaBridgeNtStatusHex -StatusValue ([uint32]3221225630)) '0xC000009E' 'Unsigned UINT32 NTSTATUS formats as 0xC000009E'
+    Assert-Equal (Format-LumaBridgeNtStatusHex -StatusValue 0) '0x00000000' 'Zero status formats cleanly'
+
+    $mockRegPath = 'MOCK:\SYSTEM\CurrentControlSet\Enum\ROOT\DISPLAY\0000\Device Parameters'
+    $global:LbTestState['MockRegPath'] = $mockRegPath
+
+    $mockPnpDevice = [pscustomobject]@{
+        InstanceId   = 'ROOT\DISPLAY\0000'
+        FriendlyName = 'LumaBridge Indirect Display Adapter'
+        Status       = 'Error'
+        Present      = $true
+        HardwareID   = @('Root\LumaBridgeIddDriver')
+        Class        = 'Display'
+    }
+
+    $propMock = {
+        param([string]$InstanceId, [string]$KeyName)
+        switch ($KeyName) {
+            'DEVPKEY_Device_HardwareIds'    { return @('Root\LumaBridgeIddDriver') }
+            'DEVPKEY_Device_ProblemCode'    { return 10 }
+            'DEVPKEY_Device_ProblemStatus'  { return -1073741666 }
+            'DEVPKEY_Device_DriverInfPath'  { return 'oem68.inf' }
+            'DEVPKEY_Device_DriverProvider' { return 'LumaBridge' }
+            'DEVPKEY_Device_DriverVersion'  { return '21.24.54.993' }
+            'DEVPKEY_Device_Service'        { return 'WUDFRd' }
+            'DEVPKEY_Device_UpperFilters'   { return @('IndirectKmd') }
+            'DEVPKEY_Device_LowerFilters'   { return @() }
+            default                         { return $null }
+        }
+    }
+
+    $diagRegProps = [pscustomobject]@{
+        DiagLastStage           = 'AdapterInitAsync'
+        DiagLastSuccessfulStage = 'IddCxDeviceInitialize'
+        DiagLastStatus          = -1073741666
+        DiagLastErrorStage      = 'AdapterInitAsync'
+        DiagLastErrorStatus     = -1073741666
+        DiagIddCxVersion        = 0x00010400
+        DiagHostProcessId       = 7420
+        DiagDllAttachCount      = 1
+    }
+
+    $global:LbTestState['PropMockObj'] = $mockPnpDevice
+    $global:LbTestState['DiagRegProps'] = $diagRegProps
+
+    Invoke-WithModuleMocks -GlobalMocks @{
+        'Get-PnpDevice' = { [CmdletBinding()] param() return @($global:LbTestState['PropMockObj']) }
+    } -ModuleMocks @{
+        'Get-PnpDevice' = { [CmdletBinding()] param() return @($global:LbTestState['PropMockObj']) }
+        'Get-LumaBridgeDevicePropertyData' = $propMock
+        'Get-LumaBridgeDeviceParametersRegistryPath' = { param([string]$InstanceId) return $global:LbTestState['MockRegPath'] }
+        'Get-LumaBridgeDeviceEnableVirtualMonitor' = { param([string]$DeviceParametersPath) return 0 }
+        'Test-Path' = {
+            param([string]$LiteralPath, [string]$PathType)
+            if ($LiteralPath -eq $global:LbTestState['MockRegPath']) { return $true }
+            if ($PathType) { return (Microsoft.PowerShell.Management\Test-Path -LiteralPath $LiteralPath -PathType $PathType) }
+            return (Microsoft.PowerShell.Management\Test-Path -LiteralPath $LiteralPath)
+        }
+        'Get-ItemProperty' = {
+            param([string]$LiteralPath)
+            if ($LiteralPath -eq $global:LbTestState['MockRegPath']) { return $global:LbTestState['DiagRegProps'] }
+            return (Microsoft.PowerShell.Management\Get-ItemProperty -LiteralPath $LiteralPath)
+        }
+    } -Body {
+        $instances = @(Get-LumaBridgePnpInstances)
+        Assert-Equal $instances.Count 1 'Exactly one PnP instance parsed'
+        Assert-Equal $instances[0].ProblemCode 10 'ProblemCode=10 preserved'
+        Assert-Equal $instances[0].ProblemStatusHex '0xC000009E' 'DEVPKEY_Device_ProblemStatus formatted as 0xC000009E'
+        Assert-True (@($instances[0].UpperFilters) -contains 'IndirectKmd') 'UpperFilters contains IndirectKmd'
+        Assert-True ($null -ne $instances[0].StartupDiagnostics) 'Diag* startup breadcrumbs collected'
+        Assert-Equal $instances[0].StartupDiagnostics.LastSuccessfulStage 'IddCxDeviceInitialize' 'LastSuccessfulStage decoded'
+        Assert-Equal $instances[0].StartupDiagnostics.LastErrorStatusHex '0xC000009E' 'LastErrorStatusHex decoded'
+        Assert-Equal $instances[0].StartupDiagnostics.IddCxRuntimeVerHex '0x00010400' 'IddCx runtime version decoded'
+
+        $binding = Test-LumaBridgeDeviceDriverBinding -Instance $instances[0]
+        Assert-Equal $binding.IsBound $false 'Failed start must fail binding check'
+        Assert-Equal $binding.ProblemStatusHex '0xC000009E' 'Binding output exposes ProblemStatusHex'
+        Assert-True (($binding.Reasons -join '; ') -match 'ProblemStatus is 0xC000009E') 'Binding reason explains ProblemStatus'
+    }
+}
+
+# 20. Install failure captures SetupAPI, ProblemStatus, and stage diagnostics BEFORE rollback removes device & OEM INF
+Invoke-UnitTest -Name 'InstallFailurePreservesPreRollbackDiagnosticsBeforeCleanup' -TestBody {
+    param($caseDir)
+    $certInfo = New-EphemeralTestCertificate -OutDirectory (Join-Path $caseDir 'certs') -NamePrefix 'prerollback'
+    $pkgDir = Join-Path $caseDir 'pkg'
+    New-SignedTestPackage -TargetDir $pkgDir -CertInfo $certInfo -ExportCerAsPackageFile
+
+    $setupApiLog = Join-Path $caseDir 'setupapi.dev.log'
+    @(
+        '>>>  [Device Install (Hardware initiated) - ROOT\DISPLAY\0000]',
+        '>>>  Section start 2026/11/18 20:52:06.472',
+        '     dvi: {Plug and Play Service: Device Install for ROOT\DISPLAY\0000}',
+        '     inf: {SetupCopyOEMInf: oem68.inf}',
+        '     ndv: Using WDF schema version 2.23 when section requires version 2.31. Section = [LumaBridge_Install.NT.Wdf]',
+        '!!!  dvi: Device not started: Device has problem: 0x0a (CM_PROB_FAILED_START), problem status: 0xc000009e.',
+        '<<<  Section end 2026/11/18 20:52:07.120',
+        '<<<  [Exit status: SUCCESS]'
+    ) | Set-Content -LiteralPath $setupApiLog -Encoding UTF8
+
+    $traceLog = Join-Path $caseDir 'driver_trace.log'
+    @(
+        '[1] [LB-DRIVER] [INFO] pid=7420 tid=100 stage=DriverEntry status=0x00000000 state=Uninitialized lastOk=DllProcessAttach msg="DriverEntry entered"',
+        '[2] [LB-DRIVER] [INFO] pid=7420 tid=100 stage=DeviceD0Entry status=0x00000000 state=DeviceInitialized lastOk=IddCxDeviceInitialize msg="EvtDeviceD0Entry entered"',
+        '[3] [LB-DRIVER] [ERROR] pid=7420 tid=100 stage=AdapterInitAsync status=0xC000009E state=AdapterFailed lastOk=DeviceD0Entry msg="IddCxAdapterInitAsync failed"'
+    ) | Set-Content -LiteralPath $traceLog -Encoding UTF8
+
+    $diagOutDir = Join-Path $caseDir 'preserved_diag'
+    $global:LbTestState['PreRb'] = [ordered]@{
+        HasPkg        = $false
+        HasDevice     = $false
+        SetupApiPath  = $setupApiLog
+        RealSetupParser = (Get-Command Get-LumaBridgeSetupApiLogExcerpt).ScriptBlock
+    }
+
+    $getInstancesPreRb = {
+        [CmdletBinding()] param([string]$HardwareId)
+        if (-not $global:LbTestState['PreRb'].HasDevice) { return @() }
+        return @([pscustomobject]@{
+            InstanceId           = 'ROOT\DISPLAY\0000'
+            FriendlyName         = 'LumaBridge Indirect Display Adapter'
+            Status               = 'Error'
+            ProblemCode          = 10
+            ProblemStatus        = -1073741666
+            ProblemStatusHex     = '0xC000009E'
+            Present              = $true
+            HardwareIds          = @('Root\LumaBridgeIddDriver')
+            DriverInfPath        = 'oem68.inf'
+            DriverProvider       = 'LumaBridge'
+            DriverVersion        = '21.24.54.993'
+            DriverService        = 'WUDFRd'
+            UpperFilters         = @('IndirectKmd')
+            LowerFilters         = @()
+            ConfigurationId      = 'oem68.inf:Root\LumaBridgeIddDriver'
+            DeviceParametersPath = 'MOCK:\ROOT\DISPLAY\0000\Device Parameters'
+            EnableVirtualMonitor = 0
+            StartupDiagnostics   = [pscustomobject]@{
+                LastStage           = 'AdapterInitAsync'
+                LastSuccessfulStage = 'DeviceD0Entry'
+                LastStatus          = -1073741666
+                LastStatusHex       = '0xC000009E'
+                LastErrorStage      = 'AdapterInitAsync'
+                LastErrorStatus     = -1073741666
+                LastErrorStatusHex  = '0xC000009E'
+                IddCxRuntimeVersion = 0x00010400
+                IddCxRuntimeVerHex  = '0x00010400'
+                HostProcessId       = 7420
+                DllAttachCount      = 1
+            }
+        })
+    }
+
+    $getPackagesPreRb = {
+        [CmdletBinding()] param([string]$InfFilter)
+        if (-not $global:LbTestState['PreRb'].HasPkg) { return @() }
+        return @([pscustomobject]@{
+            PublishedName = 'oem68.inf'
+            OriginalName  = 'lumabridgeidddriver.inf'
+            ProviderName  = 'LumaBridge'
+            ClassGuid     = '{4d36e968-e325-11ce-bfc1-08002be10318}'
+        })
+    }
+
+    Invoke-WithModuleMocks -GlobalMocks @{
+        'Assert-LumaBridgeAdministrator' = { [CmdletBinding()] param([string]$OperationName, [switch]$DryRun) return $true }
+        'Get-LumaBridgeHostSecurityState' = { [CmdletBinding()] param() return [pscustomobject]@{ SecureBoot = 'Disabled'; TestSigning = 'Enabled' } }
+        'Get-LumaBridgePnpInstances' = $getInstancesPreRb
+        'Get-LumaBridgeDriverStorePackages' = $getPackagesPreRb
+        'Get-WinEvent' = { [CmdletBinding()] param([hashtable]$FilterHashtable, [int]$MaxEvents) return @() }
+        'Get-LumaBridgeEventChannelStatus' = { [CmdletBinding()] param([string[]]$ChannelNames) return @() }
+        'Get-LumaBridgeDiagnosticEvents' = { [CmdletBinding()] param([int]$LookbackMinutes, [string[]]$InstanceIds, [string[]]$PublishedInfNames, [object[]]$ChannelStatus) return @() }
+        'Get-LumaBridgeCrashDumpInventory' = { [CmdletBinding()] param([int]$LookbackMinutes) return [pscustomobject]@{ LookbackMinutes = $LookbackMinutes; Locations = @(); Files = @(); TotalFoundCount = 0 } }
+        'Get-LumaBridgeSetupApiLogExcerpt' = {
+            [CmdletBinding()]
+            param([string]$SetupApiLogPath, [string[]]$InstanceIds, [string[]]$PublishedInfNames, [int]$MaxMatchedSections = 10)
+            & $global:LbTestState['PreRb'].RealSetupParser -SetupApiLogPath $global:LbTestState['PreRb'].SetupApiPath -InstanceIds $InstanceIds -PublishedInfNames $PublishedInfNames -MaxMatchedSections $MaxMatchedSections
+        }
+        'Set-LumaBridgeDeviceEnableVirtualMonitor' = { [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value) }
+        'Invoke-LumaBridgeExternalCommand' = {
+            [CmdletBinding()] param([string]$FilePath, [string[]]$Arguments = @(), [switch]$DryRun)
+            if ($FilePath -like '*pnputil*' -and $Arguments[0] -eq '/add-driver') {
+                $global:LbTestState['PreRb'].HasPkg = $true
+            }
+            elseif ($FilePath -like '*devcon*' -and $Arguments[0] -eq 'install') {
+                $global:LbTestState['PreRb'].HasDevice = $true
+            }
+            elseif ($FilePath -like '*pnputil*' -and $Arguments[0] -eq '/remove-device') {
+                $global:LbTestState['PreRb'].HasDevice = $false
+            }
+            elseif ($FilePath -like '*pnputil*' -and $Arguments[0] -eq '/delete-driver') {
+                $global:LbTestState['PreRb'].HasPkg = $false
+            }
+            return [pscustomobject]@{ ExitCode = 0; Output = @('OK'); DryRun = $false }
+        }
+    } -ModuleMocks @{
+        'Get-LumaBridgeHostSecurityState' = { [CmdletBinding()] param() return [pscustomobject]@{ SecureBoot = 'Disabled'; TestSigning = 'Enabled' } }
+        'Get-LumaBridgePnpInstances' = $getInstancesPreRb
+        'Get-LumaBridgeDriverStorePackages' = $getPackagesPreRb
+    } -Body {
+        Assert-Throws {
+            & (Join-Path $scriptsDir 'Install-LumaBridgeDriver.ps1') `
+                -Configuration Release `
+                -StagingDir $pkgDir `
+                -AllowUntrustedChain `
+                -DiagnosticsOutputDir $diagOutDir `
+                -DebugLogPath $traceLog `
+                -Force
+        } -ExpectedPattern 'Diagnostics preserved at.*ProblemStatus=0xC000009E.*LastSuccessfulStage=DeviceD0Entry' -Message 'Install failure message must include preserved diagnostics path and ProblemStatus'
+
+        # Verify rollback actually removed both device and oem68.inf
+        Assert-Equal $global:LbTestState['PreRb'].HasDevice $false 'Rollback must remove ROOT\DISPLAY\0000'
+        Assert-Equal $global:LbTestState['PreRb'].HasPkg $false 'Rollback must delete oem68.inf'
+
+        # Verify pre-rollback evidence persisted across rollback!
+        $summaryJsonPath = Join-Path $diagOutDir 'diagnostics-summary.json'
+        $summaryMdPath = Join-Path $diagOutDir 'diagnostics-summary.md'
+        $setupExcerptPath = Join-Path $diagOutDir 'setupapi-excerpt.log'
+        $postRollbackPath = Join-Path $diagOutDir 'post-rollback-status.json'
+
+        Assert-True (Test-Path -LiteralPath $summaryJsonPath) 'Pre-rollback diagnostics-summary.json preserved'
+        Assert-True (Test-Path -LiteralPath $summaryMdPath) 'Pre-rollback diagnostics-summary.md preserved'
+        Assert-True (Test-Path -LiteralPath $setupExcerptPath) 'Pre-rollback setupapi-excerpt.log preserved'
+        Assert-True (Test-Path -LiteralPath $postRollbackPath) 'post-rollback-status.json preserved'
+
+        $summaryJson = Get-Content -LiteralPath $summaryJsonPath -Raw | ConvertFrom-Json
+        Assert-Equal $summaryJson.Prerequisites.PnpInstances.Count 1 'Pre-rollback snapshot captured PnP instance before removal'
+        Assert-Equal $summaryJson.Prerequisites.PnpInstances[0].ProblemCode 10 'Pre-rollback snapshot captured ProblemCode=10'
+        Assert-Equal $summaryJson.Prerequisites.PnpInstances[0].ProblemStatusHex '0xC000009E' 'Pre-rollback snapshot captured ProblemStatusHex=0xC000009E'
+        Assert-Equal $summaryJson.Prerequisites.PnpInstances[0].DriverInfPath 'oem68.inf' 'Pre-rollback snapshot captured oem68.inf'
+        Assert-Equal $summaryJson.StageExecutionSummary.LastSuccessfulStage 'DeviceD0Entry' 'Pre-rollback snapshot captured LastSuccessfulStage'
+        Assert-Equal $summaryJson.StageExecutionSummary.FirstFailureStage 'AdapterInitAsync' 'Pre-rollback snapshot captured FirstFailureStage'
+        Assert-Equal $summaryJson.StageExecutionSummary.FirstFailureStatusHex '0xC000009E' 'Pre-rollback snapshot captured FirstFailureStatusHex'
+        Assert-True ($summaryJson.SetupApiExcerpt.MatchedSectionCount -ge 1) 'Pre-rollback SetupAPI excerpt matched section'
+
+        $postRbJson = Get-Content -LiteralPath $postRollbackPath -Raw | ConvertFrom-Json
+        Assert-Equal $postRbJson.PreRollbackDiagCaptured $true 'post-rollback confirms pre-rollback capture succeeded'
+        Assert-Equal @($postRbJson.RemainingInstances).Count 0 'post-rollback confirms 0 remaining instances'
+        Assert-Equal @($postRbJson.RemainingDriverStorePackages).Count 0 'post-rollback confirms 0 remaining OEM packages'
+    }
+}
+
+# 21. SetupAPI excerpt parser and multi-channel event collector filter relevant records accurately
+Invoke-UnitTest -Name 'SetupApiExcerptAndEventChannelCollection' -TestBody {
+    param($caseDir)
+    $syntheticLog = Join-Path $caseDir 'setupapi.dev.log'
+    @(
+        '>>>  [Device Install (Hardware initiated) - USB\VID_0000&PID_0001\123]',
+        '>>>  Section start 2026/11/18 19:00:00.000',
+        '     dvi: unrelated usb device install',
+        '<<<  Section end 2026/11/18 19:00:01.000',
+        '<<<  [Exit status: SUCCESS]',
+        '',
+        '>>>  [Device Install (Hardware initiated) - ROOT\DISPLAY\0000]',
+        '>>>  Section start 2026/11/18 20:52:06.472',
+        '     inf: {SetupCopyOEMInf: oem68.inf}',
+        '     ndv: Using WDF schema version 2.23 when section requires version 2.31. Section = [LumaBridge_Install.NT.Wdf]',
+        '!!!  dvi: Device not started: Device has problem: 0x0a (CM_PROB_FAILED_START), problem status: 0xc000009e.',
+        '<<<  Section end 2026/11/18 20:52:07.010',
+        '<<<  [Exit status: SUCCESS]'
+    ) | Set-Content -LiteralPath $syntheticLog -Encoding UTF8
+
+    $excerpt = Get-LumaBridgeSetupApiLogExcerpt -SetupApiLogPath $syntheticLog -InstanceIds @('ROOT\DISPLAY\0000') -PublishedInfNames @('oem68.inf')
+    Assert-Equal $excerpt.Exists $true 'Synthetic setupapi.dev.log exists'
+    Assert-Equal $excerpt.MatchedSectionCount 1 'Only ROOT\DISPLAY\0000 section matches; unrelated USB section excluded'
+    Assert-Equal $excerpt.WdfSchemaWarnings.Count 1 'WDF schema 2.23 vs 2.31 warning extracted'
+    Assert-Equal $excerpt.DeviceStartProblemLines.Count 1 'CM_PROB_FAILED_START / 0xc000009e line extracted'
+    Assert-True ($excerpt.RawExcerptText -notmatch 'USB\\VID_0000') 'Unrelated USB section must not appear in excerpt'
+
+    $nowUtc = (Get-Date)
+    $mockEventsByLog = @{
+        'Microsoft-Windows-Kernel-PnP/Configuration' = @(
+            [pscustomobject]@{
+                TimeCreated = $nowUtc; LevelDisplayName = 'Error'; Level = 2; Id = 411; RecordId = 101; ProcessId = 4
+                ProviderName = 'Microsoft-Windows-Kernel-PnP'
+                Message = 'Device ROOT\DISPLAY\0000 had a problem starting. Status: 0xC000009E'
+            }
+        )
+        'Microsoft-Windows-WerKernel/Operational' = @(
+            [pscustomobject]@{
+                TimeCreated = $nowUtc; LevelDisplayName = 'Information'; Level = 4; Id = 1001; RecordId = 202; ProcessId = 4
+                ProviderName = 'Microsoft-Windows-WerKernel'
+                Message = 'Component WATCHDOG has requested to create a Live Kernel Dump and the request has been completed.'
+            }
+        )
+        'Microsoft-Windows-CodeIntegrity/Operational' = @(
+            [pscustomobject]@{
+                TimeCreated = $nowUtc; LevelDisplayName = 'Warning'; Level = 3; Id = 3033; RecordId = 303; ProcessId = 4
+                ProviderName = 'Microsoft-Windows-CodeIntegrity'
+                Message = 'Code Integrity warning check.'
+            }
+        )
+    }
+    $global:LbTestState['MockEventsByLog'] = $mockEventsByLog
+
+    $channelStatus = @(
+        [pscustomobject]@{ LogName = 'Microsoft-Windows-Kernel-PnP/Configuration'; IsEnabled = $true },
+        [pscustomobject]@{ LogName = 'Microsoft-Windows-WerKernel/Operational'; IsEnabled = $true },
+        [pscustomobject]@{ LogName = 'Microsoft-Windows-CodeIntegrity/Operational'; IsEnabled = $true },
+        [pscustomobject]@{ LogName = 'Microsoft-Windows-IndirectDisplays-ClassExtension-Events/Diagnostic'; IsEnabled = $false }
+    )
+
+    Invoke-WithModuleMocks -GlobalMocks @{
+        'Get-WinEvent' = {
+            param([hashtable]$FilterHashtable, [int]$MaxEvents)
+            $ln = $FilterHashtable.LogName
+            if ($global:LbTestState['MockEventsByLog'].ContainsKey($ln)) {
+                return $global:LbTestState['MockEventsByLog'][$ln]
+            }
+            return @()
+        }
+    } -ModuleMocks @{
+        'Get-WinEvent' = {
+            param([hashtable]$FilterHashtable, [int]$MaxEvents)
+            $ln = $FilterHashtable.LogName
+            if ($global:LbTestState['MockEventsByLog'].ContainsKey($ln)) {
+                return $global:LbTestState['MockEventsByLog'][$ln]
+            }
+            return @()
+        }
+    } -Body {
+        $events = @(Get-LumaBridgeDiagnosticEvents -LookbackMinutes 60 -InstanceIds @('ROOT\DISPLAY\0000') -PublishedInfNames @('oem68.inf') -ChannelStatus $channelStatus)
+        Assert-True ((@($events | Where-Object { $_.Id -eq 411 -and $_.LogName -eq 'Microsoft-Windows-Kernel-PnP/Configuration' })).Count -eq 1) 'Kernel-PnP 411 captured'
+        Assert-True ((@($events | Where-Object { $_.Id -eq 1001 -and $_.LogName -eq 'Microsoft-Windows-WerKernel/Operational' })).Count -eq 1) 'WerKernel 1001 WATCHDOG captured'
+        Assert-True ((@($events | Where-Object { $_.Id -eq 3033 -and $_.LogName -eq 'Microsoft-Windows-CodeIntegrity/Operational' })).Count -eq 1) 'CodeIntegrity warning captured'
+        Assert-True ((@($events | Where-Object { $_.LogName -eq 'Microsoft-Windows-IndirectDisplays-ClassExtension-Events/Diagnostic' })).Count -eq 0) 'Disabled channel skipped cleanly'
+    }
+}
+
+# 22. Driver trace stage summary combines DebugView, TraceLogging ETL properties, and registry breadcrumbs
+Invoke-UnitTest -Name 'DriverStageSummaryIdentifiesLastSuccessfulAndFailingStage' -TestBody {
+    $traceLines = @(
+        '[10] [LB-DRIVER] [INFO] pid=7420 tid=201 stage=DriverEntry status=0x00000000 state=Uninitialized lastOk=DllProcessAttach msg="DriverEntry entered"',
+        '[11] [LB-DRIVER] [INFO] pid=7420 tid=201 stage=DeviceD0Entry status=0x00000000 state=DeviceInitialized lastOk=IddCxDeviceInitialize msg="EvtDeviceD0Entry entered"',
+        '[12] [LB-DRIVER] [ERROR] pid=7420 tid=201 stage=AdapterInitAsync status=0xC000009E state=AdapterFailed lastOk=DeviceD0Entry msg="IddCxAdapterInitAsync failed"'
+    )
+
+    $etlEvents = @(
+        [pscustomobject]@{
+            ProviderName = 'LumaBridgeIddDriver'
+            Properties   = @('INFO', 7420, 201, 'IddCxGetVersion', 0, 'AdapterInitPending', 'DeviceD0Entry', 'IddCxGetVersion succeeded')
+        }
+    )
+
+    $regDiag = [pscustomobject]@{
+        LastStage           = 'AdapterInitAsync'
+        LastSuccessfulStage = 'DeviceD0Entry'
+        LastStatusHex       = '0xC000009E'
+        LastErrorStage      = 'AdapterInitAsync'
+        LastErrorStatusHex  = '0xC000009E'
+    }
+
+    $summary = Get-LumaBridgeDriverTraceStageSummary -TraceLines $traceLines -StartupDiagnostics $regDiag -EtlEvents $etlEvents
+    Assert-Equal $summary.DriverEntryReached $true 'DriverEntryReached detected'
+    Assert-Equal $summary.LastSuccessfulStage 'DeviceD0Entry' 'LastSuccessfulStage identifies DeviceD0Entry'
+    Assert-Equal $summary.FirstFailureStage 'AdapterInitAsync' 'FirstFailureStage identifies AdapterInitAsync'
+    Assert-Equal $summary.FirstFailureStatusHex '0xC000009E' 'FirstFailureStatusHex is 0xC000009E'
+    Assert-Equal $summary.StageRecordCount 4 'Combined DebugView + TraceLogging ETL record count'
+    Assert-True ($summary.SourcesUsed -contains 'DebugView') 'SourcesUsed contains DebugView'
+    Assert-True ($summary.SourcesUsed -contains 'TraceLoggingEtl') 'SourcesUsed contains TraceLoggingEtl'
+    Assert-True ($summary.SourcesUsed -contains 'RegistryBreadcrumb') 'SourcesUsed contains RegistryBreadcrumb'
+}
+
+# 23. Crash dump inventory & ETW trace helper script work cleanly in isolation and DryRun
+Invoke-UnitTest -Name 'CrashDumpInventoryAndEtwTraceDryRun' -TestBody {
+    param($caseDir)
+    $crashDir = Join-Path $caseDir 'CrashDumps'
+    New-Item -Path $crashDir -ItemType Directory -Force | Out-Null
+    [System.IO.File]::WriteAllBytes((Join-Path $crashDir 'WUDFHost.1234.dmp'), [byte[]]@(1, 2, 3, 4))
+
+    $autoLoggerPath = Join-Path $caseDir 'Microsoft-Windows-Rdp-Graphics-RdpIdd-Trace.etl'
+    [System.IO.File]::WriteAllBytes($autoLoggerPath, [byte[]]@(5, 6, 7, 8))
+
+    $inv = Get-LumaBridgeCrashDumpInventory -LookbackMinutes 60 -LocalCrashDumpsDir $crashDir -DriverDataAutoLoggerPath $autoLoggerPath
+    Assert-Equal (@($inv.Files | Where-Object { $_.Category -eq 'UserCrashDump' -and $_.Name -eq 'WUDFHost.1234.dmp' })).Count 1 'UserCrashDump WUDFHost.1234.dmp discovered'
+    Assert-Equal (@($inv.Files | Where-Object { $_.Category -eq 'RdpIddAutoLoggerEtl' })).Count 1 'RdpIdd AutoLogger ETL discovered'
+
+    $etwDir = Join-Path $caseDir 'etw_dry'
+    $startDry = & (Join-Path $scriptsDir 'Invoke-LumaBridgeEtwTrace.ps1') -Action Start -IncludeDxgKrnl -OutputDir $etwDir -DryRun
+    Assert-Equal $startDry.DryRun $true 'ETW Start DryRun works'
+    Assert-Equal $startDry.Providers.Count 8 'ETW Start with -IncludeDxgKrnl includes all 8 providers'
+    Assert-Equal $startDry.ExecutedCommands.Count 8 'One logman create + seven logman update commands planned'
+    Assert-Equal (Test-Path -LiteralPath $etwDir) $false 'ETW Start DryRun must not create output directory'
+
+    $exportDir = Join-Path $caseDir 'etw_export'
+    $fakeEtl = Join-Path $exportDir 'LumaBridgeIddTrace.etl'
+    $global:LbTestState['MockEtlPath'] = $fakeEtl
+
+    Invoke-WithModuleMocks -GlobalMocks @{
+        'Get-LumaBridgeEtlEventSummary' = {
+            param([string]$EtlPath, [int]$MaxEvents)
+            return [pscustomobject]@{
+                EtlPath          = $EtlPath
+                Exists           = $true
+                EventCount       = 1
+                LumaBridgeEvents = @(
+                    [pscustomobject]@{
+                        ProviderName = 'LumaBridgeIddDriver'
+                        Properties   = @('INFO', 100, 200, 'DriverEntry', 0, 'Uninitialized', 'DllProcessAttach', 'DriverEntry entered')
+                    }
+                )
+                Providers        = @([pscustomobject]@{ ProviderName = 'LumaBridgeIddDriver'; Count = 1 })
+                Events           = @()
+                Error            = ''
+            }
+        }
+    } -Body {
+        $exported = & (Join-Path $scriptsDir 'Invoke-LumaBridgeEtwTrace.ps1') -Action ExportSummary -OutputDir $exportDir -EtlPath $fakeEtl
+        Assert-True (Test-Path -LiteralPath $exported.DecodedSummaryPath) 'ExportSummary writes etw-decoded-events.json'
+        Assert-Equal $exported.StageSummary.DriverEntryReached $true 'ExportSummary computes StageSummary from ETL events'
+    }
 }
 
 try {

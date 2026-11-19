@@ -3,19 +3,30 @@ Set-StrictMode -Version Latest
 Add-Type -AssemblyName System.Security
 
 $script:LumaBridgeDriverConstants = [pscustomobject]@{
-    HardwareId                = 'Root\LumaBridgeIddDriver'
-    DeviceDisplayName         = 'LumaBridge Indirect Display Adapter'
-    DriverServiceName         = 'LumaBridgeIddDriver'
-    DisplayClassGuid          = '{4d36e968-e325-11ce-bfc1-08002be10318}'
-    DriverProviderName        = 'LumaBridge'
-    InfFileName               = 'LumaBridgeIddDriver.inf'
-    DllFileName               = 'LumaBridgeIddDriver.dll'
-    CatFileName               = 'lumabridgeidddriver.cat'
-    DefaultCertificateSubject = 'CN=LumaBridge Test Driver Signing'
-    DefaultConfiguration      = 'Release'
-    SupportedInf2CatOsList    = '10_CO_X64,10_NI_X64,10_GE_X64'
-    MinimumWindows11Build     = 22000
-    RegistryValueEnableMon    = 'EnableVirtualMonitor'
+    HardwareId                  = 'Root\LumaBridgeIddDriver'
+    DeviceDisplayName           = 'LumaBridge Indirect Display Adapter'
+    DriverServiceName           = 'LumaBridgeIddDriver'
+    DisplayClassGuid            = '{4d36e968-e325-11ce-bfc1-08002be10318}'
+    DriverProviderName          = 'LumaBridge'
+    InfFileName                 = 'LumaBridgeIddDriver.inf'
+    DllFileName                 = 'LumaBridgeIddDriver.dll'
+    CatFileName                 = 'lumabridgeidddriver.cat'
+    DefaultCertificateSubject   = 'CN=LumaBridge Test Driver Signing'
+    DefaultConfiguration        = 'Release'
+    SupportedInf2CatOsList      = '10_CO_X64,10_NI_X64,10_GE_X64'
+    MinimumWindows11Build       = 22000
+    RegistryValueEnableMon      = 'EnableVirtualMonitor'
+    EtwSessionName              = 'LumaBridgeIddTrace'
+    LumaBridgeTraceProviderGuid = '{A7E4C910-5B32-4F8E-9D21-7C3A1B8E4F01}'
+    IddCxManifestProviderGuid   = '{966CD1C0-3F69-42AD-9877-517DCE8462B4}'
+    IddCxWppProviderGuid        = '{D92BCB52-FA78-406F-A9A5-2037509FADEA}'
+    IddCxWppMatchAnyKeyword     = '0x4000000004f4'
+    UmdfOperationalProviderGuid = '{2E35AAEB-857F-4BEB-A418-2E6C0E54D988}'
+    WdfCoreWppProviderGuid      = '{485E7DE9-0A80-11D8-AD15-505054503030}'
+    WatchdogEventsProviderGuid  = '{70E74DD8-39DB-5F6F-6FD1-F5581B29E834}'
+    WerKernelProviderGuid       = '{87A623F0-8DB5-5C11-7C80-A2EBBCBE5189}'
+    DxgKrnlProviderGuid         = '{802EC45A-1E99-4B83-9920-87C98277BA9D}'
+    DefaultSetupApiLogPath      = 'C:\Windows\INF\setupapi.dev.log'
 }
 
 if (-not ([System.Management.Automation.PSTypeName]'LumaBridgeNativeCatalogVerifier').Type) {
@@ -826,6 +837,116 @@ function Get-LumaBridgeDevicePropertyData {
     return $prop.Data
 }
 
+function Format-LumaBridgeNtStatusHex {
+    [CmdletBinding()]
+    param(
+        $StatusValue
+    )
+
+    if ($null -eq $StatusValue) {
+        return $null
+    }
+
+    try {
+        if ($StatusValue -is [string]) {
+            if ([string]::IsNullOrWhiteSpace($StatusValue)) {
+                return $null
+            }
+            if ($StatusValue -match '^\s*0[xX]([0-9A-Fa-f]{1,8})\s*$') {
+                $parsed = [Convert]::ToUInt32($matches[1], 16)
+                return ('0x{0:X8}' -f $parsed)
+            }
+        }
+
+        $numeric64 = [int64]$StatusValue
+        $u32 = [uint32]($numeric64 -band 0xFFFFFFFFL)
+        return ('0x{0:X8}' -f $u32)
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-LumaBridgeDeviceStartupDiagnostics {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DeviceParametersPath
+    )
+
+    $exists = $false
+    try {
+        $exists = Test-Path -LiteralPath $DeviceParametersPath -ErrorAction SilentlyContinue
+    }
+    catch {
+        $exists = $false
+    }
+
+    if (-not $exists) {
+        return $null
+    }
+
+    $diagNames = @(
+        'DiagLastStage',
+        'DiagLastSuccessfulStage',
+        'DiagLastStatus',
+        'DiagLastErrorStage',
+        'DiagLastErrorStatus',
+        'DiagIddCxVersion',
+        'DiagHostProcessId',
+        'DiagDllAttachCount'
+    )
+
+    $props = $null
+    try {
+        $props = Get-ItemProperty -LiteralPath $DeviceParametersPath -ErrorAction Stop
+    }
+    catch {
+        return $null
+    }
+
+    if ($null -eq $props) {
+        return $null
+    }
+
+    $hasAny = $false
+    foreach ($name in $diagNames) {
+        if ($props.PSObject.Properties.Name -contains $name) {
+            $hasAny = $true
+            break
+        }
+    }
+    if (-not $hasAny) {
+        return $null
+    }
+
+    $getProp = {
+        param([string]$PropName)
+        if ($props.PSObject.Properties.Name -contains $PropName) {
+            return $props.$PropName
+        }
+        return $null
+    }
+
+    $lastStatusRaw = & $getProp 'DiagLastStatus'
+    $lastErrorStatusRaw = & $getProp 'DiagLastErrorStatus'
+    $iddCxVersionRaw = & $getProp 'DiagIddCxVersion'
+
+    return [pscustomobject]@{
+        LastStage           = & $getProp 'DiagLastStage'
+        LastSuccessfulStage = & $getProp 'DiagLastSuccessfulStage'
+        LastStatus          = $lastStatusRaw
+        LastStatusHex       = Format-LumaBridgeNtStatusHex -StatusValue $lastStatusRaw
+        LastErrorStage      = & $getProp 'DiagLastErrorStage'
+        LastErrorStatus     = $lastErrorStatusRaw
+        LastErrorStatusHex  = Format-LumaBridgeNtStatusHex -StatusValue $lastErrorStatusRaw
+        IddCxRuntimeVersion = $iddCxVersionRaw
+        IddCxRuntimeVerHex  = Format-LumaBridgeNtStatusHex -StatusValue $iddCxVersionRaw
+        HostProcessId       = & $getProp 'DiagHostProcessId'
+        DllAttachCount      = & $getProp 'DiagDllAttachCount'
+    }
+}
+
 function Get-LumaBridgePnpInstances {
     [CmdletBinding()]
     param(
@@ -868,29 +989,52 @@ function Get-LumaBridgePnpInstances {
 
             if ($seenIds.Add($dev.InstanceId)) {
                 $probCode = Get-LumaBridgeDevicePropertyData -InstanceId $dev.InstanceId -KeyName 'DEVPKEY_Device_ProblemCode'
+                $probStatus = Get-LumaBridgeDevicePropertyData -InstanceId $dev.InstanceId -KeyName 'DEVPKEY_Device_ProblemStatus'
+                $probStatusHex = Format-LumaBridgeNtStatusHex -StatusValue $probStatus
                 $driverInfPath = Get-LumaBridgeDevicePropertyData -InstanceId $dev.InstanceId -KeyName 'DEVPKEY_Device_DriverInfPath'
                 $driverProvider = Get-LumaBridgeDevicePropertyData -InstanceId $dev.InstanceId -KeyName 'DEVPKEY_Device_DriverProvider'
                 $driverVersion = Get-LumaBridgeDevicePropertyData -InstanceId $dev.InstanceId -KeyName 'DEVPKEY_Device_DriverVersion'
                 $driverService = Get-LumaBridgeDevicePropertyData -InstanceId $dev.InstanceId -KeyName 'DEVPKEY_Device_Service'
                 $configurationId = Get-LumaBridgeDevicePropertyData -InstanceId $dev.InstanceId -KeyName 'DEVPKEY_Device_ConfigurationId'
+                $upperFiltersData = Get-LumaBridgeDevicePropertyData -InstanceId $dev.InstanceId -KeyName 'DEVPKEY_Device_UpperFilters'
+                $lowerFiltersData = Get-LumaBridgeDevicePropertyData -InstanceId $dev.InstanceId -KeyName 'DEVPKEY_Device_LowerFilters'
+
+                $upperFilters = if ($null -ne $upperFiltersData) {
+                    @($upperFiltersData | ForEach-Object { $_.ToString() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                }
+                else {
+                    @()
+                }
+                $lowerFilters = if ($null -ne $lowerFiltersData) {
+                    @($lowerFiltersData | ForEach-Object { $_.ToString() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                }
+                else {
+                    @()
+                }
 
                 $regParamsPath = Get-LumaBridgeDeviceParametersRegistryPath -InstanceId $dev.InstanceId
                 $enableVal = Get-LumaBridgeDeviceEnableVirtualMonitor -DeviceParametersPath $regParamsPath
+                $startupDiag = Get-LumaBridgeDeviceStartupDiagnostics -DeviceParametersPath $regParamsPath
 
                 $results.Add([pscustomobject]@{
                     InstanceId           = $dev.InstanceId
                     FriendlyName         = $dev.FriendlyName
                     Status               = $dev.Status
                     ProblemCode          = $probCode
+                    ProblemStatus        = $probStatus
+                    ProblemStatusHex     = $probStatusHex
                     Present              = [bool]$dev.Present
                     HardwareIds          = @($effectiveHardwareIds)
                     DriverInfPath        = $driverInfPath
                     DriverProvider       = $driverProvider
                     DriverVersion        = $driverVersion
                     DriverService        = $driverService
+                    UpperFilters         = @($upperFilters)
+                    LowerFilters         = @($lowerFilters)
                     ConfigurationId      = $configurationId
                     DeviceParametersPath = $regParamsPath
                     EnableVirtualMonitor = $enableVal
+                    StartupDiagnostics   = $startupDiag
                 })
             }
         }
@@ -904,21 +1048,27 @@ function Get-LumaBridgePnpInstances {
             if ($seenIds.Add($ent.PNPDeviceID)) {
                 $regParamsPath = Get-LumaBridgeDeviceParametersRegistryPath -InstanceId $ent.PNPDeviceID
                 $enableVal = Get-LumaBridgeDeviceEnableVirtualMonitor -DeviceParametersPath $regParamsPath
+                $startupDiag = Get-LumaBridgeDeviceStartupDiagnostics -DeviceParametersPath $regParamsPath
 
                 $results.Add([pscustomobject]@{
                     InstanceId           = $ent.PNPDeviceID
                     FriendlyName         = $ent.Name
                     Status               = $ent.Status
                     ProblemCode          = $ent.ConfigManagerErrorCode
+                    ProblemStatus        = $null
+                    ProblemStatusHex     = $null
                     Present              = ($ent.ConfigManagerErrorCode -eq 0)
                     HardwareIds          = @($ent.HardwareID)
                     DriverInfPath        = $null
                     DriverProvider       = $null
                     DriverVersion        = $null
                     DriverService        = $ent.Service
+                    UpperFilters         = @()
+                    LowerFilters         = @()
                     ConfigurationId      = $null
                     DeviceParametersPath = $regParamsPath
                     EnableVirtualMonitor = $enableVal
+                    StartupDiagnostics   = $startupDiag
                 })
             }
         }
@@ -927,7 +1077,7 @@ function Get-LumaBridgePnpInstances {
     return @($results.ToArray())
 }
 
-function Get-LumaBridgeInfDriverVersion {
+function Get-LumaBridgeInfDriverVerMetadata {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
@@ -950,9 +1100,28 @@ function Get-LumaBridgeInfDriverVersion {
             continue
         }
 
-        if ($inVersionSection -and $line -match '^(?i)DriverVer\s*=\s*[^,]+,\s*(?<Version>[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\s*$') {
-            return $matches['Version'].Trim()
+        if ($inVersionSection -and $line -match '^(?i)DriverVer\s*=\s*(?<Raw>(?<Date>[^,]+),\s*(?<Version>[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+))\s*$') {
+            return [pscustomobject]@{
+                Raw     = $matches['Raw'].Trim()
+                Date    = $matches['Date'].Trim()
+                Version = $matches['Version'].Trim()
+            }
         }
+    }
+
+    return $null
+}
+
+function Get-LumaBridgeInfDriverVersion {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$InfPath
+    )
+
+    $meta = Get-LumaBridgeInfDriverVerMetadata -InfPath $InfPath
+    if ($null -ne $meta) {
+        return $meta.Version
     }
 
     return $null
@@ -974,19 +1143,35 @@ function Test-LumaBridgeDeviceDriverBinding {
     $reasons = New-Object System.Collections.Generic.List[string]
     $expectedVersion = $null
     $constants = $script:LumaBridgeDriverConstants
+    $problemCode = $null
+    $problemStatusHex = $null
 
     if ($null -eq $Instance) {
         $reasons.Add('Device instance is null.')
     }
     else {
+        $problemCode = if ($Instance.PSObject.Properties.Name -contains 'ProblemCode') { $Instance.ProblemCode } else { $null }
+        $rawProbStatusHex = if ($Instance.PSObject.Properties.Name -contains 'ProblemStatusHex') { $Instance.ProblemStatusHex } else { $null }
+        $rawProbStatus = if ($Instance.PSObject.Properties.Name -contains 'ProblemStatus') { $Instance.ProblemStatus } else { $null }
+        $problemStatusHex = if (-not [string]::IsNullOrWhiteSpace([string]$rawProbStatusHex)) {
+            [string]$rawProbStatusHex
+        }
+        else {
+            Format-LumaBridgeNtStatusHex -StatusValue $rawProbStatus
+        }
+
         if (-not $Instance.Present) {
             $reasons.Add("Device is not marked Present.")
         }
         if ($Instance.Status -ine 'OK') {
             $reasons.Add(("Device status is '{0}' instead of 'OK'." -f $Instance.Status))
         }
-        if ($null -ne $Instance.ProblemCode -and [int]$Instance.ProblemCode -ne 0) {
-            $reasons.Add(("Device ProblemCode is {0} (expected 0)." -f $Instance.ProblemCode))
+        if ($null -ne $problemCode -and [int]$problemCode -ne 0) {
+            $probMsg = "Device ProblemCode is {0} (expected 0)" -f $problemCode
+            if (-not [string]::IsNullOrWhiteSpace($problemStatusHex)) {
+                $probMsg += ("; ProblemStatus is {0}" -f $problemStatusHex)
+            }
+            $reasons.Add(($probMsg + '.'))
         }
         if (@($Instance.HardwareIds | Where-Object { $_ -ieq $HardwareId }).Count -eq 0) {
             $reasons.Add(("Device DEVPKEY_Device_HardwareIds does not contain '{0}'." -f $HardwareId))
@@ -1018,6 +1203,8 @@ function Test-LumaBridgeDeviceDriverBinding {
         BoundDriverInfPath    = if ($null -ne $Instance) { $Instance.DriverInfPath } else { $null }
         BoundDriverProvider   = if ($null -ne $Instance) { $Instance.DriverProvider } else { $null }
         BoundDriverVersion    = if ($null -ne $Instance) { $Instance.DriverVersion } else { $null }
+        ProblemCode           = $problemCode
+        ProblemStatusHex      = $problemStatusHex
     }
 }
 
@@ -1417,11 +1604,15 @@ function Test-LumaBridgePackageArtifacts {
         $catHashes.AllMembersVerified
     )
 
+    $infDriverVerMeta = if ($infExists) { Get-LumaBridgeInfDriverVerMetadata -InfPath $infPath } else { $null }
+
     $result = [pscustomobject]@{
         PackageDirectory           = $PackageDirectory
         AllFilesPresent            = $allFilesPresent
         InfPath                    = $infPath
         InfPresent                 = $infExists
+        InfDriverVersion           = if ($null -ne $infDriverVerMeta) { $infDriverVerMeta.Version } else { $null }
+        InfDriverVerRaw            = if ($null -ne $infDriverVerMeta) { $infDriverVerMeta.Raw } else { $null }
         InfSha256                  = if ($infExists) { (Get-FileHash -LiteralPath $infPath -Algorithm SHA256).Hash } else { $null }
         DllPath                    = $dllPath
         DllPresent                 = $dllExists
@@ -1824,6 +2015,794 @@ function Remove-LumaBridgeCertificateFromStores {
     return @($removed.ToArray())
 }
 
+function Get-LumaBridgeSetupApiLogExcerpt {
+    [CmdletBinding()]
+    param(
+        [string]$SetupApiLogPath = $script:LumaBridgeDriverConstants.DefaultSetupApiLogPath,
+
+        [string[]]$InstanceIds = @(),
+
+        [string[]]$PublishedInfNames = @(),
+
+        [ValidateRange(1, 100)]
+        [int]$MaxMatchedSections = 20
+    )
+
+    if ([string]::IsNullOrWhiteSpace($SetupApiLogPath) -or -not (Test-Path -LiteralPath $SetupApiLogPath -PathType Leaf)) {
+        return [pscustomobject]@{
+            LogPath                  = $SetupApiLogPath
+            Exists                   = $false
+            AccessDenied             = $false
+            Error                    = 'SetupAPI log file not found.'
+            MatchedSectionCount      = 0
+            WdfSchemaWarnings        = @()
+            DeviceStartProblemLines  = @()
+            Sections                 = @()
+            RawExcerptText           = ''
+        }
+    }
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $fs = $null
+    $reader = $null
+    try {
+        $fs = [System.IO.File]::Open(
+            $SetupApiLogPath,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::ReadWrite)
+        $reader = New-Object System.IO.StreamReader($fs)
+        while (-not $reader.EndOfStream) {
+            $lines.Add($reader.ReadLine())
+        }
+    }
+    catch [System.UnauthorizedAccessException] {
+        return [pscustomobject]@{
+            LogPath                  = $SetupApiLogPath
+            Exists                   = $true
+            AccessDenied             = $true
+            Error                    = $_.Exception.Message
+            MatchedSectionCount      = 0
+            WdfSchemaWarnings        = @()
+            DeviceStartProblemLines  = @()
+            Sections                 = @()
+            RawExcerptText           = ''
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            LogPath                  = $SetupApiLogPath
+            Exists                   = $true
+            AccessDenied             = $false
+            Error                    = $_.Exception.Message
+            MatchedSectionCount      = 0
+            WdfSchemaWarnings        = @()
+            DeviceStartProblemLines  = @()
+            Sections                 = @()
+            RawExcerptText           = ''
+        }
+    }
+    finally {
+        if ($null -ne $reader) { $reader.Dispose() }
+        elseif ($null -ne $fs) { $fs.Dispose() }
+    }
+
+    $patterns = New-Object System.Collections.Generic.List[string]
+    $patterns.Add('LumaBridge')
+    $patterns.Add([regex]::Escape($script:LumaBridgeDriverConstants.HardwareId))
+    $patterns.Add([regex]::Escape($script:LumaBridgeDriverConstants.InfFileName))
+    foreach ($id in @($InstanceIds)) {
+        if (-not [string]::IsNullOrWhiteSpace($id)) {
+            $patterns.Add([regex]::Escape($id.Trim()))
+        }
+    }
+    foreach ($inf in @($PublishedInfNames)) {
+        if (-not [string]::IsNullOrWhiteSpace($inf)) {
+            $patterns.Add([regex]::Escape($inf.Trim()))
+        }
+    }
+    $combinedPattern = '(?i)(' + (($patterns | Select-Object -Unique) -join '|') + ')'
+
+    $allMatchedSections = New-Object System.Collections.Generic.List[object]
+    $currentLines = $null
+    $currentTitle = ''
+    $currentStart = ''
+
+    $flushSection = {
+        param($SecLines, [string]$Title, [string]$StartTime)
+        if ($null -eq $SecLines -or $SecLines.Count -eq 0) {
+            return
+        }
+        $joined = ($SecLines.ToArray() -join [Environment]::NewLine)
+        if ($joined -match $combinedPattern) {
+            $exitStatus = $null
+            for ($i = $SecLines.Count - 1; $i -ge 0; --$i) {
+                if ($SecLines[$i] -match '<<<\s+\[Exit status:\s*(?<Status>[^\]]+)\]') {
+                    $exitStatus = $matches['Status'].Trim()
+                    break
+                }
+            }
+            $wdfWarns = @($SecLines.ToArray() | Where-Object { $_ -match '(?i)Using WDF schema version' })
+            $probLines = @($SecLines.ToArray() | Where-Object { $_ -match '(?i)(Device not started|CM_PROB_|problem status:|FAILED)' })
+            $allMatchedSections.Add([pscustomobject]@{
+                Title                   = $Title
+                StartTime               = $StartTime
+                ExitStatus              = $exitStatus
+                LineCount               = $SecLines.Count
+                WdfSchemaWarnings       = @($wdfWarns | ForEach-Object { $_.Trim() })
+                DeviceStartProblemLines = @($probLines | ForEach-Object { $_.Trim() })
+                Text                    = $joined
+            })
+        }
+    }
+
+    foreach ($line in $lines) {
+        if ($line -match '^>>>\s+\[(?<Title>[^\]]+)\]\s*$') {
+            & $flushSection $currentLines $currentTitle $currentStart
+            $currentLines = New-Object System.Collections.Generic.List[string]
+            $currentTitle = $matches['Title'].Trim()
+            $currentStart = ''
+            $currentLines.Add($line)
+            continue
+        }
+
+        if ($null -eq $currentLines) {
+            continue
+        }
+
+        $currentLines.Add($line)
+        if ([string]::IsNullOrWhiteSpace($currentStart) -and $line -match '^>>>\s+Section start\s+(?<Ts>.+)$') {
+            $currentStart = $matches['Ts'].Trim()
+        }
+
+        if ($line -match '^<<<\s+\[Exit status:') {
+            & $flushSection $currentLines $currentTitle $currentStart
+            $currentLines = $null
+            $currentTitle = ''
+            $currentStart = ''
+        }
+    }
+
+    & $flushSection $currentLines $currentTitle $currentStart
+
+    $selectedSections = if ($allMatchedSections.Count -gt $MaxMatchedSections) {
+        @($allMatchedSections.ToArray() | Select-Object -Last $MaxMatchedSections)
+    }
+    else {
+        @($allMatchedSections.ToArray())
+    }
+    $selectedSections = @($selectedSections)
+
+    $allWdfWarns = New-Object System.Collections.Generic.List[string]
+    $allProbLines = New-Object System.Collections.Generic.List[string]
+    foreach ($sec in $selectedSections) {
+        foreach ($w in @($sec.WdfSchemaWarnings)) { $allWdfWarns.Add($w) }
+        foreach ($p in @($sec.DeviceStartProblemLines)) { $allProbLines.Add($p) }
+    }
+
+    $excerptText = ($selectedSections | ForEach-Object { $_.Text }) -join ([Environment]::NewLine + [Environment]::NewLine)
+
+    return [pscustomobject]@{
+        LogPath                 = $SetupApiLogPath
+        Exists                  = $true
+        AccessDenied            = $false
+        Error                   = ''
+        MatchedSectionCount     = $selectedSections.Count
+        WdfSchemaWarnings       = @($allWdfWarns.ToArray())
+        DeviceStartProblemLines = @($allProbLines.ToArray())
+        Sections                = @($selectedSections | ForEach-Object {
+            [pscustomobject]@{
+                Title                   = $_.Title
+                StartTime               = $_.StartTime
+                ExitStatus              = $_.ExitStatus
+                LineCount               = $_.LineCount
+                WdfSchemaWarnings       = $_.WdfSchemaWarnings
+                DeviceStartProblemLines = $_.DeviceStartProblemLines
+            }
+        })
+        RawExcerptText          = $excerptText
+    }
+}
+
+function Get-LumaBridgeEventChannelStatus {
+    [CmdletBinding()]
+    param(
+        [string[]]$ChannelNames = @(
+            'Microsoft-Windows-Kernel-PnP/Configuration',
+            'Microsoft-Windows-Kernel-PnP/Device Management',
+            'Microsoft-Windows-Kernel-PnP/Driver Watchdog',
+            'Microsoft-Windows-CodeIntegrity/Operational',
+            'Microsoft-Windows-DriverFrameworks-UserMode/Operational',
+            'Microsoft-Windows-WerKernel/Operational',
+            'Microsoft-Windows-DxgKrnl-Admin',
+            'Microsoft-Windows-DxgKrnl-Operational',
+            'Microsoft-Windows-IndirectDisplays-ClassExtension-Events/Diagnostic',
+            'System'
+        )
+    )
+
+    $winEventCmd = Get-Command -Name 'Get-WinEvent' -ErrorAction SilentlyContinue
+    $supportsListLog = ($null -ne $winEventCmd -and $winEventCmd.Parameters.ContainsKey('ListLog'))
+    $statuses = New-Object System.Collections.Generic.List[object]
+
+    foreach ($ch in $ChannelNames) {
+        if (-not $supportsListLog) {
+            $statuses.Add([pscustomobject]@{
+                LogName     = $ch
+                IsEnabled   = $true
+                LogType     = 'MockedOrUnavailable'
+                RecordCount = $null
+                QueryError  = ''
+            })
+            continue
+        }
+
+        try {
+            $logInfo = Get-WinEvent -ListLog $ch -ErrorAction Stop | Select-Object -First 1
+            $statuses.Add([pscustomobject]@{
+                LogName     = $logInfo.LogName
+                IsEnabled   = [bool]$logInfo.IsEnabled
+                LogType     = $logInfo.LogType.ToString()
+                RecordCount = $logInfo.RecordCount
+                QueryError  = ''
+            })
+        }
+        catch {
+            $statuses.Add([pscustomobject]@{
+                LogName     = $ch
+                IsEnabled   = $false
+                LogType     = 'Unavailable'
+                RecordCount = $null
+                QueryError  = $_.Exception.Message
+            })
+        }
+    }
+
+    return @($statuses.ToArray())
+}
+
+function Get-LumaBridgeDiagnosticEvents {
+    [CmdletBinding()]
+    param(
+        [ValidateRange(1, 10080)]
+        [int]$LookbackMinutes = 60,
+
+        [string[]]$InstanceIds = @(),
+
+        [string[]]$PublishedInfNames = @(),
+
+        [object[]]$ChannelStatus = @()
+    )
+
+    $cutoffTime = (Get-Date).AddMinutes(-1 * $LookbackMinutes)
+    $extraTokens = New-Object System.Collections.Generic.List[string]
+    foreach ($id in @($InstanceIds)) {
+        if (-not [string]::IsNullOrWhiteSpace($id)) { $extraTokens.Add([regex]::Escape($id.Trim())) }
+    }
+    foreach ($inf in @($PublishedInfNames)) {
+        if (-not [string]::IsNullOrWhiteSpace($inf)) { $extraTokens.Add([regex]::Escape($inf.Trim())) }
+    }
+    $dynamicSuffix = if ($extraTokens.Count -gt 0) { '|' + (($extraTokens | Select-Object -Unique) -join '|') } else { '' }
+
+    $channelSpecs = @(
+        @{
+            LogName    = 'Microsoft-Windows-Kernel-PnP/Configuration'
+            Pattern    = ('LumaBridge|ROOT\\DISPLAY|IndirectKmd|WUDFRd' + $dynamicSuffix)
+            IncludeIds = @(400, 410, 411, 420, 430)
+            AllLevels  = $false
+        },
+        @{
+            LogName    = 'Microsoft-Windows-Kernel-PnP/Device Management'
+            Pattern    = ('LumaBridge|ROOT\\DISPLAY|IndirectKmd|WUDFRd' + $dynamicSuffix)
+            IncludeIds = @()
+            AllLevels  = $false
+        },
+        @{
+            LogName    = 'Microsoft-Windows-Kernel-PnP/Driver Watchdog'
+            Pattern    = ('LumaBridge|ROOT\\DISPLAY|IndirectKmd|WUDFRd|WATCHDOG' + $dynamicSuffix)
+            IncludeIds = @()
+            AllLevels  = $true
+        },
+        @{
+            LogName    = 'Microsoft-Windows-CodeIntegrity/Operational'
+            Pattern    = ('LumaBridge|WUDF|Indirect' + $dynamicSuffix)
+            IncludeIds = @()
+            IncludeWarnOrError = $true
+            AllLevels  = $false
+        },
+        @{
+            LogName    = 'Microsoft-Windows-DriverFrameworks-UserMode/Operational'
+            Pattern    = ('LumaBridge|WUDF|UserMode|UmPass|Indirect|Idd|ROOT\\DISPLAY' + $dynamicSuffix)
+            IncludeIds = @()
+            AllLevels  = $true
+        },
+        @{
+            LogName    = 'Microsoft-Windows-WerKernel/Operational'
+            Pattern    = 'WATCHDOG|LumaBridge|WUDF|Indirect|Display|Dxg'
+            IncludeIds = @(1001)
+            AllLevels  = $true
+        },
+        @{
+            LogName    = 'Microsoft-Windows-DxgKrnl-Admin'
+            Pattern    = 'LumaBridge|Indirect|Display|Watchdog'
+            IncludeIds = @()
+            AllLevels  = $true
+        },
+        @{
+            LogName    = 'Microsoft-Windows-DxgKrnl-Operational'
+            Pattern    = 'LumaBridge|Indirect|Display|Watchdog'
+            IncludeIds = @()
+            AllLevels  = $true
+        },
+        @{
+            LogName    = 'Microsoft-Windows-IndirectDisplays-ClassExtension-Events/Diagnostic'
+            Pattern    = '.*'
+            IncludeIds = @()
+            AllLevels  = $true
+        },
+        @{
+            LogName    = 'System'
+            Pattern    = ('LumaBridge|WUDF|IndirectKmd|IddCx|Display|WATCHDOG|0xc000009e' + $dynamicSuffix)
+            IncludeIds = @()
+            AllLevels  = $false
+        }
+    )
+
+    $enabledMap = @{}
+    foreach ($cs in @($ChannelStatus)) {
+        if ($null -ne $cs -and ($cs.PSObject.Properties.Name -contains 'LogName')) {
+            $enabledMap[$cs.LogName] = [bool]$cs.IsEnabled
+        }
+    }
+
+    $collected = New-Object System.Collections.Generic.List[object]
+
+    foreach ($spec in $channelSpecs) {
+        $logName = $spec.LogName
+        if ($enabledMap.ContainsKey($logName) -and -not $enabledMap[$logName]) {
+            continue
+        }
+
+        try {
+            $events = @(Get-WinEvent -FilterHashtable @{
+                LogName   = $logName
+                StartTime = $cutoffTime
+            } -MaxEvents 200 -ErrorAction Stop)
+
+            $matched = New-Object System.Collections.Generic.List[object]
+            foreach ($ev in $events) {
+                $msg = if ($null -ne $ev.Message) { [string]$ev.Message } else { '' }
+                $prov = if ($ev.PSObject.Properties.Name -contains 'ProviderName') { [string]$ev.ProviderName } else { '' }
+                $evId = if ($ev.PSObject.Properties.Name -contains 'Id') { [int]$ev.Id } else { 0 }
+                $evLevel = if ($ev.PSObject.Properties.Name -contains 'Level') { $ev.Level } else { $null }
+
+                $isMatch = ($spec.AllLevels) -or
+                    ($msg -match $spec.Pattern) -or
+                    ($prov -match 'DriverFrameworks|WUDF|LumaBridge|Indirect|WerKernel|DxgKrnl') -or
+                    (@($spec.IncludeIds) -contains $evId)
+
+                if (-not $isMatch -and $spec.ContainsKey('IncludeWarnOrError') -and $spec.IncludeWarnOrError -and $null -ne $evLevel -and [int]$evLevel -le 3) {
+                    $isMatch = $true
+                }
+
+                if ($isMatch) {
+                    $evPid = if ($ev.PSObject.Properties.Name -contains 'ProcessId') { $ev.ProcessId } else { $null }
+                    $evRecId = if ($ev.PSObject.Properties.Name -contains 'RecordId') { $ev.RecordId } else { $null }
+                    $evLevelDisp = if ($ev.PSObject.Properties.Name -contains 'LevelDisplayName') { $ev.LevelDisplayName } else { '' }
+                    $evTime = if ($ev.PSObject.Properties.Name -contains 'TimeCreated' -and $null -ne $ev.TimeCreated) {
+                        $ev.TimeCreated.ToUniversalTime().ToString('o')
+                    }
+                    else {
+                        (Get-Date).ToUniversalTime().ToString('o')
+                    }
+
+                    $matched.Add([pscustomobject]@{
+                        LogName       = $logName
+                        TimeCreated   = $evTime
+                        LevelDisplay  = $evLevelDisp
+                        Id            = $evId
+                        EventRecordId = $evRecId
+                        ProcessId     = $evPid
+                        ProviderName  = $prov
+                        Message       = ($msg -replace '\r?\n', ' ').Trim()
+                    })
+                    if ($matched.Count -ge 40) {
+                        break
+                    }
+                }
+            }
+
+            foreach ($m in $matched) {
+                $collected.Add($m)
+            }
+        }
+        catch {
+            $collected.Add([pscustomobject]@{
+                LogName       = $logName
+                TimeCreated   = (Get-Date).ToUniversalTime().ToString('o')
+                LevelDisplay  = 'Info'
+                Id            = 0
+                EventRecordId = $null
+                ProcessId     = $null
+                ProviderName  = 'LumaBridgeDiagnostics'
+                Message       = ("Log query skipped or returned no events: {0}" -f $_.Exception.Message)
+            })
+        }
+    }
+
+    return @($collected.ToArray())
+}
+
+function Get-LumaBridgeCrashDumpInventory {
+    [CmdletBinding()]
+    param(
+        [ValidateRange(1, 10080)]
+        [int]$LookbackMinutes = 120,
+
+        [string]$LocalCrashDumpsDir,
+
+        [string]$DriverDataAutoLoggerPath
+    )
+
+    $cutoff = (Get-Date).AddMinutes(-1 * $LookbackMinutes)
+    if ([string]::IsNullOrWhiteSpace($LocalCrashDumpsDir)) {
+        $localAppData = if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+            $env:LOCALAPPDATA
+        }
+        else {
+            [Environment]::GetFolderPath('LocalApplicationData')
+        }
+        $LocalCrashDumpsDir = Join-Path -Path $localAppData -ChildPath 'CrashDumps'
+    }
+
+    if ([string]::IsNullOrWhiteSpace($DriverDataAutoLoggerPath)) {
+        $driverDataRoot = if (-not [string]::IsNullOrWhiteSpace($env:DriverData)) {
+            $env:DriverData
+        }
+        else {
+            Join-Path -Path $env:SystemRoot -ChildPath 'System32\Drivers\DriverData'
+        }
+        $DriverDataAutoLoggerPath = Join-Path -Path $driverDataRoot -ChildPath 'LogFiles\WMI\Microsoft-Windows-Rdp-Graphics-RdpIdd-Trace.etl'
+    }
+
+    $probeSpecs = @(
+        @{ Category = 'UmdfDump'; Path = 'C:\ProgramData\Microsoft\WDF'; Pattern = '*'; FilterRegex = '.*'; Recurse = $true },
+        @{ Category = 'LiveKernelDump'; Path = 'C:\Windows\LiveKernelReports'; Pattern = '*.dmp'; FilterRegex = '.*'; Recurse = $false },
+        @{ Category = 'LiveKernelWatchdog'; Path = 'C:\Windows\LiveKernelReports\WATCHDOG'; Pattern = '*.dmp'; FilterRegex = '.*'; Recurse = $true },
+        @{ Category = 'KernelMinidump'; Path = 'C:\Windows\Minidump'; Pattern = '*.dmp'; FilterRegex = '.*'; Recurse = $false },
+        @{ Category = 'UserCrashDump'; Path = $LocalCrashDumpsDir; Pattern = '*.dmp'; FilterRegex = 'WUDF|LumaBridge'; Recurse = $false },
+        @{ Category = 'WerReportQueue'; Path = 'C:\ProgramData\Microsoft\Windows\WER\ReportQueue'; Pattern = '*'; FilterRegex = 'WUDF|WATCHDOG|LiveKernel|LumaBridge|Idd|Display|DWM'; Recurse = $false },
+        @{ Category = 'WerReportArchive'; Path = 'C:\ProgramData\Microsoft\Windows\WER\ReportArchive'; Pattern = '*'; FilterRegex = 'WUDF|WATCHDOG|LiveKernel|LumaBridge|Idd|Display|DWM'; Recurse = $false },
+        @{ Category = 'RdpIddAutoLoggerEtl'; Path = $DriverDataAutoLoggerPath; Pattern = '*'; FilterRegex = '.*'; Recurse = $false; SingleFile = $true }
+    )
+
+    $locations = New-Object System.Collections.Generic.List[object]
+    $foundFiles = New-Object System.Collections.Generic.List[object]
+
+    foreach ($spec in $probeSpecs) {
+        $targetPath = $spec.Path
+        $exists = $false
+        $accessDenied = $false
+        $errMsg = ''
+        $locMatches = New-Object System.Collections.Generic.List[object]
+
+        try {
+            $exists = Test-Path -LiteralPath $targetPath -ErrorAction Stop
+        }
+        catch [System.UnauthorizedAccessException] {
+            $accessDenied = $true
+            $errMsg = $_.Exception.Message
+        }
+        catch {
+            $errMsg = $_.Exception.Message
+        }
+
+        if ($exists -and -not $accessDenied) {
+            try {
+                if ($spec.ContainsKey('SingleFile') -and $spec.SingleFile) {
+                    $item = Get-Item -LiteralPath $targetPath -Force -ErrorAction Stop
+                    $entry = [pscustomobject]@{
+                        Category         = $spec.Category
+                        FullName         = $item.FullName
+                        Name             = $item.Name
+                        LengthBytes      = [int64]$item.Length
+                        LastWriteTimeUtc = $item.LastWriteTimeUtc.ToString('o')
+                    }
+                    $locMatches.Add($entry)
+                    $foundFiles.Add($entry)
+                }
+                else {
+                    $items = Get-ChildItem -LiteralPath $targetPath -Filter $spec.Pattern -Force -Recurse:([bool]$spec.Recurse) -ErrorAction Stop |
+                        Where-Object {
+                            ($_.LastWriteTime -ge $cutoff -or $spec.Category -eq 'UmdfDump') -and
+                            ($_.Name -match $spec.FilterRegex)
+                        } |
+                        Sort-Object -Property LastWriteTimeUtc -Descending |
+                        Select-Object -First 25
+
+                    foreach ($item in @($items)) {
+                        $lengthBytes = if ($item.PSObject.Properties.Name -contains 'Length') { [int64]$item.Length } else { 0L }
+                        $entry = [pscustomobject]@{
+                            Category         = $spec.Category
+                            FullName         = $item.FullName
+                            Name             = $item.Name
+                            LengthBytes      = $lengthBytes
+                            LastWriteTimeUtc = $item.LastWriteTimeUtc.ToString('o')
+                        }
+                        $locMatches.Add($entry)
+                        $foundFiles.Add($entry)
+                    }
+                }
+            }
+            catch [System.UnauthorizedAccessException] {
+                $accessDenied = $true
+                $errMsg = $_.Exception.Message
+            }
+            catch {
+                $errMsg = $_.Exception.Message
+            }
+        }
+
+        $locations.Add([pscustomobject]@{
+            Category          = $spec.Category
+            Path              = $targetPath
+            Exists            = $exists
+            AccessDenied      = $accessDenied
+            MatchingFileCount = $locMatches.Count
+            Error             = $errMsg
+        })
+    }
+
+    return [pscustomobject]@{
+        LookbackMinutes = $LookbackMinutes
+        Locations       = @($locations.ToArray())
+        Files           = @($foundFiles.ToArray())
+        TotalFoundCount = $foundFiles.Count
+    }
+}
+
+function Get-LumaBridgeEtlEventSummary {
+    [CmdletBinding()]
+    param(
+        [string]$EtlPath,
+
+        [ValidateRange(1, 5000)]
+        [int]$MaxEvents = 500
+    )
+
+    if ([string]::IsNullOrWhiteSpace($EtlPath) -or -not (Test-Path -LiteralPath $EtlPath -PathType Leaf)) {
+        return [pscustomobject]@{
+            EtlPath      = $EtlPath
+            Exists       = $false
+            EventCount   = 0
+            LumaBridgeEvents = @()
+            Providers    = @()
+            Events       = @()
+            Error        = 'ETL file not found.'
+        }
+    }
+
+    $winEventCmd = Get-Command -Name 'Get-WinEvent' -ErrorAction SilentlyContinue
+    if ($null -eq $winEventCmd -or -not $winEventCmd.Parameters.ContainsKey('Path')) {
+        return [pscustomobject]@{
+            EtlPath      = $EtlPath
+            Exists       = $true
+            EventCount   = 0
+            LumaBridgeEvents = @()
+            Providers    = @()
+            Events       = @()
+            Error        = 'Get-WinEvent -Path is unavailable in the current environment.'
+        }
+    }
+
+    $decoded = New-Object System.Collections.Generic.List[object]
+    $err = ''
+    try {
+        $rawEvents = @(Get-WinEvent -Path $EtlPath -Oldest -MaxEvents $MaxEvents -ErrorAction Stop)
+        foreach ($ev in $rawEvents) {
+            $prov = if ($ev.PSObject.Properties.Name -contains 'ProviderName') { [string]$ev.ProviderName } else { '' }
+            $msg = if ($ev.PSObject.Properties.Name -contains 'Message' -and $null -ne $ev.Message) { ($ev.Message -replace '\r?\n', ' ').Trim() } else { '' }
+            $evPid = if ($ev.PSObject.Properties.Name -contains 'ProcessId') { $ev.ProcessId } else { $null }
+            $evTid = if ($ev.PSObject.Properties.Name -contains 'ThreadId') { $ev.ThreadId } else { $null }
+            $evId = if ($ev.PSObject.Properties.Name -contains 'Id') { [int]$ev.Id } else { 0 }
+            $evLevel = if ($ev.PSObject.Properties.Name -contains 'LevelDisplayName') { $ev.LevelDisplayName } else { '' }
+            $evTime = if ($ev.PSObject.Properties.Name -contains 'TimeCreated' -and $null -ne $ev.TimeCreated) {
+                $ev.TimeCreated.ToUniversalTime().ToString('o')
+            }
+            else {
+                $null
+            }
+
+            $propValues = @()
+            if ($ev.PSObject.Properties.Name -contains 'Properties' -and $null -ne $ev.Properties) {
+                $propValues = @($ev.Properties | ForEach-Object {
+                    if ($null -ne $_ -and ($_.PSObject.Properties.Name -contains 'Value')) {
+                        [string]$_.Value
+                    }
+                    else {
+                        [string]$_
+                    }
+                })
+            }
+
+            $decoded.Add([pscustomobject]@{
+                TimeCreated  = $evTime
+                ProviderName = $prov
+                Id           = $evId
+                LevelDisplay = $evLevel
+                ProcessId    = $evPid
+                ThreadId     = $evTid
+                Message      = $msg
+                Properties   = $propValues
+            })
+        }
+    }
+    catch {
+        $err = $_.Exception.Message
+    }
+
+    $lbEvents = @($decoded.ToArray() | Where-Object {
+        $_.ProviderName -ieq 'LumaBridgeIddDriver' -or $_.Message -match '\[LB-DRIVER\]'
+    })
+
+    $providerCounts = @($decoded.ToArray() | Group-Object -Property ProviderName | ForEach-Object {
+        [pscustomobject]@{
+            ProviderName = $_.Name
+            Count        = $_.Count
+        }
+    })
+
+    return [pscustomobject]@{
+        EtlPath          = $EtlPath
+        Exists           = $true
+        EventCount       = $decoded.Count
+        LumaBridgeEvents = $lbEvents
+        Providers        = $providerCounts
+        Events           = @($decoded.ToArray())
+        Error            = $err
+    }
+}
+
+function Get-LumaBridgeDriverTraceStageSummary {
+    [CmdletBinding()]
+    param(
+        [string[]]$TraceLines = @(),
+
+        $StartupDiagnostics = $null,
+
+        [object[]]$EtlEvents = @()
+    )
+
+    $records = New-Object System.Collections.Generic.List[object]
+    $sourcesUsed = New-Object System.Collections.Generic.List[string]
+
+    foreach ($line in @($TraceLines)) {
+        if ([string]::IsNullOrWhiteSpace($line) -or ($line -notmatch '\[LB-DRIVER\]') -or ($line -match '\[LB-DRIVER\]\s+\[METRICS\]')) {
+            continue
+        }
+
+        if ($line -match '\[LB-DRIVER\]\s+\[(?<Level>[^\]]+)\].*?stage=(?<Stage>\S+)\s+status=(?<Status>0x[0-9A-Fa-f]+)\s+state=(?<State>\S+)(?:\s+lastOk=(?<LastOk>\S+))?(?:\s+msg="(?<Msg>[^"]*)")?') {
+            $pidVal = if ($line -match '\bpid=(?<Pid>\d+)\b') { [int]$matches['Pid'] } else { $null }
+            $tidVal = if ($line -match '\btid=(?<Tid>\d+)\b') { [int]$matches['Tid'] } else { $null }
+            $records.Add([pscustomobject]@{
+                Source              = 'DebugView'
+                Level               = $matches['Level']
+                ProcessId           = $pidVal
+                ThreadId            = $tidVal
+                Stage               = $matches['Stage']
+                StatusHex           = Format-LumaBridgeNtStatusHex -StatusValue $matches['Status']
+                LifecycleState      = $matches['State']
+                LastSuccessfulStage = if ($matches.ContainsKey('LastOk') -and -not [string]::IsNullOrWhiteSpace($matches['LastOk'])) { $matches['LastOk'] } else { $null }
+                Message             = if ($matches.ContainsKey('Msg')) { $matches['Msg'] } else { '' }
+            })
+        }
+    }
+
+    if ($records.Count -gt 0) {
+        $sourcesUsed.Add('DebugView')
+    }
+
+    $etwAdded = 0
+    foreach ($ev in @($EtlEvents)) {
+        if ($null -eq $ev) { continue }
+        $prov = if ($ev.PSObject.Properties.Name -contains 'ProviderName') { [string]$ev.ProviderName } else { '' }
+        if ($prov -ine 'LumaBridgeIddDriver') { continue }
+
+        $props = if ($ev.PSObject.Properties.Name -contains 'Properties') { @($ev.Properties) } else { @() }
+        $props = @($props)
+        if ($props.Count -ge 8) {
+            ++$etwAdded
+            $records.Add([pscustomobject]@{
+                Source              = 'TraceLoggingEtl'
+                Level               = [string]$props[0]
+                ProcessId           = $props[1]
+                ThreadId            = $props[2]
+                Stage               = [string]$props[3]
+                StatusHex           = Format-LumaBridgeNtStatusHex -StatusValue $props[4]
+                LifecycleState      = [string]$props[5]
+                LastSuccessfulStage = [string]$props[6]
+                Message             = [string]$props[7]
+            })
+        }
+    }
+
+    if ($etwAdded -gt 0) {
+        $sourcesUsed.Add('TraceLoggingEtl')
+    }
+
+    $driverEntryReached = $false
+    $lastStage = $null
+    $lastSuccessfulStage = $null
+    $lastStatusHex = $null
+    $firstFailureStage = $null
+    $firstFailureStatusHex = $null
+
+    foreach ($rec in $records) {
+        if ($rec.Stage -in @('DriverEntry', 'DeviceAdd', 'DeviceInitConfig', 'WdfDeviceCreate', 'IddCxDeviceInitialize', 'DeviceD0Entry', 'AdapterInitAsync', 'AdapterInitFinished')) {
+            $driverEntryReached = $true
+        }
+
+        $lastStage = $rec.Stage
+        $lastStatusHex = $rec.StatusHex
+
+        $isFailureStatus = $false
+        if (-not [string]::IsNullOrWhiteSpace($rec.StatusHex) -and $rec.StatusHex -match '^0x([0-9A-Fa-f]{8})$') {
+            $u32 = [Convert]::ToUInt32($matches[1], 16)
+            $isFailureStatus = ($u32 -ge 0x80000000L)
+        }
+
+        if ($rec.Level -eq 'ERROR' -or $isFailureStatus) {
+            if ($null -eq $firstFailureStage) {
+                $firstFailureStage = $rec.Stage
+                $firstFailureStatusHex = $rec.StatusHex
+            }
+            if (-not [string]::IsNullOrWhiteSpace($rec.LastSuccessfulStage) -and $rec.LastSuccessfulStage -ne 'None') {
+                $lastSuccessfulStage = $rec.LastSuccessfulStage
+            }
+        }
+        else {
+            if (-not [string]::IsNullOrWhiteSpace($rec.LastSuccessfulStage) -and $rec.LastSuccessfulStage -ne 'None') {
+                $lastSuccessfulStage = $rec.LastSuccessfulStage
+            }
+            elseif ($rec.Stage -ne 'None') {
+                $lastSuccessfulStage = $rec.Stage
+            }
+        }
+    }
+
+    if ($null -ne $StartupDiagnostics) {
+        $sourcesUsed.Add('RegistryBreadcrumb')
+        $regLastStage = if ($StartupDiagnostics.PSObject.Properties.Name -contains 'LastStage') { $StartupDiagnostics.LastStage } else { $null }
+        $regLastOk = if ($StartupDiagnostics.PSObject.Properties.Name -contains 'LastSuccessfulStage') { $StartupDiagnostics.LastSuccessfulStage } else { $null }
+        $regLastStatusHex = if ($StartupDiagnostics.PSObject.Properties.Name -contains 'LastStatusHex') { $StartupDiagnostics.LastStatusHex } else { $null }
+        $regErrStage = if ($StartupDiagnostics.PSObject.Properties.Name -contains 'LastErrorStage') { $StartupDiagnostics.LastErrorStage } else { $null }
+        $regErrStatusHex = if ($StartupDiagnostics.PSObject.Properties.Name -contains 'LastErrorStatusHex') { $StartupDiagnostics.LastErrorStatusHex } else { $null }
+
+        if (-not [string]::IsNullOrWhiteSpace($regLastOk) -and $regLastOk -ne 'None') {
+            $driverEntryReached = $true
+        }
+        if ([string]::IsNullOrWhiteSpace($lastStage)) { $lastStage = $regLastStage }
+        if ([string]::IsNullOrWhiteSpace($lastSuccessfulStage) -or $lastSuccessfulStage -eq 'None') { $lastSuccessfulStage = $regLastOk }
+        if ([string]::IsNullOrWhiteSpace($lastStatusHex)) { $lastStatusHex = $regLastStatusHex }
+        if ([string]::IsNullOrWhiteSpace($firstFailureStage) -and -not [string]::IsNullOrWhiteSpace($regErrStage) -and $regErrStage -ne 'None') {
+            $firstFailureStage = $regErrStage
+            $firstFailureStatusHex = $regErrStatusHex
+        }
+    }
+
+    return [pscustomobject]@{
+        DriverEntryReached    = $driverEntryReached
+        LastStage             = $lastStage
+        LastSuccessfulStage   = $lastSuccessfulStage
+        LastStatusHex         = $lastStatusHex
+        FirstFailureStage     = $firstFailureStage
+        FirstFailureStatusHex = $firstFailureStatusHex
+        StageRecordCount      = $records.Count
+        StageRecords          = @($records.ToArray())
+        SourcesUsed           = @($sourcesUsed.ToArray() | Select-Object -Unique)
+    }
+}
+
 Export-ModuleMember -Function @(
     'Get-LumaBridgeDriverConstants',
     'Get-LumaBridgeRepoRoot',
@@ -1840,11 +2819,14 @@ Export-ModuleMember -Function @(
     'Assert-LumaBridgeAdministrator',
     'Confirm-LumaBridgeAction',
     'Invoke-LumaBridgeExternalCommand',
+    'Format-LumaBridgeNtStatusHex',
     'Get-LumaBridgeDeviceParametersRegistryPath',
     'Get-LumaBridgeDeviceEnableVirtualMonitor',
     'Set-LumaBridgeDeviceEnableVirtualMonitor',
+    'Get-LumaBridgeDeviceStartupDiagnostics',
     'Get-LumaBridgeDevicePropertyData',
     'Get-LumaBridgePnpInstances',
+    'Get-LumaBridgeInfDriverVerMetadata',
     'Get-LumaBridgeInfDriverVersion',
     'Test-LumaBridgeDeviceDriverBinding',
     'Invoke-LumaBridgePnpUtilEnumDriversXml',
@@ -1855,5 +2837,11 @@ Export-ModuleMember -Function @(
     'Invoke-LumaBridgeSigntoolCatalogVerify',
     'Test-LumaBridgePackageArtifacts',
     'Get-LumaBridgeRawWudfProcesses',
-    'Get-LumaBridgeWudfHostProcesses'
+    'Get-LumaBridgeWudfHostProcesses',
+    'Get-LumaBridgeSetupApiLogExcerpt',
+    'Get-LumaBridgeEventChannelStatus',
+    'Get-LumaBridgeDiagnosticEvents',
+    'Get-LumaBridgeCrashDumpInventory',
+    'Get-LumaBridgeEtlEventSummary',
+    'Get-LumaBridgeDriverTraceStageSummary'
 )

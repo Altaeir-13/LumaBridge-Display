@@ -776,6 +776,107 @@ LumaBridgeQueryVirtualMonitorActivationEnabled(
     return enableValue == 1UL;
 }
 
+void
+AssignUnicodeDiagnosticValue(
+    WDFKEY HardwareKey,
+    PCUNICODE_STRING ValueName,
+    const wchar_t* WideValue
+    ) noexcept
+{
+    if (HardwareKey == nullptr || ValueName == nullptr || WideValue == nullptr)
+    {
+        return;
+    }
+
+    size_t charCount = 0;
+    while (WideValue[charCount] != L'\0' && charCount < 256U)
+    {
+        ++charCount;
+    }
+
+    const USHORT byteLength = static_cast<USHORT>(charCount * sizeof(wchar_t));
+    UNICODE_STRING value{};
+    value.Length = byteLength;
+    value.MaximumLength = static_cast<USHORT>(byteLength + sizeof(wchar_t));
+    value.Buffer = const_cast<wchar_t*>(WideValue);
+    (void)WdfRegistryAssignUnicodeString(HardwareKey, ValueName, &value);
+}
+
+void
+LumaBridgePersistStartupDiagnostics(
+    WDFDEVICE Device,
+    DriverDiagnosticStage LastStage,
+    DriverDiagnosticStage LastSuccessfulStage,
+    NTSTATUS LastStatus,
+    DriverDiagnosticStage LastErrorStage,
+    NTSTATUS LastErrorStatus,
+    ULONG IddCxVersion
+    ) noexcept
+{
+    if (Device == nullptr)
+    {
+        return;
+    }
+
+    WDFKEY hardwareKey = nullptr;
+    const NTSTATUS openStatus = WdfDeviceOpenRegistryKey(
+        Device,
+        PLUGPLAY_REGKEY_DEVICE,
+        KEY_SET_VALUE,
+        WDF_NO_OBJECT_ATTRIBUTES,
+        &hardwareKey);
+    if (!NT_SUCCESS(openStatus) || hardwareKey == nullptr)
+    {
+        return;
+    }
+
+    DECLARE_CONST_UNICODE_STRING(nameLastStage, L"DiagLastStage");
+    DECLARE_CONST_UNICODE_STRING(nameLastSuccess, L"DiagLastSuccessfulStage");
+    DECLARE_CONST_UNICODE_STRING(nameLastStatus, L"DiagLastStatus");
+    DECLARE_CONST_UNICODE_STRING(nameLastErrorStage, L"DiagLastErrorStage");
+    DECLARE_CONST_UNICODE_STRING(nameLastErrorStatus, L"DiagLastErrorStatus");
+    DECLARE_CONST_UNICODE_STRING(nameIddCxVer, L"DiagIddCxVersion");
+    DECLARE_CONST_UNICODE_STRING(nameHostPid, L"DiagHostProcessId");
+    DECLARE_CONST_UNICODE_STRING(nameDllAttach, L"DiagDllAttachCount");
+
+    AssignUnicodeDiagnosticValue(
+        hardwareKey,
+        &nameLastStage,
+        lumabridge::driver::DriverDiagnosticStageToWideString(LastStage));
+    AssignUnicodeDiagnosticValue(
+        hardwareKey,
+        &nameLastSuccess,
+        lumabridge::driver::DriverDiagnosticStageToWideString(LastSuccessfulStage));
+    (void)WdfRegistryAssignULong(hardwareKey, &nameLastStatus, static_cast<ULONG>(LastStatus));
+    AssignUnicodeDiagnosticValue(
+        hardwareKey,
+        &nameLastErrorStage,
+        lumabridge::driver::DriverDiagnosticStageToWideString(LastErrorStage));
+    (void)WdfRegistryAssignULong(hardwareKey, &nameLastErrorStatus, static_cast<ULONG>(LastErrorStatus));
+    (void)WdfRegistryAssignULong(hardwareKey, &nameIddCxVer, IddCxVersion);
+    (void)WdfRegistryAssignULong(hardwareKey, &nameHostPid, GetCurrentProcessId());
+    (void)WdfRegistryAssignULong(hardwareKey, &nameDllAttach, LumaBridgeGetDllProcessAttachCount());
+
+    WdfRegistryClose(hardwareKey);
+}
+
+void
+LumaBridgePersistTrackerDiagnostics(
+    WDFDEVICE Device,
+    const lumabridge::driver::AdapterLifecycleTracker& Tracker,
+    ULONG IddCxVersion
+    ) noexcept
+{
+    LumaBridgePersistStartupDiagnostics(
+        Device,
+        Tracker.LastStage,
+        Tracker.LastSuccessfulStage,
+        Tracker.LastStageStatus,
+        Tracker.LastErrorStage,
+        Tracker.LastErrorStatus,
+        IddCxVersion);
+}
+
 } // namespace
 
 namespace lumabridge::driver {
@@ -880,6 +981,22 @@ LumaBridgeConfigureDeviceInit(
     iddConfig.EvtIddCxMonitorAssignSwapChain = LumaBridgeEvtMonitorAssignSwapChain;
     iddConfig.EvtIddCxMonitorUnassignSwapChain = LumaBridgeEvtMonitorUnassignSwapChain;
 
+    {
+        char preMsg[192]{};
+        _snprintf_s(
+            preMsg,
+            sizeof(preMsg),
+            _TRUNCATE,
+            "Calling IddCxDeviceInitConfig (configSize=%lu)",
+            static_cast<unsigned long>(iddConfig.Size));
+        LumaBridgeTraceInfo(
+            DriverDiagnosticStage::DeviceInitConfig,
+            STATUS_SUCCESS,
+            AdapterLifecycleState::Uninitialized,
+            preMsg,
+            DriverDiagnosticStage::DeviceAdd);
+    }
+
     const NTSTATUS status = IddCxDeviceInitConfig(DeviceInit, &iddConfig);
     if (!NT_SUCCESS(status))
     {
@@ -887,7 +1004,8 @@ LumaBridgeConfigureDeviceInit(
             DriverDiagnosticStage::DeviceInitConfig,
             status,
             AdapterLifecycleState::Uninitialized,
-            "IddCxDeviceInitConfig failed");
+            "IddCxDeviceInitConfig failed",
+            DriverDiagnosticStage::DeviceAdd);
         return status;
     }
 
@@ -895,7 +1013,8 @@ LumaBridgeConfigureDeviceInit(
         DriverDiagnosticStage::DeviceInitConfig,
         status,
         AdapterLifecycleState::DeviceConfigured,
-        "IddCxDeviceInitConfig succeeded");
+        "IddCxDeviceInitConfig succeeded",
+        DriverDiagnosticStage::DeviceInitConfig);
     return status;
 }
 
@@ -911,7 +1030,8 @@ LumaBridgeInitializeDeviceContext(
             DriverDiagnosticStage::IddCxDeviceInitialize,
             STATUS_INVALID_PARAMETER,
             AdapterLifecycleState::Uninitialized,
-            "IddCxDeviceInitialize skipped because WDFDEVICE is null");
+            "IddCxDeviceInitialize skipped because WDFDEVICE is null",
+            DriverDiagnosticStage::WdfDeviceCreate);
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -922,7 +1042,8 @@ LumaBridgeInitializeDeviceContext(
             DriverDiagnosticStage::IddCxDeviceInitialize,
             STATUS_INVALID_DEVICE_STATE,
             AdapterLifecycleState::Uninitialized,
-            "DeviceContext missing on WDFDEVICE");
+            "DeviceContext missing on WDFDEVICE",
+            DriverDiagnosticStage::WdfDeviceCreate);
         return STATUS_INVALID_DEVICE_STATE;
     }
 
@@ -939,30 +1060,52 @@ LumaBridgeInitializeDeviceContext(
     deviceContext->IsCleanedUp = false;
     deviceContext->Lifecycle = lumabridge::driver::AdapterLifecycleTracker{};
     lumabridge::driver::TransitionOnDeviceConfigured(deviceContext->Lifecycle);
+    lumabridge::driver::RecordDiagnosticSuccess(
+        deviceContext->Lifecycle,
+        DriverDiagnosticStage::WdfDeviceCreate,
+        STATUS_SUCCESS);
 
     if (deviceContext->SwapChainHost == nullptr)
     {
+        lumabridge::driver::RecordDiagnosticFailure(
+            deviceContext->Lifecycle,
+            DriverDiagnosticStage::IddCxDeviceInitialize,
+            STATUS_INSUFFICIENT_RESOURCES);
+        LumaBridgePersistTrackerDiagnostics(Device, deviceContext->Lifecycle, 0UL);
         LumaBridgeTraceError(
             DriverDiagnosticStage::IddCxDeviceInitialize,
             STATUS_INSUFFICIENT_RESOURCES,
             deviceContext->Lifecycle.State,
-            "Failed to allocate DeviceSwapChainHost");
+            "Failed to allocate DeviceSwapChainHost",
+            DriverDiagnosticStage::WdfDeviceCreate);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
+    LumaBridgePersistTrackerDiagnostics(Device, deviceContext->Lifecycle, 0UL);
+    LumaBridgeTraceInfo(
+        DriverDiagnosticStage::IddCxDeviceInitialize,
+        STATUS_SUCCESS,
+        deviceContext->Lifecycle.State,
+        "Calling IddCxDeviceInitialize",
+        DriverDiagnosticStage::WdfDeviceCreate);
+
     const NTSTATUS status = IddCxDeviceInitialize(Device);
     AdapterLifecycleState resultingState = AdapterLifecycleState::Uninitialized;
+    lumabridge::driver::AdapterLifecycleTracker diagSnapshot{};
     lumabridge::driver::DeviceSwapChainHost* failedHost = nullptr;
     {
         ExclusiveLockGuard lock(&deviceContext->StateLock);
         lumabridge::driver::TransitionOnDeviceInitialized(deviceContext->Lifecycle, status);
         resultingState = deviceContext->Lifecycle.State;
+        diagSnapshot = deviceContext->Lifecycle;
         if (!NT_SUCCESS(status))
         {
             failedHost = deviceContext->SwapChainHost;
             deviceContext->SwapChainHost = nullptr;
         }
     }
+
+    LumaBridgePersistTrackerDiagnostics(Device, diagSnapshot, 0UL);
 
     if (failedHost != nullptr)
     {
@@ -977,7 +1120,8 @@ LumaBridgeInitializeDeviceContext(
             DriverDiagnosticStage::IddCxDeviceInitialize,
             status,
             resultingState,
-            "IddCxDeviceInitialize failed");
+            "IddCxDeviceInitialize failed",
+            diagSnapshot.LastSuccessfulStage);
         return status;
     }
 
@@ -985,7 +1129,8 @@ LumaBridgeInitializeDeviceContext(
         DriverDiagnosticStage::IddCxDeviceInitialize,
         status,
         resultingState,
-        "IddCxDeviceInitialize succeeded");
+        "IddCxDeviceInitialize succeeded",
+        diagSnapshot.LastSuccessfulStage);
     return STATUS_SUCCESS;
 }
 
@@ -1104,10 +1249,36 @@ LumaBridgeStartAdapter(
 
     IDARG_OUT_GETVERSION versionOut{};
     const NTSTATUS versionStatus = IddCxGetVersion(&versionOut);
+    ULONG iddCxVersionSnapshot = 0;
     if (NT_SUCCESS(versionStatus))
     {
-        ExclusiveLockGuard lock(&deviceContext->StateLock);
-        deviceContext->IddCxRuntimeVersion = versionOut.IddCxVersion;
+        {
+            ExclusiveLockGuard lock(&deviceContext->StateLock);
+            deviceContext->IddCxRuntimeVersion = versionOut.IddCxVersion;
+        }
+        iddCxVersionSnapshot = versionOut.IddCxVersion;
+        char verMsg[160]{};
+        _snprintf_s(
+            verMsg,
+            sizeof(verMsg),
+            _TRUNCATE,
+            "IddCxGetVersion succeeded (iddCxVersion=0x%08lX)",
+            static_cast<unsigned long>(versionOut.IddCxVersion));
+        LumaBridgeTraceInfo(
+            DriverDiagnosticStage::IddCxGetVersion,
+            versionStatus,
+            AdapterLifecycleState::AdapterInitPending,
+            verMsg,
+            DriverDiagnosticStage::DeviceD0Entry);
+    }
+    else
+    {
+        LumaBridgeTraceWarn(
+            DriverDiagnosticStage::IddCxGetVersion,
+            versionStatus,
+            AdapterLifecycleState::AdapterInitPending,
+            "IddCxGetVersion failed",
+            DriverDiagnosticStage::DeviceD0Entry);
     }
 
     IDDCX_ENDPOINT_VERSION endpointVersion{};
@@ -1142,6 +1313,35 @@ LumaBridgeStartAdapter(
     adapterInitIn.WdfDevice = Device;
     adapterInitIn.pCaps = &adapterCaps;
     adapterInitIn.ObjectAttributes = &adapterAttributes;
+
+    {
+        lumabridge::driver::AdapterLifecycleTracker preInitTracker{};
+        {
+            ExclusiveLockGuard stateLock(&deviceContext->StateLock);
+            preInitTracker = deviceContext->Lifecycle;
+        }
+        LumaBridgePersistTrackerDiagnostics(Device, preInitTracker, iddCxVersionSnapshot);
+
+        char capsMsg[256]{};
+        _snprintf_s(
+            capsMsg,
+            sizeof(capsMsg),
+            _TRUNCATE,
+            "Calling IddCxAdapterInitAsync (capsSize=%u diagSize=%u verSize=%u maxMon=%u maxRate=%llu flags=0x%X txType=%u)",
+            adapterCaps.Size,
+            adapterCaps.EndPointDiagnostics.Size,
+            endpointVersion.Size,
+            adapterCaps.MaxMonitorsSupported,
+            static_cast<unsigned long long>(adapterCaps.MaxDisplayPipelineRate),
+            static_cast<unsigned int>(adapterCaps.Flags),
+            static_cast<unsigned int>(adapterCaps.EndPointDiagnostics.TransmissionType));
+        LumaBridgeTraceInfo(
+            DriverDiagnosticStage::AdapterInitAsync,
+            STATUS_SUCCESS,
+            preInitTracker.State,
+            capsMsg,
+            preInitTracker.LastSuccessfulStage);
+    }
 
     bool acquiredSlot = false;
     NTSTATUS slotStatus = STATUS_INVALID_DEVICE_STATE;
@@ -1194,6 +1394,7 @@ LumaBridgeStartAdapter(
     if (!acquiredSlot)
     {
         AdapterLifecycleState abortedState = AdapterLifecycleState::Uninitialized;
+        lumabridge::driver::AdapterLifecycleTracker abortedTracker{};
         {
             ExclusiveLockGuard stateLock(&deviceContext->StateLock);
             if (!deviceContext->Lifecycle.IsCleanedUp)
@@ -1204,13 +1405,16 @@ LumaBridgeStartAdapter(
                     false);
             }
             abortedState = deviceContext->Lifecycle.State;
+            abortedTracker = deviceContext->Lifecycle;
         }
+        LumaBridgePersistTrackerDiagnostics(Device, abortedTracker, iddCxVersionSnapshot);
 
         LumaBridgeTraceWarn(
             DriverDiagnosticStage::AdapterInitAsync,
             slotStatus,
             abortedState,
-            "Aborted IddCxAdapterInitAsync due to cleanup or bounded slot wait timeout");
+            "Aborted IddCxAdapterInitAsync due to cleanup or bounded slot wait timeout",
+            abortedTracker.LastSuccessfulStage);
         return slotStatus;
     }
 
@@ -1222,9 +1426,11 @@ LumaBridgeStartAdapter(
 
     NTSTATUS trackedStatus = STATUS_UNSUCCESSFUL;
     AdapterLifecycleState finalState = AdapterLifecycleState::AdapterFailed;
+    lumabridge::driver::AdapterLifecycleTracker finalTracker{};
+    bool hasValidHandle = false;
     {
         ExclusiveLockGuard gateLock(&g_AdapterInitGate);
-        const bool hasValidHandle = NT_SUCCESS(initStatus) && (adapterInitOut.AdapterObject != nullptr);
+        hasValidHandle = NT_SUCCESS(initStatus) && (adapterInitOut.AdapterObject != nullptr);
         const bool deviceCleanedUp = deviceContext->IsCleanedUp || g_InFlightInitSlot.InFlightDeviceCleanedUp;
         if (hasValidHandle)
         {
@@ -1256,24 +1462,46 @@ LumaBridgeStartAdapter(
             initStatus,
             hasValidHandle);
         finalState = deviceContext->Lifecycle.State;
+        finalTracker = deviceContext->Lifecycle;
     }
     WakeAllConditionVariable(&g_AdapterInitSlotCv);
+    LumaBridgePersistTrackerDiagnostics(Device, finalTracker, iddCxVersionSnapshot);
 
     if (!NT_SUCCESS(trackedStatus))
     {
+        char failMsg[192]{};
+        _snprintf_s(
+            failMsg,
+            sizeof(failMsg),
+            _TRUNCATE,
+            "IddCxAdapterInitAsync failed (rawInitStatus=0x%08lX hasValidHandle=%u)",
+            static_cast<unsigned long>(initStatus),
+            hasValidHandle ? 1U : 0U);
         LumaBridgeTraceError(
             DriverDiagnosticStage::AdapterInitAsync,
             trackedStatus,
             finalState,
-            "IddCxAdapterInitAsync failed");
+            failMsg,
+            finalTracker.LastSuccessfulStage);
         return trackedStatus;
     }
 
-    LumaBridgeTraceInfo(
-        DriverDiagnosticStage::AdapterInitAsync,
-        trackedStatus,
-        finalState,
-        "IddCxAdapterInitAsync submitted");
+    {
+        char okMsg[192]{};
+        _snprintf_s(
+            okMsg,
+            sizeof(okMsg),
+            _TRUNCATE,
+            "IddCxAdapterInitAsync submitted (rawInitStatus=0x%08lX hasValidHandle=%u)",
+            static_cast<unsigned long>(initStatus),
+            hasValidHandle ? 1U : 0U);
+        LumaBridgeTraceInfo(
+            DriverDiagnosticStage::AdapterInitAsync,
+            trackedStatus,
+            finalState,
+            okMsg,
+            finalTracker.LastSuccessfulStage);
+    }
     return STATUS_SUCCESS;
 }
 
@@ -1517,9 +1745,27 @@ LumaBridgeEvtAdapterInitFinished(
         return STATUS_INVALID_PARAMETER;
     }
 
+    {
+        char enterMsg[160]{};
+        _snprintf_s(
+            enterMsg,
+            sizeof(enterMsg),
+            _TRUNCATE,
+            "EvtIddCxAdapterInitFinished entered (adapterInitStatus=0x%08lX)",
+            static_cast<unsigned long>(pInArgs->AdapterInitStatus));
+        LumaBridgeTraceInfo(
+            DriverDiagnosticStage::AdapterInitFinished,
+            pInArgs->AdapterInitStatus,
+            AdapterLifecycleState::AdapterInitPending,
+            enterMsg,
+            DriverDiagnosticStage::AdapterInitAsync);
+    }
+
     WDFDEVICE wdfDevice = nullptr;
     NTSTATUS finishStatus = STATUS_INVALID_DEVICE_STATE;
     AdapterLifecycleState resultingState = AdapterLifecycleState::AdapterFailed;
+    lumabridge::driver::AdapterLifecycleTracker diagSnapshot{};
+    ULONG iddCxVersionSnapshot = 0;
     bool shouldMarkDeviceFailed = false;
     {
         ExclusiveLockGuard gateLock(&g_AdapterInitGate);
@@ -1530,7 +1776,8 @@ LumaBridgeEvtAdapterInitFinished(
                 DriverDiagnosticStage::AdapterInitFinished,
                 STATUS_INVALID_DEVICE_STATE,
                 AdapterLifecycleState::Uninitialized,
-                "EvtIddCxAdapterInitFinished ignored because no active parent WDFDEVICE was resolved");
+                "EvtIddCxAdapterInitFinished ignored because no active parent WDFDEVICE was resolved",
+                DriverDiagnosticStage::AdapterInitAsync);
             return STATUS_INVALID_DEVICE_STATE;
         }
 
@@ -1541,7 +1788,8 @@ LumaBridgeEvtAdapterInitFinished(
                 DriverDiagnosticStage::AdapterInitFinished,
                 STATUS_INVALID_DEVICE_STATE,
                 AdapterLifecycleState::Uninitialized,
-                "EvtIddCxAdapterInitFinished rejected for missing or cleaned-up DeviceContext");
+                "EvtIddCxAdapterInitFinished rejected for missing or cleaned-up DeviceContext",
+                DriverDiagnosticStage::AdapterInitAsync);
             return STATUS_INVALID_DEVICE_STATE;
         }
 
@@ -1552,7 +1800,8 @@ LumaBridgeEvtAdapterInitFinished(
                 DriverDiagnosticStage::AdapterInitFinished,
                 STATUS_INVALID_DEVICE_STATE,
                 deviceContext->Lifecycle.State,
-                "EvtIddCxAdapterInitFinished ignored late callback after cleanup");
+                "EvtIddCxAdapterInitFinished ignored late callback after cleanup",
+                deviceContext->Lifecycle.LastSuccessfulStage);
             return STATUS_INVALID_DEVICE_STATE;
         }
 
@@ -1564,6 +1813,8 @@ LumaBridgeEvtAdapterInitFinished(
             deviceContext->Lifecycle,
             pInArgs->AdapterInitStatus);
         resultingState = deviceContext->Lifecycle.State;
+        diagSnapshot = deviceContext->Lifecycle;
+        iddCxVersionSnapshot = deviceContext->IddCxRuntimeVersion;
 
         if (!NT_SUCCESS(finishStatus) && resultingState == AdapterLifecycleState::AdapterFailed)
         {
@@ -1573,13 +1824,30 @@ LumaBridgeEvtAdapterInitFinished(
         }
     }
 
+    LumaBridgePersistTrackerDiagnostics(wdfDevice, diagSnapshot, iddCxVersionSnapshot);
+
     if (shouldMarkDeviceFailed)
     {
         LumaBridgeTraceError(
             DriverDiagnosticStage::AdapterInitFinished,
             finishStatus,
             resultingState,
-            "EvtIddCxAdapterInitFinished reported adapter initialization failure; failing WDF device");
+            "EvtIddCxAdapterInitFinished reported adapter initialization failure; failing WDF device",
+            diagSnapshot.LastSuccessfulStage);
+        LumaBridgePersistStartupDiagnostics(
+            wdfDevice,
+            DriverDiagnosticStage::WdfDeviceSetFailed,
+            diagSnapshot.LastSuccessfulStage,
+            finishStatus,
+            DriverDiagnosticStage::AdapterInitFinished,
+            finishStatus,
+            iddCxVersionSnapshot);
+        LumaBridgeTraceError(
+            DriverDiagnosticStage::WdfDeviceSetFailed,
+            finishStatus,
+            resultingState,
+            "Calling WdfDeviceSetFailed(WdfDeviceFailedNoRestart)",
+            diagSnapshot.LastSuccessfulStage);
         WdfDeviceSetFailed(wdfDevice, WdfDeviceFailedNoRestart);
         WdfObjectDereference(wdfDevice);
         return finishStatus;
@@ -1591,7 +1859,8 @@ LumaBridgeEvtAdapterInitFinished(
             DriverDiagnosticStage::AdapterInitFinished,
             finishStatus,
             resultingState,
-            "EvtIddCxAdapterInitFinished ignored invalid or duplicate completion state");
+            "EvtIddCxAdapterInitFinished ignored invalid or duplicate completion state",
+            diagSnapshot.LastSuccessfulStage);
         return finishStatus;
     }
 
@@ -1599,7 +1868,8 @@ LumaBridgeEvtAdapterInitFinished(
         DriverDiagnosticStage::AdapterInitFinished,
         STATUS_SUCCESS,
         resultingState,
-        "EvtIddCxAdapterInitFinished succeeded");
+        "EvtIddCxAdapterInitFinished succeeded",
+        diagSnapshot.LastSuccessfulStage);
 
     if (resultingState == AdapterLifecycleState::AdapterReady)
     {
