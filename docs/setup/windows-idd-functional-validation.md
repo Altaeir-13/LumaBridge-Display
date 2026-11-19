@@ -14,10 +14,13 @@ Os seguintes scripts modulares automatizam o ciclo de preparacao, diagnostico e 
 | `LumaBridgeDriverCommon.psm1` | Modulo compartilhado (Hardware ID `Root\LumaBridgeIddDriver`, descoberta WDK, lookup PnP exclusivo por `DEVPKEY_Device_HardwareIds`, Driver Store via XML invariante de idioma, verificacao criptografica INF+DLL+CAT + correspondencia de certificados, correlacao `WUDFHost.exe`) | N/A |
 | `Test-LumaBridgePrerequisites.ps1` | Diagnostico somente leitura de Windows 11 x64, Secure Boot e Test Signing (com fallback via registro sem elevacao), UMDF/IddCx e artefatos | Nao |
 | `Invoke-LumaBridgePackageSigning.ps1` | Valida isolamento e limpa staging fora do repo antes do `Inf2Cat`, gera/reutiliza certificado de teste, assina `.dll`, regenera/assina `.cat`, verifica integridade INF+DLL+CAT e confirma hashes originais intactos | Somente com `-TrustCertificate` |
-| `Install-LumaBridgeDriver.ps1` | Valida pre-requisitos e assinaturas (inclusive com `-AllowUntrustedChain`, sem aceitar arquivos adulterados), desabilita/reinicia monitor antes de atualizar dispositivo existente, confirma driver vinculado e executa rollback em falhas parciais | Sim (exceto `-DryRun`) |
+| `Install-LumaBridgeDriver.ps1` | Valida pre-requisitos e assinaturas (inclusive com `-AllowUntrustedChain`, sem aceitar arquivos adulterados), desabilita/reinicia monitor antes de atualizar dispositivo existente, confirma driver vinculado, preserva diagnosticos pre-rollback (`DEVPKEY_Device_ProblemStatus`, SetupAPI, eventos, dumps e breadcrumbs `Diag*`) antes de executar rollback em falhas parciais | Sim (exceto `-DryRun`) |
 | `Set-LumaBridgeVirtualMonitor.ps1` | Localiza dinamicamente a instancia PnP via `DEVPKEY_Device_HardwareIds`, ajusta `EnableVirtualMonitor` (`1`/`0`), reinicia o dispositivo e executa rollback para `0` em falha parcial de ativacao | Sim (exceto `-DryRun`) |
-| `Collect-LumaBridgeDiagnostics.ps1` | Coleta estado PnP, Driver Store, `WUDFHost.exe` especificamente correlacionado ao LumaBridge (`LumaBridgeWudfHostProcess`), eventos Windows e metricas `[LB-DRIVER] [METRICS]` em JSON/Markdown (sem pixels da tela) | Nao |
+| `Invoke-LumaBridgeEtwTrace.ps1` | Gerencia captura ETW/WPP/TraceLogging (`logman -ets`) para `LumaBridgeIddDriver`, `IddCx` (`0x4000000004f4`), `DriverFrameworks-UserMode`, `Watchdog`, `WerKernel` e `DxgKrnl`, exportando eventos decodificados | Sim para `Start`/`Stop` (exceto `-DryRun`); Nao para `Status`/`ExportSummary` |
+| `Collect-LumaBridgeDiagnostics.ps1` | Coleta estado PnP (incluindo `DEVPKEY_Device_ProblemStatus` e breadcrumbs `Diag*`), Driver Store, excerto SetupAPI, canais/eventos, inventario de crash dumps, ETL ETW, `StageExecutionSummary`, versoes/hashes de pacote e `WUDFHost.exe` associado ao LumaBridge em JSON/Markdown (sem pixels da tela) | Nao |
 | `Uninstall-LumaBridgeDriver.ps1` | Desativa monitor, remove instancias PnP, limpa `oemXX.inf` do Driver Store sem `/force` por padrao (opt-in via `-ForceDriverStoreDelete`) e remove certificado somente por `-CertificateThumbprint` + `-ConfirmCertificateRemoval` | Sim (exceto `-DryRun`) |
+
+> **Diagnostico da falha #1 (`CM_PROB_FAILED_START` / `0xC000009E`):** Consulte [windows-idd-start-failure-investigation.md](../diagnostics/windows-idd-start-failure-investigation.md) para a linha do tempo completa, auditoria estatica vs. `IddSampleDriver`/`rdpidd.inf` e comandos da segunda tentativa instrumentada com `EnableVirtualMonitor=0`.
 
 Fluxo recomendado de simulacao antes da execucao real:
 
@@ -27,6 +30,7 @@ Fluxo recomendado de simulacao antes da execucao real:
 
 # 2. Previa Dry Run completa sem alterar o sistema
 .\windows\driver\scripts\Invoke-LumaBridgePackageSigning.ps1 -Configuration Release -CreateTestCertificateIfMissing -DryRun
+.\windows\driver\scripts\Invoke-LumaBridgeEtwTrace.ps1 -Action Start -IncludeDxgKrnl -DryRun
 .\windows\driver\scripts\Install-LumaBridgeDriver.ps1 -Configuration Release -DryRun
 .\windows\driver\scripts\Set-LumaBridgeVirtualMonitor.ps1 -Action Enable -DryRun
 .\windows\driver\scripts\Collect-LumaBridgeDiagnostics.ps1 -Configuration Release -DryRun

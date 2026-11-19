@@ -483,6 +483,95 @@ TestLateCommitModesAfterFailureOrCleanupIsRejected()
     }
 }
 
+void
+TestDiagnosticStageSuccessProgressionTracksLastSuccessfulStage()
+{
+    AdapterLifecycleTracker tracker{};
+    EXPECT_EQ(tracker.LastStage, DriverDiagnosticStage::None);
+    EXPECT_EQ(tracker.LastSuccessfulStage, DriverDiagnosticStage::None);
+    EXPECT_EQ(tracker.LastStageStatus, STATUS_SUCCESS);
+
+    TransitionOnDeviceConfigured(tracker);
+    EXPECT_EQ(tracker.LastSuccessfulStage, DriverDiagnosticStage::DeviceInitConfig);
+    EXPECT_EQ(tracker.LastStageStatus, STATUS_SUCCESS);
+
+    RecordDiagnosticSuccess(tracker, DriverDiagnosticStage::WdfDeviceCreate, STATUS_SUCCESS);
+    EXPECT_EQ(tracker.LastStage, DriverDiagnosticStage::WdfDeviceCreate);
+    EXPECT_EQ(tracker.LastSuccessfulStage, DriverDiagnosticStage::WdfDeviceCreate);
+    EXPECT_EQ(tracker.LastStageStatus, STATUS_SUCCESS);
+
+    TransitionOnDeviceInitialized(tracker, STATUS_SUCCESS);
+    EXPECT_EQ(tracker.LastSuccessfulStage, DriverDiagnosticStage::IddCxDeviceInitialize);
+    EXPECT_EQ(tracker.LastStageStatus, STATUS_SUCCESS);
+
+    EXPECT_EQ(TransitionOnD0EntryBegin(tracker).Action, D0EntryAction::StartAsyncInit);
+    EXPECT_EQ(tracker.LastSuccessfulStage, DriverDiagnosticStage::DeviceD0Entry);
+    EXPECT_EQ(tracker.LastStageStatus, STATUS_SUCCESS);
+
+    EXPECT_EQ(TransitionOnAdapterInitAsyncSubmitted(tracker, STATUS_SUCCESS, true), STATUS_SUCCESS);
+    EXPECT_EQ(tracker.LastSuccessfulStage, DriverDiagnosticStage::AdapterInitAsync);
+    EXPECT_EQ(tracker.LastStageStatus, STATUS_SUCCESS);
+
+    EXPECT_EQ(TransitionOnAdapterInitFinished(tracker, STATUS_SUCCESS), STATUS_SUCCESS);
+    EXPECT_EQ(tracker.LastSuccessfulStage, DriverDiagnosticStage::AdapterInitFinished);
+    EXPECT_EQ(tracker.LastStageStatus, STATUS_SUCCESS);
+}
+
+void
+TestDeviceInitializeFailurePreservesPreviousSuccessfulStage()
+{
+    AdapterLifecycleTracker tracker{};
+    TransitionOnDeviceConfigured(tracker);
+    RecordDiagnosticSuccess(tracker, DriverDiagnosticStage::WdfDeviceCreate, STATUS_SUCCESS);
+
+    TransitionOnDeviceInitialized(tracker, STATUS_DEVICE_POWER_FAILURE);
+    EXPECT_EQ(tracker.State, AdapterLifecycleState::AdapterFailed);
+    EXPECT_EQ(tracker.LastStage, DriverDiagnosticStage::IddCxDeviceInitialize);
+    EXPECT_EQ(tracker.LastSuccessfulStage, DriverDiagnosticStage::WdfDeviceCreate);
+    EXPECT_EQ(tracker.LastErrorStage, DriverDiagnosticStage::IddCxDeviceInitialize);
+    EXPECT_EQ(tracker.LastErrorStatus, STATUS_DEVICE_POWER_FAILURE);
+    EXPECT_EQ(tracker.LastStageStatus, STATUS_DEVICE_POWER_FAILURE);
+}
+
+void
+TestAdapterInitFailuresPreserveLastSuccessfulStage()
+{
+    // Synchronous failure in IddCxAdapterInitAsync must preserve DeviceD0Entry as last successful stage.
+    {
+        AdapterLifecycleTracker tracker{};
+        TransitionOnDeviceConfigured(tracker);
+        TransitionOnDeviceInitialized(tracker, STATUS_SUCCESS);
+        EXPECT_EQ(TransitionOnD0EntryBegin(tracker).Action, D0EntryAction::StartAsyncInit);
+
+        EXPECT_EQ(
+            TransitionOnAdapterInitAsyncSubmitted(tracker, STATUS_DEVICE_POWER_FAILURE, false),
+            STATUS_DEVICE_POWER_FAILURE);
+        EXPECT_EQ(tracker.State, AdapterLifecycleState::AdapterFailed);
+        EXPECT_EQ(tracker.LastSuccessfulStage, DriverDiagnosticStage::DeviceD0Entry);
+        EXPECT_EQ(tracker.LastErrorStage, DriverDiagnosticStage::AdapterInitAsync);
+        EXPECT_EQ(tracker.LastErrorStatus, STATUS_DEVICE_POWER_FAILURE);
+        EXPECT_EQ(tracker.LastStageStatus, STATUS_DEVICE_POWER_FAILURE);
+    }
+
+    // Asynchronous failure in EvtIddCxAdapterInitFinished must preserve AdapterInitAsync as last successful stage.
+    {
+        AdapterLifecycleTracker tracker{};
+        TransitionOnDeviceConfigured(tracker);
+        TransitionOnDeviceInitialized(tracker, STATUS_SUCCESS);
+        EXPECT_EQ(TransitionOnD0EntryBegin(tracker).Action, D0EntryAction::StartAsyncInit);
+        EXPECT_EQ(TransitionOnAdapterInitAsyncSubmitted(tracker, STATUS_SUCCESS, true), STATUS_SUCCESS);
+
+        EXPECT_EQ(
+            TransitionOnAdapterInitFinished(tracker, STATUS_DEVICE_POWER_FAILURE),
+            STATUS_DEVICE_POWER_FAILURE);
+        EXPECT_EQ(tracker.State, AdapterLifecycleState::AdapterFailed);
+        EXPECT_EQ(tracker.LastSuccessfulStage, DriverDiagnosticStage::AdapterInitAsync);
+        EXPECT_EQ(tracker.LastErrorStage, DriverDiagnosticStage::AdapterInitFinished);
+        EXPECT_EQ(tracker.LastErrorStatus, STATUS_DEVICE_POWER_FAILURE);
+        EXPECT_EQ(tracker.LastStageStatus, STATUS_DEVICE_POWER_FAILURE);
+    }
+}
+
 template <typename Fn>
 void
 RunTest(
@@ -526,6 +615,15 @@ main()
     RunTest("CleanupDuringPendingInitialization", TestCleanupDuringPendingInitialization);
     RunTest("LateAsyncInitFinishedAfterCleanupIsRejected", TestLateAsyncInitFinishedAfterCleanupIsRejected);
     RunTest("LateCommitModesAfterFailureOrCleanupIsRejected", TestLateCommitModesAfterFailureOrCleanupIsRejected);
+    RunTest(
+        "DiagnosticStageSuccessProgressionTracksLastSuccessfulStage",
+        TestDiagnosticStageSuccessProgressionTracksLastSuccessfulStage);
+    RunTest(
+        "DeviceInitializeFailurePreservesPreviousSuccessfulStage",
+        TestDeviceInitializeFailurePreservesPreviousSuccessfulStage);
+    RunTest(
+        "AdapterInitFailuresPreserveLastSuccessfulStage",
+        TestAdapterInitFailuresPreserveLastSuccessfulStage);
 
     std::printf("Summary: %d tests run, %d assertion failures.\n", g_TestsRun, g_TestsFailed);
     return (g_TestsFailed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;

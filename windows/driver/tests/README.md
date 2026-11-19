@@ -2,7 +2,7 @@
 
 ## Escopo atual
 
-`AdapterLifecycleTests.cpp` executa **16 testes unitarios deterministicos** sobre a maquina de estados (`AdapterLifecycleTracker`) e o slot de associacao em voo (`InFlightAdapterBindingSlot`) definidos em `windows/driver/LumaBridgeIddDriver/AdapterStateMachine.h`:
+`AdapterLifecycleTests.cpp` executa **19 testes unitarios deterministicos** sobre a maquina de estados (`AdapterLifecycleTracker`) e o slot de associacao em voo (`InFlightAdapterBindingSlot`) definidos em `windows/driver/LumaBridgeIddDriver/AdapterStateMachine.h`:
 
 1. `NormalInitializationLifecycle` — fluxo normal `DeviceConfigured -> DeviceInitialized -> AdapterInitPending -> AdapterReady`;
 2. `EarlyAsyncCompletionBeforeInitAsyncReturns` — conclusao assincrona (`EvtIddCxAdapterInitFinished`) chegando antes do retorno pos-processado de `IddCxAdapterInitAsync`;
@@ -19,7 +19,10 @@
 13. `CleanupDuringInFlightInitPreventsCrossDeviceLateCallbackBinding` — regressao garantindo que cleanup do dispositivo A em voo (`MarkDeviceCleanedUp` + `HasBoundDevice`) impede liberacao prematura do slot e vinculacao cruzada de callbacks tardios de A no dispositivo B;
 14. `CleanupDuringPendingInitialization` — cleanup de adaptador e dispositivo durante inicializacao pendente (`AdapterInitPending`), com rejeicao de `D0Entry` posterior;
 15. `LateAsyncInitFinishedAfterCleanupIsRejected` — rejeicao de conclusao assincrona/sincrona tardia ou duplicada apos cleanup/falha sem ressuscitar handles ou estado;
-16. `LateCommitModesAfterFailureOrCleanupIsRejected` — rejeicao de `TransitionOnCommitModes` em `AdapterFailed` ou apos cleanup sem alterar `CommittedPathCount`.
+16. `LateCommitModesAfterFailureOrCleanupIsRejected` — rejeicao de `TransitionOnCommitModes` em `AdapterFailed` ou apos cleanup sem alterar `CommittedPathCount`;
+17. `DiagnosticStageSuccessProgressionTracksLastSuccessfulStage` — progressao de `LastSuccessfulStage` e `LastStageStatus` ao longo das etapas de inicializacao (`DeviceInitConfig` -> `WdfDeviceCreate` -> `IddCxDeviceInitialize` -> `DeviceD0Entry` -> `AdapterInitAsync` -> `AdapterInitFinished`);
+18. `DeviceInitializeFailurePreservesPreviousSuccessfulStage` — preservacao de `LastSuccessfulStage = WdfDeviceCreate` quando `IddCxDeviceInitialize` falha com `STATUS_DEVICE_POWER_FAILURE`;
+19. `AdapterInitFailuresPreserveLastSuccessfulStage` — preservacao de `LastSuccessfulStage` (`DeviceD0Entry` na falha sincrona e `AdapterInitAsync` na falha assincrona) em falhas `STATUS_DEVICE_POWER_FAILURE`.
 
 `DriverPackageValidationTests.cpp` executa **5 verificacoes automatizadas** sobre o INF fonte e os pacotes gerados em `windows/driver/x64/Debug/` e `windows/driver/x64/Release/`:
 
@@ -80,7 +83,7 @@
 14. `ReentrantBackendCallbacksDoNotDeadlockOrLeakReferences` — garante ausencia de deadlock e balanco exato de referencias em callbacks reentrantes;
 15. `DerivedContainerIdsAreUniqueAndRfc4122ValidPerInstance` — confirma `ContainerId` deterministico, unico por instancia/conector e valido segundo RFC 4122.
 
-`LumaBridgeFunctionalToolingTests.ps1` executa **18 testes automatizados PowerShell** com mocks isolados e assinaturas efemeras em diretorio temporario sobre `windows/driver/scripts/`:
+`LumaBridgeFunctionalToolingTests.ps1` executa **23 testes automatizados PowerShell** com mocks isolados e assinaturas efemeras em diretorio temporario sobre `windows/driver/scripts/`:
 
 1. `PackageSigningAndCryptographicVerificationPositive` — valida assinatura em staging isolado, hashes SIP de `.dll` e `.inf` no `.cat`, assinatura PKCS#7 e correspondencia de certificados preservando hashes originais de build;
 2. `InfTamperingRejectedEvenWithAllowUntrustedChain` — comprova bloqueio de `.inf` adulterado inclusive com `-AllowUntrustedChain`;
@@ -99,7 +102,12 @@
 15. `UninstallOmitsForceByDefaultAndSupportsOptInForce` — garante ausencia de `/force` por padrao e suporte opt-in a `-ForceDriverStoreDelete`;
 16. `UninstallCertificateRemovalRequiresThumbprintAndConfirmation` — exige thumbprint SHA-1 valido e confirmacao dedicada (`-ConfirmCertificateRemoval`);
 17. `DiagnosticsIdentifiesLumaBridgeWudfHostProcess` — valida correlacao exata do processo `WUDFHost.exe` associado ao LumaBridge;
-18. `AllScriptsDryRunDoNotMutateSystemState` — confirma execucao limpa de `-DryRun` em todos os scripts sem efeitos colaterais.
+18. `AllScriptsDryRunDoNotMutateSystemState` — confirma execucao limpa de `-DryRun` em todos os scripts (incluindo `Invoke-LumaBridgeEtwTrace.ps1`) sem efeitos colaterais;
+19. `PnpProblemStatusAndStartupBreadcrumbsCollected` — valida formatacao de `DEVPKEY_Device_ProblemStatus` (`0xC000009E`), leitura de `UpperFilters` (`IndirectKmd`), leitura de breadcrumbs `Diag*` e exposicao em `Test-LumaBridgeDeviceDriverBinding`;
+20. `InstallFailurePreservesPreRollbackDiagnosticsBeforeCleanup` — simula falha real de start (`ROOT\DISPLAY\0000`, `oem68.inf`, `ProblemCode=10`, `0xC000009E`) e garante preservacao de `diagnostics-summary.json`, `diagnostics-summary.md`, `setupapi-excerpt.log` e `post-rollback-status.json` apos rollback completo;
+21. `SetupApiExcerptAndEventChannelCollection` — valida parser filtrado de `setupapi.dev.log` (WDF `2.23` vs `2.31` e `CM_PROB_FAILED_START`) e coleta multi-canal (`Kernel-PnP`, `CodeIntegrity`, `WerKernel`) pulando canais desabilitados;
+22. `DriverStageSummaryIdentifiesLastSuccessfulAndFailingStage` — valida correlacao combinada de traces `[LB-DRIVER]`, eventos TraceLogging ETL e breadcrumbs `Diag*` para identificar `LastSuccessfulStage` e `FirstFailureStage`;
+23. `CrashDumpInventoryAndEtwTraceDryRun` — valida inventario de dumps (`CrashDumps`, `AutoLogger`), `-DryRun` do `Invoke-LumaBridgeEtwTrace.ps1` e `-Action ExportSummary`.
 
 ## Fronteira com validacao em runtime WDF/IddCx
 
