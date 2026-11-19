@@ -83,7 +83,7 @@
 14. `ReentrantBackendCallbacksDoNotDeadlockOrLeakReferences` — garante ausencia de deadlock e balanco exato de referencias em callbacks reentrantes;
 15. `DerivedContainerIdsAreUniqueAndRfc4122ValidPerInstance` — confirma `ContainerId` deterministico, unico por instancia/conector e valido segundo RFC 4122.
 
-`LumaBridgeFunctionalToolingTests.ps1` executa **23 testes automatizados PowerShell** com mocks isolados e assinaturas efemeras em diretorio temporario sobre `windows/driver/scripts/`:
+`LumaBridgeFunctionalToolingTests.ps1` executa **27 testes automatizados PowerShell** com mocks isolados e assinaturas efemeras em diretorio temporario sobre `windows/driver/scripts/`:
 
 1. `PackageSigningAndCryptographicVerificationPositive` — valida assinatura em staging isolado, hashes SIP de `.dll` e `.inf` no `.cat`, assinatura PKCS#7 e correspondencia de certificados preservando hashes originais de build;
 2. `InfTamperingRejectedEvenWithAllowUntrustedChain` — comprova bloqueio de `.inf` adulterado inclusive com `-AllowUntrustedChain`;
@@ -107,7 +107,11 @@
 20. `InstallFailurePreservesPreRollbackDiagnosticsBeforeCleanup` — simula falha real de start (`ROOT\DISPLAY\0000`, `oem68.inf`, `ProblemCode=10`, `0xC000009E`) e garante preservacao de `diagnostics-summary.json`, `diagnostics-summary.md`, `setupapi-excerpt.log` e `post-rollback-status.json` apos rollback completo;
 21. `SetupApiExcerptAndEventChannelCollection` — valida parser filtrado de `setupapi.dev.log` (WDF `2.23` vs `2.31` e `CM_PROB_FAILED_START`) e coleta multi-canal (`Kernel-PnP`, `CodeIntegrity`, `WerKernel`) pulando canais desabilitados;
 22. `DriverStageSummaryIdentifiesLastSuccessfulAndFailingStage` — valida correlacao combinada de traces `[LB-DRIVER]`, eventos TraceLogging ETL e breadcrumbs `Diag*` para identificar `LastSuccessfulStage` e `FirstFailureStage`;
-23. `CrashDumpInventoryAndEtwTraceDryRun` — valida inventario de dumps (`CrashDumps`, `AutoLogger`), `-DryRun` do `Invoke-LumaBridgeEtwTrace.ps1` e `-Action ExportSummary`.
+23. `CrashDumpInventoryAndEtwTraceDryRun` — valida inventario de dumps (`CrashDumps`, `AutoLogger`), `-DryRun` do `Invoke-LumaBridgeEtwTrace.ps1` (sessoes `Core` + `Dxg`) e `-Action ExportSummary`;
+24. `EtwTraceUsesProviderFileAndSeparatesDxgKrnlSession` — valida arquivos `-pf` (`6` providers Core sem comentarios `#` e `2` providers `DxgKrnl`/`Watchdog-Events`), verificacao imediata de GUIDs via `Test-LumaBridgeEtwSessionProviders` e ausencia de `DxgKrnl` sem `-IncludeDxgKrnl`;
+25. `StreamingEtlQueryAppliesNativeXPathWithoutPreFilterCap` — valida geracao de XPath nativo (`Provider`, `TimeCreated`, `Execution[@ProcessID]`, exclusao padrao `DxgKrnl`/`Watchdog-Events`), streaming sem teto de 500 eventos pre-filtro, exposicao de `CircularWrapWarning` e filtro estreito do `setupapi.dev.log` excluindo `VBoxSup.inf`;
+26. `WppTmfCacheAndDecodeDryRunAndStreamFilter` — valida `-DryRun` de `Initialize-LumaBridgeWppTmfCache` e decodificacao WPP em streaming (`Invoke-LumaBridgeWppEtlDecode`) filtrando PID `23812` e excluindo ruido `DxgKrnl`/`Watchdog-Events`;
+27. `PrepareIddSampleReferenceDryRunEnforcesIsolation` — valida bloqueio de diretorios dentro do repositorio e execucao limpa de `Prepare-IddSampleReference.ps1 -DryRun` sem criar arquivos nem instalar drivers.
 
 ## Fronteira com validacao em runtime WDF/IddCx
 

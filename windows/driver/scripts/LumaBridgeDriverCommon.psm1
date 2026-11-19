@@ -16,11 +16,14 @@ $script:LumaBridgeDriverConstants = [pscustomobject]@{
     SupportedInf2CatOsList      = '10_CO_X64,10_NI_X64,10_GE_X64'
     MinimumWindows11Build       = 22000
     RegistryValueEnableMon      = 'EnableVirtualMonitor'
-    EtwSessionName              = 'LumaBridgeIddTrace'
+    EtwSessionName              = 'LumaBridgeIddCore'
+    EtwDxgSessionName           = 'LumaBridgeIddDxg'
+    EtwLegacySessionName        = 'LumaBridgeIddTrace'
     LumaBridgeTraceProviderGuid = '{A7E4C910-5B32-4F8E-9D21-7C3A1B8E4F01}'
     IddCxManifestProviderGuid   = '{966CD1C0-3F69-42AD-9877-517DCE8462B4}'
     IddCxWppProviderGuid        = '{D92BCB52-FA78-406F-A9A5-2037509FADEA}'
     IddCxWppMatchAnyKeyword     = '0x4000000004f4'
+    IddCxWppAllFlags            = '0xFFFFFFFFFFFFFFFF'
     UmdfOperationalProviderGuid = '{2E35AAEB-857F-4BEB-A418-2E6C0E54D988}'
     WdfCoreWppProviderGuid      = '{485E7DE9-0A80-11D8-AD15-505054503030}'
     WatchdogEventsProviderGuid  = '{70E74DD8-39DB-5F6F-6FD1-F5581B29E834}'
@@ -605,7 +608,20 @@ function Get-LumaBridgeWdkToolPath {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet('signtool.exe', 'devcon.exe', 'Inf2Cat.exe')]
+        [ValidateSet(
+            'signtool.exe',
+            'devcon.exe',
+            'Inf2Cat.exe',
+            'InfVerif.exe',
+            'tracefmt.exe',
+            'tracepdb.exe',
+            'tracelog.exe',
+            'symchk.exe',
+            'windbg.exe',
+            'cdb.exe',
+            'kd.exe',
+            'wdfverifier.exe',
+            'xperf.exe')]
         [string]$ToolName
     )
 
@@ -626,32 +642,63 @@ function Get-LumaBridgeWdkToolPath {
                 (Join-Path -Path $kitsRoot -ChildPath 'Tools\10.0.28000.0\x64\devcon.exe')
             )
         }
+        'wdfverifier.exe' {
+            @(
+                (Join-Path -Path $kitsRoot -ChildPath 'Tools\10.0.28000.0\x64\wdfverifier.exe')
+            )
+        }
+        'InfVerif.exe' {
+            @(
+                (Join-Path -Path $kitsRoot -ChildPath 'Tools\10.0.28000.0\x64\infverif.exe')
+            )
+        }
         'Inf2Cat.exe' {
             @(
                 (Join-Path -Path $kitsRoot -ChildPath 'bin\10.0.28000.0\x86\Inf2Cat.exe'),
                 (Join-Path -Path $kitsRoot -ChildPath 'bin\10.0.28000.0\x64\Inf2Cat.exe')
             )
         }
+        { $_ -in @('tracefmt.exe', 'tracepdb.exe', 'tracelog.exe') } {
+            @(
+                (Join-Path -Path $kitsRoot -ChildPath ("bin\10.0.28000.0\x64\{0}" -f $ToolName)),
+                (Join-Path -Path $kitsRoot -ChildPath ("bin\10.0.26100.0\x64\{0}" -f $ToolName))
+            )
+        }
+        { $_ -in @('symchk.exe', 'windbg.exe', 'cdb.exe', 'kd.exe') } {
+            @(
+                (Join-Path -Path $kitsRoot -ChildPath ("Debuggers\x64\{0}" -f $ToolName))
+            )
+        }
+        'xperf.exe' {
+            @(
+                (Join-Path -Path $kitsRoot -ChildPath 'Windows Performance Toolkit\xperf.exe')
+            )
+        }
     }
 
     foreach ($candidate in $preferredPaths) {
-        if (Test-Path -LiteralPath $candidate) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
             return $candidate
         }
     }
 
-    $searchRoot = if ($ToolName -eq 'devcon.exe') {
-        Join-Path -Path $kitsRoot -ChildPath 'Tools'
-    }
-    else {
-        Join-Path -Path $kitsRoot -ChildPath 'bin'
+    $searchRoot = switch ($ToolName) {
+        { $_ -in @('devcon.exe', 'wdfverifier.exe', 'InfVerif.exe') } { Join-Path -Path $kitsRoot -ChildPath 'Tools'; break }
+        { $_ -in @('symchk.exe', 'windbg.exe', 'cdb.exe', 'kd.exe') } { Join-Path -Path $kitsRoot -ChildPath 'Debuggers'; break }
+        'xperf.exe' { Join-Path -Path $kitsRoot -ChildPath 'Windows Performance Toolkit'; break }
+        default { Join-Path -Path $kitsRoot -ChildPath 'bin'; break }
     }
 
     if (-not (Test-Path -LiteralPath $searchRoot)) {
         return $null
     }
 
-    $archPattern = if ($ToolName -eq 'Inf2Cat.exe') { '\\(x64|x86)\\' } else { '\\x64\\' }
+    $archPattern = switch ($ToolName) {
+        'Inf2Cat.exe' { '\\(x64|x86)\\'; break }
+        'xperf.exe' { '.*'; break }
+        default { '\\x64\\'; break }
+    }
+
     $discovered = Get-ChildItem -Path $searchRoot -Recurse -Filter $ToolName -File -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -match $archPattern } |
         Sort-Object -Property FullName -Descending |
@@ -2087,21 +2134,30 @@ function Get-LumaBridgeSetupApiLogExcerpt {
         elseif ($null -ne $fs) { $fs.Dispose() }
     }
 
-    $patterns = New-Object System.Collections.Generic.List[string]
-    $patterns.Add('LumaBridge')
-    $patterns.Add([regex]::Escape($script:LumaBridgeDriverConstants.HardwareId))
-    $patterns.Add([regex]::Escape($script:LumaBridgeDriverConstants.InfFileName))
+    $primaryPatterns = New-Object System.Collections.Generic.List[string]
+    $primaryPatterns.Add('LumaBridge')
+    $primaryPatterns.Add([regex]::Escape($script:LumaBridgeDriverConstants.HardwareId))
+    $primaryPatterns.Add([regex]::Escape($script:LumaBridgeDriverConstants.InfFileName))
     foreach ($id in @($InstanceIds)) {
         if (-not [string]::IsNullOrWhiteSpace($id)) {
-            $patterns.Add([regex]::Escape($id.Trim()))
+            $primaryPatterns.Add([regex]::Escape($id.Trim()))
         }
     }
+    $primaryPattern = '(?i)(' + (($primaryPatterns | Select-Object -Unique) -join '|') + ')'
+
+    $publishedPatterns = New-Object System.Collections.Generic.List[string]
     foreach ($inf in @($PublishedInfNames)) {
         if (-not [string]::IsNullOrWhiteSpace($inf)) {
-            $patterns.Add([regex]::Escape($inf.Trim()))
+            $publishedPatterns.Add([regex]::Escape($inf.Trim()))
         }
     }
-    $combinedPattern = '(?i)(' + (($patterns | Select-Object -Unique) -join '|') + ')'
+    $publishedPattern = if ($publishedPatterns.Count -gt 0) {
+        '(?i)(' + (($publishedPatterns | Select-Object -Unique) -join '|') + ')'
+    }
+    else {
+        $null
+    }
+    $publishedContextGuard = '(?i)(LumaBridge|4d36e968-e325-11ce-bfc1-08002be10318|WUDFRd|IndirectKmd|ROOT\\DISPLAY)'
 
     $allMatchedSections = New-Object System.Collections.Generic.List[object]
     $currentLines = $null
@@ -2114,7 +2170,9 @@ function Get-LumaBridgeSetupApiLogExcerpt {
             return
         }
         $joined = ($SecLines.ToArray() -join [Environment]::NewLine)
-        if ($joined -match $combinedPattern) {
+        $isPrimaryMatch = ($joined -match $primaryPattern)
+        $isPublishedMatch = ($null -ne $publishedPattern) -and ($joined -match $publishedPattern) -and ($joined -match $publishedContextGuard)
+        if ($isPrimaryMatch -or $isPublishedMatch) {
             $exitStatus = $null
             for ($i = $SecLines.Count - 1; $i -ge 0; --$i) {
                 if ($SecLines[$i] -match '<<<\s+\[Exit status:\s*(?<Status>[^\]]+)\]') {
@@ -2561,106 +2619,744 @@ function Get-LumaBridgeCrashDumpInventory {
     }
 }
 
+function New-LumaBridgeEtwProviderFileContent {
+    [CmdletBinding()]
+    param(
+        [ValidateSet('Core', 'Dxg')]
+        [string]$SessionKind = 'Core',
+
+        [switch]$RestrictIddCxWppKeywords
+    )
+
+    $c = $script:LumaBridgeDriverConstants
+    $lines = New-Object System.Collections.Generic.List[string]
+
+    if ($SessionKind -eq 'Core') {
+        $iddWppFlags = if ($RestrictIddCxWppKeywords) { $c.IddCxWppMatchAnyKeyword } else { $c.IddCxWppAllFlags }
+        $specs = @(
+            @{ Guid = $c.LumaBridgeTraceProviderGuid; Flags = '0xFFFFFFFFFFFFFFFF'; Level = '5' },
+            @{ Guid = $c.IddCxManifestProviderGuid;   Flags = '0xFFFFFFFFFFFFFFFF'; Level = '5' },
+            @{ Guid = $c.IddCxWppProviderGuid;        Flags = $iddWppFlags;         Level = '5' },
+            @{ Guid = $c.UmdfOperationalProviderGuid; Flags = '0xFFFFFFFFFFFFFFFF'; Level = '5' },
+            @{ Guid = $c.WdfCoreWppProviderGuid;      Flags = '0xFFFFFFFFFFFFFFFF'; Level = '5' },
+            @{ Guid = $c.WerKernelProviderGuid;       Flags = '0xFFFFFFFFFFFFFFFF'; Level = '5' }
+        )
+    }
+    else {
+        $specs = @(
+            @{ Guid = $c.DxgKrnlProviderGuid;        Flags = '0xFFFFFFFFFFFFFFFF'; Level = '4' },
+            @{ Guid = $c.WatchdogEventsProviderGuid; Flags = '0xFFFFFFFFFFFFFFFF'; Level = '5' }
+        )
+    }
+
+    foreach ($s in $specs) {
+        $lines.Add(("{0} {1} {2}" -f $s.Guid, $s.Flags, $s.Level))
+    }
+
+    return @($lines.ToArray())
+}
+
+function Test-LumaBridgeEtwSessionProviders {
+    [CmdletBinding()]
+    param(
+        [string[]]$QueryOutputLines = @(),
+
+        [string[]]$ExpectedProviderGuids = @()
+    )
+
+    $foundSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $guidRegex = [regex]'\{?[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}?'
+
+    foreach ($line in @($QueryOutputLines)) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        foreach ($m in $guidRegex.Matches($line)) {
+            $bare = ($m.Value -replace '[{}]', '').ToUpperInvariant()
+            $null = $foundSet.Add(('{' + $bare + '}'))
+        }
+    }
+
+    $normalizedExpected = New-Object System.Collections.Generic.List[string]
+    $missing = New-Object System.Collections.Generic.List[string]
+
+    foreach ($exp in @($ExpectedProviderGuids)) {
+        if ([string]::IsNullOrWhiteSpace($exp)) { continue }
+        $bare = ($exp.Trim() -replace '[{}]', '').ToUpperInvariant()
+        $norm = '{' + $bare + '}'
+        if ($normalizedExpected -notcontains $norm) {
+            $normalizedExpected.Add($norm)
+            if (-not $foundSet.Contains($norm)) {
+                $missing.Add($norm)
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Checked              = $true
+        ExpectedCount        = $normalizedExpected.Count
+        ExpectedProviderGuids = @($normalizedExpected.ToArray())
+        FoundProviderGuids   = @($foundSet | Sort-Object)
+        MissingProviderGuids = @($missing.ToArray())
+        AllProvidersVerified = ($normalizedExpected.Count -gt 0 -and $missing.Count -eq 0)
+    }
+}
+
+function Get-LumaBridgeEtlTraceStats {
+    [CmdletBinding()]
+    param(
+        [string]$EtlPath
+    )
+
+    $result = [pscustomobject]@{
+        Available           = $false
+        EtlPath             = $EtlPath
+        StartTimeUtc        = $null
+        EndTimeUtc          = $null
+        LogFileMode         = $null
+        CircularBufferMode  = $false
+        LostBuffers         = $null
+        LostEvents          = $null
+        CircularWrapWarning = $null
+        Error               = ''
+    }
+
+    if ([string]::IsNullOrWhiteSpace($EtlPath) -or -not (Test-Path -LiteralPath $EtlPath -PathType Leaf)) {
+        $result.Error = 'ETL file not found.'
+        return $result
+    }
+
+    $xperfPath = Get-LumaBridgeWdkToolPath -ToolName 'xperf.exe'
+    if ([string]::IsNullOrWhiteSpace($xperfPath)) {
+        $result.Error = 'xperf.exe not found under Windows Kits\10.'
+        return $result
+    }
+
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $lines = & $xperfPath -i $EtlPath -a tracestats 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $result.Error = ("xperf tracestats exited with code {0}" -f $LASTEXITCODE)
+            return $result
+        }
+
+        $result.Available = $true
+        foreach ($rawLine in @($lines)) {
+            $line = [string]$rawLine
+            if ($line -match '^\s*Start time \(UTC\)\s*:\s*(?<Ts>\d{4}/\d{2}/\d{2}:\d{2}:\d{2}:\d{2}\.\d+)' -and $null -eq $result.StartTimeUtc) {
+                $dt = [DateTime]::MinValue
+                if ([DateTime]::TryParseExact($matches['Ts'], 'yyyy/MM/dd:HH:mm:ss.fffffff', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$dt)) {
+                    $result.StartTimeUtc = $dt.ToUniversalTime().ToString('o')
+                }
+            }
+            elseif ($line -match '^\s*End time \(UTC\)\s*:\s*(?<Ts>\d{4}/\d{2}/\d{2}:\d{2}:\d{2}:\d{2}\.\d+)' -and $null -eq $result.EndTimeUtc) {
+                $dt = [DateTime]::MinValue
+                if ([DateTime]::TryParseExact($matches['Ts'], 'yyyy/MM/dd:HH:mm:ss.fffffff', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$dt)) {
+                    $result.EndTimeUtc = $dt.ToUniversalTime().ToString('o')
+                }
+            }
+            elseif ($line -match '^\s*Log file mode\s*:\s*(?<Mode>.+)$') {
+                $mode = $matches['Mode'].Trim()
+                $result.LogFileMode = $mode
+                $result.CircularBufferMode = ($mode -match '(?i)Circular')
+            }
+            elseif ($line -match '^\s*#\s*Lost Buffers\s*:\s*(?<Val>\d+)') {
+                $result.LostBuffers = [int]$matches['Val']
+            }
+            elseif ($line -match '^\s*#\s*Lost Events\s*:\s*(?<Val>\d+)') {
+                $result.LostEvents = [int]$matches['Val']
+            }
+        }
+
+        if ($result.CircularBufferMode) {
+            $result.CircularWrapWarning = 'ETL uses circular buffer mode; older events from high-volume providers (e.g. DxgKrnl) may overwrite earlier startup windows unless separated.'
+        }
+    }
+    catch {
+        $result.Error = $_.Exception.Message
+    }
+    finally {
+        $ErrorActionPreference = $prevEap
+    }
+
+    return $result
+}
+
+function Get-LumaBridgeEtlXPathQuery {
+    [CmdletBinding()]
+    param(
+        [string[]]$ProviderGuids = @(),
+
+        [string[]]$ProviderNames = @(),
+
+        [Nullable[DateTime]]$StartTimeUtc = $null,
+
+        [Nullable[DateTime]]$EndTimeUtc = $null,
+
+        [Nullable[int]]$ProcessId = $null,
+
+        [switch]$ExcludeHighVolumeGraphics
+    )
+
+    $c = $script:LumaBridgeDriverConstants
+    $systemClauses = New-Object System.Collections.Generic.List[string]
+    $providerTerms = New-Object System.Collections.Generic.List[string]
+
+    foreach ($g in @($ProviderGuids)) {
+        if ([string]::IsNullOrWhiteSpace($g)) { continue }
+        $norm = '{' + (($g.Trim() -replace '[{}]', '').ToLowerInvariant()) + '}'
+        $providerTerms.Add(("@Guid='{0}'" -f $norm))
+    }
+
+    foreach ($n in @($ProviderNames)) {
+        if ([string]::IsNullOrWhiteSpace($n)) { continue }
+        $safeName = $n.Trim().Replace("'", '')
+        $providerTerms.Add(("@Name='{0}'" -f $safeName))
+    }
+
+    if ($providerTerms.Count -gt 0) {
+        $systemClauses.Add(('Provider[' + ($providerTerms.ToArray() -join ' or ') + ']'))
+    }
+    elseif ($ExcludeHighVolumeGraphics) {
+        $dxg = '{' + (($c.DxgKrnlProviderGuid -replace '[{}]', '').ToLowerInvariant()) + '}'
+        $wdg = '{' + (($c.WatchdogEventsProviderGuid -replace '[{}]', '').ToLowerInvariant()) + '}'
+        $systemClauses.Add(("Provider[@Guid!='{0}' and @Guid!='{1}']" -f $dxg, $wdg))
+    }
+
+    $timeTerms = New-Object System.Collections.Generic.List[string]
+    if ($null -ne $StartTimeUtc) {
+        $timeTerms.Add(("@SystemTime>='{0}'" -f ([DateTime]$StartTimeUtc).ToUniversalTime().ToString('o')))
+    }
+    if ($null -ne $EndTimeUtc) {
+        $timeTerms.Add(("@SystemTime<='{0}'" -f ([DateTime]$EndTimeUtc).ToUniversalTime().ToString('o')))
+    }
+    if ($timeTerms.Count -gt 0) {
+        $systemClauses.Add(('TimeCreated[' + ($timeTerms.ToArray() -join ' and ') + ']'))
+    }
+
+    if ($null -ne $ProcessId) {
+        $systemClauses.Add(("Execution[@ProcessID={0}]" -f ([int]$ProcessId)))
+    }
+
+    if ($systemClauses.Count -eq 0) {
+        return '*'
+    }
+
+    return ("*[System[{0}]]" -f ($systemClauses.ToArray() -join ' and '))
+}
+
+function Invoke-LumaBridgeEtlXPathReader {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$EtlPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$XPath,
+
+        [ValidateRange(1, 50000)]
+        [int]$MaxMatchedEvents = 500
+    )
+
+    $matched = New-Object System.Collections.Generic.List[object]
+    $limitReached = $false
+    $reader = $null
+
+    try {
+        $query = [System.Diagnostics.Eventing.Reader.EventLogQuery]::new(
+            $EtlPath,
+            [System.Diagnostics.Eventing.Reader.PathType]::FilePath,
+            $XPath)
+        $reader = [System.Diagnostics.Eventing.Reader.EventLogReader]::new($query)
+
+        while ($null -ne ($ev = $reader.ReadEvent())) {
+            try {
+                if ($matched.Count -ge $MaxMatchedEvents) {
+                    $limitReached = $true
+                    break
+                }
+
+                $prov = if ($null -ne $ev.ProviderName) { [string]$ev.ProviderName } else { '' }
+                $provId = if ($null -ne $ev.ProviderId) { ('{' + $ev.ProviderId.ToString().ToLowerInvariant() + '}') } else { '' }
+                $evMsg = ''
+                try {
+                    $desc = $ev.FormatDescription()
+                    if (-not [string]::IsNullOrWhiteSpace($desc)) {
+                        $evMsg = ($desc -replace '\r?\n', ' ').Trim()
+                    }
+                }
+                catch {
+                    $evMsg = ''
+                }
+
+                $evTime = if ($null -ne $ev.TimeCreated) { $ev.TimeCreated.ToUniversalTime().ToString('o') } else { $null }
+                $evLevel = if ($null -ne $ev.LevelDisplayName) { [string]$ev.LevelDisplayName } else { [string]$ev.Level }
+
+                $propValues = New-Object System.Collections.Generic.List[string]
+                if ($null -ne $ev.Properties) {
+                    foreach ($p in $ev.Properties) {
+                        if ($null -ne $p -and $null -ne $p.Value) {
+                            $propValues.Add([string]$p.Value)
+                        }
+                        else {
+                            $propValues.Add('')
+                        }
+                    }
+                }
+
+                $matched.Add([pscustomobject]@{
+                    TimeCreated  = $evTime
+                    ProviderName = $prov
+                    ProviderId   = $provId
+                    Id           = [int]$ev.Id
+                    LevelDisplay = $evLevel
+                    ProcessId    = $ev.ProcessId
+                    ThreadId     = $ev.ThreadId
+                    Message      = $evMsg
+                    Properties   = @($propValues.ToArray())
+                })
+            }
+            finally {
+                $ev.Dispose()
+            }
+        }
+    }
+    finally {
+        if ($null -ne $reader) {
+            $reader.Dispose()
+        }
+    }
+
+    return [pscustomobject]@{
+        Events       = @($matched.ToArray())
+        LimitReached = $limitReached
+    }
+}
+
 function Get-LumaBridgeEtlEventSummary {
     [CmdletBinding()]
     param(
         [string]$EtlPath,
 
-        [ValidateRange(1, 5000)]
-        [int]$MaxEvents = 500
+        [string[]]$ProviderGuids = @(),
+
+        [string[]]$ProviderNames = @(),
+
+        [Nullable[DateTime]]$StartTimeUtc = $null,
+
+        [Nullable[DateTime]]$EndTimeUtc = $null,
+
+        [Nullable[int]]$ProcessId = $null,
+
+        [Alias('MaxEvents')]
+        [ValidateRange(1, 50000)]
+        [int]$MaxMatchedEvents = 500,
+
+        [switch]$ExcludeHighVolumeGraphics
     )
+
+    $excludeHighVol = if ($PSBoundParameters.ContainsKey('ExcludeHighVolumeGraphics')) {
+        [bool]$ExcludeHighVolumeGraphics
+    }
+    else {
+        (@($ProviderGuids).Count -eq 0 -and @($ProviderNames).Count -eq 0)
+    }
 
     if ([string]::IsNullOrWhiteSpace($EtlPath) -or -not (Test-Path -LiteralPath $EtlPath -PathType Leaf)) {
         return [pscustomobject]@{
-            EtlPath      = $EtlPath
-            Exists       = $false
-            EventCount   = 0
-            LumaBridgeEvents = @()
-            Providers    = @()
-            Events       = @()
-            Error        = 'ETL file not found.'
+            EtlPath               = $EtlPath
+            Exists                = $false
+            EventCount            = 0
+            MatchedEventCount     = 0
+            MatchedLimitReached   = $false
+            FilteredOutHighVolume = $excludeHighVol
+            XPathUsed             = ''
+            TraceStats            = $null
+            CircularWrapWarning   = $null
+            LumaBridgeEvents      = @()
+            Providers             = @()
+            Events                = @()
+            Error                 = 'ETL file not found.'
         }
     }
 
-    $winEventCmd = Get-Command -Name 'Get-WinEvent' -ErrorAction SilentlyContinue
-    if ($null -eq $winEventCmd -or -not $winEventCmd.Parameters.ContainsKey('Path')) {
-        return [pscustomobject]@{
-            EtlPath      = $EtlPath
-            Exists       = $true
-            EventCount   = 0
-            LumaBridgeEvents = @()
-            Providers    = @()
-            Events       = @()
-            Error        = 'Get-WinEvent -Path is unavailable in the current environment.'
-        }
-    }
+    $xpath = Get-LumaBridgeEtlXPathQuery `
+        -ProviderGuids $ProviderGuids `
+        -ProviderNames $ProviderNames `
+        -StartTimeUtc $StartTimeUtc `
+        -EndTimeUtc $EndTimeUtc `
+        -ProcessId $ProcessId `
+        -ExcludeHighVolumeGraphics:$excludeHighVol
 
-    $decoded = New-Object System.Collections.Generic.List[object]
+    $traceStats = Get-LumaBridgeEtlTraceStats -EtlPath $EtlPath
+    $events = @()
+    $limitReached = $false
     $err = ''
+
     try {
-        $rawEvents = @(Get-WinEvent -Path $EtlPath -Oldest -MaxEvents $MaxEvents -ErrorAction Stop)
-        foreach ($ev in $rawEvents) {
-            $prov = if ($ev.PSObject.Properties.Name -contains 'ProviderName') { [string]$ev.ProviderName } else { '' }
-            $msg = if ($ev.PSObject.Properties.Name -contains 'Message' -and $null -ne $ev.Message) { ($ev.Message -replace '\r?\n', ' ').Trim() } else { '' }
-            $evPid = if ($ev.PSObject.Properties.Name -contains 'ProcessId') { $ev.ProcessId } else { $null }
-            $evTid = if ($ev.PSObject.Properties.Name -contains 'ThreadId') { $ev.ThreadId } else { $null }
-            $evId = if ($ev.PSObject.Properties.Name -contains 'Id') { [int]$ev.Id } else { 0 }
-            $evLevel = if ($ev.PSObject.Properties.Name -contains 'LevelDisplayName') { $ev.LevelDisplayName } else { '' }
-            $evTime = if ($ev.PSObject.Properties.Name -contains 'TimeCreated' -and $null -ne $ev.TimeCreated) {
-                $ev.TimeCreated.ToUniversalTime().ToString('o')
-            }
-            else {
-                $null
-            }
-
-            $propValues = @()
-            if ($ev.PSObject.Properties.Name -contains 'Properties' -and $null -ne $ev.Properties) {
-                $propValues = @($ev.Properties | ForEach-Object {
-                    if ($null -ne $_ -and ($_.PSObject.Properties.Name -contains 'Value')) {
-                        [string]$_.Value
-                    }
-                    else {
-                        [string]$_
-                    }
-                })
-            }
-
-            $decoded.Add([pscustomobject]@{
-                TimeCreated  = $evTime
-                ProviderName = $prov
-                Id           = $evId
-                LevelDisplay = $evLevel
-                ProcessId    = $evPid
-                ThreadId     = $evTid
-                Message      = $msg
-                Properties   = $propValues
-            })
-        }
+        $readOut = Invoke-LumaBridgeEtlXPathReader -EtlPath $EtlPath -XPath $xpath -MaxMatchedEvents $MaxMatchedEvents
+        $events = @($readOut.Events)
+        $limitReached = [bool]$readOut.LimitReached
     }
     catch {
         $err = $_.Exception.Message
     }
 
-    $lbEvents = @($decoded.ToArray() | Where-Object {
-        $_.ProviderName -ieq 'LumaBridgeIddDriver' -or $_.Message -match '\[LB-DRIVER\]'
+    $lbGuidLower = '{' + (($script:LumaBridgeDriverConstants.LumaBridgeTraceProviderGuid -replace '[{}]', '').ToLowerInvariant()) + '}'
+    $lbEvents = @($events | Where-Object {
+        $_.ProviderName -ieq 'LumaBridgeIddDriver' -or
+        (($_.PSObject.Properties.Name -contains 'ProviderId') -and ($_.ProviderId -ieq $lbGuidLower)) -or
+        $_.Message -match '\[LB-DRIVER\]'
     })
 
-    $providerCounts = @($decoded.ToArray() | Group-Object -Property ProviderName | ForEach-Object {
+    $providerCounts = @($events | Group-Object -Property {
+        if (-not [string]::IsNullOrWhiteSpace($_.ProviderName)) { $_.ProviderName }
+        elseif (($_.PSObject.Properties.Name -contains 'ProviderId') -and -not [string]::IsNullOrWhiteSpace($_.ProviderId)) { $_.ProviderId }
+        else { 'ClassicOrWpp' }
+    } | ForEach-Object {
         [pscustomobject]@{
             ProviderName = $_.Name
             Count        = $_.Count
         }
     })
 
+    $wrapWarning = if ($null -ne $traceStats) { $traceStats.CircularWrapWarning } else { $null }
+
     return [pscustomobject]@{
-        EtlPath          = $EtlPath
-        Exists           = $true
-        EventCount       = $decoded.Count
-        LumaBridgeEvents = $lbEvents
-        Providers        = $providerCounts
-        Events           = @($decoded.ToArray())
-        Error            = $err
+        EtlPath               = $EtlPath
+        Exists                = $true
+        EventCount            = $events.Count
+        MatchedEventCount     = $events.Count
+        MatchedLimitReached   = $limitReached
+        FilteredOutHighVolume = $excludeHighVol
+        XPathUsed             = $xpath
+        TraceStats            = $traceStats
+        CircularWrapWarning   = $wrapWarning
+        LumaBridgeEvents      = $lbEvents
+        Providers             = $providerCounts
+        Events                = $events
+        Error                 = $err
     }
+}
+
+function Initialize-LumaBridgeWppTmfCache {
+    [CmdletBinding()]
+    param(
+        [string]$SymbolCacheDir,
+
+        [string]$TmfCacheDir,
+
+        [string[]]$Binaries = @(
+            (Join-Path -Path $env:SystemRoot -ChildPath 'System32\drivers\UMDF\IddCx.dll'),
+            (Join-Path -Path $env:SystemRoot -ChildPath 'System32\WUDFx02000.dll')
+        ),
+
+        [string]$SymbolServerUrl = 'https://msdl.microsoft.com/download/symbols',
+
+        [switch]$SkipSymbolDownload,
+
+        [switch]$DryRun
+    )
+
+    if ([string]::IsNullOrWhiteSpace($SymbolCacheDir)) {
+        $baseTmp = [System.IO.Path]::GetTempPath()
+        $SymbolCacheDir = Join-Path -Path $baseTmp -ChildPath 'LumaBridgeSymCache'
+    }
+    if ([string]::IsNullOrWhiteSpace($TmfCacheDir)) {
+        $baseTmp = [System.IO.Path]::GetTempPath()
+        $TmfCacheDir = Join-Path -Path $baseTmp -ChildPath 'LumaBridgeTmfCache'
+    }
+
+    $symchkPath = Get-LumaBridgeWdkToolPath -ToolName 'symchk.exe'
+    $tracepdbPath = Get-LumaBridgeWdkToolPath -ToolName 'tracepdb.exe'
+    $errors = New-Object System.Collections.Generic.List[string]
+    $executedCommands = New-Object System.Collections.Generic.List[string]
+
+    if (-not $DryRun) {
+        if (-not (Test-Path -LiteralPath $SymbolCacheDir)) { $null = New-Item -Path $SymbolCacheDir -ItemType Directory -Force }
+        if (-not (Test-Path -LiteralPath $TmfCacheDir)) { $null = New-Item -Path $TmfCacheDir -ItemType Directory -Force }
+    }
+
+    if (-not $SkipSymbolDownload) {
+        if ([string]::IsNullOrWhiteSpace($symchkPath)) {
+            $errors.Add('symchk.exe not found under Windows Kits\10\Debuggers\x64.')
+        }
+        else {
+            foreach ($bin in @($Binaries)) {
+                if ([string]::IsNullOrWhiteSpace($bin)) { continue }
+                if (-not $DryRun -and -not (Test-Path -LiteralPath $bin -PathType Leaf)) {
+                    $errors.Add(("Binary not found for symbol check: {0}" -f $bin))
+                    continue
+                }
+                $symSpec = "srv*{0}*{1}" -f $SymbolCacheDir, $SymbolServerUrl
+                $symArgs = @('/if', $bin, '/s', $symSpec, '/op', '/os')
+                try {
+                    $null = Invoke-LumaBridgeExternalCommand -FilePath $symchkPath -Arguments $symArgs -DryRun:$DryRun
+                    $executedCommands.Add(("{0} {1}" -f $symchkPath, ($symArgs -join ' ')))
+                }
+                catch {
+                    $errors.Add($_.Exception.Message)
+                }
+            }
+        }
+    }
+
+    $pdbFiles = @(if (Test-Path -LiteralPath $SymbolCacheDir) {
+        Get-ChildItem -LiteralPath $SymbolCacheDir -Recurse -File -Filter '*.pdb' -ErrorAction SilentlyContinue
+    })
+
+    if ([string]::IsNullOrWhiteSpace($tracepdbPath)) {
+        $errors.Add('tracepdb.exe not found under Windows Kits\10\bin.')
+    }
+    elseif ($DryRun) {
+        $executedCommands.Add(("{0} -f <cached_pdb_file> -p {1}" -f $tracepdbPath, $TmfCacheDir))
+    }
+    else {
+        foreach ($pdb in $pdbFiles) {
+            $tpArgs = @('-f', $pdb.FullName, '-p', $TmfCacheDir)
+            try {
+                $null = Invoke-LumaBridgeExternalCommand -FilePath $tracepdbPath -Arguments $tpArgs
+                $executedCommands.Add(("{0} {1}" -f $tracepdbPath, ($tpArgs -join ' ')))
+            }
+            catch {
+                $errors.Add($_.Exception.Message)
+            }
+        }
+    }
+
+    $tmfFiles = @(if (Test-Path -LiteralPath $TmfCacheDir) {
+        Get-ChildItem -LiteralPath $TmfCacheDir -File -Filter '*.tmf' -ErrorAction SilentlyContinue
+    })
+
+    return [pscustomobject]@{
+        DryRun           = [bool]$DryRun
+        SymbolCacheDir   = $SymbolCacheDir
+        TmfCacheDir      = $TmfCacheDir
+        PdbCount         = @($pdbFiles).Count
+        TmfCount         = @($tmfFiles).Count
+        ExecutedCommands = @($executedCommands.ToArray())
+        Errors           = @($errors.ToArray())
+    }
+}
+
+function Invoke-LumaBridgeWppEtlDecode {
+    [CmdletBinding()]
+    param(
+        [string]$EtlPath,
+
+        [string]$TmfCacheDir,
+
+        [string]$SymbolCacheDir,
+
+        [string]$SymbolServerUrl = 'https://msdl.microsoft.com/download/symbols',
+
+        [string]$OutputPath,
+
+        [string]$ExistingTraceFmtTextPath,
+
+        [Nullable[int]]$ProcessId = $null,
+
+        [string[]]$ExcludeProviders = @('Microsoft-Windows-DxgKrnl', 'Microsoft-Windows-Watchdog-Events'),
+
+        [ValidateRange(1, 50000)]
+        [int]$MaxMatchedLines = 500,
+
+        [switch]$SkipSymbolServer,
+
+        [switch]$DryRun
+    )
+
+    if ([string]::IsNullOrWhiteSpace($TmfCacheDir)) {
+        $TmfCacheDir = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath 'LumaBridgeTmfCache'
+    }
+    if ([string]::IsNullOrWhiteSpace($SymbolCacheDir)) {
+        $SymbolCacheDir = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath 'LumaBridgeSymCache'
+    }
+
+    $tracefmtPath = Get-LumaBridgeWdkToolPath -ToolName 'tracefmt.exe'
+    if ($DryRun) {
+        $cmdPreview = if ([string]::IsNullOrWhiteSpace($tracefmtPath)) { 'tracefmt.exe' } else { $tracefmtPath }
+        return [pscustomobject]@{
+            DryRun            = $true
+            EtlPath           = $EtlPath
+            TmfCacheDir       = $TmfCacheDir
+            PlannedCommand    = ("{0} {1} -p {2} -o <temp_stream_txt> -nosummary" -f $cmdPreview, $EtlPath, $TmfCacheDir)
+            OutputPath        = $OutputPath
+            MatchedLineCount  = 0
+            MatchedLines      = @()
+            IddCxWppLines     = @()
+            ProviderCounts    = @()
+            TotalScannedLines = 0
+            Error             = ''
+        }
+    }
+
+    $sourceTextPath = $null
+    $cleanupTemp = $false
+    $traceStats = $null
+
+    if (-not [string]::IsNullOrWhiteSpace($ExistingTraceFmtTextPath)) {
+        if (-not (Test-Path -LiteralPath $ExistingTraceFmtTextPath -PathType Leaf)) {
+            return [pscustomobject]@{
+                DryRun            = $false
+                EtlPath           = $EtlPath
+                Exists            = $false
+                TotalScannedLines = 0
+                ProviderCounts    = @()
+                MatchedLineCount  = 0
+                MatchedLines      = @()
+                IddCxWppLines     = @()
+                OutputPath        = $OutputPath
+                Error             = ("ExistingTraceFmtTextPath not found: {0}" -f $ExistingTraceFmtTextPath)
+            }
+        }
+        $sourceTextPath = $ExistingTraceFmtTextPath
+    }
+    else {
+        if ([string]::IsNullOrWhiteSpace($EtlPath) -or -not (Test-Path -LiteralPath $EtlPath -PathType Leaf)) {
+            return [pscustomobject]@{
+                DryRun            = $false
+                EtlPath           = $EtlPath
+                Exists            = $false
+                TotalScannedLines = 0
+                ProviderCounts    = @()
+                MatchedLineCount  = 0
+                MatchedLines      = @()
+                IddCxWppLines     = @()
+                OutputPath        = $OutputPath
+                Error             = 'ETL file not found.'
+            }
+        }
+
+        $traceStats = Get-LumaBridgeEtlTraceStats -EtlPath $EtlPath
+        if ([string]::IsNullOrWhiteSpace($tracefmtPath)) {
+            return [pscustomobject]@{
+                DryRun            = $false
+                EtlPath           = $EtlPath
+                Exists            = $true
+                TotalScannedLines = 0
+                ProviderCounts    = @()
+                MatchedLineCount  = 0
+                MatchedLines      = @()
+                IddCxWppLines     = @()
+                OutputPath        = $OutputPath
+                Error             = 'tracefmt.exe not found under Windows Kits\10\bin.'
+            }
+        }
+
+        $sourceTextPath = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ("lb_tracefmt_{0}.txt" -f ([guid]::NewGuid().ToString('N')))
+        $cleanupTemp = $true
+        $tfArgs = @($EtlPath, '-p', $TmfCacheDir)
+        if (-not $SkipSymbolServer) {
+            $tfArgs += @('-r', ("srv*{0}*{1}" -f $SymbolCacheDir, $SymbolServerUrl))
+        }
+        $tfArgs += @('-o', $sourceTextPath, '-nosummary')
+
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $null = & $tracefmtPath @tfArgs 2>&1
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $sourceTextPath -PathType Leaf)) {
+                return [pscustomobject]@{
+                    DryRun            = $false
+                    EtlPath           = $EtlPath
+                    Exists            = $true
+                    TotalScannedLines = 0
+                    ProviderCounts    = @()
+                    MatchedLineCount  = 0
+                    MatchedLines      = @()
+                    IddCxWppLines     = @()
+                    OutputPath        = $OutputPath
+                    Error             = ("tracefmt.exe exited with code {0}." -f $LASTEXITCODE)
+                }
+            }
+        }
+        finally {
+            $ErrorActionPreference = $prevEap
+        }
+    }
+
+    $totalLines = 0
+    $providerMap = @{}
+    $matchedLines = New-Object System.Collections.Generic.List[string]
+    $iddCxLines = New-Object System.Collections.Generic.List[string]
+    $excludedSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($ex in @($ExcludeProviders)) {
+        if (-not [string]::IsNullOrWhiteSpace($ex)) { $null = $excludedSet.Add($ex.Trim()) }
+    }
+
+    try {
+        foreach ($line in [System.IO.File]::ReadLines($sourceTextPath)) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            ++$totalLines
+
+            $prov = ''
+            $linePid = $null
+            if ($line -match '^\[[^\]]+\](?<PidHex>[0-9A-Fa-f]+)\.[0-9A-Fa-f]+::[0-9/:-]+\.[0-9]+\s+\[(?<Prov>[^\]]+)\]') {
+                $linePid = [Convert]::ToInt32($matches['PidHex'], 16)
+                $prov = $matches['Prov'].Trim()
+            }
+            elseif ($line -match '^\s*(?:Unknown|Invalid)\(') {
+                continue
+            }
+
+            $provKey = if (-not [string]::IsNullOrWhiteSpace($prov)) { $prov } else { 'Other' }
+            if (-not $providerMap.ContainsKey($provKey)) { $providerMap[$provKey] = 0 }
+            $providerMap[$provKey] = $providerMap[$provKey] + 1
+
+            if ($excludedSet.Contains($provKey)) {
+                continue
+            }
+
+            if ($null -ne $ProcessId -and $null -ne $linePid -and $linePid -ne ([int]$ProcessId)) {
+                continue
+            }
+
+            if ($matchedLines.Count -lt $MaxMatchedLines) {
+                $matchedLines.Add($line)
+            }
+            if ($line -match '(\[cx\]|\[IddCx\]|LumaBridge|0xc000009e)') {
+                $iddCxLines.Add($line)
+            }
+        }
+    }
+    finally {
+        if ($cleanupTemp -and -not [string]::IsNullOrWhiteSpace($sourceTextPath)) {
+            Remove-Item -LiteralPath $sourceTextPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    $providerCounts = @($providerMap.GetEnumerator() | Sort-Object -Property Value -Descending | ForEach-Object {
+        [pscustomobject]@{
+            ProviderName = $_.Key
+            Count        = $_.Value
+        }
+    })
+
+    $payload = [pscustomobject]@{
+        DryRun              = $false
+        EtlPath             = $EtlPath
+        Exists              = $true
+        TmfCacheDir         = $TmfCacheDir
+        TotalScannedLines   = $totalLines
+        ProviderCounts      = $providerCounts
+        MatchedLineCount    = $matchedLines.Count
+        MatchedLines        = @($matchedLines.ToArray())
+        IddCxWppLines       = @($iddCxLines.ToArray())
+        TraceStats          = $traceStats
+        CircularWrapWarning = if ($null -ne $traceStats) { $traceStats.CircularWrapWarning } else { $null }
+        OutputPath          = $OutputPath
+        Error               = ''
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($OutputPath)) {
+        $parent = Split-Path -Path $OutputPath -Parent
+        if (-not [string]::IsNullOrWhiteSpace($parent) -and -not (Test-Path -LiteralPath $parent)) {
+            $null = New-Item -Path $parent -ItemType Directory -Force
+        }
+        $payload | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $OutputPath -Encoding UTF8
+    }
+
+    return $payload
 }
 
 function Get-LumaBridgeDriverTraceStageSummary {
@@ -2842,6 +3538,13 @@ Export-ModuleMember -Function @(
     'Get-LumaBridgeEventChannelStatus',
     'Get-LumaBridgeDiagnosticEvents',
     'Get-LumaBridgeCrashDumpInventory',
+    'New-LumaBridgeEtwProviderFileContent',
+    'Test-LumaBridgeEtwSessionProviders',
+    'Get-LumaBridgeEtlTraceStats',
+    'Get-LumaBridgeEtlXPathQuery',
+    'Invoke-LumaBridgeEtlXPathReader',
     'Get-LumaBridgeEtlEventSummary',
+    'Initialize-LumaBridgeWppTmfCache',
+    'Invoke-LumaBridgeWppEtlDecode',
     'Get-LumaBridgeDriverTraceStageSummary'
 )

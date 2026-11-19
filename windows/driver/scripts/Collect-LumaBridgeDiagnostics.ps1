@@ -21,6 +21,18 @@ param(
 
     [string]$EtlPath,
 
+    [string]$DxgEtlPath,
+
+    [Nullable[DateTime]]$EtlStartTimeUtc = $null,
+
+    [Nullable[DateTime]]$EtlEndTimeUtc = $null,
+
+    [Nullable[int]]$EtlProcessId = $null,
+
+    [switch]$DecodeWpp,
+
+    [string]$TmfCacheDir,
+
     [string]$SetupApiLogPath,
 
     [string]$FailureContext,
@@ -188,8 +200,49 @@ $setupApiExcerpt = Get-LumaBridgeSetupApiLogExcerpt `
 $crashDumpInventory = Get-LumaBridgeCrashDumpInventory -LookbackMinutes $EventLookbackMinutes
 
 $etlEventSummary = $null
+$wppDecodeSummary = $null
+$dxgEtlStats = $null
+
+if (-not [string]::IsNullOrWhiteSpace($DxgEtlPath)) {
+    $dxgEtlStats = Get-LumaBridgeEtlTraceStats -EtlPath $DxgEtlPath
+}
+
 if (-not [string]::IsNullOrWhiteSpace($EtlPath)) {
-    $etlEventSummary = Get-LumaBridgeEtlEventSummary -EtlPath $EtlPath
+    $effectiveEtlStart = $EtlStartTimeUtc
+    $effectiveEtlEnd = $EtlEndTimeUtc
+
+    if ($null -eq $effectiveEtlStart -and $null -eq $effectiveEtlEnd) {
+        $anchorTimes = New-Object System.Collections.Generic.List[DateTime]
+        foreach ($ev in $recentEvents) {
+            if ($null -eq $ev) { continue }
+            $ln = [string](Get-LumaBridgeOptionalPropertyValue -InputObject $ev -PropertyName 'LogName' -DefaultValue '')
+            $evId = Get-LumaBridgeOptionalPropertyValue -InputObject $ev -PropertyName 'Id' -DefaultValue 0
+            $tsStr = [string](Get-LumaBridgeOptionalPropertyValue -InputObject $ev -PropertyName 'TimeCreated' -DefaultValue '')
+            if (($ln -match 'Kernel-PnP|DriverFrameworks-UserMode' -or $evId -in @(400, 411, 2006, 2103)) -and
+                -not [string]::IsNullOrWhiteSpace($tsStr) -and $evId -ne 0) {
+                $dt = [DateTime]::MinValue
+                if ([DateTime]::TryParse($tsStr, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal, [ref]$dt)) {
+                    $anchorTimes.Add($dt.ToUniversalTime())
+                }
+            }
+        }
+        if ($anchorTimes.Count -gt 0) {
+            $sortedAnchors = @($anchorTimes.ToArray() | Sort-Object)
+            $effectiveEtlStart = $sortedAnchors[0].AddSeconds(-30)
+            $effectiveEtlEnd = $sortedAnchors[$sortedAnchors.Count - 1].AddSeconds(30)
+        }
+    }
+
+    $etlEventSummary = Get-LumaBridgeEtlEventSummary `
+        -EtlPath $EtlPath `
+        -StartTimeUtc $effectiveEtlStart `
+        -EndTimeUtc $effectiveEtlEnd `
+        -ProcessId $EtlProcessId
+
+    if ($DecodeWpp -and (Test-Path -LiteralPath $EtlPath -PathType Leaf)) {
+        $tmfInit = Initialize-LumaBridgeWppTmfCache -TmfCacheDir $TmfCacheDir -SkipSymbolDownload
+        $wppDecodeSummary = Invoke-LumaBridgeWppEtlDecode -EtlPath $EtlPath -TmfCacheDir $tmfInit.TmfCacheDir -ProcessId $EtlProcessId -SkipSymbolServer
+    }
 }
 
 $parsedDriverEvents = New-Object System.Collections.Generic.List[string]
@@ -253,6 +306,8 @@ $summary = [pscustomobject]@{
     SetupApiExcerpt           = $setupApiExcerpt
     CrashDumpInventory        = $crashDumpInventory
     EtlEventSummary           = $etlEventSummary
+    WppDecodeSummary          = $wppDecodeSummary
+    DxgEtlStats               = $dxgEtlStats
     LumaBridgeWudfHostProcess = $primaryLumaBridgeWudf
     LumaBridgeWudfHostProcesses = $lumaBridgeWudfProcesses
     WudfHostProcesses         = $wudfProcesses
@@ -380,8 +435,31 @@ foreach ($dumpFile in @($crashDumpInventory.Files | Select-Object -First 15)) {
 if ($null -ne $etlEventSummary) {
     $mdLines.Add('')
     $mdLines.Add('## ETW Trace Summary')
-    $mdLines.Add(("- ETL: ``{0}`` | Exists=``{1}`` | EventCount=``{2}`` | LumaBridgeEvents=``{3}`` | Error=``{4}``" -f `
-        $etlEventSummary.EtlPath, $etlEventSummary.Exists, $etlEventSummary.EventCount, @($etlEventSummary.LumaBridgeEvents).Count, $etlEventSummary.Error))
+    $xpathUsed = Get-LumaBridgeOptionalPropertyValue -InputObject $etlEventSummary -PropertyName 'XPathUsed' -DefaultValue ''
+    $filteredOut = Get-LumaBridgeOptionalPropertyValue -InputObject $etlEventSummary -PropertyName 'FilteredOutHighVolume' -DefaultValue $false
+    $wrapWarn = Get-LumaBridgeOptionalPropertyValue -InputObject $etlEventSummary -PropertyName 'CircularWrapWarning' -DefaultValue ''
+    $mdLines.Add(("- ETL: ``{0}`` | Exists=``{1}`` | EventCount=``{2}`` | LumaBridgeEvents=``{3}`` | ExcludedHighVolume=``{4}`` | Error=``{5}``" -f `
+        $etlEventSummary.EtlPath, $etlEventSummary.Exists, $etlEventSummary.EventCount, @($etlEventSummary.LumaBridgeEvents).Count, $filteredOut, $etlEventSummary.Error))
+    if (-not [string]::IsNullOrWhiteSpace([string]$xpathUsed)) {
+        $mdLines.Add(("- XPath Filter: ``{0}``" -f $xpathUsed))
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$wrapWarn)) {
+        $mdLines.Add(("- WARNING: {0}" -f $wrapWarn))
+    }
+}
+
+if ($null -ne $wppDecodeSummary) {
+    $mdLines.Add('')
+    $mdLines.Add('## WPP Trace Decode Summary')
+    $mdLines.Add(("- TotalScannedLines=``{0}`` | MatchedLines=``{1}`` | IddCxWppLines=``{2}`` | Error=``{3}``" -f `
+        $wppDecodeSummary.TotalScannedLines, $wppDecodeSummary.MatchedLineCount, @($wppDecodeSummary.IddCxWppLines).Count, $wppDecodeSummary.Error))
+}
+
+if ($null -ne $dxgEtlStats) {
+    $mdLines.Add('')
+    $mdLines.Add('## Separated DxgKrnl / Watchdog ETL Metadata')
+    $mdLines.Add(("- DxgETL: ``{0}`` | Available=``{1}`` | Mode=``{2}`` | Start=``{3}`` | End=``{4}``" -f `
+        $dxgEtlStats.EtlPath, $dxgEtlStats.Available, $dxgEtlStats.LogFileMode, $dxgEtlStats.StartTimeUtc, $dxgEtlStats.EndTimeUtc))
 }
 
 $mdLines.Add('')

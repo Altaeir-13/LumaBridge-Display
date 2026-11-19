@@ -818,6 +818,8 @@ LumaBridgePersistStartupDiagnostics(
         return;
     }
 
+    static volatile LONG g_DiagRegOpenFailureLogged = 0;
+
     WDFKEY hardwareKey = nullptr;
     const NTSTATUS openStatus = WdfDeviceOpenRegistryKey(
         Device,
@@ -827,6 +829,25 @@ LumaBridgePersistStartupDiagnostics(
         &hardwareKey);
     if (!NT_SUCCESS(openStatus) || hardwareKey == nullptr)
     {
+        if (InterlockedCompareExchange(&g_DiagRegOpenFailureLogged, 1, 0) == 0)
+        {
+            const NTSTATUS effectiveStatus = !NT_SUCCESS(openStatus)
+                ? openStatus
+                : STATUS_UNSUCCESSFUL;
+            char regErrMsg[192]{};
+            _snprintf_s(
+                regErrMsg,
+                sizeof(regErrMsg),
+                _TRUNCATE,
+                "WdfDeviceOpenRegistryKey(PLUGPLAY_REGKEY_DEVICE, KEY_SET_VALUE) failed (0x%08lX); Diag* breadcrumbs unavailable",
+                static_cast<unsigned long>(effectiveStatus));
+            LumaBridgeTraceWarn(
+                LastStage,
+                effectiveStatus,
+                AdapterLifecycleState::Uninitialized,
+                regErrMsg,
+                LastSuccessfulStage);
+        }
         return;
     }
 

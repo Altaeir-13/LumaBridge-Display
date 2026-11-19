@@ -1634,30 +1634,47 @@ Invoke-UnitTest -Name 'CrashDumpInventoryAndEtwTraceDryRun' -TestBody {
     $etwDir = Join-Path $caseDir 'etw_dry'
     $startDry = & (Join-Path $scriptsDir 'Invoke-LumaBridgeEtwTrace.ps1') -Action Start -IncludeDxgKrnl -OutputDir $etwDir -DryRun
     Assert-Equal $startDry.DryRun $true 'ETW Start DryRun works'
-    Assert-Equal $startDry.Providers.Count 8 'ETW Start with -IncludeDxgKrnl includes all 8 providers'
-    Assert-Equal $startDry.ExecutedCommands.Count 8 'One logman create + seven logman update commands planned'
+    Assert-Equal @($startDry.CoreProviders).Count 6 'ETW Start Core session has 6 providers'
+    Assert-Equal @($startDry.DxgProviders).Count 2 'ETW Start with -IncludeDxgKrnl adds 2 Dxg providers in separate session'
+    Assert-Equal @($startDry.Providers).Count 6 'ETW Start compatibility Providers equals 6 Core providers'
+    Assert-Equal @($startDry.ExecutedCommands).Count 3 'Core logman create (-pf) + Core logman query + Dxg logman create planned'
     Assert-Equal (Test-Path -LiteralPath $etwDir) $false 'ETW Start DryRun must not create output directory'
 
     $exportDir = Join-Path $caseDir 'etw_export'
-    $fakeEtl = Join-Path $exportDir 'LumaBridgeIddTrace.etl'
+    $fakeEtl = Join-Path $exportDir 'LumaBridgeIddCore.etl'
     $global:LbTestState['MockEtlPath'] = $fakeEtl
 
     Invoke-WithModuleMocks -GlobalMocks @{
         'Get-LumaBridgeEtlEventSummary' = {
-            param([string]$EtlPath, [int]$MaxEvents)
+            param(
+                [string]$EtlPath,
+                [string[]]$ProviderGuids = @(),
+                [string[]]$ProviderNames = @(),
+                [Nullable[DateTime]]$StartTimeUtc = $null,
+                [Nullable[DateTime]]$EndTimeUtc = $null,
+                [Nullable[int]]$ProcessId = $null,
+                [int]$MaxMatchedEvents = 500,
+                [switch]$ExcludeHighVolumeGraphics
+            )
             return [pscustomobject]@{
-                EtlPath          = $EtlPath
-                Exists           = $true
-                EventCount       = 1
-                LumaBridgeEvents = @(
+                EtlPath               = $EtlPath
+                Exists                = $true
+                EventCount            = 1
+                MatchedEventCount     = 1
+                MatchedLimitReached   = $false
+                FilteredOutHighVolume = $true
+                XPathUsed             = '*'
+                TraceStats            = $null
+                CircularWrapWarning   = $null
+                LumaBridgeEvents      = @(
                     [pscustomobject]@{
                         ProviderName = 'LumaBridgeIddDriver'
                         Properties   = @('INFO', 100, 200, 'DriverEntry', 0, 'Uninitialized', 'DllProcessAttach', 'DriverEntry entered')
                     }
                 )
-                Providers        = @([pscustomobject]@{ ProviderName = 'LumaBridgeIddDriver'; Count = 1 })
-                Events           = @()
-                Error            = ''
+                Providers             = @([pscustomobject]@{ ProviderName = 'LumaBridgeIddDriver'; Count = 1 })
+                Events                = @()
+                Error                 = ''
             }
         }
     } -Body {
@@ -1665,6 +1682,208 @@ Invoke-UnitTest -Name 'CrashDumpInventoryAndEtwTraceDryRun' -TestBody {
         Assert-True (Test-Path -LiteralPath $exported.DecodedSummaryPath) 'ExportSummary writes etw-decoded-events.json'
         Assert-Equal $exported.StageSummary.DriverEntryReached $true 'ExportSummary computes StageSummary from ETL events'
     }
+}
+
+# 24. ETW trace uses clean -pf provider files, verifies providers, and separates DxgKrnl session
+Invoke-UnitTest -Name 'EtwTraceUsesProviderFileAndSeparatesDxgKrnlSession' -TestBody {
+    param($caseDir)
+
+    $corePf = @(New-LumaBridgeEtwProviderFileContent -SessionKind 'Core')
+    Assert-Equal $corePf.Count 6 'Core -pf content emits 6 provider lines'
+    Assert-Equal (@($corePf | Where-Object { $_ -match '^#' })).Count 0 'Core -pf lines must not contain comment headers'
+    Assert-Equal (@($corePf | Where-Object { $_ -match 'A7E4C910-5B32-4F8E-9D21-7C3A1B8E4F01' })).Count 1 'Core -pf includes LumaBridge TraceLogging provider'
+    Assert-Equal (@($corePf | Where-Object { $_ -match 'D92BCB52-FA78-406F-A9A5-2037509FADEA' })).Count 1 'Core -pf includes IddCx WPP provider'
+    Assert-Equal (@($corePf | Where-Object { $_ -match '802EC45A-1E99-4B83-9920-87C98277BA9D|70E74DD8-39DB-5F6F-6FD1-F5581B29E834' })).Count 0 'Core -pf excludes DxgKrnl and Watchdog-Events'
+
+    $dxgPf = @(New-LumaBridgeEtwProviderFileContent -SessionKind 'Dxg')
+    Assert-Equal $dxgPf.Count 2 'Dxg -pf content emits 2 high-volume provider lines'
+    Assert-Equal (@($dxgPf | Where-Object { $_ -match '802EC45A-1E99-4B83-9920-87C98277BA9D' })).Count 1 'Dxg -pf includes DxgKrnl'
+    Assert-Equal (@($dxgPf | Where-Object { $_ -match '70E74DD8-39DB-5F6F-6FD1-F5581B29E834' })).Count 1 'Dxg -pf includes Watchdog-Events'
+
+    $c = Get-LumaBridgeDriverConstants
+    $expectedCoreGuids = @(
+        $c.LumaBridgeTraceProviderGuid,
+        $c.IddCxManifestProviderGuid,
+        $c.IddCxWppProviderGuid,
+        $c.UmdfOperationalProviderGuid,
+        $c.WdfCoreWppProviderGuid,
+        $c.WerKernelProviderGuid
+    )
+    $mockQueryComplete = @(
+        'Name:                 LumaBridgeIddCore',
+        ('Provider:             {0}' -f $c.LumaBridgeTraceProviderGuid),
+        ('Provider:             {0}' -f $c.IddCxManifestProviderGuid),
+        ('Provider:             {0}' -f $c.IddCxWppProviderGuid),
+        ('Provider:             {0}' -f $c.UmdfOperationalProviderGuid),
+        ('Provider:             {0}' -f $c.WdfCoreWppProviderGuid),
+        ('Provider:             {0}' -f $c.WerKernelProviderGuid)
+    )
+    $okVerify = Test-LumaBridgeEtwSessionProviders -QueryOutputLines $mockQueryComplete -ExpectedProviderGuids $expectedCoreGuids
+    Assert-Equal $okVerify.AllProvidersVerified $true 'Test-LumaBridgeEtwSessionProviders verifies all 6 Core GUIDs'
+    Assert-Equal @($okVerify.MissingProviderGuids).Count 0 'Zero missing GUIDs when complete'
+
+    $incompleteVerify = Test-LumaBridgeEtwSessionProviders -QueryOutputLines @($mockQueryComplete | Select-Object -SkipLast 1) -ExpectedProviderGuids $expectedCoreGuids
+    Assert-Equal $incompleteVerify.AllProvidersVerified $false 'Test-LumaBridgeEtwSessionProviders detects missing provider GUID'
+    Assert-Equal @($incompleteVerify.MissingProviderGuids).Count 1 'Exactly 1 missing GUID reported'
+
+    $etwCoreOnlyDir = Join-Path $caseDir 'etw_core_only'
+    $coreOnlyDry = & (Join-Path $scriptsDir 'Invoke-LumaBridgeEtwTrace.ps1') -Action Start -OutputDir $etwCoreOnlyDir -DryRun
+    Assert-Equal $coreOnlyDry.SessionName 'LumaBridgeIddCore' 'Default ETW Start uses LumaBridgeIddCore sequential session'
+    Assert-Equal $coreOnlyDry.IncludeDxgKrnl $false 'DxgKrnl disabled by default'
+    Assert-Equal @($coreOnlyDry.ExecutedCommands).Count 2 'Core-only Start schedules create (-pf) + query verification only'
+    Assert-True ($coreOnlyDry.ExecutedCommands[0] -match '-pf\s') 'logman create trace uses -pf provider file'
+    Assert-True ($coreOnlyDry.ExecutedCommands[0] -match '-f bin\s') 'Core session uses sequential -f bin mode'
+    Assert-True ($coreOnlyDry.ExecutedCommands[1] -match 'query LumaBridgeIddCore -ets') 'Immediate provider query verification planned'
+}
+
+# 25. Streaming ETL XPath removes 500-event pre-filter cap and SetupAPI excludes unrelated VBoxSup sections
+Invoke-UnitTest -Name 'StreamingEtlQueryAppliesNativeXPathWithoutPreFilterCap' -TestBody {
+    param($caseDir)
+
+    $defaultXPath = Get-LumaBridgeEtlXPathQuery -ExcludeHighVolumeGraphics
+    Assert-True ($defaultXPath -match '802ec45a-1e99-4b83-9920-87c98277ba9d') 'Default XPath excludes DxgKrnl GUID'
+    Assert-True ($defaultXPath -match '70e74dd8-39db-5f6f-6fd1-f5581b29e834') 'Default XPath excludes Watchdog-Events GUID'
+
+    $startUtc = [DateTime]::SpecifyKind([DateTime]'2026-11-19T00:57:18', [DateTimeKind]::Utc)
+    $endUtc = [DateTime]::SpecifyKind([DateTime]'2026-11-19T00:58:18', [DateTimeKind]::Utc)
+    $targetedXPath = Get-LumaBridgeEtlXPathQuery `
+        -ProviderGuids @('{A7E4C910-5B32-4F8E-9D21-7C3A1B8E4F01}') `
+        -ProviderNames @('Microsoft-Windows-DriverFrameworks-UserMode') `
+        -StartTimeUtc $startUtc `
+        -EndTimeUtc $endUtc `
+        -ProcessId 23812
+    Assert-True ($targetedXPath -match 'a7e4c910-5b32-4f8e-9d21-7c3a1b8e4f01') 'Targeted XPath includes normalized Provider GUID'
+    Assert-True ($targetedXPath -match "Microsoft-Windows-DriverFrameworks-UserMode") 'Targeted XPath includes Provider Name'
+    Assert-True ($targetedXPath -match '@SystemTime>=') 'Targeted XPath includes StartTimeUtc lower bound'
+    Assert-True ($targetedXPath -match '@SystemTime<=') 'Targeted XPath includes EndTimeUtc upper bound'
+    Assert-True ($targetedXPath -match 'Execution\[@ProcessID=23812\]') 'Targeted XPath includes ProcessId filter'
+
+    $dummyEtl = Join-Path $caseDir 'dummy.etl'
+    [System.IO.File]::WriteAllBytes($dummyEtl, [byte[]]@(1, 2, 3, 4))
+    $global:LbTestState['CapturedXPath'] = $null
+    $global:LbTestState['CapturedMax'] = 0
+
+    Invoke-WithModuleMocks -ModuleMocks @{
+        'Get-LumaBridgeEtlTraceStats' = {
+            param([string]$EtlPath)
+            return [pscustomobject]@{
+                Available           = $true
+                CircularWrapWarning = 'Circular wrap evicted window before 00:58:04Z'
+                Error               = ''
+            }
+        }
+        'Invoke-LumaBridgeEtlXPathReader' = {
+            param([string]$EtlPath, [string]$XPath, [int]$MaxMatchedEvents)
+            $global:LbTestState['CapturedXPath'] = $XPath
+            $global:LbTestState['CapturedMax'] = $MaxMatchedEvents
+            return [pscustomobject]@{
+                LimitReached = $false
+                Events       = @(
+                    [pscustomobject]@{
+                        TimeCreated  = '2026-11-19T00:57:48.030Z'
+                        ProviderName = 'LumaBridgeIddDriver'
+                        ProviderId   = '{a7e4c910-5b32-4f8e-9d21-7c3a1b8e4f01}'
+                        Id           = 1
+                        LevelDisplay = 'Information'
+                        ProcessId    = 23812
+                        ThreadId     = 100
+                        Message      = '[LB-DRIVER] DriverEntry entered'
+                        Properties   = @()
+                    },
+                    [pscustomobject]@{
+                        TimeCreated  = '2026-11-19T00:57:48.031Z'
+                        ProviderName = 'Microsoft-Windows-DriverFrameworks-UserMode'
+                        ProviderId   = '{2e35aaeb-857f-4beb-a418-2e6c0e54d988}'
+                        Id           = 2103
+                        LevelDisplay = 'Error'
+                        ProcessId    = 23812
+                        ThreadId     = 101
+                        Message      = 'PnP fail 0xC000009E'
+                        Properties   = @()
+                    }
+                )
+            }
+        }
+    } -Body {
+        $etlOut = Get-LumaBridgeEtlEventSummary -EtlPath $dummyEtl -MaxMatchedEvents 1200
+        Assert-True ($global:LbTestState['CapturedXPath'] -match '802ec45a-1e99-4b83-9920-87c98277ba9d') 'Native XPath passed directly to streaming reader'
+        Assert-Equal $global:LbTestState['CapturedMax'] 1200 'MaxMatchedEvents cap (1200) forwarded after native filtering instead of fixed 500 pre-filter'
+        Assert-Equal $etlOut.MatchedEventCount 2 'Both matching events returned'
+        Assert-Equal $etlOut.FilteredOutHighVolume $true 'High-volume graphics exclusion active by default'
+        Assert-Equal @($etlOut.LumaBridgeEvents).Count 1 'LumaBridge TraceLogging event isolated'
+        Assert-True ($etlOut.CircularWrapWarning -match 'Circular wrap') 'CircularWrapWarning surfaced in summary'
+    }
+
+    $setupLogPath = Join-Path $caseDir 'setupapi_test.log'
+    @(
+        '>>>  [Device Install (UpdateDriverForPlugAndPlayDevices) - Root\VBoxSup]',
+        '     Inf name: oem68.inf',
+        '<<<  Section end 2026/11/18 20:50:00.000: [Exit status: SUCCESS]',
+        '>>>  [Device Install (Hardware initiated) - ROOT\DISPLAY\0000]',
+        '     Installing LumaBridgeIddDriver.inf (oem68.inf)',
+        '     ! dvi: Device failed start CM_PROB_FAILED_START ProblemStatus 0xC000009E',
+        '<<<  Section end 2026/11/18 20:57:48.100: [Exit status: SUCCESS]'
+    ) | Set-Content -LiteralPath $setupLogPath -Encoding UTF8
+
+    $setupExcerpt = Get-LumaBridgeSetupApiLogExcerpt -SetupApiLogPath $setupLogPath -InstanceIds @('ROOT\DISPLAY\0000') -PublishedInfNames @('oem68.inf')
+    Assert-Equal $setupExcerpt.MatchedSectionCount 1 'Only LumaBridge/Display section matched despite shared oem68.inf token in VBoxSup section'
+    Assert-Equal ($setupExcerpt.RawExcerptText -match 'VBoxSup') $false 'Unrelated VBoxSup.inf section excluded'
+    Assert-True ($setupExcerpt.RawExcerptText -match 'CM_PROB_FAILED_START') 'Relevant LumaBridge start failure preserved'
+}
+
+# 26. WPP TMF cache DryRun & line-streaming WPP decode filtering
+Invoke-UnitTest -Name 'WppTmfCacheAndDecodeDryRunAndStreamFilter' -TestBody {
+    param($caseDir)
+
+    $symDir = Join-Path $caseDir 'sym_dry'
+    $tmfDir = Join-Path $caseDir 'tmf_dry'
+    $tmfDry = Initialize-LumaBridgeWppTmfCache -SymbolCacheDir $symDir -TmfCacheDir $tmfDir -DryRun
+    Assert-Equal $tmfDry.DryRun $true 'Initialize-LumaBridgeWppTmfCache -DryRun succeeds'
+    Assert-Equal (Test-Path -LiteralPath $symDir) $false 'DryRun must not create SymbolCacheDir'
+    Assert-Equal (Test-Path -LiteralPath $tmfDir) $false 'DryRun must not create TmfCacheDir'
+    Assert-True (@($tmfDry.ExecutedCommands | Where-Object { $_ -match 'tracepdb' }).Count -ge 1) 'DryRun plans tracepdb execution'
+
+    $sampleFmt = Join-Path $caseDir 'tracefmt_sample.txt'
+    @(
+        '[0]0004.1168::11/18/2026-21:57:48.010 [Microsoft-Windows-DxgKrnl]noisy dxg event',
+        '[0]0004.1168::11/18/2026-21:57:48.011 [Microsoft-Windows-Watchdog-Events]noisy watchdog event',
+        '[9]5D04.1F7C::11/18/2026-21:57:48.021 [cx][IddCx]DriverEntry: Exit, status=STATUS_SUCCESS',
+        '[3]1234.0ABC::11/18/2026-21:57:48.022 [cx][IddCx]OtherPid: Exit, status=STATUS_SUCCESS'
+    ) | Set-Content -LiteralPath $sampleFmt -Encoding UTF8
+
+    $decodedOut = Join-Path $caseDir 'wpp_decoded.txt'
+    $wpp = Invoke-LumaBridgeWppEtlDecode -ExistingTraceFmtTextPath $sampleFmt -ProcessId 23812 -OutputPath $decodedOut
+    Assert-Equal $wpp.TotalScannedLines 4 'Streamed all 4 lines from tracefmt output'
+    Assert-Equal $wpp.MatchedLineCount 1 'Matched exactly 1 line for PID 23812 (5D04) excluding high-volume noise'
+    Assert-Equal @($wpp.IddCxWppLines).Count 1 'IddCx WPP line isolated cleanly'
+    Assert-True ($wpp.IddCxWppLines[0] -match 'IddCx.*DriverEntry') 'Decoded IddCx WPP text preserved'
+    Assert-True (Test-Path -LiteralPath $decodedOut) 'WPP filtered text written to OutputPath'
+}
+
+# 27. Prepare-IddSampleReference.ps1 enforces repository isolation and clean DryRun
+Invoke-UnitTest -Name 'PrepareIddSampleReferenceDryRunEnforcesIsolation' -TestBody {
+    param($caseDir)
+
+    $insideRepoDir = Join-Path (Split-Path $scriptsDir -Parent) 'ref_inside_repo_invalid'
+    $threwIsolation = $false
+    try {
+        $null = & (Join-Path $scriptsDir 'Prepare-IddSampleReference.ps1') -WorkDir $insideRepoDir -DryRun
+    }
+    catch {
+        if ($_.Exception.Message -match 'strictly isolated') {
+            $threwIsolation = $true
+        }
+    }
+    Assert-True $threwIsolation 'Prepare-IddSampleReference rejects WorkDir inside repo'
+
+    $isolatedWorkDir = Join-Path $caseDir 'ref_isolated'
+    $refDry = & (Join-Path $scriptsDir 'Prepare-IddSampleReference.ps1') -WorkDir $isolatedWorkDir -DryRun
+    Assert-Equal $refDry.DryRun $true 'Prepare-IddSampleReference -DryRun returns structured result'
+    Assert-Equal $refDry.InstallAttempted $false 'Prepare-IddSampleReference never attempts driver install'
+    Assert-Equal (Test-Path -LiteralPath $isolatedWorkDir) $false 'DryRun must not create WorkDir'
+    Assert-True (@($refDry.PlannedCommands | Where-Object { $_ -match 'gh api' }).Count -eq 1) 'Plans GitHub Contents API download for IndirectDisplay'
+    Assert-True (@($refDry.PlannedCommands | Where-Object { $_ -match 'msbuild' }).Count -eq 1) 'Plans isolated MSBuild compile'
+    Assert-True (@($refDry.PlannedCommands | Where-Object { $_ -match 'infverif' }).Count -eq 1) 'Plans InfVerif /v /u verification'
 }
 
 try {

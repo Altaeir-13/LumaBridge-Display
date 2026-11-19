@@ -11,6 +11,8 @@ TRACELOGGING_DEFINE_PROVIDER(
 namespace {
 
 volatile LONG g_DllProcessAttachCount = 0;
+HRESULT g_TraceLoggingRegisterHr = S_FALSE;
+bool g_TraceLoggingRegistered = false;
 
 } // namespace
 
@@ -45,6 +47,22 @@ LumaBridgeGetDllProcessAttachCount() noexcept
     return static_cast<ULONG>(InterlockedCompareExchange(&g_DllProcessAttachCount, 0, 0));
 }
 
+HRESULT
+LumaBridgeGetTraceLoggingRegisterResult() noexcept
+{
+    return g_TraceLoggingRegisterHr;
+}
+
+bool
+LumaBridgeIsTraceLoggingEnabled() noexcept
+{
+#if defined(LUMABRIDGE_ENABLE_TRACELOGGING)
+    return g_TraceLoggingRegistered && (TraceLoggingProviderEnabled(g_LumaBridgeTraceProvider, 0, 0) != FALSE);
+#else
+    return false;
+#endif
+}
+
 extern "C"
 _Use_decl_annotations_
 NTSTATUS
@@ -53,18 +71,28 @@ DriverEntry(
     PUNICODE_STRING RegistryPath
     )
 {
+    HRESULT tlRegHr = E_NOTIMPL;
+    bool tlEnabled = false;
 #if defined(LUMABRIDGE_ENABLE_TRACELOGGING)
-    TraceLoggingRegister(g_LumaBridgeTraceProvider);
+    tlRegHr = TraceLoggingRegister(g_LumaBridgeTraceProvider);
+    g_TraceLoggingRegisterHr = tlRegHr;
+    g_TraceLoggingRegistered = SUCCEEDED(tlRegHr);
+    tlEnabled = g_TraceLoggingRegistered && (TraceLoggingProviderEnabled(g_LumaBridgeTraceProvider, 0, 0) != FALSE);
+#else
+    g_TraceLoggingRegisterHr = tlRegHr;
+    g_TraceLoggingRegistered = false;
 #endif
 
     {
-        char entryMsg[192]{};
+        char entryMsg[224]{};
         _snprintf_s(
             entryMsg,
             sizeof(entryMsg),
             _TRUNCATE,
-            "DriverEntry entered (dllAttachCount=%lu)",
-            static_cast<unsigned long>(LumaBridgeGetDllProcessAttachCount()));
+            "DriverEntry entered (dllAttachCount=%lu tlRegHr=0x%08lX tlEnabled=%u)",
+            static_cast<unsigned long>(LumaBridgeGetDllProcessAttachCount()),
+            static_cast<unsigned long>(tlRegHr),
+            tlEnabled ? 1U : 0U);
         LumaBridgeTraceInfo(
             DriverDiagnosticStage::DriverEntry,
             STATUS_SUCCESS,
@@ -93,7 +121,11 @@ DriverEntry(
             "WdfDriverCreate failed",
             DriverDiagnosticStage::DllProcessAttach);
 #if defined(LUMABRIDGE_ENABLE_TRACELOGGING)
-        TraceLoggingUnregister(g_LumaBridgeTraceProvider);
+        if (g_TraceLoggingRegistered)
+        {
+            TraceLoggingUnregister(g_LumaBridgeTraceProvider);
+            g_TraceLoggingRegistered = false;
+        }
 #endif
         return status;
     }
@@ -122,7 +154,11 @@ LumaBridgeEvtDriverUnload(
         "Driver unloading");
 
 #if defined(LUMABRIDGE_ENABLE_TRACELOGGING)
-    TraceLoggingUnregister(g_LumaBridgeTraceProvider);
+    if (g_TraceLoggingRegistered)
+    {
+        TraceLoggingUnregister(g_LumaBridgeTraceProvider);
+        g_TraceLoggingRegistered = false;
+    }
 #endif
 }
 

@@ -1,15 +1,36 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Start', 'Stop', 'Status', 'ExportSummary')]
+    [ValidateSet('Start', 'Stop', 'Status', 'ExportSummary', 'DecodeWpp', 'VerifyProviders')]
     [string]$Action = 'Status',
 
     [string]$SessionName,
+
+    [string]$DxgSessionName,
 
     [string]$OutputDir,
 
     [string]$EtlPath,
 
+    [string]$DxgEtlPath,
+
     [switch]$IncludeDxgKrnl,
+
+    [Nullable[DateTime]]$StartTimeUtc = $null,
+
+    [Nullable[DateTime]]$EndTimeUtc = $null,
+
+    [Nullable[int]]$ProcessId = $null,
+
+    [ValidateRange(1, 50000)]
+    [int]$MaxMatchedEvents = 500,
+
+    [switch]$DecodeWpp,
+
+    [string]$SymbolCacheDir,
+
+    [string]$TmfCacheDir,
+
+    [switch]$SkipSymbolDownload,
 
     [switch]$DryRun,
 
@@ -29,6 +50,9 @@ $constants = Get-LumaBridgeDriverConstants
 if ([string]::IsNullOrWhiteSpace($SessionName)) {
     $SessionName = $constants.EtwSessionName
 }
+if ([string]::IsNullOrWhiteSpace($DxgSessionName)) {
+    $DxgSessionName = $constants.EtwDxgSessionName
+}
 
 if ([string]::IsNullOrWhiteSpace($OutputDir)) {
     $localAppData = if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
@@ -43,27 +67,30 @@ if ([string]::IsNullOrWhiteSpace($OutputDir)) {
 if ([string]::IsNullOrWhiteSpace($EtlPath)) {
     $EtlPath = Join-Path -Path $OutputDir -ChildPath ("{0}.etl" -f $SessionName)
 }
+if ([string]::IsNullOrWhiteSpace($DxgEtlPath)) {
+    $DxgEtlPath = Join-Path -Path $OutputDir -ChildPath ("{0}.etl" -f $DxgSessionName)
+}
 
-$providers = @(
+$coreProviders = @(
     [pscustomobject]@{ Name = 'LumaBridgeIddDriver (TraceLogging)'; Guid = $constants.LumaBridgeTraceProviderGuid; Flags = '0xFFFFFFFFFFFFFFFF'; Level = '5' },
     [pscustomobject]@{ Name = 'Microsoft-Windows-IndirectDisplays-ClassExtension-Events'; Guid = $constants.IddCxManifestProviderGuid; Flags = '0xFFFFFFFFFFFFFFFF'; Level = '5' },
-    [pscustomobject]@{ Name = 'IddCx WPP (Class Extension)'; Guid = $constants.IddCxWppProviderGuid; Flags = $constants.IddCxWppMatchAnyKeyword; Level = '4' },
+    [pscustomobject]@{ Name = 'IddCx WPP (Class Extension)'; Guid = $constants.IddCxWppProviderGuid; Flags = $constants.IddCxWppAllFlags; Level = '5' },
     [pscustomobject]@{ Name = 'Microsoft-Windows-DriverFrameworks-UserMode'; Guid = $constants.UmdfOperationalProviderGuid; Flags = '0xFFFFFFFFFFFFFFFF'; Level = '5' },
     [pscustomobject]@{ Name = 'WDF/UMDF Core WPP'; Guid = $constants.WdfCoreWppProviderGuid; Flags = '0xFFFFFFFFFFFFFFFF'; Level = '5' },
-    [pscustomobject]@{ Name = 'Microsoft-Windows-Watchdog-Events'; Guid = $constants.WatchdogEventsProviderGuid; Flags = '0xFFFFFFFFFFFFFFFF'; Level = '5' },
     [pscustomobject]@{ Name = 'Microsoft-Windows-WerKernel'; Guid = $constants.WerKernelProviderGuid; Flags = '0xFFFFFFFFFFFFFFFF'; Level = '5' }
 )
 
-if ($IncludeDxgKrnl) {
-    $providers += [pscustomobject]@{
-        Name  = 'Microsoft-Windows-DxgKrnl'
-        Guid  = $constants.DxgKrnlProviderGuid
-        Flags = '0xFFFFFFFFFFFFFFFF'
-        Level = '4'
-    }
-}
+$dxgProviders = @(
+    [pscustomobject]@{ Name = 'Microsoft-Windows-DxgKrnl'; Guid = $constants.DxgKrnlProviderGuid; Flags = '0xFFFFFFFFFFFFFFFF'; Level = '4' },
+    [pscustomobject]@{ Name = 'Microsoft-Windows-Watchdog-Events'; Guid = $constants.WatchdogEventsProviderGuid; Flags = '0xFFFFFFFFFFFFFFFF'; Level = '5' }
+)
 
+$coreExpectedGuids = @($coreProviders | ForEach-Object { $_.Guid })
+$coreProvidersFile = Join-Path -Path $OutputDir -ChildPath ("{0}.providers.txt" -f $SessionName)
+$dxgProvidersFile = Join-Path -Path $OutputDir -ChildPath ("{0}.providers.txt" -f $DxgSessionName)
 $decodedSummaryPath = Join-Path -Path $OutputDir -ChildPath 'etw-decoded-events.json'
+$wppDecodedPath = Join-Path -Path $OutputDir -ChildPath 'wpp-decoded-events.json'
+
 $rdpIddAutoLoggerSource = if ([string]::IsNullOrWhiteSpace($env:DriverData)) {
     $null
 }
@@ -75,16 +102,31 @@ switch ($Action) {
     'Status' {
         $channels = @(Get-LumaBridgeEventChannelStatus)
         $sessionRunning = $false
+        $dxgSessionRunning = $false
         $queryOutput = @()
         $queryError = $null
+        $providerVerification = $null
 
         try {
             $queryResult = Invoke-LumaBridgeExternalCommand -FilePath 'logman.exe' -Arguments @('query', $SessionName, '-ets') -DryRun:$DryRun
             $queryOutput = @($queryResult.Output)
             $sessionRunning = (-not $DryRun)
+            if ($sessionRunning) {
+                $providerVerification = Test-LumaBridgeEtwSessionProviders -QueryOutputLines $queryOutput -ExpectedProviderGuids $coreExpectedGuids
+            }
         }
         catch {
             $queryError = $_.Exception.Message
+        }
+
+        if (-not $DryRun) {
+            try {
+                $null = Invoke-LumaBridgeExternalCommand -FilePath 'logman.exe' -Arguments @('query', $DxgSessionName, '-ets')
+                $dxgSessionRunning = $true
+            }
+            catch {
+                $dxgSessionRunning = $false
+            }
         }
 
         $rdpAutoLoggerExists = $false
@@ -105,16 +147,52 @@ switch ($Action) {
             Action                       = 'Status'
             DryRun                       = [bool]$DryRun
             SessionName                  = $SessionName
+            DxgSessionName               = $DxgSessionName
             SessionRunning               = $sessionRunning
+            DxgSessionRunning            = $dxgSessionRunning
             ExpectedEtlPath              = $EtlPath
             EtlExists                    = (Test-Path -LiteralPath $EtlPath)
+            DxgEtlPath                   = $DxgEtlPath
+            DxgEtlExists                 = (Test-Path -LiteralPath $DxgEtlPath)
             RdpIddAutoLoggerPath         = $rdpIddAutoLoggerSource
             RdpIddAutoLoggerExists       = $rdpAutoLoggerExists
             RdpIddAutoLoggerAccessDenied = $rdpAutoLoggerAccessDenied
             QueryOutput                  = $queryOutput
             QueryError                   = $queryError
+            ProviderVerification         = $providerVerification
             EventChannels                = $channels
-            ConfiguredProviders          = $providers
+            CoreProviders                = $coreProviders
+            DxgProviders                 = $dxgProviders
+            ConfiguredProviders          = $coreProviders
+        }
+    }
+
+    'VerifyProviders' {
+        $queryOutput = @()
+        $queryError = $null
+        $verification = $null
+        $sessionRunning = $false
+
+        try {
+            $queryResult = Invoke-LumaBridgeExternalCommand -FilePath 'logman.exe' -Arguments @('query', $SessionName, '-ets') -DryRun:$DryRun
+            $queryOutput = @($queryResult.Output)
+            $sessionRunning = (-not $DryRun)
+            if ($sessionRunning) {
+                $verification = Test-LumaBridgeEtwSessionProviders -QueryOutputLines $queryOutput -ExpectedProviderGuids $coreExpectedGuids
+            }
+        }
+        catch {
+            $queryError = $_.Exception.Message
+        }
+
+        return [pscustomobject]@{
+            Action               = 'VerifyProviders'
+            DryRun               = [bool]$DryRun
+            SessionName          = $SessionName
+            SessionRunning       = $sessionRunning
+            QueryOutput          = $queryOutput
+            QueryError           = $queryError
+            ProviderVerification = $verification
         }
     }
 
@@ -123,68 +201,99 @@ switch ($Action) {
 
         $proceed = $true
         if (-not $DryRun) {
-            $proceed = Confirm-LumaBridgeAction -PromptMessage ("Start ETW capture session '{0}' writing to '{1}'?" -f $SessionName, $EtlPath) -DryRun:$DryRun -Force:$Force
+            $proceed = Confirm-LumaBridgeAction -PromptMessage ("Start sequential Core ETW capture session '{0}' (using provider file '{1}') writing to '{2}'?" -f $SessionName, $coreProvidersFile, $EtlPath) -DryRun:$DryRun -Force:$Force
         }
 
         if (-not $proceed) {
             return [pscustomobject]@{
-                Action      = 'Start'
-                Cancelled   = $true
-                DryRun      = $false
-                SessionName = $SessionName
-                EtlPath     = $EtlPath
-                OutputDir   = $OutputDir
-                Providers   = $providers
+                Action         = 'Start'
+                Cancelled      = $true
+                DryRun         = $false
+                SessionName    = $SessionName
+                DxgSessionName = $DxgSessionName
+                EtlPath        = $EtlPath
+                DxgEtlPath     = $DxgEtlPath
+                OutputDir      = $OutputDir
+                CoreProviders  = $coreProviders
+                DxgProviders   = $dxgProviders
+                Providers      = $coreProviders
             }
         }
 
+        $corePfLines = @(New-LumaBridgeEtwProviderFileContent -SessionKind 'Core')
+        $dxgPfLines = if ($IncludeDxgKrnl) { @(New-LumaBridgeEtwProviderFileContent -SessionKind 'Dxg') } else { @() }
+
         if (-not $DryRun) {
-            if (-not (Test-Path -LiteralPath $OutputDir)) {
-                $null = New-Item -Path $OutputDir -ItemType Directory -Force
+            foreach ($dirToEnsure in @($OutputDir, (Split-Path -Path $EtlPath -Parent), $(if ($IncludeDxgKrnl) { Split-Path -Path $DxgEtlPath -Parent } else { $null }))) {
+                if (-not [string]::IsNullOrWhiteSpace($dirToEnsure) -and -not (Test-Path -LiteralPath $dirToEnsure)) {
+                    $null = New-Item -Path $dirToEnsure -ItemType Directory -Force
+                }
             }
-            $etlParent = Split-Path -Path $EtlPath -Parent
-            if (-not [string]::IsNullOrWhiteSpace($etlParent) -and -not (Test-Path -LiteralPath $etlParent)) {
-                $null = New-Item -Path $etlParent -ItemType Directory -Force
+            $corePfLines | Set-Content -LiteralPath $coreProvidersFile -Encoding ASCII
+            if ($IncludeDxgKrnl) {
+                $dxgPfLines | Set-Content -LiteralPath $dxgProvidersFile -Encoding ASCII
             }
         }
 
         $executedCommands = New-Object System.Collections.Generic.List[string]
-        $primaryProvider = $providers[0]
-        $createArgs = @(
+        $coreCreateArgs = @(
             'create', 'trace', $SessionName,
-            '-p', $primaryProvider.Guid, $primaryProvider.Flags, $primaryProvider.Level,
+            '-pf', $coreProvidersFile,
             '-o', $EtlPath,
             '-bs', '1024',
             '-nb', '16', '64',
             '-ct', 'perf',
-            '-f', 'bincirc',
-            '-max', '128',
+            '-f', 'bin',
+            '-max', '256',
             '-ets'
         )
-        $null = Invoke-LumaBridgeExternalCommand -FilePath 'logman.exe' -Arguments $createArgs -DryRun:$DryRun
-        $executedCommands.Add(("logman.exe {0}" -f ($createArgs -join ' ')))
+        $null = Invoke-LumaBridgeExternalCommand -FilePath 'logman.exe' -Arguments $coreCreateArgs -DryRun:$DryRun
+        $executedCommands.Add(("logman.exe {0}" -f ($coreCreateArgs -join ' ')))
 
-        for ($i = 1; $i -lt $providers.Count; $i++) {
-            $provider = $providers[$i]
-            $updateArgs = @(
-                'update', 'trace', $SessionName,
-                '-p', $provider.Guid, $provider.Flags, $provider.Level,
+        $verifyArgs = @('query', $SessionName, '-ets')
+        $verifyResult = Invoke-LumaBridgeExternalCommand -FilePath 'logman.exe' -Arguments $verifyArgs -DryRun:$DryRun
+        $executedCommands.Add(("logman.exe {0}" -f ($verifyArgs -join ' ')))
+
+        $providerVerification = $null
+        if (-not $DryRun) {
+            $providerVerification = Test-LumaBridgeEtwSessionProviders -QueryOutputLines @($verifyResult.Output) -ExpectedProviderGuids $coreExpectedGuids
+        }
+
+        if ($IncludeDxgKrnl) {
+            $dxgCreateArgs = @(
+                'create', 'trace', $DxgSessionName,
+                '-pf', $dxgProvidersFile,
+                '-o', $DxgEtlPath,
+                '-bs', '1024',
+                '-nb', '16', '64',
+                '-ct', 'perf',
+                '-f', 'bincirc',
+                '-max', '128',
                 '-ets'
             )
-            $null = Invoke-LumaBridgeExternalCommand -FilePath 'logman.exe' -Arguments $updateArgs -DryRun:$DryRun
-            $executedCommands.Add(("logman.exe {0}" -f ($updateArgs -join ' ')))
+            $null = Invoke-LumaBridgeExternalCommand -FilePath 'logman.exe' -Arguments $dxgCreateArgs -DryRun:$DryRun
+            $executedCommands.Add(("logman.exe {0}" -f ($dxgCreateArgs -join ' ')))
         }
 
         return [pscustomobject]@{
-            Action           = 'Start'
-            Cancelled        = $false
-            DryRun           = [bool]$DryRun
-            SessionName      = $SessionName
-            OutputDir        = $OutputDir
-            EtlPath          = $EtlPath
-            IncludeDxgKrnl   = [bool]$IncludeDxgKrnl
-            Providers        = $providers
-            ExecutedCommands = @($executedCommands.ToArray())
+            Action               = 'Start'
+            Cancelled            = $false
+            DryRun               = [bool]$DryRun
+            SessionName          = $SessionName
+            DxgSessionName       = $DxgSessionName
+            OutputDir            = $OutputDir
+            EtlPath              = $EtlPath
+            DxgEtlPath           = if ($IncludeDxgKrnl) { $DxgEtlPath } else { $null }
+            CoreProvidersFile    = $coreProvidersFile
+            DxgProvidersFile     = if ($IncludeDxgKrnl) { $dxgProvidersFile } else { $null }
+            CoreProvidersContent = $corePfLines
+            DxgProvidersContent  = $dxgPfLines
+            IncludeDxgKrnl       = [bool]$IncludeDxgKrnl
+            CoreProviders        = $coreProviders
+            DxgProviders         = if ($IncludeDxgKrnl) { $dxgProviders } else { @() }
+            Providers            = $coreProviders
+            ProviderVerification = $providerVerification
+            ExecutedCommands     = @($executedCommands.ToArray())
         }
     }
 
@@ -198,17 +307,41 @@ switch ($Action) {
 
         if (-not $proceed) {
             return [pscustomobject]@{
-                Action      = 'Stop'
-                Cancelled   = $true
-                DryRun      = $false
-                SessionName = $SessionName
-                EtlPath     = $EtlPath
-                OutputDir   = $OutputDir
+                Action         = 'Stop'
+                Cancelled      = $true
+                DryRun         = $false
+                SessionName    = $SessionName
+                DxgSessionName = $DxgSessionName
+                EtlPath        = $EtlPath
+                DxgEtlPath     = $DxgEtlPath
+                OutputDir      = $OutputDir
             }
         }
 
         $stopArgs = @('stop', $SessionName, '-ets')
         $null = Invoke-LumaBridgeExternalCommand -FilePath 'logman.exe' -Arguments $stopArgs -DryRun:$DryRun
+
+        $dxgStopped = $false
+        if ($IncludeDxgKrnl) {
+            $dxgStopArgs = @('stop', $DxgSessionName, '-ets')
+            try {
+                $null = Invoke-LumaBridgeExternalCommand -FilePath 'logman.exe' -Arguments $dxgStopArgs -DryRun:$DryRun
+                $dxgStopped = $true
+            }
+            catch {
+                $dxgStopped = $false
+            }
+        }
+        elseif (-not $DryRun) {
+            try {
+                $null = Invoke-LumaBridgeExternalCommand -FilePath 'logman.exe' -Arguments @('query', $DxgSessionName, '-ets')
+                $null = Invoke-LumaBridgeExternalCommand -FilePath 'logman.exe' -Arguments @('stop', $DxgSessionName, '-ets')
+                $dxgStopped = $true
+            }
+            catch {
+                $dxgStopped = $false
+            }
+        }
 
         if ($DryRun) {
             return [pscustomobject]@{
@@ -216,7 +349,10 @@ switch ($Action) {
                 Cancelled            = $false
                 DryRun               = $true
                 SessionName          = $SessionName
+                DxgSessionName       = $DxgSessionName
+                IncludeDxgKrnl       = [bool]$IncludeDxgKrnl
                 EtlPath              = $EtlPath
+                DxgEtlPath           = $DxgEtlPath
                 OutputDir            = $OutputDir
                 DecodedSummaryPath   = $decodedSummaryPath
                 RdpIddAutoLoggerPath = $rdpIddAutoLoggerSource
@@ -239,36 +375,67 @@ switch ($Action) {
             }
         }
 
-        $etlSummary = Get-LumaBridgeEtlEventSummary -EtlPath $EtlPath
+        $etlSummary = Get-LumaBridgeEtlEventSummary `
+            -EtlPath $EtlPath `
+            -StartTimeUtc $StartTimeUtc `
+            -EndTimeUtc $EndTimeUtc `
+            -ProcessId $ProcessId `
+            -MaxMatchedEvents $MaxMatchedEvents
         $stageSummary = Get-LumaBridgeDriverTraceStageSummary -EtlEvents @($etlSummary.LumaBridgeEvents)
+
+        $wppResult = $null
+        if ($DecodeWpp) {
+            $null = Initialize-LumaBridgeWppTmfCache -SymbolCacheDir $SymbolCacheDir -TmfCacheDir $TmfCacheDir -SkipSymbolDownload:$SkipSymbolDownload
+            $wppResult = Invoke-LumaBridgeWppEtlDecode -EtlPath $EtlPath -TmfCacheDir $TmfCacheDir -SymbolCacheDir $SymbolCacheDir -OutputPath $wppDecodedPath -ProcessId $ProcessId -SkipSymbolServer:$SkipSymbolDownload
+        }
 
         $exportPayload = [pscustomobject]@{
             ExportedAtUtc       = (Get-Date).ToUniversalTime().ToString('o')
             SessionName         = $SessionName
+            DxgSessionName      = $DxgSessionName
+            DxgSessionStopped   = $dxgStopped
             EtlPath             = $EtlPath
+            DxgEtlPath          = $DxgEtlPath
             CopiedRdpIddEtlPath = $copiedAutoLoggerPath
             EtlSummary          = $etlSummary
+            WppDecodeSummary    = $wppResult
             StageSummary        = $stageSummary
         }
         $exportPayload | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $decodedSummaryPath -Encoding UTF8
 
         return [pscustomobject]@{
-            Action               = 'Stop'
-            Cancelled            = $false
-            DryRun               = $false
-            SessionName          = $SessionName
-            EtlPath              = $EtlPath
-            OutputDir            = $OutputDir
-            DecodedSummaryPath   = $decodedSummaryPath
-            CopiedRdpIddEtlPath  = $copiedAutoLoggerPath
-            EtlSummary           = $etlSummary
-            StageSummary         = $stageSummary
+            Action              = 'Stop'
+            Cancelled           = $false
+            DryRun              = $false
+            SessionName         = $SessionName
+            DxgSessionName      = $DxgSessionName
+            DxgSessionStopped   = $dxgStopped
+            EtlPath             = $EtlPath
+            DxgEtlPath          = $DxgEtlPath
+            OutputDir           = $OutputDir
+            DecodedSummaryPath  = $decodedSummaryPath
+            WppDecodedPath      = if ($DecodeWpp) { $wppDecodedPath } else { $null }
+            CopiedRdpIddEtlPath = $copiedAutoLoggerPath
+            EtlSummary          = $etlSummary
+            WppDecodeSummary    = $wppResult
+            StageSummary        = $stageSummary
         }
     }
 
     'ExportSummary' {
-        $etlSummary = Get-LumaBridgeEtlEventSummary -EtlPath $EtlPath
+        $etlSummary = Get-LumaBridgeEtlEventSummary `
+            -EtlPath $EtlPath `
+            -StartTimeUtc $StartTimeUtc `
+            -EndTimeUtc $EndTimeUtc `
+            -ProcessId $ProcessId `
+            -MaxMatchedEvents $MaxMatchedEvents
         $stageSummary = Get-LumaBridgeDriverTraceStageSummary -EtlEvents @($etlSummary.LumaBridgeEvents)
+
+        $wppResult = $null
+        if ($DecodeWpp -and -not $DryRun) {
+            $null = Initialize-LumaBridgeWppTmfCache -SymbolCacheDir $SymbolCacheDir -TmfCacheDir $TmfCacheDir -SkipSymbolDownload:$SkipSymbolDownload
+            $wppResult = Invoke-LumaBridgeWppEtlDecode -EtlPath $EtlPath -TmfCacheDir $TmfCacheDir -SymbolCacheDir $SymbolCacheDir -OutputPath $wppDecodedPath -ProcessId $ProcessId -SkipSymbolServer:$SkipSymbolDownload
+        }
 
         if (-not $DryRun) {
             if (-not (Test-Path -LiteralPath $OutputDir)) {
@@ -276,11 +443,12 @@ switch ($Action) {
             }
 
             $exportPayload = [pscustomobject]@{
-                ExportedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
-                SessionName   = $SessionName
-                EtlPath       = $EtlPath
-                EtlSummary    = $etlSummary
-                StageSummary  = $stageSummary
+                ExportedAtUtc    = (Get-Date).ToUniversalTime().ToString('o')
+                SessionName      = $SessionName
+                EtlPath          = $EtlPath
+                EtlSummary       = $etlSummary
+                WppDecodeSummary = $wppResult
+                StageSummary     = $stageSummary
             }
             $exportPayload | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $decodedSummaryPath -Encoding UTF8
         }
@@ -291,8 +459,45 @@ switch ($Action) {
             EtlPath            = $EtlPath
             OutputDir          = $OutputDir
             DecodedSummaryPath = if ($DryRun) { $null } else { $decodedSummaryPath }
+            WppDecodedPath     = if ($DecodeWpp -and -not $DryRun) { $wppDecodedPath } else { $null }
             EtlSummary         = $etlSummary
+            WppDecodeSummary   = $wppResult
             StageSummary       = $stageSummary
+        }
+    }
+
+    'DecodeWpp' {
+        $tmfInit = Initialize-LumaBridgeWppTmfCache `
+            -SymbolCacheDir $SymbolCacheDir `
+            -TmfCacheDir $TmfCacheDir `
+            -SkipSymbolDownload:$SkipSymbolDownload `
+            -DryRun:$DryRun
+
+        $effectiveOutputPath = if ($DryRun) { $wppDecodedPath } else {
+            if (-not (Test-Path -LiteralPath $OutputDir)) {
+                $null = New-Item -Path $OutputDir -ItemType Directory -Force
+            }
+            $wppDecodedPath
+        }
+
+        $wppDecode = Invoke-LumaBridgeWppEtlDecode `
+            -EtlPath $EtlPath `
+            -TmfCacheDir $tmfInit.TmfCacheDir `
+            -SymbolCacheDir $tmfInit.SymbolCacheDir `
+            -OutputPath $effectiveOutputPath `
+            -ProcessId $ProcessId `
+            -MaxMatchedLines $MaxMatchedEvents `
+            -SkipSymbolServer:$SkipSymbolDownload `
+            -DryRun:$DryRun
+
+        return [pscustomobject]@{
+            Action           = 'DecodeWpp'
+            DryRun           = [bool]$DryRun
+            EtlPath          = $EtlPath
+            OutputDir        = $OutputDir
+            TmfInit          = $tmfInit
+            WppDecodeSummary = $wppDecode
+            OutputPath       = if ($DryRun) { $null } else { $effectiveOutputPath }
         }
     }
 }
