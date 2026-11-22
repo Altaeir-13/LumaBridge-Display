@@ -1886,6 +1886,88 @@ Invoke-UnitTest -Name 'PrepareIddSampleReferenceDryRunEnforcesIsolation' -TestBo
     Assert-True (@($refDry.PlannedCommands | Where-Object { $_ -match 'infverif' }).Count -eq 1) 'Plans InfVerif /v /u verification'
 }
 
+# 28. DiagnosticStage build helper stages manifest/SHA-256 and reads subkey DiagBuildStage breadcrumbs
+Invoke-UnitTest -Name 'DiagnosticStageBuildManifestAndSubkeyBreadcrumbs' -TestBody {
+    param($caseDir)
+
+    $subkeyPath = Join-Path $caseDir 'DeviceParameters\LumaBridgeIddDriver'
+    $baseParamsPath = Join-Path $caseDir 'DeviceParameters'
+    $diagRegProps = [pscustomobject]@{
+        DiagLastStage           = 'AdapterInitAsync'
+        DiagLastSuccessfulStage = 'DeviceD0Entry'
+        DiagLastStatus          = 0
+        DiagLastErrorStage      = 'None'
+        DiagLastErrorStatus     = 0
+        DiagIddCxVersion        = 0x00010400
+        DiagHostProcessId       = 4120
+        DiagDllAttachCount      = 1
+        DiagBuildStage          = 1
+    }
+
+    $global:LbTestState['SubkeyPath'] = $subkeyPath
+    $global:LbTestState['BaseParamsPath'] = $baseParamsPath
+    $global:LbTestState['SubkeyDiagProps'] = $diagRegProps
+
+    Invoke-WithModuleMocks -ModuleMocks @{
+        'Test-Path' = {
+            param([string]$LiteralPath, [string]$PathType)
+            if ($LiteralPath -eq $global:LbTestState['BaseParamsPath']) { return $true }
+            if ($LiteralPath -eq $global:LbTestState['SubkeyPath']) { return $true }
+            if ($PathType) { return (Microsoft.PowerShell.Management\Test-Path -LiteralPath $LiteralPath -PathType $PathType) }
+            return (Microsoft.PowerShell.Management\Test-Path -LiteralPath $LiteralPath)
+        }
+        'Get-ItemProperty' = {
+            param([string]$LiteralPath)
+            if ($LiteralPath -eq $global:LbTestState['BaseParamsPath']) {
+                return [pscustomobject]@{ EnableVirtualMonitor = 0 }
+            }
+            if ($LiteralPath -eq $global:LbTestState['SubkeyPath']) {
+                return $global:LbTestState['SubkeyDiagProps']
+            }
+            return (Microsoft.PowerShell.Management\Get-ItemProperty -LiteralPath $LiteralPath)
+        }
+    } -Body {
+        $diag = Get-LumaBridgeDeviceStartupDiagnostics -DeviceParametersPath $baseParamsPath
+        Assert-True ($null -ne $diag) 'Subkey Diag* breadcrumbs resolved automatically'
+        Assert-Equal $diag.LastStage 'AdapterInitAsync' 'Subkey LastStage decoded'
+        Assert-Equal $diag.BuildStage 1 'DiagBuildStage decoded from subkey'
+        Assert-Equal $diag.RegistryPath $subkeyPath 'Resolved RegistryPath points to driver subkey'
+    }
+
+    $stageOutRoot = Join-Path $caseDir 'stage_out'
+    $dryStage = & (Join-Path $scriptsDir 'Build-LumaBridgeDiagnosticStage.ps1') -DiagnosticStage 1 -OutputRoot $stageOutRoot -DryRun
+    Assert-Equal $dryStage.DryRun $true 'Build-LumaBridgeDiagnosticStage -DryRun returns structured result'
+    Assert-Equal $dryStage.DiagnosticStage 1 'DiagnosticStage recorded in DryRun output'
+    Assert-Equal (Test-Path -LiteralPath $stageOutRoot) $false 'DryRun must not create OutputRoot'
+
+    $dummySrcOut = Join-Path $caseDir 'dummy_out'
+    $dummySrcPkg = Join-Path $dummySrcOut 'LumaBridgeIddDriver'
+    $null = New-Item -Path $dummySrcPkg -ItemType Directory -Force
+    [System.IO.File]::WriteAllBytes((Join-Path $dummySrcPkg 'LumaBridgeIddDriver.dll'), [byte[]]@(1..64))
+    [System.IO.File]::WriteAllText((Join-Path $dummySrcPkg 'LumaBridgeIddDriver.inf'), '; test inf')
+    [System.IO.File]::WriteAllBytes((Join-Path $dummySrcPkg 'LumaBridgeIddDriver.cat'), [byte[]]@(65..96))
+    [System.IO.File]::WriteAllBytes((Join-Path $dummySrcOut 'LumaBridgeIddDriver.pdb'), [byte[]]@(97..128))
+
+    $stageResult = & (Join-Path $scriptsDir 'Build-LumaBridgeDiagnosticStage.ps1') `
+        -DiagnosticStage 1 `
+        -Configuration Release `
+        -OutputRoot $stageOutRoot `
+        -SourcePackageDir $dummySrcPkg `
+        -SkipBuild
+
+    Assert-Equal $stageResult.DryRun $false 'SkipBuild staging ran cleanly'
+    Assert-Equal $stageResult.DiagnosticStage 1 'Stage manifest DiagnosticStage=1'
+    Assert-True (Test-Path -LiteralPath $stageResult.ManifestPath -PathType Leaf) 'stage-build-manifest.json written'
+    Assert-True (-not [string]::IsNullOrWhiteSpace($stageResult.DllSha256)) 'DllSha256 recorded'
+    Assert-True (-not [string]::IsNullOrWhiteSpace($stageResult.InfSha256)) 'InfSha256 recorded'
+    Assert-True (-not [string]::IsNullOrWhiteSpace($stageResult.CatSha256)) 'CatSha256 recorded'
+    Assert-True (-not [string]::IsNullOrWhiteSpace($stageResult.PdbSha256)) 'PdbSha256 recorded'
+
+    $parsedManifest = Get-Content -LiteralPath $stageResult.ManifestPath -Raw | ConvertFrom-Json
+    Assert-Equal $parsedManifest.DiagnosticStage 1 'JSON manifest DiagnosticStage equals 1'
+    Assert-Equal $parsedManifest.DllSha256 $stageResult.DllSha256 'JSON manifest DllSha256 matches result'
+}
+
 try {
     Write-Host ("Summary: {0} tests run, {1} assertion failures." -f $script:TestsRun, $script:TestsFailed)
 }

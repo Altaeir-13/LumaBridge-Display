@@ -2,7 +2,7 @@
 
 ## Escopo atual
 
-`AdapterLifecycleTests.cpp` executa **19 testes unitarios deterministicos** sobre a maquina de estados (`AdapterLifecycleTracker`) e o slot de associacao em voo (`InFlightAdapterBindingSlot`) definidos em `windows/driver/LumaBridgeIddDriver/AdapterStateMachine.h`:
+`AdapterLifecycleTests.cpp` executa **21 testes unitarios deterministicos** sobre a maquina de estados (`AdapterLifecycleTracker`), o slot de associacao em voo (`InFlightAdapterBindingSlot`) e a configuracao de validacao/estagios (`DiagnosticStageConfig.h`) definidos em `windows/driver/LumaBridgeIddDriver/`:
 
 1. `NormalInitializationLifecycle` — fluxo normal `DeviceConfigured -> DeviceInitialized -> AdapterInitPending -> AdapterReady`;
 2. `EarlyAsyncCompletionBeforeInitAsyncReturns` — conclusao assincrona (`EvtIddCxAdapterInitFinished`) chegando antes do retorno pos-processado de `IddCxAdapterInitAsync`;
@@ -22,15 +22,18 @@
 16. `LateCommitModesAfterFailureOrCleanupIsRejected` — rejeicao de `TransitionOnCommitModes` em `AdapterFailed` ou apos cleanup sem alterar `CommittedPathCount`;
 17. `DiagnosticStageSuccessProgressionTracksLastSuccessfulStage` — progressao de `LastSuccessfulStage` e `LastStageStatus` ao longo das etapas de inicializacao (`DeviceInitConfig` -> `WdfDeviceCreate` -> `IddCxDeviceInitialize` -> `DeviceD0Entry` -> `AdapterInitAsync` -> `AdapterInitFinished`);
 18. `DeviceInitializeFailurePreservesPreviousSuccessfulStage` — preservacao de `LastSuccessfulStage = WdfDeviceCreate` quando `IddCxDeviceInitialize` falha com `STATUS_DEVICE_POWER_FAILURE`;
-19. `AdapterInitFailuresPreserveLastSuccessfulStage` — preservacao de `LastSuccessfulStage` (`DeviceD0Entry` na falha sincrona e `AdapterInitAsync` na falha assincrona) em falhas `STATUS_DEVICE_POWER_FAILURE`.
+19. `AdapterInitFailuresPreserveLastSuccessfulStage` — preservacao de `LastSuccessfulStage` (`DeviceD0Entry` na falha sincrona e `AdapterInitAsync` na falha assincrona) em falhas `STATUS_DEVICE_POWER_FAILURE`;
+20. `IddCxRuntimeTransmissionTypeValidatorRejectsNetworkOtherAndAcceptsWiredOther` — valida a regra binaria de runtime do `IddCx.dll` (`10.0.26100.9818`) que rejeita `0` e `9` (`IDDCX_TRANSMISSION_TYPE_NETWORK_OTHER`) e aceita `[1..8]` (incluindo `3 = IDDCX_TRANSMISSION_TYPE_WIRED_OTHER`) e `0xFFFFFFFF`;
+21. `DiagnosticStageCapabilitiesProgressMonotonicallyFromStage1ToStage6` — valida `kActiveDiagnosticStage == 6` por padrao e o escalonamento incremental de capacidades dos Estagios `1..6`.
 
-`DriverPackageValidationTests.cpp` executa **5 verificacoes automatizadas** sobre o INF fonte e os pacotes gerados em `windows/driver/x64/Debug/` e `windows/driver/x64/Release/`:
+`DriverPackageValidationTests.cpp` executa **6 verificacoes automatizadas** sobre o INF fonte e os pacotes gerados em `windows/driver/x64/Debug/` e `windows/driver/x64/Release/`:
 
 1. `ParserAndHelperRejectInvalidInputs` — valida parsing de secao/arquivos referenciados e rejeicao de placeholders/PEs invalidos;
 2. `SourceInfContainsStampInfPlaceholders` — confirma tokens `NT$ARCH$.10.0...22000`, `$UMDFVERSION$` e `CatalogFile` no INF fonte;
 3. `DebugPackageArtifactsValidAndConsistent` — valida DLL x64 sem assinatura embutida (`IMAGE_DIRECTORY_ENTRY_SECURITY` + `WinVerifyTrust`), INF carimbado sem tokens nao expandidos e com todas as diretivas obrigatorias UMDF/IddCx (`wudfrd.inf`, `IddCx0102`, `IndirectKmd`, `DeviceGroupId`, `AllowKernelModeClients`, `ProcessSharingDisabled`, `NTamd64.10.0...22000`), integridade do catalogo via APIs oficiais do Windows (`CryptCATOpen`, `CryptCATEnumerateCatAttr` para Windows 11 `_v100_X64_21H2`/`22H2`/`24H2`, `CryptCATEnumerateMember`, hashes Authenticode/SIP via `CryptCATAdminCalcHashFromFileHandle2`, ausencia de assinatura via `CryptQueryObject`/`WinVerifyTrust`) e paridade entre `$(PackageDir)` e `$(OutDir)` em `Debug|x64`;
 4. `ReleasePackageArtifactsValidAndConsistent` — repete a verificacao integral para o pacote `Release|x64`;
-5. `NegativeTamperedAndInconsistentPackagesRejected` — testes negativos cobrindo adulteracao de `.dll` e `.inf`, catalogo corrompido, catalogo inconsistente entre configuracoes e artefato ausente.
+5. `NegativeTamperedAndInconsistentPackagesRejected` — testes negativos cobrindo adulteracao de `.dll` e `.inf`, catalogo corrompido, catalogo inconsistente entre configuracoes e artefato ausente;
+6. `AdapterSourceEnforcesSupportedIddCxTransmissionTypeAndStageConfig` — garante uso de `kAdapterTransmissionType = IDDCX_TRANSMISSION_TYPE_WIRED_OTHER`, `kEndpointMajorVersion = 1`, `WDF_REGKEY_DEVICE_SUBKEY`, `DiagBuildStage`, ausencia de `IDDCX_TRANSMISSION_TYPE_NETWORK_OTHER` em `Adapter.cpp` e propagacao nao mascarada de falha em `LumaBridgeEvtDeviceD0Entry`.
 
 `MonitorModesTests.cpp` executa **12 testes unitarios deterministicos** sobre `MonitorModes.h` / `MonitorModes.cpp`:
 
@@ -83,7 +86,7 @@
 14. `ReentrantBackendCallbacksDoNotDeadlockOrLeakReferences` — garante ausencia de deadlock e balanco exato de referencias em callbacks reentrantes;
 15. `DerivedContainerIdsAreUniqueAndRfc4122ValidPerInstance` — confirma `ContainerId` deterministico, unico por instancia/conector e valido segundo RFC 4122.
 
-`LumaBridgeFunctionalToolingTests.ps1` executa **27 testes automatizados PowerShell** com mocks isolados e assinaturas efemeras em diretorio temporario sobre `windows/driver/scripts/`:
+`LumaBridgeFunctionalToolingTests.ps1` executa **28 testes automatizados PowerShell** com mocks isolados e assinaturas efemeras em diretorio temporario sobre `windows/driver/scripts/`:
 
 1. `PackageSigningAndCryptographicVerificationPositive` — valida assinatura em staging isolado, hashes SIP de `.dll` e `.inf` no `.cat`, assinatura PKCS#7 e correspondencia de certificados preservando hashes originais de build;
 2. `InfTamperingRejectedEvenWithAllowUntrustedChain` — comprova bloqueio de `.inf` adulterado inclusive com `-AllowUntrustedChain`;
@@ -111,7 +114,8 @@
 24. `EtwTraceUsesProviderFileAndSeparatesDxgKrnlSession` — valida arquivos `-pf` (`6` providers Core sem comentarios `#` e `2` providers `DxgKrnl`/`Watchdog-Events`), verificacao imediata de GUIDs via `Test-LumaBridgeEtwSessionProviders` e ausencia de `DxgKrnl` sem `-IncludeDxgKrnl`;
 25. `StreamingEtlQueryAppliesNativeXPathWithoutPreFilterCap` — valida geracao de XPath nativo (`Provider`, `TimeCreated`, `Execution[@ProcessID]`, exclusao padrao `DxgKrnl`/`Watchdog-Events`), streaming sem teto de 500 eventos pre-filtro, exposicao de `CircularWrapWarning` e filtro estreito do `setupapi.dev.log` excluindo `VBoxSup.inf`;
 26. `WppTmfCacheAndDecodeDryRunAndStreamFilter` — valida `-DryRun` de `Initialize-LumaBridgeWppTmfCache` e decodificacao WPP em streaming (`Invoke-LumaBridgeWppEtlDecode`) filtrando PID `23812` e excluindo ruido `DxgKrnl`/`Watchdog-Events`;
-27. `PrepareIddSampleReferenceDryRunEnforcesIsolation` — valida bloqueio de diretorios dentro do repositorio e execucao limpa de `Prepare-IddSampleReference.ps1 -DryRun` sem criar arquivos nem instalar drivers.
+27. `PrepareIddSampleReferenceDryRunEnforcesIsolation` — valida bloqueio de diretorios dentro do repositorio e execucao limpa de `Prepare-IddSampleReference.ps1 -DryRun` sem criar arquivos nem instalar drivers;
+28. `DiagnosticStageBuildManifestAndSubkeyBreadcrumbs` — valida leitura automatica de `Diag*` (incluindo `DiagBuildStage`) na subchave `Device Parameters\LumaBridgeIddDriver` e geracao isolada de manifesto/SHA-256 em `Build-LumaBridgeDiagnosticStage.ps1`.
 
 ## Fronteira com validacao em runtime WDF/IddCx
 

@@ -921,15 +921,7 @@ function Get-LumaBridgeDeviceStartupDiagnostics {
         [string]$DeviceParametersPath
     )
 
-    $exists = $false
-    try {
-        $exists = Test-Path -LiteralPath $DeviceParametersPath -ErrorAction SilentlyContinue
-    }
-    catch {
-        $exists = $false
-    }
-
-    if (-not $exists) {
+    if ([string]::IsNullOrWhiteSpace($DeviceParametersPath)) {
         return $null
     }
 
@@ -941,29 +933,57 @@ function Get-LumaBridgeDeviceStartupDiagnostics {
         'DiagLastErrorStatus',
         'DiagIddCxVersion',
         'DiagHostProcessId',
-        'DiagDllAttachCount'
+        'DiagDllAttachCount',
+        'DiagBuildStage'
+    )
+
+    $candidatePaths = @(
+        $DeviceParametersPath,
+        ("{0}\LumaBridgeIddDriver" -f $DeviceParametersPath.TrimEnd('\'))
     )
 
     $props = $null
-    try {
-        $props = Get-ItemProperty -LiteralPath $DeviceParametersPath -ErrorAction Stop
-    }
-    catch {
-        return $null
-    }
+    $resolvedPath = $null
+    foreach ($candidatePath in $candidatePaths) {
+        $exists = $false
+        try {
+            $exists = Test-Path -LiteralPath $candidatePath -ErrorAction SilentlyContinue
+        }
+        catch {
+            $exists = $false
+        }
 
-    if ($null -eq $props) {
-        return $null
-    }
+        if (-not $exists) {
+            continue
+        }
 
-    $hasAny = $false
-    foreach ($name in $diagNames) {
-        if ($props.PSObject.Properties.Name -contains $name) {
-            $hasAny = $true
+        $candidateProps = $null
+        try {
+            $candidateProps = Get-ItemProperty -LiteralPath $candidatePath -ErrorAction Stop
+        }
+        catch {
+            $candidateProps = $null
+        }
+
+        if ($null -eq $candidateProps) {
+            continue
+        }
+
+        $hasAny = $false
+        foreach ($name in $diagNames) {
+            if ($candidateProps.PSObject.Properties.Name -contains $name) {
+                $hasAny = $true
+                break
+            }
+        }
+        if ($hasAny) {
+            $props = $candidateProps
+            $resolvedPath = $candidatePath
             break
         }
     }
-    if (-not $hasAny) {
+
+    if ($null -eq $props) {
         return $null
     }
 
@@ -980,6 +1000,7 @@ function Get-LumaBridgeDeviceStartupDiagnostics {
     $iddCxVersionRaw = & $getProp 'DiagIddCxVersion'
 
     return [pscustomobject]@{
+        RegistryPath        = $resolvedPath
         LastStage           = & $getProp 'DiagLastStage'
         LastSuccessfulStage = & $getProp 'DiagLastSuccessfulStage'
         LastStatus          = $lastStatusRaw
@@ -991,6 +1012,7 @@ function Get-LumaBridgeDeviceStartupDiagnostics {
         IddCxRuntimeVerHex  = Format-LumaBridgeNtStatusHex -StatusValue $iddCxVersionRaw
         HostProcessId       = & $getProp 'DiagHostProcessId'
         DllAttachCount      = & $getProp 'DiagDllAttachCount'
+        BuildStage          = & $getProp 'DiagBuildStage'
     }
 }
 

@@ -84,35 +84,71 @@ Com os `.tmf` oficiais extraidos dos simbolos de `IddCx.dll` (`10.0.26100.9818`)
 
 ---
 
-## 2. Auditoria Estatica vs. Exemplo Oficial Microsoft e `rdpidd.inf`
+## 2. Descoberta da Causa Raiz por Auditoria Binaria (`cdb.exe`) e Controle Experimental
 
-Ambiente auditado no host: Windows 11 x64 build `26300.9974`, WDK `10.0.28000.0`, MSVC `14.51.36231`, `WUDFx02000.dll` `2.35.0`, UMDF alvo `2.31` (min `2.25`), IddCx alvo `1.4` (min `1.4`), `Driver_SpectreMitigation=Spectre`, Test Signing `Enabled`, Secure Boot `Disabled`.
+### 2.1 Resultado do Controle Experimental (`IddSampleDriver`)
+
+No mesmo host Windows 11 x64 (`26300.9974`, GPU NVIDIA GeForce RTX 3060 Ti, certificado de teste, `WUDFx02000.dll` `10.0.26100.9818` e `IddCx.dll` `10.0.26100.9818`), o exemplo oficial Microsoft `IddSampleDriver` funcionou em **ambos** os modos de enumeracao:
+
+1. **`SwDeviceCreate` (`IddSampleApp.exe`):** `InstanceId = SWD\IDDSAMPLEDRIVER\IDDSAMPLEDRIVER`, `Status = OK`, `3` monitores virtuais criados.
+2. **Enumeracao `ROOT` via DevCon (`Root\IddSampleDriver`):** `InstanceId = ROOT\DISPLAY\0000`, `Status = OK`, `DEVPKEY_Device_ProblemCode = 0`, `DEVPKEY_Device_ProblemStatus = Empty`, `3` monitores virtuais criados.
+3. Limpeza confirmada sem residuos (`ROOT\DISPLAY\0000` e `oem68.inf` removidos).
+
+Esse resultado descartou definitivamente hipotese de incompatibilidade ambiental no host Windows 11, GPU RTX 3060 Ti, certificado de teste ou enumeracao `ROOT\DISPLAY` via `DevCon`.
+
+### 2.2 Causa Raiz Primaria Comprovada via `cdb.exe`: `IddCx!Validate(IDDCX_ADAPTER_CAPS)` rejeita `IDDCX_TRANSMISSION_TYPE_NETWORK_OTHER` (`9`)
+
+A desmontagem de `C:\Windows\System32\drivers\UMDF\IddCx.dll` (`10.0.26100.9818`) e `C:\Windows\System32\WUDFx02000.dll` (`10.0.26100.9818`) com simbolos publicos Microsoft comprovou a cadeia exata da primeira falha sincronamente em ~2 ms:
+
+1. **`LumaBridgeStartAdapter` (`Adapter.cpp`) definia `TransmissionType = IDDCX_TRANSMISSION_TYPE_NETWORK_OTHER` (`0x9`):** enquanto `IddSampleDriver` define `IDDCX_TRANSMISSION_TYPE_WIRED_OTHER` (`0x3`).
+2. **`IddCx!IddCxImplAdapterInitAsync` (`0000000180014ac0`) chama `IddCx!Validate(struct IDDCX_ADAPTER_CAPS const &)` (`00000001800194b0`) em `+0x111` (`0000000180014bd1`).**
+3. **Bug off-by-one em `IddCx!Validate+0x13e` (`00000001800195ee`):** o validador de `EndPointDiagnostics.TransmissionType` (`dword ptr [rbx+1Ch]`) executa:
+   ```asm
+   00000001`800195ee 8b4b1c          mov     ecx,dword ptr [rbx+1Ch]   ; ecx = 9
+   00000001`800195f1 85c9            test    ecx,ecx
+   00000001`800195f3 7408            je      IddCx!Validate+0x14d
+   00000001`800195f5 8d41f7          lea     eax,[rcx-9]               ; eax = 0
+   00000001`800195f8 83f8f5          cmp     eax,0FFFFFFF5h            ; 0 <= 0xFFFFFFF5 (nao salta)
+   00000001`800195fb 7723            ja      IddCx!Validate+0x170        ; so aceita [1..8] e 0xFFFFFFFF
+   IddCx!Validate+0x14d:                                                ; "Invalid IDDCX_TRANSMISSION_TYPE, value %d"
+   00000001`80019608 8bce            mov     ecx,esi                   ; 0xC000000D (STATUS_INVALID_PARAMETER)
+   00000001`8001961b e8e4310000      call    IddCx!StatusException::ThrowForStatusWithMsg
+   ```
+   Como `(uint32_t)(9 - 9) = 0 <= 0xFFFFFFF5`, o runtime `IddCx.dll` `10.0.26100.9818` aceita somente `[1..8]` (`WIRED_USB`..`WIRELESS_OTHER`) e `0xFFFFFFFF` (`IDDCX_TRANSMISSION_TYPE_OTHER`), rejeitando `IDDCX_TRANSMISSION_TYPE_NETWORK_OTHER` (`9`) incondicionalmente com **`0xC000000D` (`STATUS_INVALID_PARAMETER`)**.
+4. **Traducao no UMDF (`0xC000000D` -> `0xC000009E`):** `IddCx!IddCxImplAdapterInitAsync$catch$6` (`0000000180048945`) retorna `0xC000000D` sincronamente para `LumaBridgeStartAdapter`, que propaga `0xC000000D` em `LumaBridgeEvtDeviceD0Entry` para `WUDFx02000!FxPkgPnp::PowerD0Starting`. Na maquina PnP/Power, `WUDFx02000!FxPkgPnp::PnpEventHardwareAvailablePowerPolicyFailed` (`000000018008edf0`) grava **`0xC000009E` (`STATUS_DEVICE_POWER_FAILURE`)** no IRP `IRP_MN_START_DEVICE (27, 0)`, concluindo em `235 us` (UMDF Event `2103` e `CM_PROB_FAILED_START` / Code `10`). Em contraste, `IddSampleDeviceD0Entry` chama `VOID InitAdapter()` e sempre retorna `STATUS_SUCCESS`. *(O LumaBridge **nao mascara** falhas em `EvtDeviceD0Entry`.)*
+
+### 2.3 Causa Secundaria dos Breadcrumbs `Diag*` Ausentes no Attempt #2
+
+A desmontagem de `WUDFx02000!FxDevice::_OpenKey` (`000000018004adf4`) e `WUDFx02000!FxDevice::_OpenDeviceRegistryKey` (`00000001800341a4`) mostrou que `WdfDeviceOpenRegistryKey(Device, PLUGPLAY_REGKEY_DEVICE, KEY_SET_VALUE, ...)` sem o bit 8 (`WDF_REGKEY_DEVICE_SUBKEY = 256` em `wdfregistry.h`) abre a raiz `Device Parameters\`, onde `WUDFHost.exe` (`NT AUTHORITY\LOCAL SERVICE`) nao possui `KEY_SET_VALUE`. Com `PLUGPLAY_REGKEY_DEVICE | WDF_REGKEY_DEVICE_SUBKEY`, o UMDF cria/abre `Device Parameters\LumaBridgeIddDriver` com permissao de escrita.
+
+### 2.4 Correcoes Implementadas e Validacao Estática do Pacote
+
+- **`Adapter.h` / `DiagnosticStageConfig.h`:** adicionado `kAdapterTransmissionType = IDDCX_TRANSMISSION_TYPE_WIRED_OTHER` (`0x3`), `static_assert(IsSupportedIddCxRuntimeTransmissionType(...))` e `kEndpointMajorVersion = 1`.
+- **`Adapter.cpp` (`LumaBridgePersistStartupDiagnostics`):** passou a abrir `PLUGPLAY_REGKEY_DEVICE | WDF_REGKEY_DEVICE_SUBKEY` (com fallback para `PLUGPLAY_REGKEY_DEVICE`) e persistir `DiagBuildStage`; **`Get-LumaBridgeDeviceStartupDiagnostics`** (`LumaBridgeDriverCommon.psm1`) consulta ambas as chaves.
+- **Variante diagnostica em 7 estagios (`LUMABRIDGE_DIAGNOSTIC_STAGE` `1..6`, default `6` + Estagio `0` controle Microsoft):** implementada via `DiagnosticStageConfig.h` e `Build-LumaBridgeDiagnosticStage.ps1`, sem alterar o `.inf`, UMDF `2.31` (min `25`), IddCx `1.4` (min `4`) ou `/Qspectre`.
+
+Ambiente auditado no host: Windows 11 x64 build `26300.9974`, WDK `10.0.28000.0`, MSVC `14.51.36231`, `WUDFx02000.dll` `10.0.26100.9818`, `IddCx.dll` `10.0.26100.9818`, UMDF alvo `2.31` (min `2.25`), IddCx alvo `1.4` (min `1.4`), `Driver_SpectreMitigation=Spectre`, Test Signing `Enabled`, Secure Boot `Disabled`.
 
 | Area auditada | Situacao observada no LumaBridge | Referencia / Verificacao no host | Conclusao |
 |---|---|---|---|
 | **Exports & dependencias da DLL** | `dumpbin /exports /dependents` mostra export `FxDriverEntryUm`, dependencias `d3d11.dll`, `dxgi.dll`, `ntdll.dll`, `KERNEL32.dll` e Win32 API sets (`api-ms-win-*`), zero dependencia de VCRuntime | Driver UMDF C++ sem CRT dinamica externa | Carregamento de dependencias estaticamente integro |
 | **Assinatura & CodeIntegrity** | Pacote validado com `signtool` / `CryptCAT*`; log `CodeIntegrity/Operational` sem rejeicoes no horario da falha | Assinatura de teste + `TestSigning=Enabled` ativos | Nao houve bloqueio por assinatura/HVCI/CI |
-| **Versao WDF / IddCx ABI** | `WdfBindInfo` (`2.31`, min `25`) e `_IddCx_BIND_INFO` (`1.4`, min `4`) | `WUDFx02000.dll` `2.35.0` no host satisfaz ambas | Compativel; nenhuma evidencia para downgrade |
+| **Versao WDF / IddCx ABI** | `WdfBindInfo` (`2.31`, min `25`, `273` funcs) e `_IddCx_BIND_INFO` (`1.4`, min `4`, `25` funcs, `0x47` structs) | `_IddCx_BIND_INFO` byte-a-byte identico ao `IddSampleDriver` (`WUDFx02000.dll` `10.0.26100.9818` satisfaz ambos) | Compativel; nenhuma evidencia para downgrade |
 | **Divergencia WDF schema `2.23` vs `2.31`** | Aviso `"Using WDF schema version 2.23 when section requires version 2.31"` no `setupapi.dev.log` | INFs inbox ativos no host (`usbncmum.inf`, `hidcfu.inf`, `storfwupdate.inf`) emitem exatamente o mesmo aviso | **Benigno** (limitacao do parser do `Wudfrd`/`SetupAPI`, nao e a causa raiz) |
 | **Validacao `InfVerif`** | `LumaBridgeIddDriver.inf` estampado em `Debug\|x64` e `Release\|x64` | `infverif.exe /v /u` e `infverif.exe /v /w` retornam exit code `0` | INF estruturalmente valido |
 | **Execucao via Driver Store (`DIRID 13`)** | `[DestinationDirs] UMDriverCopy = 13`, `ServiceBinary = %13%\LumaBridgeIddDriver.dll` | `C:\Windows\INF\rdpidd.inf` usa identico `UMDriverCopy = 13` + `%13%\RdpIdd.dll` | `DIRID 13` suportado e funcional no host |
-| **Diretivas INF (`NT.Wdf` / `NT.hw`)** | `UmdfExtensions = IddCx0102`, `UpperFilters = IndirectKmd`, `AllowKernelModeClients`, `ProcessSharingDisabled`; `DeviceGroupId` esta em `[LumaBridge_HardwareDeviceSettings]` (`NT.hw`), sem `Security` SDDL explicito | Em `rdpidd.inf`, `DeviceGroupId` fica em `[RdpIdd_Install.AddReg]` (secao do servico) e ha `HKR,, Security,, "D:P(A;;GA;;;WD)"` | Diferenca estrutural anotada apenas como hipotese (INF **nao alterado** sem prova em runtime) |
-| **Fluxo `DriverEntry` -> `IddCxAdapterInitAsync`** | `DriverEntry`, `LumaBridgeEvtDeviceAdd` (`IddCxDeviceInitConfig` -> `WdfDeviceCreate` -> `IddCxDeviceInitialize`), `EvtDeviceD0Entry` (`IddCxGetVersion` -> `IDD_STRUCTURE_SIZE` em caps/versoes -> `IddCxAdapterInitAsync`), `EvtIddCxAdapterInitFinished` (`WdfDeviceSetFailed` em erro) | Alinhado a `Windows-driver-samples/video/IndirectDisplay` e `IddCx.h` (`10.0.28000.0`); mutex/locks nao ficam retidos durante `IddCxAdapterInitAsync` | Sem defeito estatico obvio; requer telemetria de runtime para identificar o estagio exacto aos +88 ms |
+| **Diretivas INF (`NT.Wdf` / `NT.hw`)** | `UmdfExtensions = IddCx0102`, `UpperFilters = IndirectKmd`, `AllowKernelModeClients`, `ProcessSharingDisabled`; `DeviceGroupId` em `[LumaBridge_HardwareDeviceSettings]` (`NT.hw`) | Na tentativa #2 `WUDFHost.exe` carregou a DLL normalmente; validadores de INF nao exigiram alteracao | INF **preservado sem alteracoes** |
+| **`IDDCX_ADAPTER_CAPS` (`TransmissionType`)** | **Antes:** `IDDCX_TRANSMISSION_TYPE_NETWORK_OTHER` (`9`). **Corrigido:** `kAdapterTransmissionType = IDDCX_TRANSMISSION_TYPE_WIRED_OTHER` (`3`), `kEndpointMajorVersion = 1` | `IddCx!Validate+0x13e` (`IddCx.dll` `10.0.26100.9818`) rejeita `9` com `0xC000000D`; `3` e identico ao `IddSampleDriver` | **Causa raiz #1 identificada e corrigida** |
+| **Breadcrumbs `Diag*` (`WdfDeviceOpenRegistryKey`)** | **Antes:** `PLUGPLAY_REGKEY_DEVICE` abria `\` sem escrita para `LOCAL SERVICE`. **Corrigido:** `PLUGPLAY_REGKEY_DEVICE \| WDF_REGKEY_DEVICE_SUBKEY` + `DiagBuildStage` | `WUDFx02000!FxDevice::_OpenDeviceRegistryKey` (`00000001800341a4`) mapeia bit 8 para subchave gravavel `LumaBridgeIddDriver` | **Causa secundaria corrigida** |
+| **Validacao de Monitor / Modos (Auditoria Preventiva)** | `IddCx!Validate(IDDCX_MONITOR_INFO)` (`000000018001a22c`) e `IddCx!Validate(DISPLAYCONFIG_VIDEO_SIGNAL_INFO)` (`0000000180018be0`) conferidos | `VirtualMonitor.cpp` (`MONITOR_TYPE_INDIRECT_WIRED`, `EDID` `0`/`nullptr`, `MaxMonitors=1`) e `MonitorModes.cpp` (`720p60`/`1080p60`) atendem integralmente | Compativel com futura ativacao (`EnableVirtualMonitor=1`) |
 
 ---
 
-## 3. Hipoteses Ranqueadas (Atualizadas apos Execucao #2)
+## 3. Historico de Hipoteses (Resolvido)
 
-1. **H1 (Mais provavel) — Falha sincrona ou interna em `IddCxDeviceInitialize`, `EvtDeviceD0Entry` ou `IddCxAdapterInitAsync` (~2.1 ms apos Event `2006`):**
-   Na tentativa #2, `WUDFHost.exe` (PID `23812`) carregou `LumaBridgeIddDriver.dll` (`00:57:48.0287643Z`, Event `2006`), `IddCx!DriverEntry` concluiu `STATUS_SUCCESS`, e somente **`235 us` apos** o envio de `IRP_MN_START_DEVICE (27, 0)` o Event `2103` registrou `0xC000009E` (`00:57:48.0308806Z`), seguido **215 us depois** pelo `WATCHDOG` Event `1001` (`00:57:48.0310951Z`). Isso refuta hipotese de timeout prolongado no `WATCHDOG`. Alem disso, diferentemente de `IddSampleDeviceD0Entry` (que sempre retorna `STATUS_SUCCESS`), `LumaBridgeEvtDeviceD0Entry` propaga o `NTSTATUS` retornado por `LumaBridgeStartAdapter`, fazendo com que qualquer erro em `IddCxAdapterInitAsync` ou pre-check falhe `D0Entry`/`IRP_MN_START_DEVICE`.
-2. **H2 — Falha em `DriverEntry` / `EvtDeviceAdd` / `IddCxDeviceInitConfig` / `WdfDeviceCreate`:**
-   `DriverEntry` ou `EvtDeviceAdd` falha antes de `D0Entry`; na tentativa #2 essa evidencia nao sobreviveu no ETL por sobrescrita circular causada pelo `DxgKrnl` + `Watchdog-Events` (1.152.206 eventos, `FirstReliableEventTimeStamp = +40.937 s`).
-3. **H3 — Comportamento especifico de enumeracao raiz (`Root\LumaBridgeIddDriver`) vs `SwDeviceCreate` ou metadados INF (`DeviceGroupId` / `ProcessSharingDisabled`):**
-   Deve ser isolado antes de qualquer alteracao no `.inf` por meio do teste de controle com `IddSampleDriver` (`SwDeviceCreate` vs `Root\IddSampleDriver`) e do runbook de WinDbg em [windows-idd-windbg-and-reference-control.md](./windows-idd-windbg-and-reference-control.md).
-4. **H4 — Rejeicao assincrona em `EvtIddCxAdapterInitFinished` (`WdfDeviceSetFailed`):**
-   `IddCxAdapterInitAsync` retorna `STATUS_SUCCESS`, mas `dxgkrnl`/`IddCx` conclui a inicializacao com falha devido a capacidades/ambiente (`IDDCX_ADAPTER_CAPS`, GPU de renderizacao ou contexto).
-5. **H5 (Refutada) — Timeout do `WATCHDOG`, aviso WDF schema `2.23` vs `2.31` ou `CodeIntegrity`:**
-   O `WATCHDOG` Event `1001` ocorreu **apos** a falha `2103` (`+215 us`); o aviso WDF schema ocorre igualmente nos INFs inbox do Windows 11; e os logs `CodeIntegrity` e assinatura estao integros.
+1. **Confirmada (Causa Primaria):** Rejeicao sincrona de `IDDCX_TRANSMISSION_TYPE_NETWORK_OTHER` (`9`) em `IddCx!Validate(IDDCX_ADAPTER_CAPS)+0x13e` retornando `0xC000000D`, propagada por `LumaBridgeEvtDeviceD0Entry` (sem mascarar erro) e convertida por `WUDFx02000!FxPkgPnp::PnpEventHardwareAvailablePowerPolicyFailed` em `0xC000009E` (`Event 2103`, `Code 10`).
+2. **Confirmada (Causa Secundaria de Telemetria):** `WdfDeviceOpenRegistryKey(PLUGPLAY_REGKEY_DEVICE, KEY_SET_VALUE)` sem `WDF_REGKEY_DEVICE_SUBKEY` falhava sob `LOCAL SERVICE` + overwrite circular do ETL por `DxgKrnl`.
+3. **Refutadas:** Ambiente Windows / GPU RTX 3060 Ti, enumeracao `ROOT\DISPLAY`, WDF bind `2.31` vs `2.25`, aviso de WDF schema `2.23` vs `2.31`, timeout de `WATCHDOG`, `CodeIntegrity` e assinatura.
 
 ---
 
@@ -145,13 +181,11 @@ Ambiente auditado no host: Windows 11 x64 build `26300.9974`, WDK `10.0.28000.0`
 
 ---
 
-## 5. Procedimento Sequencial — Controle Experimental, Depuracao e Tentativa #3 (`EnableVirtualMonitor=0`)
+## 5. Procedimento Sequencial — Validacao do Build Corrigido (Estagio 6, `EnableVirtualMonitor=0`)
 
-> **Ordem recomendada:** Antes de executar uma 3a instalacao do LumaBridge, siga [windows-idd-windbg-and-reference-control.md](./windows-idd-windbg-and-reference-control.md) para validar o driver de controle `IddSampleDriver` no host e/ou anexar WinDbg + WDF Verifier. Ao executar uma nova captura ETW para o LumaBridge (`Attempt3`), utilize o procedimento atualizado abaixo (sessao `LumaBridgeIddCore` `-f bin` sem `DxgKrnl` no mesmo ETL).
+Execute todos os comandos abaixo em um **PowerShell elevado (Administrador)** na raiz do repositorio. Nenhum comando habilita `EnableVirtualMonitor=1` inicialmente, mantendo a validacao controlada sobre o start PnP/adapter primeiro. Caso ocorra qualquer falha residual apos a correcao de `TransmissionType`, consulte a tabela em 7 estagios em [windows-idd-windbg-and-reference-control.md](./windows-idd-windbg-and-reference-control.md#4-plano-de-variante-diagnostica-em-7-estagios-lumabridge_diagnostic_stage-16--estagio-0).
 
-Execute todos os comandos abaixo em um **PowerShell elevado (Administrador)** na raiz do repositorio. Nenhum comando deve habilitar `EnableVirtualMonitor=1` nesta etapa.
-
-### Etapa A — Recompilar pacote Release|x64 e validar estaticamente
+### Etapa A — Confirmar pacotes Release|x64 (Estagio 6 padrao) e validar estaticamente
 
 Em um prompt do **VS x64 Developer Command Prompt** (`VsDevCmd.bat -arch=amd64 -host_arch=amd64`):
 
@@ -159,7 +193,7 @@ Em um prompt do **VS x64 Developer Command Prompt** (`VsDevCmd.bat -arch=amd64 -
 msbuild windows\driver\LumaBridgeIddDriver.sln /t:Rebuild /p:Configuration=Release;Platform=x64 /m
 ```
 
-- **Resultado esperado:** build concluido com `0 warnings` e `0 errors`, contendo `LUMABRIDGE_ENABLE_TRACELOGGING=1` e `/Qspectre`.
+- **Resultado esperado:** build concluido com `0 warnings` e `0 errors`, `LUMABRIDGE_DIAGNOSTIC_STAGE=6`, `LUMABRIDGE_ENABLE_TRACELOGGING=1`, `/Qspectre` e `InfVerif /v /u` + `/v /w` com saida `0`.
 
 ### Etapa B — Previa Dry-Run (nao destrutiva) e preparar staging assinado
 
@@ -168,7 +202,6 @@ $stagingDir = 'C:\Temp\LumaBridgeStaging_Attempt3'
 $diagDir    = "$env:LOCALAPPDATA\LumaBridgeDisplay\Diagnostics\Attempt3"
 $etwDir     = "$diagDir\Etw"
 $etlPath    = "$etwDir\LumaBridgeIddCore.etl"
-$dxgEtlPath = "$etwDir\LumaBridgeIddDxg.etl"
 
 # 1. Previa nao destrutiva
 .\windows\driver\scripts\Test-LumaBridgePrerequisites.ps1 -Configuration Release -StagingDir $stagingDir
@@ -200,22 +233,22 @@ wevtutil.exe sl "Microsoft-Windows-IndirectDisplays-ClassExtension-Events/Diagno
 
 - **Resultado esperado:** ambos os canais reportam `IsEnabled = True`.
 
-### Etapa D — Iniciar captura Core sequencial (`-pf`), verificar providers e instalar com `EnableVirtualMonitor=0`
+### Etapa D — Iniciar captura Core sequencial (`-pf`, sem `DxgKrnl`), verificar providers e instalar
 
 1. *(Opcional recomendado)* Abrir Sysinternals **DebugView** como Administrador com *Capture Win32*, *Capture Global Win32* e *Log to File* salvando em `"$diagDir\debugview.log"`.
-2. Iniciar a sessao sequencial `LumaBridgeIddCore` (adicione `-IncludeDxgKrnl` somente se quiser o `DxgKrnl` na sessao circular separada `LumaBridgeIddDxg`), confirmar `AllProvidersVerified -eq $true` e executar `Install-LumaBridgeDriver.ps1`:
+2. Iniciar a sessao sequencial `LumaBridgeIddCore` **sem `DxgKrnl`** na sessao principal, confirmar `AllProvidersVerified -eq $true` antes de instalar e executar `Install-LumaBridgeDriver.ps1`:
 
 ```powershell
-# 1. Iniciar sessao sequencial Core via -pf (opcionalmente adicione -IncludeDxgKrnl para sessao separada DxgKrnl)
+# 1. Iniciar sessao sequencial Core via -pf (sem DxgKrnl na sessao principal)
 $traceStart = .\windows\driver\scripts\Invoke-LumaBridgeEtwTrace.ps1 `
     -Action Start `
     -OutputDir $etwDir `
     -EtlPath $etlPath `
-    -DxgEtlPath $dxgEtlPath `
     -Force
 
 $traceStart.ProviderVerification | Format-List AllProvidersVerified, MissingProviderGuids
-.\windows\driver\scripts\Invoke-LumaBridgeEtwTrace.ps1 -Action VerifyProviders -OutputDir $etwDir
+$verify = .\windows\driver\scripts\Invoke-LumaBridgeEtwTrace.ps1 -Action VerifyProviders -OutputDir $etwDir
+if (-not $verify.AllProvidersVerified) { throw 'Nem todos os providers Core foram habilitados no ETW.' }
 
 # 2. Executar instalacao controlada mantendo EnableVirtualMonitor=0 e captura pre-rollback
 .\windows\driver\scripts\Install-LumaBridgeDriver.ps1 `
@@ -227,50 +260,38 @@ $traceStart.ProviderVerification | Format-List AllProvidersVerified, MissingProv
 # Se estiver gravando DebugView em arquivo, passe tambem: -DebugLogPath "$diagDir\debugview.log"
 ```
 
-### Etapa E — Parar captura ETW, decodificar WPP/ETL em streaming e inspecionar evidencias
+### Etapa E — Parar captura ETW, decodificar WPP/ETL e verificar estado PnP/breadcrumbs
 
 ```powershell
 .\windows\driver\scripts\Invoke-LumaBridgeEtwTrace.ps1 `
     -Action Stop `
     -OutputDir $etwDir `
     -EtlPath $etlPath `
-    -DxgEtlPath $dxgEtlPath `
     -DecodeWpp `
     -Force
 
-# Inspecionar artefatos preservados:
-Get-Content -LiteralPath "$diagDir\diagnostics-summary.md"
-Get-Content -LiteralPath "$etwDir\etw-decoded-events.json"
-Get-Content -LiteralPath "$etwDir\wpp-decoded-summary.json" -ErrorAction SilentlyContinue
-Get-ChildItem -LiteralPath "C:\Windows\LiveKernelReports\WATCHDOG" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 5
-```
-
-*(Para reprocessar manualmente os `.etl` existentes ou com janela temporal / PID especifico sem nova instalacao:)*
-
-```powershell
 .\windows\driver\scripts\Collect-LumaBridgeDiagnostics.ps1 `
     -Configuration Release `
     -StagingDir $stagingDir `
-    -OutputDir "$diagDir\PostEtwMerge" `
+    -OutputDir $diagDir `
     -EtlPath $etlPath `
-    -DxgEtlPath $dxgEtlPath `
-    -DecodeWpp `
-    -DebugLogPath "$diagDir\debugview.log"
+    -DecodeWpp
+
+# Inspecionar resultados (esperado Status=OK, ProblemCode=0, DiagBuildStage=6, DiagLastStage=AdapterInitFinished):
+Get-Content -LiteralPath "$diagDir\diagnostics-summary.md"
+Get-Content -LiteralPath "$etwDir\etw-decoded-events.json"
+Get-PnpDevice -Class Display | Format-Table Status, InstanceId, FriendlyName, Problem -AutoSize
 ```
 
-### Etapa F — Limpeza completa e restauracao do host (Recuperacao)
+### Etapa F — Limpeza / Rollback apos a sessao de testes
 
 ```powershell
-# 1. Garantir parada das sessoes ETW caso ainda estejam ativas
+# 1. Parar sessao ETW caso ainda esteja ativa e restaurar canais ao estado padrao
 logman.exe stop LumaBridgeIddCore -ets 2>$null
-logman.exe stop LumaBridgeIddDxg -ets 2>$null
-logman.exe stop LumaBridgeIddTrace -ets 2>$null
-
-# 2. Desabilitar os canais que estavam desligados antes do teste
 wevtutil.exe sl "Microsoft-Windows-IndirectDisplays-ClassExtension-Events/Diagnostic" /e:false
 wevtutil.exe sl "Microsoft-Windows-DriverFrameworks-UserMode/Operational" /e:false
 
-# 3. Remover dispositivo, pacote OEM e certificado somente se ainda presentes (substituir pelo thumbprint usado)
+# 2. Desinstalar dispositivo, pacote OEM e certificado de teste (substitua pelo thumbprint se quiser remover)
 .\windows\driver\scripts\Uninstall-LumaBridgeDriver.ps1 `
     -RemoveTestCertificate `
     -CertificateThumbprint $signResult.CertificateThumbprint `

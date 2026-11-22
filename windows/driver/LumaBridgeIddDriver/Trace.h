@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include "AdapterStateMachine.h"
+#include "DiagnosticStageConfig.h"
 
 #if defined(LUMABRIDGE_ENABLE_TRACELOGGING)
 #pragma warning(push)
@@ -153,47 +154,59 @@ LumaBridgeTraceEmit(
     DriverDiagnosticStage lastSuccessfulStage = DriverDiagnosticStage::None
     ) noexcept
 {
-    const DWORD processId = GetCurrentProcessId();
-    const DWORD threadId = GetCurrentThreadId();
-    const char* safeLevel = (level != nullptr) ? level : "INFO";
-    const char* safeStage = DriverDiagnosticStageToString(stage);
-    const char* safeState = AdapterLifecycleStateToString(state);
-    const char* safeLastOk = DriverDiagnosticStageToString(lastSuccessfulStage);
-    const char* safeMessage = (message != nullptr) ? message : "";
-
-    char buffer[512]{};
-    _snprintf_s(
-        buffer,
-        sizeof(buffer),
-        _TRUNCATE,
-        "[LB-DRIVER] [%s] pid=%lu tid=%lu stage=%s status=0x%08lX state=%s lastOk=%s msg=\"%s\"\n",
-        safeLevel,
-        static_cast<unsigned long>(processId),
-        static_cast<unsigned long>(threadId),
-        safeStage,
-        static_cast<unsigned long>(status),
-        safeState,
-        safeLastOk,
-        safeMessage);
-    OutputDebugStringA(buffer);
-
-#if defined(LUMABRIDGE_ENABLE_TRACELOGGING)
-    if (safeLevel[0] == 'E')
+    if constexpr (!GetDiagnosticStageCapabilities(kActiveDiagnosticStage).EnableTraceLoggingAndRegistryBreadcrumbs)
     {
-        LumaBridgeWriteStageEtwEvent<2U>(
-            safeLevel, processId, threadId, safeStage, status, safeState, safeLastOk, safeMessage);
-    }
-    else if (safeLevel[0] == 'W')
-    {
-        LumaBridgeWriteStageEtwEvent<3U>(
-            safeLevel, processId, threadId, safeStage, status, safeState, safeLastOk, safeMessage);
+        UNREFERENCED_PARAMETER(level);
+        UNREFERENCED_PARAMETER(stage);
+        UNREFERENCED_PARAMETER(status);
+        UNREFERENCED_PARAMETER(state);
+        UNREFERENCED_PARAMETER(message);
+        UNREFERENCED_PARAMETER(lastSuccessfulStage);
     }
     else
     {
-        LumaBridgeWriteStageEtwEvent<4U>(
-            safeLevel, processId, threadId, safeStage, status, safeState, safeLastOk, safeMessage);
-    }
+        const DWORD processId = GetCurrentProcessId();
+        const DWORD threadId = GetCurrentThreadId();
+        const char* safeLevel = (level != nullptr) ? level : "INFO";
+        const char* safeStage = DriverDiagnosticStageToString(stage);
+        const char* safeState = AdapterLifecycleStateToString(state);
+        const char* safeLastOk = DriverDiagnosticStageToString(lastSuccessfulStage);
+        const char* safeMessage = (message != nullptr) ? message : "";
+
+        char buffer[512]{};
+        _snprintf_s(
+            buffer,
+            sizeof(buffer),
+            _TRUNCATE,
+            "[LB-DRIVER] [%s] pid=%lu tid=%lu stage=%s status=0x%08lX state=%s lastOk=%s msg=\"%s\"\n",
+            safeLevel,
+            static_cast<unsigned long>(processId),
+            static_cast<unsigned long>(threadId),
+            safeStage,
+            static_cast<unsigned long>(status),
+            safeState,
+            safeLastOk,
+            safeMessage);
+        OutputDebugStringA(buffer);
+
+#if defined(LUMABRIDGE_ENABLE_TRACELOGGING)
+        if (safeLevel[0] == 'E')
+        {
+            LumaBridgeWriteStageEtwEvent<2U>(
+                safeLevel, processId, threadId, safeStage, status, safeState, safeLastOk, safeMessage);
+        }
+        else if (safeLevel[0] == 'W')
+        {
+            LumaBridgeWriteStageEtwEvent<3U>(
+                safeLevel, processId, threadId, safeStage, status, safeState, safeLastOk, safeMessage);
+        }
+        else
+        {
+            LumaBridgeWriteStageEtwEvent<4U>(
+                safeLevel, processId, threadId, safeStage, status, safeState, safeLastOk, safeMessage);
+        }
 #endif
+    }
 }
 
 inline void
@@ -263,38 +276,69 @@ LumaBridgeTraceMetrics(
     DWORD handleCount
     ) noexcept
 {
-    char buffer[512]{};
-    _snprintf_s(
-        buffer,
-        sizeof(buffer),
-        _TRUNCATE,
-        "[LB-DRIVER] [METRICS] stage=%s adapterState=%s monitorState=%s monCreate=%llu monArrive=%llu monDepart=%llu monDepartFail=%llu scState=%s scActive=%u scAssigned=%llu scDeleted=%llu framesAcq=%llu framesProc=%llu framesDrop=%llu acqFps=%.2f procFps=%.2f lastUs=%llu avgUs=%llu maxUs=%llu dxgiDevRem=%llu transientErr=%llu fatalErr=%llu wsKB=%llu privKB=%llu handles=%lu\n",
-        DriverDiagnosticStageToString(stage),
-        AdapterLifecycleStateToString(adapterState),
-        (monitorStateName != nullptr) ? monitorStateName : "Unknown",
-        monitorCreates,
-        monitorArrivals,
-        monitorDepartures,
-        monitorDepartureFailures,
-        (swapChainStateName != nullptr) ? swapChainStateName : "Unknown",
-        swapChainActive ? 1U : 0U,
-        swapChainsAssigned,
-        swapChainsDeleted,
-        framesAcquired,
-        framesProcessed,
-        framesDropped,
-        acquireFps,
-        processFps,
-        lastFrameUs,
-        avgFrameUs,
-        maxFrameUs,
-        dxgiDeviceRemovedErrors,
-        transientErrors,
-        fatalErrors,
-        static_cast<unsigned long long>(workingSetKb),
-        static_cast<unsigned long long>(privateUsageKb),
-        static_cast<unsigned long>(handleCount));
-    OutputDebugStringA(buffer);
+    if constexpr (!GetDiagnosticStageCapabilities(kActiveDiagnosticStage).EnableTraceLoggingAndRegistryBreadcrumbs)
+    {
+        UNREFERENCED_PARAMETER(stage);
+        UNREFERENCED_PARAMETER(adapterState);
+        UNREFERENCED_PARAMETER(monitorStateName);
+        UNREFERENCED_PARAMETER(monitorCreates);
+        UNREFERENCED_PARAMETER(monitorArrivals);
+        UNREFERENCED_PARAMETER(monitorDepartures);
+        UNREFERENCED_PARAMETER(monitorDepartureFailures);
+        UNREFERENCED_PARAMETER(swapChainStateName);
+        UNREFERENCED_PARAMETER(swapChainActive);
+        UNREFERENCED_PARAMETER(swapChainsAssigned);
+        UNREFERENCED_PARAMETER(swapChainsDeleted);
+        UNREFERENCED_PARAMETER(framesAcquired);
+        UNREFERENCED_PARAMETER(framesProcessed);
+        UNREFERENCED_PARAMETER(framesDropped);
+        UNREFERENCED_PARAMETER(acquireFps);
+        UNREFERENCED_PARAMETER(processFps);
+        UNREFERENCED_PARAMETER(lastFrameUs);
+        UNREFERENCED_PARAMETER(avgFrameUs);
+        UNREFERENCED_PARAMETER(maxFrameUs);
+        UNREFERENCED_PARAMETER(dxgiDeviceRemovedErrors);
+        UNREFERENCED_PARAMETER(transientErrors);
+        UNREFERENCED_PARAMETER(fatalErrors);
+        UNREFERENCED_PARAMETER(workingSetKb);
+        UNREFERENCED_PARAMETER(privateUsageKb);
+        UNREFERENCED_PARAMETER(handleCount);
+    }
+    else
+    {
+        char buffer[512]{};
+        _snprintf_s(
+            buffer,
+            sizeof(buffer),
+            _TRUNCATE,
+            "[LB-DRIVER] [METRICS] stage=%s adapterState=%s monitorState=%s monCreate=%llu monArrive=%llu monDepart=%llu monDepartFail=%llu scState=%s scActive=%u scAssigned=%llu scDeleted=%llu framesAcq=%llu framesProc=%llu framesDrop=%llu acqFps=%.2f procFps=%.2f lastUs=%llu avgUs=%llu maxUs=%llu dxgiDevRem=%llu transientErr=%llu fatalErr=%llu wsKB=%llu privKB=%llu handles=%lu\n",
+            DriverDiagnosticStageToString(stage),
+            AdapterLifecycleStateToString(adapterState),
+            (monitorStateName != nullptr) ? monitorStateName : "Unknown",
+            monitorCreates,
+            monitorArrivals,
+            monitorDepartures,
+            monitorDepartureFailures,
+            (swapChainStateName != nullptr) ? swapChainStateName : "Unknown",
+            swapChainActive ? 1U : 0U,
+            swapChainsAssigned,
+            swapChainsDeleted,
+            framesAcquired,
+            framesProcessed,
+            framesDropped,
+            acquireFps,
+            processFps,
+            lastFrameUs,
+            avgFrameUs,
+            maxFrameUs,
+            dxgiDeviceRemovedErrors,
+            transientErrors,
+            fatalErrors,
+            static_cast<unsigned long long>(workingSetKb),
+            static_cast<unsigned long long>(privateUsageKb),
+            static_cast<unsigned long>(handleCount));
+        OutputDebugStringA(buffer);
+    }
 }
 
 } // namespace lumabridge::driver

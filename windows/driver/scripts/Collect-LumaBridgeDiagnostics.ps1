@@ -387,7 +387,7 @@ else {
 
         $sDiag = Get-LumaBridgeOptionalPropertyValue -InputObject $inst -PropertyName 'StartupDiagnostics'
         if ($null -ne $sDiag) {
-            $mdLines.Add(("  - StartupBreadcrumbs: LastStage=``{0}``, LastSuccessfulStage=``{1}``, LastStatus=``{2}``, LastErrorStage=``{3}``, LastErrorStatus=``{4}``, IddCxVersion=``{5}``, HostPID=``{6}``, DllAttachCount=``{7}``" -f `
+            $mdLines.Add(("  - StartupBreadcrumbs: LastStage=``{0}``, LastSuccessfulStage=``{1}``, LastStatus=``{2}``, LastErrorStage=``{3}``, LastErrorStatus=``{4}``, IddCxVersion=``{5}``, HostPID=``{6}``, DllAttachCount=``{7}``, BuildStage=``{8}``" -f `
                 (Get-LumaBridgeOptionalPropertyValue -InputObject $sDiag -PropertyName 'LastStage'), `
                 (Get-LumaBridgeOptionalPropertyValue -InputObject $sDiag -PropertyName 'LastSuccessfulStage'), `
                 (Get-LumaBridgeOptionalPropertyValue -InputObject $sDiag -PropertyName 'LastStatusHex'), `
@@ -395,7 +395,8 @@ else {
                 (Get-LumaBridgeOptionalPropertyValue -InputObject $sDiag -PropertyName 'LastErrorStatusHex'), `
                 (Get-LumaBridgeOptionalPropertyValue -InputObject $sDiag -PropertyName 'IddCxRuntimeVerHex'), `
                 (Get-LumaBridgeOptionalPropertyValue -InputObject $sDiag -PropertyName 'HostProcessId'), `
-                (Get-LumaBridgeOptionalPropertyValue -InputObject $sDiag -PropertyName 'DllAttachCount')))
+                (Get-LumaBridgeOptionalPropertyValue -InputObject $sDiag -PropertyName 'DllAttachCount'), `
+                (Get-LumaBridgeOptionalPropertyValue -InputObject $sDiag -PropertyName 'BuildStage')))
         }
     }
 }

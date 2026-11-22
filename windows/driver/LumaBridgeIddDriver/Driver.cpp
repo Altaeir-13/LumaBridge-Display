@@ -1,5 +1,6 @@
 #include "Driver.h"
 #include "Adapter.h"
+#include "DiagnosticStageConfig.h"
 
 #if defined(LUMABRIDGE_ENABLE_TRACELOGGING)
 TRACELOGGING_DEFINE_PROVIDER(
@@ -73,23 +74,34 @@ DriverEntry(
 {
     HRESULT tlRegHr = E_NOTIMPL;
     bool tlEnabled = false;
+    if constexpr (lumabridge::driver::GetDiagnosticStageCapabilities(
+                      lumabridge::driver::kActiveDiagnosticStage)
+                      .EnableTraceLoggingAndRegistryBreadcrumbs)
+    {
 #if defined(LUMABRIDGE_ENABLE_TRACELOGGING)
-    tlRegHr = TraceLoggingRegister(g_LumaBridgeTraceProvider);
-    g_TraceLoggingRegisterHr = tlRegHr;
-    g_TraceLoggingRegistered = SUCCEEDED(tlRegHr);
-    tlEnabled = g_TraceLoggingRegistered && (TraceLoggingProviderEnabled(g_LumaBridgeTraceProvider, 0, 0) != FALSE);
+        tlRegHr = TraceLoggingRegister(g_LumaBridgeTraceProvider);
+        g_TraceLoggingRegisterHr = tlRegHr;
+        g_TraceLoggingRegistered = SUCCEEDED(tlRegHr);
+        tlEnabled = g_TraceLoggingRegistered && (TraceLoggingProviderEnabled(g_LumaBridgeTraceProvider, 0, 0) != FALSE);
 #else
-    g_TraceLoggingRegisterHr = tlRegHr;
-    g_TraceLoggingRegistered = false;
+        g_TraceLoggingRegisterHr = tlRegHr;
+        g_TraceLoggingRegistered = false;
 #endif
+    }
+    else
+    {
+        g_TraceLoggingRegisterHr = tlRegHr;
+        g_TraceLoggingRegistered = false;
+    }
 
     {
-        char entryMsg[224]{};
+        char entryMsg[240]{};
         _snprintf_s(
             entryMsg,
             sizeof(entryMsg),
             _TRUNCATE,
-            "DriverEntry entered (dllAttachCount=%lu tlRegHr=0x%08lX tlEnabled=%u)",
+            "DriverEntry entered (diagStage=%u dllAttachCount=%lu tlRegHr=0x%08lX tlEnabled=%u)",
+            static_cast<unsigned int>(lumabridge::driver::kActiveDiagnosticStage),
             static_cast<unsigned long>(LumaBridgeGetDllProcessAttachCount()),
             static_cast<unsigned long>(tlRegHr),
             tlEnabled ? 1U : 0U);
