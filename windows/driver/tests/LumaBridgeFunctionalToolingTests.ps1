@@ -2465,20 +2465,33 @@ Invoke-UnitTest -Name 'HostProcessOutputCaptureGlobalTimeoutAndTwoProfileRunner'
             if (-not $isPerf) {
                 $payload = [pscustomobject]@{
                     ExitReason = 'DurationElapsed'; HostProcessExitedNormally = $true; TransportHealthy = $true;
-                    ConnectCount = 1; FramesReceived = 3; FramesValid = 3; FrameTargetReached = $false;
-                    MinFramesReached = $true; ChecksumMismatches = 0; ProtocolErrors = 0; FatalIoTimeouts = 0; FatalIpcErrors = 0;
-                    LastFrameSequence = 33; LastProtocolStatus = 'Ok'; AvgEndToEndLatencyUs = 1200; ReceiveFps = 0.6
+                    ConnectCount = 1; FramesReceived = 3; FramesValid = 3; LiveFramesReceived = 0; PreConnectFramesReceived = 3;
+                    FrameTargetReached = $false; MinFramesReached = $true; ChecksumMismatches = 0; ProtocolErrors = 0; FatalIoTimeouts = 0; FatalIpcErrors = 0;
+                    LastFrameSequence = 33; LastProtocolStatus = 'Ok'; AvgEndToEndLatencyUs = 1200; ReceiveFps = 0.6;
+                    TimestampMeasurementErrors = 0; OutOfOrderSequenceCount = 0; NonMonotonicTimestampCount = 0; MissingCoreTimestampCount = 0;
+                    FutureTimestampErrorCount = 0; IncompatibleTimestampUnitsCount = 0; QpcFrequencyMismatchCount = 0;
+                    ValidCoreTimestampSamples = 3; ValidLiveTimestampSamples = 0; ValidPresentTimestampSamples = 0;
+                    CoreTimestampCoveragePercent = 100.0; LiveTimestampCoveragePercent = 0.0; PresentTimestampCoveragePercent = 0.0;
+                    EndToEndLatency = [pscustomobject]@{ Available = $true; SampleCount = 3; AvgUs = 1200; P95Us = 1400; P99Us = 1450 };
+                    LiveEndToEndLatency = [pscustomobject]@{ Available = $false; SampleCount = 0; AvgUs = 0; P95Us = 0; P99Us = 0 }
                 }
                 $payload | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
                 return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Output = @('[LB-HOST] Summary: frames=3'); StdErr = @(); DryRun = $false }
             }
             else {
                 $failPerf = $st.PerfFails
+                $fc = $(if ($failPerf) { 12 } else { 60 })
                 $payload = [pscustomobject]@{
                     ExitReason = 'DurationElapsed'; HostProcessExitedNormally = $true; TransportHealthy = $true;
-                    ConnectCount = 1; FramesReceived = $(if ($failPerf) { 12 } else { 60 }); FramesValid = $(if ($failPerf) { 12 } else { 60 });
+                    ConnectCount = 1; FramesReceived = $fc; FramesValid = $fc; LiveFramesReceived = $fc; PreConnectFramesReceived = 0;
                     FrameTargetReached = (-not $failPerf); ChecksumMismatches = 0; ProtocolErrors = 0; FatalIoTimeouts = 0; FatalIpcErrors = 0;
-                    LastFrameSequence = 93; LastProtocolStatus = 'Ok'; AvgEndToEndLatencyUs = 45000; ReceiveFps = 58.5;
+                    LastFrameSequence = 93; LastProtocolStatus = 'Ok'; AvgEndToEndLatencyUs = 2400; ReceiveFps = 58.5;
+                    TimestampMeasurementErrors = 0; OutOfOrderSequenceCount = 0; NonMonotonicTimestampCount = 0; MissingCoreTimestampCount = 0;
+                    FutureTimestampErrorCount = 0; IncompatibleTimestampUnitsCount = 0; QpcFrequencyMismatchCount = 0;
+                    ValidCoreTimestampSamples = $fc; ValidLiveTimestampSamples = $fc; ValidPresentTimestampSamples = $fc;
+                    CoreTimestampCoveragePercent = 100.0; LiveTimestampCoveragePercent = 100.0; PresentTimestampCoveragePercent = 100.0;
+                    EndToEndLatency = [pscustomobject]@{ Available = $true; SampleCount = $fc; AvgUs = 2400; P95Us = 3200; P99Us = 3800 };
+                    LiveEndToEndLatency = [pscustomobject]@{ Available = $true; SampleCount = $fc; AvgUs = 2400; P95Us = 3200; P99Us = 3800 };
                     VisualStimulus = [pscustomobject]@{ VirtualDisplayIdentified = $true; Started = $true }
                 }
                 $payload | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
@@ -2623,11 +2636,18 @@ Invoke-UnitTest -Name 'M42GpuTransportNvencGatesAndRollback' -TestBody {
                 NegotiatedTransportMode = $(if ($isGpu) { 'GpuSharedNtHandle' } else { 'CpuStagingPipe' });
                 FallbackToCpuActivated = $false; GpuFramesOpened = $(if ($isGpu) { 3 } else { 0 });
                 GpuSharedOpenFailures = 0; GpuSyncTimeouts = 0; AdapterMismatchErrors = 0; CpuStagingReadsPerformed = $cpuReads;
-                ConnectCount = 1; FramesReceived = 60; FramesValid = 60; FrameTargetReached = $true; MinFramesReached = $true;
+                ConnectCount = 1; FramesReceived = 60; FramesValid = 60; LiveFramesReceived = 60; PreConnectFramesReceived = 0;
+                FrameTargetReached = $true; MinFramesReached = $true; TotalConnectedDurationUs = 1000000;
                 ChecksumMismatches = 0; ProtocolErrors = 0; FatalIoTimeouts = 0; FatalIpcErrors = 0;
-                LastFrameSequence = 60; LastProtocolStatus = 'Ok'; AvgEndToEndLatencyUs = 450; ReceiveFps = 240.0;
-                Nvenc = [pscustomobject]@{ NvencFramesEncoded = 60; TotalBitstreamBytes = 2500000 };
-                H264DecodeValidation = [pscustomobject]@{ Passed = $true };
+                LastFrameSequence = 60; LastProtocolStatus = 'Ok'; AvgEndToEndLatencyUs = 450; ReceiveFps = 60.0;
+                TimestampMeasurementErrors = 0; OutOfOrderSequenceCount = 0; NonMonotonicTimestampCount = 0; MissingCoreTimestampCount = 0;
+                FutureTimestampErrorCount = 0; IncompatibleTimestampUnitsCount = 0; QpcFrequencyMismatchCount = 0;
+                ValidCoreTimestampSamples = 60; ValidLiveTimestampSamples = 60; ValidPresentTimestampSamples = 60;
+                CoreTimestampCoveragePercent = 100.0; LiveTimestampCoveragePercent = 100.0; PresentTimestampCoveragePercent = 100.0;
+                EndToEndLatency = [pscustomobject]@{ Available = $true; SampleCount = 60; AvgUs = 450; P95Us = 800; P99Us = 950 };
+                LiveEndToEndLatency = [pscustomobject]@{ Available = $true; SampleCount = 60; AvgUs = 450; P95Us = 800; P99Us = 950 };
+                Nvenc = [pscustomobject]@{ NvencFramesEncoded = 60; TotalBitstreamBytes = 2500000; InvalidTimestampCount = 0; ExtractToBitstreamCoveragePercent = 100.0 };
+                H264DecodeValidation = [pscustomobject]@{ Passed = $true; StructuralDecodeValidated = $true; FidelityPsnrValidated = $false };
                 VisualStimulus = [pscustomobject]@{ VirtualDisplayIdentified = $true; Started = $true }
             }
             $payload | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
@@ -2659,6 +2679,221 @@ Invoke-UnitTest -Name 'M42GpuTransportNvencGatesAndRollback' -TestBody {
         Assert-Throws {
             & $valScript -Configuration Release -TestProfile Smoke -TransportMode Gpu -RequireGpuShared -StagingDir $stgDir -OutputDir $outGpuCpuReadFail -HostExecutablePath $fakeHostExe -CertificateThumbprint $certInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
         } -ExpectedPattern 'GpuSharedPassed.*RollbackClean=True' -Message 'CpuStagingReadsPerformed > 0 violates RequireGpuShared GpuSharedPassed gate'
+    }
+}
+
+Invoke-UnitTest -Name 'M421TimestampErrorsMaskingRejectedAndProlongedProfilesDryRun' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+    $certInfo = New-EphemeralTestCertificate -OutDirectory (Join-Path $caseDir 'certs') -NamePrefix 'm421'
+    $stgDir = Join-Path $caseDir 'stg_m421'
+    $outTsFail = Join-Path $caseDir 'out_ts_fail'
+    $out120Pass = Join-Path $caseDir 'out_120_pass'
+    $out30sPass = Join-Path $caseDir 'out_30s_pass'
+    $fakeHostExe = Join-Path $caseDir 'lumabridge-host.exe'
+    [System.IO.File]::WriteAllBytes($fakeHostExe, [byte[]]@(0x4D, 0x5A, 0x90, 0x00))
+
+    $c = Get-LumaBridgeDriverConstants
+    $mockLogmanLines = @(
+        'Name:                 LumaBridgeIddCore',
+        ('Provider:             {0}' -f $c.LumaBridgeTraceProviderGuid),
+        ('Provider:             {0}' -f $c.IddCxManifestProviderGuid),
+        ('Provider:             {0}' -f $c.IddCxWppProviderGuid),
+        ('Provider:             {0}' -f $c.UmdfOperationalProviderGuid),
+        ('Provider:             {0}' -f $c.WdfCoreWppProviderGuid),
+        ('Provider:             {0}' -f $c.WerKernelProviderGuid)
+    )
+
+    $global:LbTestState['M421Mock'] = [ordered]@{
+        CertInfo    = $certInfo
+        Signtool    = Get-LumaBridgeWdkToolPath -ToolName 'signtool.exe'
+        LogmanLines = $mockLogmanLines
+        EnableMon   = 0
+        EnableExt   = 0
+        EnableGpuTrans = $null
+        AuthSid     = $null
+        Mode        = 'MaskingBug'
+        DryArgsLog  = @{}
+    }
+
+    $m421Mocks = @{
+        'Assert-LumaBridgeAdministrator'               = { [CmdletBinding()] param([string]$OperationName, [switch]$DryRun) return $true }
+        'Get-LumaBridgeHostSecurityState'              = { [CmdletBinding()] param() return [pscustomobject]@{ SecureBoot = 'Disabled'; TestSigning = 'Enabled' } }
+        'Find-LumaBridgeSigningCertificate'            = { [CmdletBinding()] param([string]$CertificateThumbprint, [string]$CertificateSubject) return $global:LbTestState['M421Mock'].CertInfo.Certificate }
+        'Export-LumaBridgeCertificateFile'             = { [CmdletBinding()] param($Certificate, [string]$FilePath) [System.IO.File]::WriteAllBytes($FilePath, $Certificate.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)) }
+        'Get-LumaBridgePnpInstances'                   = {
+            [CmdletBinding()] param([string]$HardwareId)
+            $st = $global:LbTestState['M421Mock']
+            return @([pscustomobject]@{
+                InstanceId = 'ROOT\DISPLAY\0000'; FriendlyName = 'LumaBridge Indirect Display Adapter'; Status = 'OK';
+                ProblemCode = 0; ProblemStatus = 0; ProblemStatusHex = '0x00000000'; Present = $true;
+                HardwareIds = @('Root\LumaBridgeIddDriver'); DriverInfPath = 'oem99.inf'; DriverProvider = 'LumaBridge';
+                DriverVersion = '22.0.0.1'; DriverService = 'WUDFRd'; UpperFilters = @('IndirectKmd'); LowerFilters = @();
+                ConfigurationId = 'oem99.inf:Root\LumaBridgeIddDriver'; DeviceParametersPath = 'MOCK:\ROOT\DISPLAY\0000\Device Parameters';
+                EnableVirtualMonitor = $st.EnableMon; EnableFrameExtraction = $st.EnableExt;
+                EnableGpuSharedTransport = $st.EnableGpuTrans; AuthorizedHostUserSid = $st.AuthSid;
+                StartupDiagnostics = [pscustomobject]@{ LastStage = 'AdapterInitFinished'; LastSuccessfulStage = 'AdapterInitFinished'; LastStatusHex = '0x00000000'; LastErrorStatusHex = '0x00000000' }
+            })
+        }
+        'Set-LumaBridgeDeviceEnableVirtualMonitor'     = { [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value) $global:LbTestState['M421Mock'].EnableMon = $Value }
+        'Get-LumaBridgeDeviceEnableVirtualMonitor'     = { [CmdletBinding()] param([string]$DeviceParametersPath) return $global:LbTestState['M421Mock'].EnableMon }
+        'Set-LumaBridgeDeviceEnableFrameExtraction'    = { [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value) $global:LbTestState['M421Mock'].EnableExt = $Value }
+        'Get-LumaBridgeDeviceEnableFrameExtraction'    = { [CmdletBinding()] param([string]$DeviceParametersPath) return $global:LbTestState['M421Mock'].EnableExt }
+        'Set-LumaBridgeDeviceEnableGpuSharedTransport' = {
+            [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value = 1, [switch]$Clear)
+            if ($Clear) { $global:LbTestState['M421Mock'].EnableGpuTrans = $null } else { $global:LbTestState['M421Mock'].EnableGpuTrans = $Value }
+        }
+        'Get-LumaBridgeDeviceEnableGpuSharedTransport' = { [CmdletBinding()] param([string]$DeviceParametersPath) return $global:LbTestState['M421Mock'].EnableGpuTrans }
+        'Set-LumaBridgeDeviceAuthorizedHostUserSid'    = { [CmdletBinding()] param([string]$DeviceParametersPath, [string]$SidString, [switch]$Clear) if ($Clear -or [string]::IsNullOrWhiteSpace($SidString)) { $global:LbTestState['M421Mock'].AuthSid = $null } else { $global:LbTestState['M421Mock'].AuthSid = $SidString } }
+        'Get-LumaBridgeDeviceAuthorizedHostUserSid'    = { [CmdletBinding()] param([string]$DeviceParametersPath) return $global:LbTestState['M421Mock'].AuthSid }
+        'Get-LumaBridgeWudfHostProcesses'              = { [CmdletBinding()] param($PnpInstances, $RecentEvents, $DebugTraceLines) return @([pscustomobject]@{ Id = 8768; IsLumaBridgeHost = $true; AssociationMethod = 'LoadedModule'; WorkingSetMB = 30.0; PrivateMemoryMB = 15.0; HandleCount = 400 }) }
+        'Get-LumaBridgeCrashDumpInventory'             = { [CmdletBinding()] param([int]$LookbackMinutes) return [pscustomobject]@{ LookbackMinutes = $LookbackMinutes; Locations = @(); Files = @(); TotalFoundCount = 0 } }
+        'Get-LumaBridgeEventChannelStatus'             = { [CmdletBinding()] param($ChannelNames) return @() }
+        'Get-LumaBridgeDiagnosticEvents'               = { [CmdletBinding()] param($LookbackMinutes, $InstanceIds, $PublishedInfNames, $ChannelStatus) return @() }
+        'Get-LumaBridgeSetupApiLogExcerpt'             = { [CmdletBinding()] param($SetupApiLogPath, $InstanceIds, $PublishedInfNames, $MaxMatchedSections) return [pscustomobject]@{ LogPath = $SetupApiLogPath; Exists = $false; AccessDenied = $false; Error = ''; MatchedSectionCount = 0; WdfSchemaWarnings = @(); DeviceStartProblemLines = @(); Sections = @(); RawExcerptText = '' } }
+        'Get-LumaBridgeDriverStorePackages'            = { [CmdletBinding()] param($InfFilter) return @() }
+        'Get-LumaBridgeEtlEventSummary'                = { [CmdletBinding()] param($EtlPath, $StartTimeUtc, $EndTimeUtc, $ProcessId, [int]$MaxMatchedEvents = 500, [switch]$ExcludeHighVolumeGraphics) return [pscustomobject]@{ EtlPath = $EtlPath; Exists = $true; EventCount = 1; MatchedEventCount = 1; MatchedLimitReached = $false; FilteredOutHighVolume = $true; XPathUsed = '*'; TraceStats = $null; CircularWrapWarning = $null; LumaBridgeEvents = @(); Providers = @(); Events = @(); Error = '' } }
+        'Invoke-LumaBridgeExternalCommand'             = {
+            [CmdletBinding()] param([string]$FilePath, [string[]]$Arguments = @(), [switch]$DryRun)
+            $st = $global:LbTestState['M421Mock']
+            if ($FilePath -like '*git*') { return [pscustomobject]@{ ExitCode = 0; Output = @('feature/windows-gpu-shared-textures-nvenc'); DryRun = $false } }
+            if ($DryRun) { return [pscustomobject]@{ ExitCode = 0; Output = @('[DRY-RUN]'); DryRun = $true } }
+            if ($FilePath -ieq $st.Signtool -and $Arguments[0] -eq 'sign') {
+                $out = & $FilePath sign /fd SHA256 /f $st.CertInfo.PfxPath /p $st.CertInfo.Password $Arguments[-1] 2>&1
+                if ($LASTEXITCODE -ne 0) { throw 'mock signtool sign error' }
+                return [pscustomobject]@{ ExitCode = 0; Output = @($out); DryRun = $false }
+            }
+            if ($FilePath -like '*Inf2Cat*' -or ($FilePath -ieq $st.Signtool -and $Arguments[0] -eq 'verify')) {
+                $out = & $FilePath @Arguments 2>&1
+                if ($LASTEXITCODE -ne 0) { throw 'mock verify error' }
+                return [pscustomobject]@{ ExitCode = 0; Output = @($out); DryRun = $false }
+            }
+            if ($FilePath -like '*logman*') {
+                if ($Arguments[0] -eq 'query' -and $Arguments[1] -eq 'LumaBridgeIddDxg') { throw 'not found' }
+                if ($Arguments[0] -eq 'query') { return [pscustomobject]@{ ExitCode = 0; Output = $st.LogmanLines; DryRun = $false } }
+            }
+            return [pscustomobject]@{ ExitCode = 0; Output = @('OK'); DryRun = $false }
+        }
+        'Invoke-LumaBridgeHostProcess'                 = {
+            [CmdletBinding()] param([string]$ExecutablePath, [string[]]$Arguments = @(), [int]$HardTimeoutMs = 30000, [switch]$DryRun)
+            $st = $global:LbTestState['M421Mock']
+            if ($DryRun) {
+                $st.DryArgsLog[$st.Mode] = @($Arguments)
+                return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Output = @('[DRY-RUN]'); StdErr = @(); DryRun = $true }
+            }
+            $jsonIdx = [Array]::IndexOf($Arguments, '--json-summary')
+            $jsonPath = $Arguments[$jsonIdx + 1]
+            if ($st.Mode -eq 'MaskingBug') {
+                # Simulates M4.2 regression: 120 frames ok in seq/CRC, but 120 TimestampMeasurementErrors and 0 LiveEndToEnd samples
+                $payload = [pscustomobject]@{
+                    ExitReason = 'FrameTargetReached'; HostProcessExitedNormally = $true; TransportHealthy = $true;
+                    NegotiatedTransportMode = 'GpuSharedNtHandle'; FallbackToCpuActivated = $false; GpuFramesOpened = 3;
+                    GpuSharedOpenFailures = 0; GpuSyncTimeouts = 0; AdapterMismatchErrors = 0; CpuStagingReadsPerformed = 0;
+                    ConnectCount = 1; FramesReceived = 120; FramesValid = 120; LiveFramesReceived = 120; PreConnectFramesReceived = 0;
+                    FrameTargetReached = $true; MinFramesReached = $true; TotalConnectedDurationUs = 2000000;
+                    ChecksumMismatches = 0; ProtocolErrors = 0; FatalIoTimeouts = 0; FatalIpcErrors = 0;
+                    LastFrameSequence = 120; LastProtocolStatus = 'Ok'; AvgEndToEndLatencyUs = 0; ReceiveFps = 59.6;
+                    TimestampMeasurementErrors = 120; OutOfOrderSequenceCount = 0; NonMonotonicTimestampCount = 0;
+                    MissingCoreTimestampCount = 0; FutureTimestampErrorCount = 120; IncompatibleTimestampUnitsCount = 0; QpcFrequencyMismatchCount = 0;
+                    ValidCoreTimestampSamples = 0; ValidLiveTimestampSamples = 0; ValidPresentTimestampSamples = 6;
+                    CoreTimestampCoveragePercent = 0.0; LiveTimestampCoveragePercent = 0.0; PresentTimestampCoveragePercent = 5.0;
+                    EndToEndLatency = [pscustomobject]@{ Available = $false; SampleCount = 0; AvgUs = 0 };
+                    LiveEndToEndLatency = [pscustomobject]@{ Available = $false; SampleCount = 0; AvgUs = 0 };
+                    Nvenc = [pscustomobject]@{ NvencFramesEncoded = 120; TotalBitstreamBytes = 4000000; InvalidTimestampCount = 0; ExtractToBitstreamCoveragePercent = 100.0 };
+                    H264DecodeValidation = [pscustomobject]@{ Passed = $true; StructuralDecodeValidated = $true; FidelityPsnrValidated = $false };
+                    VisualStimulus = [pscustomobject]@{ VirtualDisplayIdentified = $true; Started = $true }
+                }
+            }
+            elseif ($st.Mode -eq 'Short120Ok') {
+                $payload = [pscustomobject]@{
+                    ExitReason = 'FrameTargetReached'; HostProcessExitedNormally = $true; TransportHealthy = $true;
+                    NegotiatedTransportMode = 'GpuSharedNtHandle'; FallbackToCpuActivated = $false; GpuFramesOpened = 3;
+                    GpuSharedOpenFailures = 0; GpuSyncTimeouts = 0; AdapterMismatchErrors = 0; CpuStagingReadsPerformed = 0;
+                    ConnectCount = 1; FramesReceived = 120; FramesValid = 120; LiveFramesReceived = 120; PreConnectFramesReceived = 0;
+                    FrameTargetReached = $true; MinFramesReached = $true; TotalConnectedDurationUs = 2000000;
+                    ChecksumMismatches = 0; ProtocolErrors = 0; FatalIoTimeouts = 0; FatalIpcErrors = 0;
+                    LastFrameSequence = 120; LastProtocolStatus = 'Ok'; AvgEndToEndLatencyUs = 900; ReceiveFps = 60.0;
+                    TimestampMeasurementErrors = 0; OutOfOrderSequenceCount = 0; NonMonotonicTimestampCount = 0;
+                    MissingCoreTimestampCount = 0; FutureTimestampErrorCount = 0; IncompatibleTimestampUnitsCount = 0; QpcFrequencyMismatchCount = 0;
+                    ValidCoreTimestampSamples = 120; ValidLiveTimestampSamples = 120; ValidPresentTimestampSamples = 120;
+                    CoreTimestampCoveragePercent = 100.0; LiveTimestampCoveragePercent = 100.0; PresentTimestampCoveragePercent = 100.0;
+                    EndToEndLatency = [pscustomobject]@{ Available = $true; SampleCount = 120; AvgUs = 900 };
+                    LiveEndToEndLatency = [pscustomobject]@{ Available = $true; SampleCount = 120; AvgUs = 900 };
+                    Nvenc = [pscustomobject]@{ NvencFramesEncoded = 120; TotalBitstreamBytes = 4000000; InvalidTimestampCount = 0; ExtractToBitstreamCoveragePercent = 100.0 };
+                    H264DecodeValidation = [pscustomobject]@{ Passed = $true; StructuralDecodeValidated = $true; FidelityPsnrValidated = $false };
+                    VisualStimulus = [pscustomobject]@{ VirtualDisplayIdentified = $true; Started = $true }
+                }
+            }
+            else {
+                # Valid 30s 1800-frame benchmark run
+                $payload = [pscustomobject]@{
+                    ExitReason = 'DurationElapsed'; HostProcessExitedNormally = $true; TransportHealthy = $true;
+                    NegotiatedTransportMode = 'GpuSharedNtHandle'; FallbackToCpuActivated = $false; GpuFramesOpened = 3;
+                    GpuSharedOpenFailures = 0; GpuSyncTimeouts = 0; AdapterMismatchErrors = 0; CpuStagingReadsPerformed = 0;
+                    ConnectCount = 1; FramesReceived = 1800; FramesValid = 1800; LiveFramesReceived = 1800; PreConnectFramesReceived = 0;
+                    FrameTargetReached = $false; MinFramesReached = $true; TotalConnectedDurationUs = 30000000; SustainedLiveFps = 60.0;
+                    ChecksumMismatches = 0; ProtocolErrors = 0; FatalIoTimeouts = 0; FatalIpcErrors = 0;
+                    LastFrameSequence = 1800; LastProtocolStatus = 'Ok'; AvgEndToEndLatencyUs = 950; ReceiveFps = 60.0;
+                    TimestampMeasurementErrors = 0; OutOfOrderSequenceCount = 0; NonMonotonicTimestampCount = 0;
+                    MissingCoreTimestampCount = 0; FutureTimestampErrorCount = 0; IncompatibleTimestampUnitsCount = 0; QpcFrequencyMismatchCount = 0;
+                    ValidCoreTimestampSamples = 1800; ValidLiveTimestampSamples = 1800; ValidPresentTimestampSamples = 1800;
+                    CoreTimestampCoveragePercent = 100.0; LiveTimestampCoveragePercent = 100.0; PresentTimestampCoveragePercent = 100.0;
+                    EndToEndLatency = [pscustomobject]@{ Available = $true; SampleCount = 1800; AvgUs = 950; P95Us = 1500; P99Us = 1900 };
+                    LiveEndToEndLatency = [pscustomobject]@{ Available = $true; SampleCount = 1800; AvgUs = 950; P95Us = 1500; P99Us = 1900 };
+                    Nvenc = [pscustomobject]@{ NvencFramesEncoded = 1800; TotalBitstreamBytes = 60000000; InvalidTimestampCount = 0; ExtractToBitstreamCoveragePercent = 100.0 };
+                    H264DecodeValidation = [pscustomobject]@{ Passed = $true; StructuralDecodeValidated = $true; FidelityPsnrValidated = $false };
+                    VisualStimulus = [pscustomobject]@{ VirtualDisplayIdentified = $true; Started = $true }
+                }
+            }
+            $payload | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+            return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Output = @('[LB-HOST] Summary'); StdErr = @(); DryRun = $false }
+        }
+    }
+
+    Invoke-WithModuleMocks -GlobalMocks $m421Mocks -ModuleMocks $m421Mocks -Body {
+        # 1. Regression check: 120 TimestampMeasurementErrors + 0 LiveEndToEnd samples MUST FAIL even when LastFrameSequence=120 & ProtocolErrors=0
+        $global:LbTestState['M421Mock'].Mode = 'MaskingBug'
+        Assert-Throws {
+            & $valScript -Configuration Release -TestProfile Performance -PerformanceTargetFrames 120 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $stgDir -OutputDir $outTsFail -HostExecutablePath $fakeHostExe -CertificateThumbprint $certInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        } -ExpectedPattern 'SequenceAndTimestampsConsistent.*RollbackClean=True' -Message '120 timestamp measurement errors + 0 live samples must reject SequenceAndTimestampsConsistent and AllPassed while keeping clean rollback'
+
+        $tsFailReport = Get-Content -LiteralPath (Join-Path $outTsFail 'functional-validation-report.json') -Raw | ConvertFrom-Json
+        Assert-Equal $tsFailReport.AcceptanceCriteria.AllPassed $false 'AllPassed is false when timestamp errors occur'
+        Assert-Equal $tsFailReport.AcceptanceCriteria.SequenceAndTimestampsConsistent $false 'SequenceAndTimestampsConsistent is false when timestamp errors occur'
+        Assert-Equal $tsFailReport.AcceptanceCriteria.TimestampsValidOk $false 'TimestampsValidOk is false on 120 timestamp errors'
+        Assert-Equal $tsFailReport.AcceptanceCriteria.MeasurableLatenciesOk $false 'MeasurableLatenciesOk is false when LiveEndToEnd SampleCount == 0'
+        Assert-Equal $tsFailReport.AcceptanceCriteria.TemporalCoverageSufficient $false 'TemporalCoverageSufficient is false when coverage == 0%'
+        Assert-Equal $tsFailReport.AcceptanceCriteria.TimestampMeasurementErrors 120 'Report preserves exact TimestampMeasurementErrors count'
+        Assert-Equal $tsFailReport.RollbackClean $true 'RollbackClean remains true'
+
+        # 2. 120-frame clean run validates structural decode + timestamps, but NEVER sets ProlongedStabilityProven=true or FidelityPsnrValidated=true
+        $global:LbTestState['M421Mock'].Mode = 'Short120Ok'
+        $shortRes = & $valScript -Configuration Release -TestProfile Performance -PerformanceTargetFrames 120 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $stgDir -OutputDir $out120Pass -HostExecutablePath $fakeHostExe -CertificateThumbprint $certInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        Assert-Equal $shortRes.ValidationSucceeded $true 'Clean 120-frame run passes Performance profile'
+        Assert-Equal $shortRes.AcceptanceCriteria.StructuralDecodeValidated $true 'StructuralDecodeValidated is true on live decode'
+        Assert-Equal $shortRes.AcceptanceCriteria.FidelityPsnrValidated $false 'FidelityPsnrValidated remains false without synthetic reference'
+        Assert-Equal $shortRes.AcceptanceCriteria.ProlongedStabilityProven $false '120-frame run never claims ProlongedStabilityProven=true'
+
+        # 3. DryRun for Benchmark30s and ProlongedStability (120s)
+        $global:LbTestState['M421Mock'].Mode = 'Dry30s'
+        $dry30s = & $valScript -Configuration Release -TestProfile Benchmark30s -BenchmarkDurationSec 30 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $stgDir -OutputDir $out30sPass -HostExecutablePath $fakeHostExe -CertificateThumbprint $certInfo.Thumbprint -SkipDriverInstall -DryRun
+        Assert-Equal $dry30s.DryRun $true 'Benchmark30s DryRun succeeded'
+        Assert-True ($global:LbTestState['M421Mock'].DryArgsLog['Dry30s'] -contains '30000') 'Benchmark30s DryRun passes 30000 ms duration'
+        Assert-True ($global:LbTestState['M421Mock'].DryArgsLog['Dry30s'] -contains '--prewarm-width') 'Benchmark30s DryRun forwards --prewarm-width'
+
+        $global:LbTestState['M421Mock'].Mode = 'DryStab'
+        $dryStab = & $valScript -Configuration Release -TestProfile ProlongedStability -StabilityDurationSec 120 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $stgDir -OutputDir $out30sPass -HostExecutablePath $fakeHostExe -CertificateThumbprint $certInfo.Thumbprint -SkipDriverInstall -DryRun
+        Assert-Equal $dryStab.DryRun $true 'ProlongedStability DryRun succeeded'
+        Assert-True ($global:LbTestState['M421Mock'].DryArgsLog['DryStab'] -contains '120000') 'ProlongedStability DryRun passes 120000 ms duration'
+
+        # 4. Valid 30s 1800-frame benchmark run proves ProlongedStabilityProven=true
+        $global:LbTestState['M421Mock'].Mode = 'Bench30s'
+        $benchRes = & $valScript -Configuration Release -TestProfile Benchmark30s -BenchmarkDurationSec 30 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $stgDir -OutputDir $out30sPass -HostExecutablePath $fakeHostExe -CertificateThumbprint $certInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        Assert-Equal $benchRes.ValidationSucceeded $true 'Benchmark30s profile passes with 1800 frames / 30s'
+        Assert-Equal $benchRes.AcceptanceCriteria.Benchmark30sExecuted $true 'Benchmark30sExecuted=true'
+        Assert-Equal $benchRes.AcceptanceCriteria.Benchmark30sPassed $true 'Benchmark30sPassed=true'
+        Assert-Equal $benchRes.AcceptanceCriteria.ProlongedStabilityProven $true 'ProlongedStabilityProven=true after 30s / 1800 frames'
+        Assert-Equal $benchRes.RollbackClean $true 'RollbackClean=true after Benchmark30s'
     }
 }
 

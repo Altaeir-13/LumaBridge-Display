@@ -746,6 +746,100 @@ TestNvencH264IndependentMediaFoundationDecodeAndPsnrValidation()
     return true;
 }
 
+bool
+TestNvencTimestampCoverageValidationAndStageBreakdown()
+{
+    static constexpr const char* kTestName = "NvencTimestampCoverageValidationAndStageBreakdown";
+
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    ASSERT_TRUE(SUCCEEDED(CreateNvidiaHardwareD3d11Device(device, context)));
+    const uint64_t qpcFreq = QueryQpcFreq();
+
+    lumabridge::host::NvencEncoderConfig cfg{};
+    cfg.Width = 1280U;
+    cfg.Height = 720U;
+    cfg.TargetFps = 60U;
+    cfg.BitrateBps = 15000000U;
+    cfg.GopLength = 60U;
+    cfg.LowLatencyTuning = true;
+    cfg.RepeatSpsPpsEveryIdr = true;
+
+    lumabridge::host::NvencH264Encoder encoder;
+    // Empty encoder metrics must report Available == false rather than 0 us fake latency.
+    {
+        const auto emptySnap = encoder.GetMetricsSnapshot();
+        ASSERT_TRUE(!emptySnap.EncodeLatencyUs.Available);
+        ASSERT_TRUE(!emptySnap.PresentToBitstreamLatencyUs.Available);
+        ASSERT_TRUE(!emptySnap.ExtractToBitstreamLatencyUs.Available);
+        ASSERT_TRUE(emptySnap.PresentToBitstreamCoveragePercent == 0.0);
+        ASSERT_TRUE(emptySnap.ExtractToBitstreamCoveragePercent == 0.0);
+    }
+
+    ASSERT_TRUE(SUCCEEDED(encoder.Initialize(device.Get(), context.Get(), cfg)));
+    const auto initSnap = encoder.GetMetricsSnapshot();
+    ASSERT_TRUE(initSnap.SessionInitializeLatencyUs > 0ULL && initSnap.SessionInitializeLatencyUs < 10000000ULL);
+
+    ComPtr<ID3D11Texture2D> tex;
+    ASSERT_TRUE(SUCCEEDED(CreateSyntheticGpuTexture(
+        device.Get(),
+        1280U,
+        720U,
+        1U,
+        DXGI_FORMAT_B8G8R8A8_UNORM,
+        tex)));
+
+    // Frame 1: Fully valid present, extract, hostReceive QPCs.
+    const uint64_t recv1 = QueryQpcNow();
+    Sleep(1U);
+    ASSERT_TRUE(SUCCEEDED(encoder.EncodeGpuTexture(tex.Get(), 1ULL, 1U, recv1, recv1, qpcFreq, nullptr, recv1)));
+
+    // Frame 2: Missing optional PresentDisplayQpcTime (0), valid extract + hostReceive QPCs.
+    const uint64_t recv2 = QueryQpcNow();
+    ASSERT_TRUE(SUCCEEDED(encoder.EncodeGpuTexture(tex.Get(), 2ULL, 2U, 0ULL, recv2, qpcFreq, nullptr, recv2)));
+
+    // Frame 3: Future timestamps (1 second ahead) -> must be rejected as InvalidTimestampCount, not recorded as 0 us!
+    const uint64_t recv3 = QueryQpcNow();
+    const uint64_t futureQpc = recv3 + qpcFreq;
+    ASSERT_TRUE(SUCCEEDED(encoder.EncodeGpuTexture(tex.Get(), 3ULL, 3U, futureQpc, futureQpc, qpcFreq, nullptr, recv3)));
+
+    // Frame 4: Incompatible QPC frequency -> must increment InvalidTimestampCount, not record corrupted deltas.
+    const uint64_t recv4 = QueryQpcNow();
+    ASSERT_TRUE(SUCCEEDED(encoder.EncodeGpuTexture(tex.Get(), 4ULL, 4U, recv4, recv4, qpcFreq + 12345ULL, nullptr, recv4)));
+
+    // Pop 2 queued frames after brief wait to exercise EncodedQueueWaitLatencyUs.
+    Sleep(2U);
+    lumabridge::host::EncodedFramePacket popped{};
+    uint32_t popCount = 0U;
+    while (encoder.TryPopEncodedFrame(popped))
+    {
+        ++popCount;
+    }
+    ASSERT_TRUE(popCount == 4U);
+
+    const auto snap = encoder.GetMetricsSnapshot();
+    ASSERT_TRUE(snap.NvencFramesEncoded == 4ULL);
+    ASSERT_TRUE(snap.MissingPresentTimestampCount == 1ULL);
+    ASSERT_TRUE(snap.MissingExtractTimestampCount == 0ULL);
+    // Frame 3 future present + future extract (2), Frame 4 incompatible units on hostRecv+present+extract (3) => 5.
+    ASSERT_TRUE(snap.InvalidTimestampCount >= 4ULL);
+    ASSERT_TRUE(snap.ValidPresentToBitstreamSamples == 1ULL);
+    ASSERT_TRUE(snap.ValidExtractToBitstreamSamples == 2ULL);
+    ASSERT_TRUE(snap.PresentToBitstreamCoveragePercent > 24.0 && snap.PresentToBitstreamCoveragePercent < 26.0);
+    ASSERT_TRUE(snap.ExtractToBitstreamCoveragePercent > 49.0 && snap.ExtractToBitstreamCoveragePercent < 51.0);
+    ASSERT_TRUE(snap.EncodeLatencyUs.Available && snap.EncodeLatencyUs.SampleCount == 4ULL);
+    ASSERT_TRUE(snap.FormatPrepareLatencyUs.Available && snap.FormatPrepareLatencyUs.SampleCount == 4ULL);
+    ASSERT_TRUE(snap.EncodePictureLatencyUs.Available && snap.EncodePictureLatencyUs.SampleCount == 4ULL);
+    ASSERT_TRUE(snap.BitstreamLockCopyLatencyUs.Available && snap.BitstreamLockCopyLatencyUs.SampleCount == 4ULL);
+    ASSERT_TRUE(snap.HostReceiveToSubmitLatencyUs.Available && snap.HostReceiveToSubmitLatencyUs.SampleCount == 3ULL);
+    ASSERT_TRUE(snap.EncodedQueueWaitLatencyUs.Available && snap.EncodedQueueWaitLatencyUs.SampleCount == 4ULL);
+    ASSERT_TRUE(snap.EncodeInterFrameJitterUs.Available && snap.EncodeInterFrameJitterUs.SampleCount >= 2ULL);
+
+    encoder.Shutdown();
+    std::printf("[PASS] %s\n", kTestName);
+    return true;
+}
+
 } // namespace
 
 int
@@ -769,6 +863,7 @@ main()
     run(TestNvencPeriodicIdrAndExplicitForceKeyframeRequest);
     run(TestNvencEncoderBusyDeviceRemovedAndSessionReconstruction);
     run(TestNvencH264IndependentMediaFoundationDecodeAndPsnrValidation);
+    run(TestNvencTimestampCoverageValidationAndStageBreakdown);
 
     std::printf("NvencEncoderTests: %d/%d passed (%d failures)\n", passed, executed, g_failures);
     return (g_failures == 0 && passed == executed) ? EXIT_SUCCESS : EXIT_FAILURE;

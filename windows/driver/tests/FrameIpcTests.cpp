@@ -2170,6 +2170,205 @@ TestGpuSharedTextureIncompatibleAdapterAndInvalidHandleAckHandling()
     pool.Shutdown();
 }
 
+void
+TestM421TimestampValidationAndRegressionScenarios()
+{
+    constexpr uint64_t kFreq = 10000000ULL;
+
+    // 1. Unit tests for unavailable metrics, optional PresentDisplayQpcTime, core missing, future, and unit mismatch.
+    {
+        const LatencySummaryStats emptyStats = ComputeLatencySummary({}, 0ULL);
+        EXPECT_TRUE(!emptyStats.Available);
+        EXPECT_EQ(emptyStats.SampleCount, 0ULL);
+        EXPECT_EQ(emptyStats.AvgUs, 0ULL);
+
+        FrameIpcFrameHeader hdr{};
+        hdr.Envelope = InitEnvelope(FrameIpcMessageType::FrameHeader, sizeof(hdr));
+        hdr.QpcFrequency = kFreq;
+        hdr.PresentDisplayQpcTime = 0ULL; // optional
+        hdr.ExtractCompleteQpcTime = 2000ULL;
+        hdr.ServerSendQpcTime = 3000ULL;
+        hdr.Flags = PackFrameFlags(0U, 500ULL);
+        const ValidatedFrameIntervals missingPresent = ComputeValidatedFrameIntervals(hdr, 4000ULL, 5000ULL, kFreq, true);
+        EXPECT_TRUE(missingPresent.Valid);
+        EXPECT_TRUE(missingPresent.CoreTimestampsValid);
+        EXPECT_TRUE(!missingPresent.MissingCoreTimestamp);
+        EXPECT_TRUE(missingPresent.PresentTimestampMissing);
+        EXPECT_TRUE(!missingPresent.PresentTimestampAvailable);
+        EXPECT_TRUE(!missingPresent.HasPresentToExtract);
+        EXPECT_TRUE(!missingPresent.FutureTimestampDetected);
+        EXPECT_TRUE(!missingPresent.IncompatibleTimestampUnits);
+        EXPECT_EQ(missingPresent.QueueWaitUs, 100ULL);
+        EXPECT_EQ(missingPresent.IpcTransitUs, 100ULL);
+        EXPECT_EQ(missingPresent.HostVerifyAckUs, 100ULL);
+        EXPECT_EQ(missingPresent.EndToEndUs, 200ULL);
+
+        // Missing core timestamp (ExtractCompleteQpcTime == 0).
+        hdr.ExtractCompleteQpcTime = 0ULL;
+        const ValidatedFrameIntervals missingCore = ComputeValidatedFrameIntervals(hdr, 4000ULL, 5000ULL, kFreq, true);
+        EXPECT_TRUE(!missingCore.Valid);
+        EXPECT_TRUE(!missingCore.CoreTimestampsValid);
+        EXPECT_TRUE(missingCore.MissingCoreTimestamp);
+
+        // Future PresentDisplayQpcTime > ExtractCompleteQpcTime (simulating raw future IddCx VSync target).
+        hdr.PresentDisplayQpcTime = 3500ULL;
+        hdr.ExtractCompleteQpcTime = 2000ULL;
+        hdr.ServerSendQpcTime = 3000ULL;
+        const ValidatedFrameIntervals futurePresent = ComputeValidatedFrameIntervals(hdr, 4000ULL, 5000ULL, kFreq, true);
+        EXPECT_TRUE(!futurePresent.Valid);
+        EXPECT_TRUE(futurePresent.FutureTimestampDetected);
+        EXPECT_TRUE(futurePresent.OutOfOrderTimestamps);
+
+        // Future ServerSendQpcTime > recvPayloadQpc.
+        hdr.PresentDisplayQpcTime = 1500ULL;
+        hdr.ExtractCompleteQpcTime = 2000ULL;
+        hdr.ServerSendQpcTime = 4500ULL;
+        const ValidatedFrameIntervals futureCore = ComputeValidatedFrameIntervals(hdr, 4000ULL, 5000ULL, kFreq, true);
+        EXPECT_TRUE(!futureCore.Valid);
+        EXPECT_TRUE(futureCore.FutureTimestampDetected);
+        EXPECT_TRUE(futureCore.OutOfOrderTimestamps);
+
+        // Incompatible timestamp units (> 30s delta between extract and server send).
+        hdr.PresentDisplayQpcTime = 1500ULL;
+        hdr.ExtractCompleteQpcTime = 2000ULL;
+        hdr.ServerSendQpcTime = 2000ULL + kFreq * 35ULL;
+        const ValidatedFrameIntervals hugeDelta = ComputeValidatedFrameIntervals(hdr, hdr.ServerSendQpcTime + 1000ULL, hdr.ServerSendQpcTime + 2000ULL, kFreq, true);
+        EXPECT_TRUE(!hugeDelta.Valid);
+        EXPECT_TRUE(hugeDelta.IncompatibleTimestampUnits);
+
+        // Incompatible QpcFrequency.
+        hdr.ServerSendQpcTime = 3000ULL;
+        hdr.QpcFrequency = kFreq + 12345ULL;
+        const ValidatedFrameIntervals freqMismatch = ComputeValidatedFrameIntervals(hdr, 4000ULL, 5000ULL, kFreq, true);
+        EXPECT_TRUE(!freqMismatch.Valid);
+        EXPECT_TRUE(freqMismatch.QpcFrequencyMismatch);
+        EXPECT_TRUE(freqMismatch.IncompatibleTimestampUnits);
+    }
+
+    // 2. Live over-pipe regression: Send 7 valid-CRC frames covering missing optional Present, valid causal,
+    //    backwards non-monotonic, future Present, missing core Extract, >30s unit mismatch, and QPC freq mismatch.
+    {
+        const std::wstring pipeName = MakeUniquePipeName(90U);
+        HANDLE serverPipe = CreateNamedPipeW(
+            pipeName.c_str(),
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            1U,
+            65536U,
+            65536U,
+            0U,
+            nullptr);
+        EXPECT_TRUE(serverPipe != INVALID_HANDLE_VALUE);
+
+        std::thread rawServer([&]() {
+            ConnectNamedPipe(serverPipe, nullptr);
+            FrameIpcClientHello cHello{};
+            ReadAllSync(serverPipe, &cHello, sizeof(cHello));
+
+            LARGE_INTEGER freqLi{};
+            LARGE_INTEGER nowLi{};
+            QueryPerformanceFrequency(&freqLi);
+            QueryPerformanceCounter(&nowLi);
+            const uint64_t freq = (freqLi.QuadPart > 0) ? static_cast<uint64_t>(freqLi.QuadPart) : kFreq;
+            const uint64_t nowQpc = static_cast<uint64_t>(nowLi.QuadPart);
+            // Anchor 50 ms in the past so live consumer recvQpc >= ServerSendQpcTime and < 30s.
+            const uint64_t anchorQpc = (nowQpc > (freq / 20ULL)) ? (nowQpc - (freq / 20ULL)) : nowQpc;
+
+            FrameIpcServerHello sHello{};
+            sHello.Envelope = InitEnvelope(FrameIpcMessageType::ServerHello, sizeof(sHello));
+            sHello.Status = static_cast<uint32_t>(FrameIpcStatus::Ok);
+            sHello.ServerProcessId = GetCurrentProcessId();
+            sHello.SessionId = 777ULL;
+            sHello.MaxQueueDepth = 3U;
+            WriteAllSync(serverPipe, &sHello, sizeof(sHello));
+
+            std::vector<uint8_t> pixels(64U * 64U * 4U, 0x42U);
+            const uint32_t crc = ComputeFrameCrc32(pixels.data(), pixels.size());
+
+            struct FrameTsCase
+            {
+                uint64_t Present;
+                uint64_t Extract;
+                uint64_t Send;
+                uint64_t Freq;
+            };
+            const FrameTsCase cases[7] = {
+                // 1: Missing optional PresentDisplayQpcTime, valid core timestamps
+                {0ULL, anchorQpc + 2000ULL, anchorQpc + 3000ULL, freq},
+                // 2: Valid monotonic causal Present <= Extract <= Send
+                {anchorQpc + 3200ULL, anchorQpc + 4000ULL, anchorQpc + 5000ULL, freq},
+                // 3: Non-monotonic backwards Extract/Send (< Frame 2)
+                {anchorQpc + 1000ULL, anchorQpc + 1500ULL, anchorQpc + 2500ULL, freq},
+                // 4: Future Present > Extract
+                {anchorQpc + 9000ULL, anchorQpc + 6000ULL, anchorQpc + 7000ULL, freq},
+                // 5: Missing core Extract == 0
+                {0ULL, 0ULL, anchorQpc + 8000ULL, freq},
+                // 6: Incompatible units (> 30s old Extract)
+                {0ULL, (anchorQpc > freq * 45ULL) ? (anchorQpc - freq * 45ULL) : 1ULL, anchorQpc + 8500ULL, freq},
+                // 7: QPC frequency mismatch
+                {anchorQpc + 8800ULL, anchorQpc + 9000ULL, anchorQpc + 9500ULL, freq + 12345ULL},
+            };
+
+            for (uint32_t i = 0U; i < 7U; ++i)
+            {
+                FrameIpcFrameHeader hdr{};
+                hdr.Envelope = InitEnvelope(FrameIpcMessageType::FrameHeader, sizeof(hdr));
+                hdr.SessionId = 777ULL;
+                hdr.FrameSequence = static_cast<uint64_t>(i) + 1ULL;
+                hdr.PresentationFrameNumber = i + 1U;
+                hdr.Width = 64U;
+                hdr.Height = 64U;
+                hdr.RowPitchBytes = 256U;
+                hdr.PixelFormat = static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
+                hdr.PayloadSizeBytes = static_cast<uint32_t>(pixels.size());
+                hdr.PayloadCrc32 = crc;
+                hdr.QpcFrequency = cases[i].Freq;
+                hdr.PresentDisplayQpcTime = cases[i].Present;
+                hdr.ExtractCompleteQpcTime = cases[i].Extract;
+                hdr.ServerSendQpcTime = cases[i].Send;
+                hdr.Flags = PackFrameFlags(0U, 200ULL);
+                WriteAllSync(serverPipe, &hdr, sizeof(hdr));
+                WriteAllSync(serverPipe, pixels.data(), pixels.size());
+
+                FrameIpcFrameAck ack{};
+                ReadAllSync(serverPipe, &ack, sizeof(ack));
+            }
+            Sleep(30U);
+            CloseHandle(serverPipe);
+        });
+
+        HostConsumerConfig cfg;
+        cfg.PipeName = pipeName;
+        cfg.MaxFrames = 7ULL;
+        cfg.IoTimeoutMs = 500U;
+        cfg.ConnectTimeoutMs = 2000U;
+        FrameConsumer consumer(cfg);
+        const HRESULT runHr = consumer.RunLoop();
+        rawServer.join();
+
+        EXPECT_EQ(runHr, S_OK);
+        const auto snap = consumer.GetMetricsSnapshot();
+        EXPECT_EQ(snap.FramesReceived, 7ULL);
+        EXPECT_EQ(snap.FramesValid, 7ULL);
+        EXPECT_EQ(snap.ProtocolErrors, 0ULL);
+        EXPECT_EQ(snap.ChecksumMismatches, 0ULL);
+        EXPECT_EQ(snap.MissingPresentTimestampCount, 1ULL); // frame 1 (valid core, missing optional present)
+        EXPECT_EQ(snap.MissingCoreTimestampCount, 1ULL);    // frame 5
+        EXPECT_EQ(snap.FutureTimestampErrorCount, 1ULL);    // frame 4
+        EXPECT_EQ(snap.NonMonotonicTimestampCount, 1ULL);   // frame 3
+        EXPECT_EQ(snap.IncompatibleTimestampUnitsCount, 2ULL); // frames 6 & 7
+        EXPECT_EQ(snap.QpcFrequencyMismatchCount, 1ULL);    // frame 7
+        EXPECT_EQ(snap.TimestampMeasurementErrors, 5ULL);   // frames 3..7
+        EXPECT_EQ(snap.ValidPresentTimestampSamples, 1ULL); // frame 2 only
+        EXPECT_EQ(snap.ValidCoreTimestampSamples, 2ULL);    // frames 1 & 2
+        EXPECT_TRUE(snap.CoreTimestampCoveragePercent > 20.0 && snap.CoreTimestampCoveragePercent < 50.0);
+        EXPECT_TRUE(snap.PresentTimestampCoveragePercent > 10.0 && snap.PresentTimestampCoveragePercent < 20.0);
+        EXPECT_TRUE(snap.PresentToExtractLatency.Available);
+        EXPECT_TRUE(snap.EndToEndLatency.Available);
+        EXPECT_TRUE(snap.LiveEndToEndLatency.Available);
+    }
+}
+
 template <typename Fn>
 void
 RunTest(
@@ -2216,6 +2415,7 @@ main()
     RunTest("GpuSharedTextureIpcUnauthorizedClientCannotObtainHandle", TestGpuSharedTextureIpcUnauthorizedClientCannotObtainHandle);
     RunTest("GpuSharedTextureDelayedAckAndMidUseClientDisconnectRecovery", TestGpuSharedTextureDelayedAckAndMidUseClientDisconnectRecovery);
     RunTest("GpuSharedTextureIncompatibleAdapterAndInvalidHandleAckHandling", TestGpuSharedTextureIncompatibleAdapterAndInvalidHandleAckHandling);
+    RunTest("M421TimestampValidationAndRegressionScenarios", TestM421TimestampValidationAndRegressionScenarios);
 
     std::printf("Summary: %d tests run, %d assertion failures.\n", g_TestsRun, g_TestsFailed);
     return (g_TestsFailed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;

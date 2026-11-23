@@ -1,16 +1,16 @@
 <#
 .SYNOPSIS
     Executes the end-to-end Windows 11 functional validation workflow for LumaBridgeIddDriver
-    (M4.1/M4.1.1 real D3D11 frame extraction + hardened Named Pipe IPC + lumabridge-host.exe)
-    with explicit separation between Functional Smoke Test and Continuous Frame Performance Test,
-    plus guaranteed rollback in finally.
+    (M4.1/M4.1.1 real D3D11 frame extraction + M4.2/M4.2.1 GPU Shared Textures + NVENC H.264)
+    with explicit separation between Smoke, Performance, 30s 1080p60 Benchmark, and
+    Prolonged Stability profiles, causal timestamp telemetry checks, and guaranteed finally rollback.
 #>
 [CmdletBinding()]
 param(
     [ValidateSet('Debug', 'Release')]
     [string]$Configuration = 'Release',
 
-    [ValidateSet('Smoke', 'Performance', 'Both')]
+    [ValidateSet('Smoke', 'Performance', 'Both', 'Benchmark30s', 'ProlongedStability', 'Full')]
     [string]$TestProfile = 'Smoke',
 
     [string]$StagingDir,
@@ -18,6 +18,8 @@ param(
     [string]$OutputDir,
 
     [string]$HostExecutablePath,
+
+    [string]$SyntheticFidelityExecutablePath,
 
     [string]$CertificateThumbprint,
 
@@ -47,6 +49,12 @@ param(
 
     [ValidateRange(500, 120000)]
     [int]$PerformanceDurationMs = 10000,
+
+    [ValidateRange(30, 600)]
+    [int]$BenchmarkDurationSec = 30,
+
+    [ValidateRange(30, 3600)]
+    [int]$StabilityDurationSec = 120,
 
     [ValidateRange(1, 120)]
     [int]$StimulusFps = 60,
@@ -123,6 +131,136 @@ function Get-LumaBridgeValidationOptionalProp {
     return $DefaultValue
 }
 
+function Get-LumaBridgeGpuEngineUtilizationSample {
+    [CmdletBinding()]
+    param()
+
+    try {
+        $counter = Get-Counter '\GPU Engine(*)\Utilization Percentage' -ErrorAction Stop
+        $samples = @($counter.CounterSamples)
+        if ($samples.Count -eq 0) {
+            return [pscustomobject]@{
+                Available               = $false
+                TotalUtilizationPercent = $null
+                PeakEnginePercent       = $null
+                SampleCount             = 0
+                Error                   = 'No GPU Engine counter samples returned.'
+            }
+        }
+        $sum = 0.0
+        $peak = 0.0
+        foreach ($s in $samples) {
+            $val = [double]$s.CookedValue
+            $sum += $val
+            if ($val -gt $peak) {
+                $peak = $val
+            }
+        }
+        return [pscustomobject]@{
+            Available               = $true
+            TotalUtilizationPercent = [Math]::Round($sum, 2)
+            PeakEnginePercent       = [Math]::Round($peak, 2)
+            SampleCount             = $samples.Count
+            Error                   = $null
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            Available               = $false
+            TotalUtilizationPercent = $null
+            PeakEnginePercent       = $null
+            SampleCount             = 0
+            Error                   = $_.Exception.Message
+        }
+    }
+}
+
+function Test-LumaBridgeTemporalTelemetry {
+    [CmdletBinding()]
+    param($Summary)
+
+    if ($null -eq $Summary) {
+        return [pscustomobject]@{
+            Evaluated                       = $false
+            SequenceMonotonicityOk          = $false
+            TimestampsMonotonicOk           = $false
+            TimestampsValidOk               = $false
+            MeasurableLatenciesOk           = $false
+            TemporalCoverageSufficient      = $false
+            SequenceAndTimestampsConsistent = $false
+            TimestampMeasurementErrors      = [uint64]0
+            CoreTimestampCoveragePercent    = 0.0
+            LiveTimestampCoveragePercent    = 0.0
+            PresentTimestampCoveragePercent = 0.0
+            NvencExtractToBsCoveragePercent = 0.0
+            ValidCoreTimestampSamples       = [uint64]0
+            ValidLiveTimestampSamples       = [uint64]0
+            ValidPresentTimestampSamples    = [uint64]0
+        }
+    }
+
+    $lastSeq = [uint64](Get-LumaBridgeValidationOptionalProp $Summary 'LastFrameSequence' 0)
+    $protoErr = [uint64](Get-LumaBridgeValidationOptionalProp $Summary 'ProtocolErrors' 0)
+    $outOfOrderSeq = [uint64](Get-LumaBridgeValidationOptionalProp $Summary 'OutOfOrderSequenceCount' 0)
+    $nonMonotonicTs = [uint64](Get-LumaBridgeValidationOptionalProp $Summary 'NonMonotonicTimestampCount' 0)
+    $tsErrors = [uint64](Get-LumaBridgeValidationOptionalProp $Summary 'TimestampMeasurementErrors' 0)
+    $missingCore = [uint64](Get-LumaBridgeValidationOptionalProp $Summary 'MissingCoreTimestampCount' 0)
+    $futureErr = [uint64](Get-LumaBridgeValidationOptionalProp $Summary 'FutureTimestampErrorCount' 0)
+    $incompatUnits = [uint64](Get-LumaBridgeValidationOptionalProp $Summary 'IncompatibleTimestampUnitsCount' 0)
+    $qpcMismatch = [uint64](Get-LumaBridgeValidationOptionalProp $Summary 'QpcFrequencyMismatchCount' 0)
+    $liveFrames = [uint64](Get-LumaBridgeValidationOptionalProp $Summary 'LiveFramesReceived' 0)
+
+    $validCoreSamples = [uint64](Get-LumaBridgeValidationOptionalProp $Summary 'ValidCoreTimestampSamples' 0)
+    $validLiveSamples = [uint64](Get-LumaBridgeValidationOptionalProp $Summary 'ValidLiveTimestampSamples' 0)
+    $validPresSamples = [uint64](Get-LumaBridgeValidationOptionalProp $Summary 'ValidPresentTimestampSamples' 0)
+    $coreCov = [double](Get-LumaBridgeValidationOptionalProp $Summary 'CoreTimestampCoveragePercent' 0.0)
+    $liveCov = [double](Get-LumaBridgeValidationOptionalProp $Summary 'LiveTimestampCoveragePercent' 0.0)
+    $presCov = [double](Get-LumaBridgeValidationOptionalProp $Summary 'PresentTimestampCoveragePercent' 0.0)
+
+    $e2e = Get-LumaBridgeValidationOptionalProp $Summary 'EndToEndLatency' $null
+    $liveE2E = Get-LumaBridgeValidationOptionalProp $Summary 'LiveEndToEndLatency' $null
+    $e2eSampleCount = if ($null -ne $e2e) { [uint64](Get-LumaBridgeValidationOptionalProp $e2e 'SampleCount' 0) } else { [uint64]0 }
+    $e2eAvailable = if ($null -ne $e2e) { [bool](Get-LumaBridgeValidationOptionalProp $e2e 'Available' ($e2eSampleCount -ge 1)) } else { $false }
+    $liveE2ESampleCount = if ($null -ne $liveE2E) { [uint64](Get-LumaBridgeValidationOptionalProp $liveE2E 'SampleCount' 0) } else { [uint64]0 }
+    $liveE2EAvailable = if ($null -ne $liveE2E) { [bool](Get-LumaBridgeValidationOptionalProp $liveE2E 'Available' ($liveE2ESampleCount -ge 1)) } else { $false }
+
+    $nvenc = Get-LumaBridgeValidationOptionalProp $Summary 'Nvenc' $null
+    $nvEncoded = if ($null -ne $nvenc) { [uint64](Get-LumaBridgeValidationOptionalProp $nvenc 'NvencFramesEncoded' 0) } else { [uint64]0 }
+    $nvInvalidTs = if ($null -ne $nvenc) { [uint64](Get-LumaBridgeValidationOptionalProp $nvenc 'InvalidTimestampCount' 0) } else { [uint64]0 }
+    $nvBsCov = if ($null -ne $nvenc) { [double](Get-LumaBridgeValidationOptionalProp $nvenc 'ExtractToBitstreamCoveragePercent' 0.0) } else { 0.0 }
+
+    $seqMonotonicOk = ($lastSeq -ge 1) -and ($outOfOrderSeq -eq 0) -and ($protoErr -eq 0)
+    $tsMonotonicOk = ($nonMonotonicTs -eq 0)
+    $tsValidOk = ($tsErrors -eq 0) -and ($missingCore -eq 0) -and ($futureErr -eq 0) -and ($incompatUnits -eq 0) -and ($qpcMismatch -eq 0)
+    $measurableOk = if ($liveFrames -gt 0) {
+        $liveE2EAvailable -and ($liveE2ESampleCount -ge 1)
+    }
+    else {
+        $e2eAvailable -and ($e2eSampleCount -ge 1)
+    }
+    $nvCovOk = ($nvEncoded -eq 0) -or (($nvInvalidTs -eq 0) -and ($nvBsCov -ge 95.0))
+    $coverageOk = ($coreCov -ge 95.0) -and (($liveFrames -eq 0) -or ($liveCov -ge 95.0)) -and $nvCovOk
+
+    $consistent = $seqMonotonicOk -and $tsMonotonicOk -and $tsValidOk -and $measurableOk -and $coverageOk
+    return [pscustomobject]@{
+        Evaluated                       = $true
+        SequenceMonotonicityOk          = $seqMonotonicOk
+        TimestampsMonotonicOk           = $tsMonotonicOk
+        TimestampsValidOk               = $tsValidOk
+        MeasurableLatenciesOk           = $measurableOk
+        TemporalCoverageSufficient      = $coverageOk
+        SequenceAndTimestampsConsistent = $consistent
+        TimestampMeasurementErrors      = $tsErrors
+        CoreTimestampCoveragePercent    = $coreCov
+        LiveTimestampCoveragePercent    = $liveCov
+        PresentTimestampCoveragePercent = $presCov
+        NvencExtractToBsCoveragePercent = $nvBsCov
+        ValidCoreTimestampSamples       = $validCoreSamples
+        ValidLiveTimestampSamples       = $validLiveSamples
+        ValidPresentTimestampSamples    = $validPresSamples
+    }
+}
+
 $constants = Get-LumaBridgeDriverConstants
 $repoRoot = Get-LumaBridgeRepoRoot
 $sourcePackageDir = Get-LumaBridgePackageDirectory -Configuration $Configuration
@@ -158,8 +296,10 @@ if ($effectiveAuthorizedUserSid -notmatch '^S-1-[0-9-]+$') {
 }
 
 $effectiveAllowUntrusted = ($AllowUntrustedChain -or (-not $TrustCertificate))
-$runSmokeProfile = ($TestProfile -in @('Smoke', 'Both'))
+$runSmokeProfile = ($TestProfile -in @('Smoke', 'Both', 'Full'))
 $runPerfProfile = ($TestProfile -in @('Performance', 'Both'))
+$runBenchmark30sProfile = ($TestProfile -in @('Benchmark30s', 'Full'))
+$runStabilityProfile = ($TestProfile -in @('ProlongedStability', 'Full'))
 
 $prereqScript = Join-Path -Path $PSScriptRoot -ChildPath 'Test-LumaBridgePrerequisites.ps1'
 $signingScript = Join-Path -Path $PSScriptRoot -ChildPath 'Invoke-LumaBridgePackageSigning.ps1'
@@ -174,6 +314,8 @@ $diagDir = Join-Path -Path $OutputDir -ChildPath 'diagnostics'
 $installFailDiagDir = Join-Path -Path $OutputDir -ChildPath 'install-failure-diag'
 $hostSmokeJsonPath = Join-Path -Path $OutputDir -ChildPath 'lumabridge-host-smoke-summary.json'
 $hostPerfJsonPath = Join-Path -Path $OutputDir -ChildPath 'lumabridge-host-performance-summary.json'
+$hostBench30sJsonPath = Join-Path -Path $OutputDir -ChildPath 'lumabridge-host-benchmark30s-summary.json'
+$hostStabilityJsonPath = Join-Path -Path $OutputDir -ChildPath 'lumabridge-host-stability-summary.json'
 $hostJsonPath = Join-Path -Path $OutputDir -ChildPath 'lumabridge-host-summary.json'
 $reportJsonPath = Join-Path -Path $OutputDir -ChildPath 'functional-validation-report.json'
 $reportMdPath = Join-Path -Path $OutputDir -ChildPath 'functional-validation-report.md'
@@ -295,6 +437,10 @@ function Add-LumaBridgeM42HostArgs {
         }
         $ArgList.Add('--nvenc-bitrate-bps')
         $ArgList.Add("$NvencBitrateBps")
+        $ArgList.Add('--prewarm-width')
+        $ArgList.Add('1920')
+        $ArgList.Add('--prewarm-height')
+        $ArgList.Add('1080')
     }
 
     if ($VerifyH264Decode) {
@@ -347,6 +493,37 @@ function Build-PerfHostArgs {
     return @($list.ToArray())
 }
 
+function Build-ProlongedHostArgs {
+    param(
+        [string]$JsonOut,
+        [int]$DurationSec
+    )
+
+    $durationMs = $DurationSec * 1000
+    $minTargetFrames = [int][Math]::Max(1, [Math]::Floor($DurationSec * $StimulusFps * 0.75))
+    $list = New-Object System.Collections.Generic.List[string]
+    foreach ($item in @(
+        '--pipe', '\\.\pipe\LumaBridgeFrameIpc_v1',
+        '--min-frames', "$minTargetFrames",
+        '--duration-ms', "$durationMs",
+        '--connect-timeout-ms', "$ConnectTimeoutMs",
+        '--io-timeout-ms', "$IoTimeoutMs",
+        '--reconnect',
+        '--visual-stimulus',
+        '--require-virtual-stimulus',
+        '--stimulus-fps', "$StimulusFps",
+        '--json-summary', $JsonOut
+    )) {
+        $list.Add($item)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($StimulusDisplayName)) {
+        $list.Add('--stimulus-display')
+        $list.Add($StimulusDisplayName)
+    }
+    Add-LumaBridgeM42HostArgs -ArgList $list
+    return @($list.ToArray())
+}
+
 if ($DryRun) {
     $signingDry = & $signingScript `
         -Configuration $Configuration `
@@ -376,31 +553,44 @@ if ($DryRun) {
         $perfHardMs = [Math]::Max($HostHardTimeoutMs, ($PerformanceDurationMs + $ConnectTimeoutMs + 5000))
         $perfDry = Invoke-LumaBridgeHostProcess -ExecutablePath $HostExecutablePath -Arguments (Build-PerfHostArgs -JsonOut $hostPerfJsonPath) -HardTimeoutMs $perfHardMs -DryRun
     }
+    $bench30sDry = $null
+    if ($runBenchmark30sProfile) {
+        $bench30sHardMs = [Math]::Max($HostHardTimeoutMs, (($BenchmarkDurationSec * 1000) + $ConnectTimeoutMs + 15000))
+        $bench30sDry = Invoke-LumaBridgeHostProcess -ExecutablePath $HostExecutablePath -Arguments (Build-ProlongedHostArgs -JsonOut $hostBench30sJsonPath -DurationSec $BenchmarkDurationSec) -HardTimeoutMs $bench30sHardMs -DryRun
+    }
+    $stabilityDry = $null
+    if ($runStabilityProfile) {
+        $stabilityHardMs = [Math]::Max($HostHardTimeoutMs, (($StabilityDurationSec * 1000) + $ConnectTimeoutMs + 15000))
+        $stabilityDry = Invoke-LumaBridgeHostProcess -ExecutablePath $HostExecutablePath -Arguments (Build-ProlongedHostArgs -JsonOut $hostStabilityJsonPath -DurationSec $StabilityDurationSec) -HardTimeoutMs $stabilityHardMs -DryRun
+    }
 
     $etwStopDry = & $etwScript -Action Stop -OutputDir $etwDir -IncludeDxgKrnl:$IncludeDxgKrnl -DryRun
     $diagDry = & $diagScript -Configuration $Configuration -StagingDir $StagingDir -OutputDir $diagDir -DryRun
     Write-Host ("[DRY-RUN] Stage 11 (finally rollback): Would stop active ETW, revert EnableFrameExtraction=0, clear AuthorizedHostUserSid, restore EnableVirtualMonitor, restart device{0}, and write report '{1}'" -f $(if ($FullUninstallOnExit) { ' and run Uninstall-LumaBridgeDriver.ps1' } else { '' }), $reportJsonPath) -ForegroundColor Cyan
 
+    $dryHostPreview = if ($null -ne $stabilityDry) { $stabilityDry } elseif ($null -ne $bench30sDry) { $bench30sDry } elseif ($null -ne $perfDry) { $perfDry } else { $smokeDry }
     return [pscustomobject]@{
-        DryRun                = $true
-        Configuration         = $Configuration
-        TestProfile           = $TestProfile
-        Branch                = $currentBranch
-        PreValidationState    = $preValidationState
-        PlannedStagingDir     = $StagingDir
-        PlannedOutputDir      = $OutputDir
-        HostExecutablePath    = $HostExecutablePath
-        AuthorizedHostUserSid = $effectiveAuthorizedUserSid
-        PreBuildHashes        = $preBuildHashes
-        SigningPreview        = $signingDry
-        EtwStartPreview       = $etwStartDry
-        SmokeHostPreview      = $smokeDry
-        PerfHostPreview       = $perfDry
-        HostPreview           = $(if ($null -ne $perfDry) { $perfDry } else { $smokeDry })
-        EtwStopPreview        = $etwStopDry
-        DiagnosticsPreview    = $diagDry
-        PlannedReportJsonPath = $reportJsonPath
-        PlannedReportMdPath   = $reportMdPath
+        DryRun                  = $true
+        Configuration           = $Configuration
+        TestProfile             = $TestProfile
+        Branch                  = $currentBranch
+        PreValidationState      = $preValidationState
+        PlannedStagingDir       = $StagingDir
+        PlannedOutputDir        = $OutputDir
+        HostExecutablePath      = $HostExecutablePath
+        AuthorizedHostUserSid   = $effectiveAuthorizedUserSid
+        PreBuildHashes          = $preBuildHashes
+        SigningPreview          = $signingDry
+        EtwStartPreview         = $etwStartDry
+        SmokeHostPreview        = $smokeDry
+        PerfHostPreview         = $perfDry
+        Benchmark30sHostPreview = $bench30sDry
+        StabilityHostPreview    = $stabilityDry
+        HostPreview             = $dryHostPreview
+        EtwStopPreview          = $etwStopDry
+        DiagnosticsPreview      = $diagDry
+        PlannedReportJsonPath   = $reportJsonPath
+        PlannedReportMdPath     = $reportMdPath
     }
 }
 
@@ -476,6 +666,14 @@ $smokeHostResult = $null
 $smokeSummary = $null
 $perfHostResult = $null
 $perfSummary = $null
+$bench30sHostResult = $null
+$bench30sSummary = $null
+$stabilityHostResult = $null
+$stabilitySummary = $null
+$syntheticFidelityResult = $null
+$preStage9WudfProcs = @()
+$gpuUtilSample = $null
+$processResourceSummary = $null
 $hostProcResult = $null
 $hostSummary = $null
 $diagResult = $null
@@ -588,8 +786,11 @@ try {
     }
 
     # ---------------------------------------------------------------------
-    # Stage 9: Time-bounded lumabridge-host.exe execution (Profile A / Profile B)
+    # Stage 9: Time-bounded lumabridge-host.exe execution (Smoke / Perf / 30s Benchmark / Prolonged Stability)
     # ---------------------------------------------------------------------
+    $preStage9WudfProcs = @(Get-LumaBridgeWudfHostProcesses -PnpInstances @($targetInstance))
+    $gpuUtilSample = Get-LumaBridgeGpuEngineUtilizationSample
+
     if ($runSmokeProfile) {
         $smokeHardTimeoutMs = [Math]::Max($HostHardTimeoutMs, ($HostDurationMs + $ConnectTimeoutMs + 5000))
         $smokeHostResult = Invoke-LumaBridgeHostProcess `
@@ -609,7 +810,9 @@ try {
     }
     else { [uint64]0 }
 
-    if ($runPerfProfile -and ((-not $runSmokeProfile) -or ($smokeFramesValidCount -ge [uint64]$SmokeMinFrames))) {
+    $smokeGateForNext = ((-not $runSmokeProfile) -or ($smokeFramesValidCount -ge [uint64]$SmokeMinFrames))
+
+    if ($runPerfProfile -and $smokeGateForNext) {
         $perfHardTimeoutMs = [Math]::Max($HostHardTimeoutMs, ($PerformanceDurationMs + $ConnectTimeoutMs + 5000))
         $perfHostResult = Invoke-LumaBridgeHostProcess `
             -ExecutablePath $HostExecutablePath `
@@ -617,11 +820,52 @@ try {
             -HardTimeoutMs $perfHardTimeoutMs
         if (Test-Path -LiteralPath $hostPerfJsonPath -PathType Leaf) {
             $perfSummary = Get-Content -LiteralPath $hostPerfJsonPath -Raw | ConvertFrom-Json
-            if ($null -eq $smokeSummary) {
-                Copy-Item -LiteralPath $hostPerfJsonPath -Destination $hostJsonPath -Force
-                $hostProcResult = $perfHostResult
-                $hostSummary = $perfSummary
-            }
+            Copy-Item -LiteralPath $hostPerfJsonPath -Destination $hostJsonPath -Force
+            $hostProcResult = $perfHostResult
+            $hostSummary = $perfSummary
+        }
+    }
+
+    if ($runBenchmark30sProfile -and $smokeGateForNext) {
+        $bench30sHardTimeoutMs = [Math]::Max($HostHardTimeoutMs, (($BenchmarkDurationSec * 1000) + $ConnectTimeoutMs + 15000))
+        $bench30sHostResult = Invoke-LumaBridgeHostProcess `
+            -ExecutablePath $HostExecutablePath `
+            -Arguments (Build-ProlongedHostArgs -JsonOut $hostBench30sJsonPath -DurationSec $BenchmarkDurationSec) `
+            -HardTimeoutMs $bench30sHardTimeoutMs
+        if (Test-Path -LiteralPath $hostBench30sJsonPath -PathType Leaf) {
+            $bench30sSummary = Get-Content -LiteralPath $hostBench30sJsonPath -Raw | ConvertFrom-Json
+            Copy-Item -LiteralPath $hostBench30sJsonPath -Destination $hostJsonPath -Force
+            $hostProcResult = $bench30sHostResult
+            $hostSummary = $bench30sSummary
+        }
+    }
+
+    if ($runStabilityProfile -and $smokeGateForNext) {
+        $stabilityHardTimeoutMs = [Math]::Max($HostHardTimeoutMs, (($StabilityDurationSec * 1000) + $ConnectTimeoutMs + 15000))
+        $stabilityHostResult = Invoke-LumaBridgeHostProcess `
+            -ExecutablePath $HostExecutablePath `
+            -Arguments (Build-ProlongedHostArgs -JsonOut $hostStabilityJsonPath -DurationSec $StabilityDurationSec) `
+            -HardTimeoutMs $stabilityHardTimeoutMs
+        if (Test-Path -LiteralPath $hostStabilityJsonPath -PathType Leaf) {
+            $stabilitySummary = Get-Content -LiteralPath $hostStabilityJsonPath -Raw | ConvertFrom-Json
+            Copy-Item -LiteralPath $hostStabilityJsonPath -Destination $hostJsonPath -Force
+            $hostProcResult = $stabilityHostResult
+            $hostSummary = $stabilitySummary
+        }
+    }
+
+    $gpuUtilDuringRun = Get-LumaBridgeGpuEngineUtilizationSample
+    if ($null -ne $gpuUtilDuringRun -and $gpuUtilDuringRun.Available) {
+        $gpuUtilSample = $gpuUtilDuringRun
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($SyntheticFidelityExecutablePath) -and (Test-Path -LiteralPath $SyntheticFidelityExecutablePath -PathType Leaf)) {
+        $synRes = Invoke-LumaBridgeExternalCommand -FilePath $SyntheticFidelityExecutablePath -Arguments @()
+        $syntheticFidelityResult = [pscustomobject]@{
+            ExecutablePath = $SyntheticFidelityExecutablePath
+            ExitCode       = $synRes.ExitCode
+            Passed         = ($synRes.ExitCode -eq 0)
+            Output         = @($synRes.Output)
         }
     }
 
@@ -676,8 +920,33 @@ try {
 
     $virtualMonitorActive = ($null -ne $targetInstance -and [int]$targetInstance.EnableVirtualMonitor -eq 1)
 
-    $primaryEvalSummary = if ($null -ne $smokeSummary) { $smokeSummary } else { $perfSummary }
-    $primaryEvalProc = if ($null -ne $smokeHostResult) { $smokeHostResult } else { $perfHostResult }
+    $primaryEvalSummary = if ($null -ne $stabilitySummary) {
+        $stabilitySummary
+    }
+    elseif ($null -ne $bench30sSummary) {
+        $bench30sSummary
+    }
+    elseif ($null -ne $perfSummary) {
+        $perfSummary
+    }
+    else {
+        $smokeSummary
+    }
+    $primaryEvalProc = if ($null -ne $stabilitySummary) {
+        $stabilityHostResult
+    }
+    elseif ($null -ne $bench30sSummary) {
+        $bench30sHostResult
+    }
+    elseif ($null -ne $perfSummary) {
+        $perfHostResult
+    }
+    else {
+        $smokeHostResult
+    }
+
+    $smokeEvalSummary = if ($null -ne $smokeSummary) { $smokeSummary } else { $primaryEvalSummary }
+    $smokeEvalProc = if ($null -ne $smokeHostResult) { $smokeHostResult } else { $primaryEvalProc }
 
     $framesReceived = if ($null -ne $primaryEvalSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $primaryEvalSummary -PropertyName 'FramesReceived' -DefaultValue 0) } else { [uint64]0 }
     $framesValid = if ($null -ne $primaryEvalSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $primaryEvalSummary -PropertyName 'FramesValid' -DefaultValue $framesReceived) } else { [uint64]0 }
@@ -691,11 +960,39 @@ try {
     $hostTransportHealthy = if ($null -ne $primaryEvalSummary) { [bool](Get-LumaBridgeValidationOptionalProp -InputObject $primaryEvalSummary -PropertyName 'TransportHealthy' -DefaultValue $false) } else { $false }
     $frameTargetReached = if ($null -ne $primaryEvalSummary) { [bool](Get-LumaBridgeValidationOptionalProp -InputObject $primaryEvalSummary -PropertyName 'FrameTargetReached' -DefaultValue $false) } else { $false }
 
+    $smokeFramesValid = if ($null -ne $smokeEvalSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $smokeEvalSummary -PropertyName 'FramesValid' -DefaultValue 0) } else { [uint64]0 }
+    $smokeChecksumMismatches = if ($null -ne $smokeEvalSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $smokeEvalSummary -PropertyName 'ChecksumMismatches' -DefaultValue 1) } else { [uint64]1 }
+    $smokeProtocolErrors = if ($null -ne $smokeEvalSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $smokeEvalSummary -PropertyName 'ProtocolErrors' -DefaultValue 1) } else { [uint64]1 }
+    $smokeFatalIoTimeouts = if ($null -ne $smokeEvalSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $smokeEvalSummary -PropertyName 'FatalIoTimeouts' -DefaultValue 0) } else { [uint64]0 }
+    $smokeFatalIpcErrors = if ($null -ne $smokeEvalSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $smokeEvalSummary -PropertyName 'FatalIpcErrors' -DefaultValue 0) } else { [uint64]0 }
+    $smokeConnectCount = if ($null -ne $smokeEvalSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $smokeEvalSummary -PropertyName 'ConnectCount' -DefaultValue 0) } else { [uint64]0 }
+    $smokeHostTransportHealthy = if ($null -ne $smokeEvalSummary) { [bool](Get-LumaBridgeValidationOptionalProp -InputObject $smokeEvalSummary -PropertyName 'TransportHealthy' -DefaultValue $false) } else { $false }
+    $smokeHostExitedNormally = ($null -ne $smokeEvalProc -and (-not $smokeEvalProc.TimedOut) -and ($smokeEvalProc.ExitCode -eq 0))
+    $smokeTemporalEval = Test-LumaBridgeTemporalTelemetry -Summary $smokeEvalSummary
+
+    $executedSummaries = @(@($smokeSummary, $perfSummary, $bench30sSummary, $stabilitySummary) | Where-Object { $null -ne $_ })
+    $primaryTemporal = Test-LumaBridgeTemporalTelemetry -Summary $primaryEvalSummary
+    $seqMonotonicityOk = ($executedSummaries.Count -ge 1)
+    $timestampsMonotonicOk = ($executedSummaries.Count -ge 1)
+    $timestampsValidOk = ($executedSummaries.Count -ge 1)
+    $measurableLatenciesOk = ($executedSummaries.Count -ge 1)
+    $temporalCoverageSufficient = ($executedSummaries.Count -ge 1)
+    $totalTimestampMeasurementErrors = [uint64]0
+    foreach ($execSum in $executedSummaries) {
+        $tEval = Test-LumaBridgeTemporalTelemetry -Summary $execSum
+        $seqMonotonicityOk = $seqMonotonicityOk -and $tEval.SequenceMonotonicityOk
+        $timestampsMonotonicOk = $timestampsMonotonicOk -and $tEval.TimestampsMonotonicOk
+        $timestampsValidOk = $timestampsValidOk -and $tEval.TimestampsValidOk
+        $measurableLatenciesOk = $measurableLatenciesOk -and $tEval.MeasurableLatenciesOk
+        $temporalCoverageSufficient = $temporalCoverageSufficient -and $tEval.TemporalCoverageSufficient
+        $totalTimestampMeasurementErrors += $tEval.TimestampMeasurementErrors
+    }
+    $sequenceAndTimestampsOk = ($seqMonotonicityOk -and $timestampsMonotonicOk -and $timestampsValidOk -and $measurableLatenciesOk -and $temporalCoverageSufficient)
+
     $hostExitedNormally = ($null -ne $primaryEvalProc -and (-not $primaryEvalProc.TimedOut) -and ($primaryEvalProc.ExitCode -eq 0))
     $ipcConnected = ($connectCount -ge 1)
     $transportHealthy = ($hostTransportHealthy -and $protocolErrors -eq 0 -and $checksumMismatches -eq 0 -and $fatalIoTimeouts -eq 0 -and $fatalIpcErrors -eq 0)
     $crc32Valid = ($framesValid -ge 1 -and $checksumMismatches -eq 0)
-    $sequenceAndTimestampsOk = ($null -ne $primaryEvalSummary -and $lastFrameSeq -ge 1 -and $protocolErrors -eq 0)
     $noUnauthorizedIpcClients = ($lastProtocolStatus -ne 'UnauthorizedClient')
     $noNewCrashDumps = ($postDumpCount -le $initialDumpCount)
     $wudfProcessHealthy = ($postRunWudfProcs.Count -ge 1 -or $null -eq $preExistingInstance)
@@ -705,12 +1002,12 @@ try {
         $cmProbNone -and
         $adapterInitFinishedOk -and
         $virtualMonitorActive -and
-        $ipcConnected -and
-        $hostExitedNormally -and
-        ($framesValid -ge [uint64]$SmokeMinFrames) -and
-        $crc32Valid -and
-        $sequenceAndTimestampsOk -and
-        $transportHealthy -and
+        ($smokeConnectCount -ge 1) -and
+        $smokeHostExitedNormally -and
+        ($smokeFramesValid -ge [uint64]$SmokeMinFrames) -and
+        ($smokeChecksumMismatches -eq 0) -and
+        $smokeTemporalEval.SequenceAndTimestampsConsistent -and
+        ($smokeHostTransportHealthy -and $smokeProtocolErrors -eq 0 -and $smokeFatalIoTimeouts -eq 0 -and $smokeFatalIpcErrors -eq 0) -and
         $noUnauthorizedIpcClients -and
         $noNewCrashDumps -and
         $wudfProcessHealthy
@@ -722,6 +1019,7 @@ try {
     $perfTargetReachedFlag = if ($null -ne $perfSummary) { [bool](Get-LumaBridgeValidationOptionalProp -InputObject $perfSummary -PropertyName 'FrameTargetReached' -DefaultValue $false) } else { $false }
     $perfStim = if ($null -ne $perfSummary) { Get-LumaBridgeValidationOptionalProp -InputObject $perfSummary -PropertyName 'VisualStimulus' -DefaultValue $null } else { $null }
     $perfStimStarted = ($null -ne $perfStim -and [bool](Get-LumaBridgeValidationOptionalProp -InputObject $perfStim -PropertyName 'VirtualDisplayIdentified' -DefaultValue $false) -and [bool](Get-LumaBridgeValidationOptionalProp -InputObject $perfStim -PropertyName 'Started' -DefaultValue $false))
+    $perfTemporalEval = Test-LumaBridgeTemporalTelemetry -Summary $perfSummary
     $perfTargetReached = (
         $perfExecuted -and
         (-not $perfHostResult.TimedOut) -and
@@ -729,11 +1027,57 @@ try {
         $perfTransportHealthy -and
         $perfTargetReachedFlag -and
         ($perfFramesValid -ge [uint64]$PerformanceTargetFrames) -and
-        $perfStimStarted
+        $perfStimStarted -and
+        $perfTemporalEval.SequenceAndTimestampsConsistent
+    )
+
+    $bench30sExecuted = ($null -ne $bench30sHostResult)
+    $bench30sValidFrames = if ($null -ne $bench30sSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $bench30sSummary -PropertyName 'FramesValid' -DefaultValue 0) } else { [uint64]0 }
+    $bench30sDurationUs = if ($null -ne $bench30sSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $bench30sSummary -PropertyName 'TotalConnectedDurationUs' -DefaultValue (Get-LumaBridgeValidationOptionalProp -InputObject $bench30sSummary -PropertyName 'TotalExecutionDurationUs' 0)) } else { [uint64]0 }
+    $bench30sMinFramesExpected = [uint64][Math]::Max(1, [int][Math]::Floor($BenchmarkDurationSec * $StimulusFps * 0.75))
+    $bench30sStim = if ($null -ne $bench30sSummary) { Get-LumaBridgeValidationOptionalProp -InputObject $bench30sSummary -PropertyName 'VisualStimulus' -DefaultValue $null } else { $null }
+    $bench30sStimStarted = ($null -ne $bench30sStim -and [bool](Get-LumaBridgeValidationOptionalProp -InputObject $bench30sStim -PropertyName 'VirtualDisplayIdentified' -DefaultValue $false) -and [bool](Get-LumaBridgeValidationOptionalProp -InputObject $bench30sStim -PropertyName 'Started' -DefaultValue $false))
+    $bench30sTemporal = Test-LumaBridgeTemporalTelemetry -Summary $bench30sSummary
+    $bench30sPassed = (
+        $bench30sExecuted -and
+        (-not $bench30sHostResult.TimedOut) -and
+        ($bench30sHostResult.ExitCode -eq 0) -and
+        ($null -ne $bench30sSummary) -and
+        [bool](Get-LumaBridgeValidationOptionalProp -InputObject $bench30sSummary -PropertyName 'TransportHealthy' -DefaultValue $false) -and
+        $bench30sStimStarted -and
+        ($bench30sValidFrames -ge $bench30sMinFramesExpected) -and
+        ($bench30sDurationUs -ge [uint64]($BenchmarkDurationSec * 900000)) -and
+        $bench30sTemporal.SequenceAndTimestampsConsistent
+    )
+
+    $stabilityExecuted = ($null -ne $stabilityHostResult)
+    $stabilityValidFrames = if ($null -ne $stabilitySummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $stabilitySummary -PropertyName 'FramesValid' -DefaultValue 0) } else { [uint64]0 }
+    $stabilityDurationUs = if ($null -ne $stabilitySummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $stabilitySummary -PropertyName 'TotalConnectedDurationUs' -DefaultValue (Get-LumaBridgeValidationOptionalProp -InputObject $stabilitySummary -PropertyName 'TotalExecutionDurationUs' 0)) } else { [uint64]0 }
+    $stabilityMinFramesExpected = [uint64][Math]::Max(1, [int][Math]::Floor($StabilityDurationSec * $StimulusFps * 0.75))
+    $stabilityStim = if ($null -ne $stabilitySummary) { Get-LumaBridgeValidationOptionalProp -InputObject $stabilitySummary -PropertyName 'VisualStimulus' -DefaultValue $null } else { $null }
+    $stabilityStimStarted = ($null -ne $stabilityStim -and [bool](Get-LumaBridgeValidationOptionalProp -InputObject $stabilityStim -PropertyName 'VirtualDisplayIdentified' -DefaultValue $false) -and [bool](Get-LumaBridgeValidationOptionalProp -InputObject $stabilityStim -PropertyName 'Started' -DefaultValue $false))
+    $stabilityTemporal = Test-LumaBridgeTemporalTelemetry -Summary $stabilitySummary
+    $stabilityPassed = (
+        $stabilityExecuted -and
+        (-not $stabilityHostResult.TimedOut) -and
+        ($stabilityHostResult.ExitCode -eq 0) -and
+        ($null -ne $stabilitySummary) -and
+        [bool](Get-LumaBridgeValidationOptionalProp -InputObject $stabilitySummary -PropertyName 'TransportHealthy' -DefaultValue $false) -and
+        $stabilityStimStarted -and
+        ($stabilityValidFrames -ge $stabilityMinFramesExpected) -and
+        ($stabilityDurationUs -ge [uint64]($StabilityDurationSec * 900000)) -and
+        $stabilityTemporal.SequenceAndTimestampsConsistent
+    )
+
+    $prolongedStabilityProven = (
+        ($bench30sPassed -and $bench30sValidFrames -ge 1500 -and $bench30sDurationUs -ge 28000000) -or
+        ($stabilityPassed -and $stabilityValidFrames -ge 1500 -and $stabilityDurationUs -ge 28000000)
     )
 
     $smokeGateOk = (-not $runSmokeProfile) -or $functionalSmokePassed
     $perfGateOk = (-not $runPerfProfile) -or $perfTargetReached
+    $bench30sGateOk = (-not $runBenchmark30sProfile) -or $bench30sPassed
+    $stabilityGateOk = (-not $runStabilityProfile) -or $stabilityPassed
 
     $evalGpuMode = if ($null -ne $primaryEvalSummary) { [string](Get-LumaBridgeValidationOptionalProp -InputObject $primaryEvalSummary -PropertyName 'NegotiatedTransportMode' -DefaultValue 'CpuStagingPipe') } else { 'CpuStagingPipe' }
     $evalFallback = if ($null -ne $primaryEvalSummary) { [bool](Get-LumaBridgeValidationOptionalProp -InputObject $primaryEvalSummary -PropertyName 'FallbackToCpuActivated' -DefaultValue $false) } else { $false }
@@ -747,7 +1091,16 @@ try {
     $evalNvencBytes = if ($null -ne $evalNvenc) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $evalNvenc -PropertyName 'TotalBitstreamBytes' -DefaultValue 0) } else { [uint64]0 }
     $evalH264 = if ($null -ne $primaryEvalSummary) { Get-LumaBridgeValidationOptionalProp -InputObject $primaryEvalSummary -PropertyName 'H264DecodeValidation' -DefaultValue $null } else { $null }
     $evalH264Passed = if ($null -ne $evalH264) { [bool](Get-LumaBridgeValidationOptionalProp -InputObject $evalH264 -PropertyName 'Passed' -DefaultValue $false) } else { $false }
+    $structuralDecodeValidated = if ($null -ne $evalH264) {
+        [bool](Get-LumaBridgeValidationOptionalProp -InputObject $evalH264 -PropertyName 'StructuralDecodeValidated' -DefaultValue $evalH264Passed) -and $evalH264Passed
+    }
+    else { $false }
+    $fidelityPsnrValidated = (
+        ($null -ne $evalH264 -and [bool](Get-LumaBridgeValidationOptionalProp -InputObject $evalH264 -PropertyName 'FidelityPsnrValidated' -DefaultValue $false)) -or
+        ($null -ne $syntheticFidelityResult -and [bool]$syntheticFidelityResult.Passed)
+    )
 
+    $realGpuSyncHealthy = (-not $RequireGpuShared) -or ($evalGpuMode -eq 'GpuSharedNtHandle' -and (-not $evalFallback) -and $evalGpuOpened -ge 1 -and $evalOpenFailures -eq 0 -and $evalSyncTimeouts -eq 0 -and $evalLuidErrors -eq 0)
     $gpuSharedPassed = ($evalGpuMode -eq 'GpuSharedNtHandle' -and (-not $evalFallback) -and $evalGpuOpened -ge 1 -and $evalOpenFailures -eq 0 -and $evalSyncTimeouts -eq 0 -and $evalLuidErrors -eq 0 -and $evalCpuReads -eq 0)
     $nvencPassed = ($evalNvencEncoded -ge 1 -and $evalNvencBytes -ge 1)
     $h264DecodePassed = $evalH264Passed
@@ -756,7 +1109,39 @@ try {
     $nvencGateOk = (-not $RequireNvenc) -or $nvencPassed
     $h264GateOk = (-not $VerifyH264Decode) -or $h264DecodePassed
 
-    $allPassed = ($cmProbNone -and $adapterInitFinishedOk -and $virtualMonitorActive -and $noUnauthorizedIpcClients -and $noNewCrashDumps -and $wudfProcessHealthy -and $smokeGateOk -and $perfGateOk -and $gpuGateOk -and $nvencGateOk -and $h264GateOk)
+    $allPassed = (
+        $cmProbNone -and
+        $adapterInitFinishedOk -and
+        $virtualMonitorActive -and
+        $noUnauthorizedIpcClients -and
+        $noNewCrashDumps -and
+        $wudfProcessHealthy -and
+        $sequenceAndTimestampsOk -and
+        $realGpuSyncHealthy -and
+        $smokeGateOk -and
+        $perfGateOk -and
+        $bench30sGateOk -and
+        $stabilityGateOk -and
+        $gpuGateOk -and
+        $nvencGateOk -and
+        $h264GateOk
+    )
+
+    $preWudfWsMb = if ($preStage9WudfProcs.Count -gt 0) { [double](Get-LumaBridgeValidationOptionalProp $preStage9WudfProcs[0] 'WorkingSetMB' 0.0) } else { $null }
+    $postWudfWsMb = if ($postRunWudfProcs.Count -gt 0) { [double](Get-LumaBridgeValidationOptionalProp $postRunWudfProcs[0] 'WorkingSetMB' 0.0) } else { $null }
+    $preWudfPrivMb = if ($preStage9WudfProcs.Count -gt 0) { [double](Get-LumaBridgeValidationOptionalProp $preStage9WudfProcs[0] 'PrivateMemoryMB' 0.0) } else { $null }
+    $postWudfPrivMb = if ($postRunWudfProcs.Count -gt 0) { [double](Get-LumaBridgeValidationOptionalProp $postRunWudfProcs[0] 'PrivateMemoryMB' 0.0) } else { $null }
+
+    $processResourceSummary = [pscustomobject]@{
+        PreWudfWorkingSetMB     = $preWudfWsMb
+        PostWudfWorkingSetMB    = $postWudfWsMb
+        WudfWorkingSetDeltaMB   = if ($null -ne $preWudfWsMb -and $null -ne $postWudfWsMb) { [Math]::Round(($postWudfWsMb - $preWudfWsMb), 2) } else { $null }
+        PreWudfPrivateMemoryMB  = $preWudfPrivMb
+        PostWudfPrivateMemoryMB = $postWudfPrivMb
+        WudfPrivateDeltaMB      = if ($null -ne $preWudfPrivMb -and $null -ne $postWudfPrivMb) { [Math]::Round(($postWudfPrivMb - $preWudfPrivMb), 2) } else { $null }
+        HostResourceUsage       = if ($null -ne $primaryEvalSummary) { Get-LumaBridgeValidationOptionalProp $primaryEvalSummary 'ResourceUsage' $null } else { $null }
+        GpuUtilization          = $gpuUtilSample
+    }
 
     $acceptanceCriteria = [pscustomobject]@{
         CmProbNone                      = $cmProbNone
@@ -772,12 +1157,30 @@ try {
         FunctionalSmokePassed           = $functionalSmokePassed
         PerformanceTestExecuted         = $perfExecuted
         PerformanceTargetReached        = $perfTargetReached
+        Benchmark30sExecuted            = $bench30sExecuted
+        Benchmark30sPassed              = $bench30sPassed
+        ProlongedStabilityExecuted      = $stabilityExecuted
+        ProlongedStabilityPassed        = $stabilityPassed
+        ProlongedStabilityProven        = $prolongedStabilityProven
         TransportHealthy                = $transportHealthy
+        RealGpuSyncHealthy              = $realGpuSyncHealthy
         GpuSharedPassed                 = $gpuSharedPassed
         NvencPassed                     = $nvencPassed
         H264DecodePassed                = $h264DecodePassed
+        StructuralDecodeValidated       = $structuralDecodeValidated
+        FidelityPsnrValidated           = $fidelityPsnrValidated
         Crc32Valid                      = $crc32Valid
+        SequenceMonotonicityOk          = $seqMonotonicityOk
+        TimestampsMonotonicOk           = $timestampsMonotonicOk
+        TimestampsValidOk               = $timestampsValidOk
+        MeasurableLatenciesOk           = $measurableLatenciesOk
+        TemporalCoverageSufficient      = $temporalCoverageSufficient
         SequenceAndTimestampsConsistent = $sequenceAndTimestampsOk
+        TimestampMeasurementErrors      = $totalTimestampMeasurementErrors
+        CoreTimestampCoveragePercent    = $primaryTemporal.CoreTimestampCoveragePercent
+        LiveTimestampCoveragePercent    = $primaryTemporal.LiveTimestampCoveragePercent
+        PresentTimestampCoveragePercent = $primaryTemporal.PresentTimestampCoveragePercent
+        NvencExtractToBsCoveragePercent = $primaryTemporal.NvencExtractToBsCoveragePercent
         NoUnauthorizedIpcClients        = $noUnauthorizedIpcClients
         NoNewCrashDumps                 = $noNewCrashDumps
         WudfProcessHealthy              = $wudfProcessHealthy
@@ -786,9 +1189,25 @@ try {
     }
 
     if (-not $allPassed) {
-        $failedFlags = @($acceptanceCriteria.PSObject.Properties | Where-Object { $_.Name -notin @('AllPassed', 'RollbackClean', 'FramesReceived', 'FramesValid', 'FrameTargetReached', 'PerformanceTestExecuted', 'PerformanceTargetReached', 'GpuSharedPassed', 'NvencPassed', 'H264DecodePassed') -and -not [bool]$_.Value } | ForEach-Object { $_.Name })
+        $skipEvalNames = @(
+            'AllPassed', 'RollbackClean', 'FramesReceived', 'FramesValid', 'FrameTargetReached',
+            'PerformanceTestExecuted', 'PerformanceTargetReached',
+            'Benchmark30sExecuted', 'Benchmark30sPassed',
+            'ProlongedStabilityExecuted', 'ProlongedStabilityPassed', 'ProlongedStabilityProven',
+            'GpuSharedPassed', 'NvencPassed', 'H264DecodePassed',
+            'StructuralDecodeValidated', 'FidelityPsnrValidated',
+            'TimestampMeasurementErrors', 'CoreTimestampCoveragePercent',
+            'LiveTimestampCoveragePercent', 'PresentTimestampCoveragePercent', 'NvencExtractToBsCoveragePercent'
+        )
+        $failedFlags = @($acceptanceCriteria.PSObject.Properties | Where-Object { $_.Name -notin $skipEvalNames -and -not [bool]$_.Value } | ForEach-Object { $_.Name })
         if ($runPerfProfile -and -not $perfTargetReached) {
             $failedFlags += 'PerformanceTargetReached'
+        }
+        if ($runBenchmark30sProfile -and -not $bench30sPassed) {
+            $failedFlags += 'Benchmark30sPassed'
+        }
+        if ($runStabilityProfile -and -not $stabilityPassed) {
+            $failedFlags += 'ProlongedStabilityPassed'
         }
         if ($RequireGpuShared -and -not $gpuSharedPassed) {
             $failedFlags += 'GpuSharedPassed'
@@ -799,7 +1218,7 @@ try {
         if ($VerifyH264Decode -and -not $h264DecodePassed) {
             $failedFlags += 'H264DecodePassed'
         }
-        throw ("Functional validation acceptance criteria not satisfied: {0}" -f ($failedFlags -join ', '))
+        throw ("Functional validation acceptance criteria not satisfied: {0}" -f (($failedFlags | Select-Object -Unique) -join ', '))
     }
 }
 catch {
@@ -997,6 +1416,12 @@ finally {
         SmokeHostSummary          = $smokeSummary
         PerfHostProcessResult     = $perfHostResult
         PerfHostSummary           = $perfSummary
+        Benchmark30sProcessResult = $bench30sHostResult
+        Benchmark30sHostSummary   = $bench30sSummary
+        StabilityProcessResult    = $stabilityHostResult
+        StabilityHostSummary      = $stabilitySummary
+        SyntheticFidelityResult   = $syntheticFidelityResult
+        ProcessResourceSummary    = $processResourceSummary
         HostProcessResult         = $hostProcResult
         HostSummary               = $hostSummary
         AcceptanceCriteria        = $acceptanceCriteria
@@ -1014,10 +1439,10 @@ finally {
         if (-not (Test-Path -LiteralPath $OutputDir)) {
             $null = New-Item -Path $OutputDir -ItemType Directory -Force
         }
-        $reportPayload | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $reportJsonPath -Encoding UTF8
+        $reportPayload | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $reportJsonPath -Encoding UTF8
 
         $mdLines = New-Object System.Collections.Generic.List[string]
-        $mdLines.Add('# LumaBridge M4.1.1 Functional Validation Report')
+        $mdLines.Add('# LumaBridge M4.2.1 Functional Validation Report')
         $mdLines.Add('')
         $mdLines.Add(("- Completed UTC: ``{0}``" -f $reportPayload.CompletedAtUtc))
         $mdLines.Add(("- Branch: ``{0}`` | Configuration: ``{1}`` | Profile: ``{2}``" -f $currentBranch, $Configuration, $TestProfile))
@@ -1028,23 +1453,45 @@ finally {
             $mdLines.Add(("- Error: ``{0}``" -f $validationError))
         }
         if ($null -ne $smokeSummary) {
-            $mdLines.Add(("- Smoke Host: ExitReason=``{0}``, Frames=``{1}``, Valid=``{2}``, Live=``{3}``, PreConn=``{4}``, ExecFps=``{5}``, TransportHealthy=``{6}``" -f `
+            $mdLines.Add(("- Smoke Host: ExitReason=``{0}``, Frames=``{1}``, Valid=``{2}``, Live=``{3}``, PreConn=``{4}``, ExecFps=``{5}``, TransportHealthy=``{6}``, TsErrors=``{7}``" -f `
                 (Get-LumaBridgeValidationOptionalProp $smokeSummary 'ExitReason' 'Unknown'), `
                 $smokeSummary.FramesReceived, `
                 (Get-LumaBridgeValidationOptionalProp $smokeSummary 'FramesValid' $smokeSummary.FramesReceived), `
                 (Get-LumaBridgeValidationOptionalProp $smokeSummary 'LiveFramesReceived' 0), `
                 (Get-LumaBridgeValidationOptionalProp $smokeSummary 'PreConnectFramesReceived' 0), `
                 (Get-LumaBridgeValidationOptionalProp $smokeSummary 'AverageExecutionFps' $smokeSummary.ReceiveFps), `
-                (Get-LumaBridgeValidationOptionalProp $smokeSummary 'TransportHealthy' $false)))
+                (Get-LumaBridgeValidationOptionalProp $smokeSummary 'TransportHealthy' $false), `
+                (Get-LumaBridgeValidationOptionalProp $smokeSummary 'TimestampMeasurementErrors' 0)))
         }
         if ($null -ne $perfSummary) {
-            $mdLines.Add(("- Performance Host: ExitReason=``{0}``, Frames=``{1}``, TargetReached=``{2}``, ActiveFps=``{3}``, LiveFps=``{4}``, LiveE2EAvgUs=``{5}``" -f `
+            $mdLines.Add(("- Performance Host: ExitReason=``{0}``, Frames=``{1}``, TargetReached=``{2}``, ActiveFps=``{3}``, LiveFps=``{4}``, LiveE2EAvgUs=``{5}``, TsErrors=``{6}``" -f `
                 (Get-LumaBridgeValidationOptionalProp $perfSummary 'ExitReason' 'Unknown'), `
                 $perfSummary.FramesReceived, `
                 (Get-LumaBridgeValidationOptionalProp $perfSummary 'FrameTargetReached' $false), `
                 (Get-LumaBridgeValidationOptionalProp $perfSummary 'ObservedActiveFps' $perfSummary.ReceiveFps), `
                 (Get-LumaBridgeValidationOptionalProp $perfSummary 'SustainedLiveFps' 0), `
-                $perfSummary.AvgEndToEndLatencyUs))
+                $perfSummary.AvgEndToEndLatencyUs, `
+                (Get-LumaBridgeValidationOptionalProp $perfSummary 'TimestampMeasurementErrors' 0)))
+        }
+        if ($null -ne $bench30sSummary) {
+            $mdLines.Add(("- Benchmark 30s Host: FramesValid=``{0}``, LiveFps=``{1}``, CoreCov=``{2}%``, LiveCov=``{3}%``, TsErrors=``{4}``" -f `
+                (Get-LumaBridgeValidationOptionalProp $bench30sSummary 'FramesValid' 0), `
+                (Get-LumaBridgeValidationOptionalProp $bench30sSummary 'SustainedLiveFps' 0), `
+                (Get-LumaBridgeValidationOptionalProp $bench30sSummary 'CoreTimestampCoveragePercent' 0), `
+                (Get-LumaBridgeValidationOptionalProp $bench30sSummary 'LiveTimestampCoveragePercent' 0), `
+                (Get-LumaBridgeValidationOptionalProp $bench30sSummary 'TimestampMeasurementErrors' 0)))
+        }
+        if ($null -ne $stabilitySummary) {
+            $mdLines.Add(("- Prolonged Stability Host: FramesValid=``{0}``, LiveFps=``{1}``, CoreCov=``{2}%``, LiveCov=``{3}%``, TsErrors=``{4}``" -f `
+                (Get-LumaBridgeValidationOptionalProp $stabilitySummary 'FramesValid' 0), `
+                (Get-LumaBridgeValidationOptionalProp $stabilitySummary 'SustainedLiveFps' 0), `
+                (Get-LumaBridgeValidationOptionalProp $stabilitySummary 'CoreTimestampCoveragePercent' 0), `
+                (Get-LumaBridgeValidationOptionalProp $stabilitySummary 'LiveTimestampCoveragePercent' 0), `
+                (Get-LumaBridgeValidationOptionalProp $stabilitySummary 'TimestampMeasurementErrors' 0)))
+        }
+        if ($null -ne $acceptanceCriteria) {
+            $mdLines.Add(("- Acceptance: StructuralDecode=``{0}``, FidelityPSNR=``{1}``, ProlongedStabilityProven=``{2}``" -f `
+                $acceptanceCriteria.StructuralDecodeValidated, $acceptanceCriteria.FidelityPsnrValidated, $acceptanceCriteria.ProlongedStabilityProven))
         }
         $mdLines.Add('')
         $mdLines.Add('## Rollback Actions')
@@ -1083,8 +1530,13 @@ return [pscustomobject]@{
     HostSummaryPath           = $hostJsonPath
     SmokeSummaryPath          = $hostSmokeJsonPath
     PerfSummaryPath           = $hostPerfJsonPath
+    Benchmark30sSummaryPath   = $hostBench30sJsonPath
+    StabilitySummaryPath      = $hostStabilityJsonPath
     SmokeSummary              = $smokeSummary
     PerfSummary               = $perfSummary
+    Benchmark30sSummary       = $bench30sSummary
+    StabilitySummary          = $stabilitySummary
+    ProcessResourceSummary    = $processResourceSummary
     HostSummary               = $hostSummary
     AcceptanceCriteria        = $acceptanceCriteria
     DiagnosticsResult         = $diagResult
