@@ -246,7 +246,7 @@ LumaBridgeTraceError(
 }
 
 /// Emits a structured runtime metrics snapshot using the [LB-DRIVER] [METRICS] convention
-/// without copying or storing any desktop pixel or visual surface contents.
+/// and TraceLogging without copying or storing any desktop pixel or visual surface contents.
 inline void
 LumaBridgeTraceMetrics(
     DriverDiagnosticStage stage,
@@ -273,7 +273,23 @@ LumaBridgeTraceMetrics(
     unsigned long long fatalErrors,
     SIZE_T workingSetKb,
     SIZE_T privateUsageKb,
-    DWORD handleCount
+    DWORD handleCount,
+    bool frameExtractionEnabled = false,
+    unsigned long long framesExtractionAccepted = 0ULL,
+    unsigned long long framesCopied = 0ULL,
+    unsigned long long framesDelivered = 0ULL,
+    unsigned long long framesDroppedByBackpressure = 0ULL,
+    unsigned long long protectedFramesRejected = 0ULL,
+    unsigned long long frameCopyFailures = 0ULL,
+    unsigned long long frameTransportFailures = 0ULL,
+    unsigned long activeHostConnections = 0UL,
+    unsigned long long lastFrameSequence = 0ULL,
+    unsigned long long frameCopyLatencyUs = 0ULL,
+    unsigned long long frameDeliveryLatencyUs = 0ULL,
+    unsigned long queueDepth = 0UL,
+    unsigned long peakQueueDepth = 0UL,
+    HRESULT lastExtractionError = S_OK,
+    HRESULT lastTransportError = S_OK
     ) noexcept
 {
     if constexpr (!GetDiagnosticStageCapabilities(kActiveDiagnosticStage).EnableTraceLoggingAndRegistryBreadcrumbs)
@@ -303,23 +319,44 @@ LumaBridgeTraceMetrics(
         UNREFERENCED_PARAMETER(workingSetKb);
         UNREFERENCED_PARAMETER(privateUsageKb);
         UNREFERENCED_PARAMETER(handleCount);
+        UNREFERENCED_PARAMETER(frameExtractionEnabled);
+        UNREFERENCED_PARAMETER(framesExtractionAccepted);
+        UNREFERENCED_PARAMETER(framesCopied);
+        UNREFERENCED_PARAMETER(framesDelivered);
+        UNREFERENCED_PARAMETER(framesDroppedByBackpressure);
+        UNREFERENCED_PARAMETER(protectedFramesRejected);
+        UNREFERENCED_PARAMETER(frameCopyFailures);
+        UNREFERENCED_PARAMETER(frameTransportFailures);
+        UNREFERENCED_PARAMETER(activeHostConnections);
+        UNREFERENCED_PARAMETER(lastFrameSequence);
+        UNREFERENCED_PARAMETER(frameCopyLatencyUs);
+        UNREFERENCED_PARAMETER(frameDeliveryLatencyUs);
+        UNREFERENCED_PARAMETER(queueDepth);
+        UNREFERENCED_PARAMETER(peakQueueDepth);
+        UNREFERENCED_PARAMETER(lastExtractionError);
+        UNREFERENCED_PARAMETER(lastTransportError);
     }
     else
     {
-        char buffer[512]{};
+        const char* safeStage = DriverDiagnosticStageToString(stage);
+        const char* safeAdapterState = AdapterLifecycleStateToString(adapterState);
+        const char* safeMonitorState = (monitorStateName != nullptr) ? monitorStateName : "Unknown";
+        const char* safeSwapChainState = (swapChainStateName != nullptr) ? swapChainStateName : "Unknown";
+
+        char buffer[1024]{};
         _snprintf_s(
             buffer,
             sizeof(buffer),
             _TRUNCATE,
-            "[LB-DRIVER] [METRICS] stage=%s adapterState=%s monitorState=%s monCreate=%llu monArrive=%llu monDepart=%llu monDepartFail=%llu scState=%s scActive=%u scAssigned=%llu scDeleted=%llu framesAcq=%llu framesProc=%llu framesDrop=%llu acqFps=%.2f procFps=%.2f lastUs=%llu avgUs=%llu maxUs=%llu dxgiDevRem=%llu transientErr=%llu fatalErr=%llu wsKB=%llu privKB=%llu handles=%lu\n",
-            DriverDiagnosticStageToString(stage),
-            AdapterLifecycleStateToString(adapterState),
-            (monitorStateName != nullptr) ? monitorStateName : "Unknown",
+            "[LB-DRIVER] [METRICS] stage=%s adapterState=%s monitorState=%s monCreate=%llu monArrive=%llu monDepart=%llu monDepartFail=%llu scState=%s scActive=%u scAssigned=%llu scDeleted=%llu framesAcq=%llu framesProc=%llu framesDrop=%llu acqFps=%.2f procFps=%.2f lastUs=%llu avgUs=%llu maxUs=%llu dxgiDevRem=%llu transientErr=%llu fatalErr=%llu extractEn=%u framesExtAcc=%llu framesCopy=%llu framesDeliv=%llu backpressDrop=%llu protRej=%llu copyFail=%llu ipcFail=%llu hostConn=%lu lastSeq=%llu copyUs=%llu delivUs=%llu qDepth=%lu peakQ=%lu extErr=0x%08lX ipcErr=0x%08lX wsKB=%llu privKB=%llu handles=%lu\n",
+            safeStage,
+            safeAdapterState,
+            safeMonitorState,
             monitorCreates,
             monitorArrivals,
             monitorDepartures,
             monitorDepartureFailures,
-            (swapChainStateName != nullptr) ? swapChainStateName : "Unknown",
+            safeSwapChainState,
             swapChainActive ? 1U : 0U,
             swapChainsAssigned,
             swapChainsDeleted,
@@ -334,10 +371,62 @@ LumaBridgeTraceMetrics(
             dxgiDeviceRemovedErrors,
             transientErrors,
             fatalErrors,
+            frameExtractionEnabled ? 1U : 0U,
+            framesExtractionAccepted,
+            framesCopied,
+            framesDelivered,
+            framesDroppedByBackpressure,
+            protectedFramesRejected,
+            frameCopyFailures,
+            frameTransportFailures,
+            activeHostConnections,
+            lastFrameSequence,
+            frameCopyLatencyUs,
+            frameDeliveryLatencyUs,
+            queueDepth,
+            peakQueueDepth,
+            static_cast<unsigned long>(lastExtractionError),
+            static_cast<unsigned long>(lastTransportError),
             static_cast<unsigned long long>(workingSetKb),
             static_cast<unsigned long long>(privateUsageKb),
             static_cast<unsigned long>(handleCount));
         OutputDebugStringA(buffer);
+
+#if defined(LUMABRIDGE_ENABLE_TRACELOGGING)
+        TraceLoggingWrite(
+            g_LumaBridgeTraceProvider,
+            "DriverMetrics",
+            TraceLoggingLevel(4U),
+            TraceLoggingString(safeStage, "Stage"),
+            TraceLoggingString(safeAdapterState, "AdapterState"),
+            TraceLoggingString(safeMonitorState, "MonitorState"),
+            TraceLoggingString(safeSwapChainState, "SwapChainState"),
+            TraceLoggingBoolean(static_cast<BOOLEAN>(swapChainActive ? TRUE : FALSE), "SwapChainActive"),
+            TraceLoggingUInt64(framesAcquired, "FramesAcquired"),
+            TraceLoggingUInt64(framesProcessed, "FramesProcessed"),
+            TraceLoggingUInt64(framesDropped, "FramesDropped"),
+            TraceLoggingFloat64(acquireFps, "AcquireFps"),
+            TraceLoggingFloat64(processFps, "ProcessFps"),
+            TraceLoggingBoolean(static_cast<BOOLEAN>(frameExtractionEnabled ? TRUE : FALSE), "FrameExtractionEnabled"),
+            TraceLoggingUInt64(framesExtractionAccepted, "FramesExtractionAccepted"),
+            TraceLoggingUInt64(framesCopied, "FramesCopied"),
+            TraceLoggingUInt64(framesDelivered, "FramesDelivered"),
+            TraceLoggingUInt64(framesDroppedByBackpressure, "FramesDroppedByBackpressure"),
+            TraceLoggingUInt64(protectedFramesRejected, "ProtectedFramesRejected"),
+            TraceLoggingUInt64(frameCopyFailures, "FrameCopyFailures"),
+            TraceLoggingUInt64(frameTransportFailures, "FrameTransportFailures"),
+            TraceLoggingUInt32(activeHostConnections, "ActiveHostConnections"),
+            TraceLoggingUInt64(lastFrameSequence, "LastFrameSequence"),
+            TraceLoggingUInt64(frameCopyLatencyUs, "FrameCopyLatencyUs"),
+            TraceLoggingUInt64(frameDeliveryLatencyUs, "FrameDeliveryLatencyUs"),
+            TraceLoggingUInt32(queueDepth, "QueueDepth"),
+            TraceLoggingUInt32(peakQueueDepth, "PeakQueueDepth"),
+            TraceLoggingHResult(lastExtractionError, "LastExtractionError"),
+            TraceLoggingHResult(lastTransportError, "LastTransportError"),
+            TraceLoggingUInt64(static_cast<unsigned long long>(workingSetKb), "WorkingSetKb"),
+            TraceLoggingUInt64(static_cast<unsigned long long>(privateUsageKb), "PrivateUsageKb"),
+            TraceLoggingUInt32(handleCount, "HandleCount"));
+#endif
     }
 }
 

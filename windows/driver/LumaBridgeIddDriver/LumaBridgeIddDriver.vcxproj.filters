@@ -21,6 +21,12 @@
     <ClCompile Include="Driver.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="FrameExtractor.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="FrameTransport.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="MonitorModes.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -38,7 +44,19 @@
     <ClInclude Include="AdapterStateMachine.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="DiagnosticStageConfig.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="Driver.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="FrameExtractor.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="FrameIpcProtocol.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="FrameTransport.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="MonitorModes.h">

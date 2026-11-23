@@ -58,7 +58,7 @@ SwapChainProcessorStateToString(
     }
 }
 
-/// Per-frame metadata extracted from IDDCX_METADATA without copying desktop pixel contents.
+/// Per-frame metadata extracted from IDDCX_METADATA and optional D3D11 pixel extraction status.
 struct SwapChainFrameMetadata
 {
     uint32_t PresentationFrameNumber{0};
@@ -67,6 +67,17 @@ struct SwapChainFrameMetadata
     bool HwProtectedSurface{false};
     uint64_t PresentDisplayQPCTime{0};
     bool HasValidSurface{false};
+    bool ExtractionAttempted{false};
+    bool ExtractionAccepted{false};
+    bool PixelsCopied{false};
+    bool ProtectedContentRejected{false};
+    bool EvictedOldestByBackpressure{false};
+    uint32_t ExtractedWidth{0};
+    uint32_t ExtractedHeight{0};
+    uint32_t ExtractedFormat{0};
+    uint64_t FrameSequence{0};
+    uint64_t CopyLatencyUs{0};
+    HRESULT ExtractionHResult{S_OK};
 };
 
 /// Synchronized snapshot of swapchain lifecycle, errors, circuit breaker, and frame-processing metrics.
@@ -98,6 +109,30 @@ struct SwapChainMetricsSnapshot
     LUID ActiveRenderAdapterLuid{0, 0};
     SwapChainProcessorState State{SwapChainProcessorState::Ready};
     bool IsActive{false};
+    bool FrameExtractionEnabled{false};
+    uint64_t FramesExtractionAccepted{0};
+    uint64_t FramesCopied{0};
+    uint64_t FramesDelivered{0};
+    uint64_t FramesDroppedByBackpressure{0};
+    uint64_t ProtectedFramesRejected{0};
+    uint64_t FrameCopyFailures{0};
+    uint64_t FrameTransportFailures{0};
+    uint32_t ActiveHostConnections{0};
+    uint64_t LastFrameSequence{0};
+    uint64_t FrameCopyLatencyUs{0};
+    uint64_t TotalFrameCopyLatencyUs{0};
+    uint64_t AvgFrameCopyLatencyUs{0};
+    uint64_t MaxFrameCopyLatencyUs{0};
+    uint64_t FrameDeliveryLatencyUs{0};
+    uint64_t AvgFrameDeliveryLatencyUs{0};
+    uint64_t MaxFrameDeliveryLatencyUs{0};
+    uint32_t QueueDepth{0};
+    uint32_t PeakQueueDepth{0};
+    uint32_t LastExtractedWidth{0};
+    uint32_t LastExtractedHeight{0};
+    uint32_t LastExtractedFormat{0};
+    HRESULT LastExtractionError{S_OK};
+    HRESULT LastTransportError{S_OK};
 };
 
 /// Abstraction over D3D11/DXGI device setup and IddCx swapchain DDIs for testability.
@@ -129,6 +164,14 @@ public:
     virtual void DeleteSwapChainObject(
         void* swapChainHandle
         ) noexcept = 0;
+
+    /// Populates transport/IPC delivery and backpressure metrics from the backend if supported.
+    virtual void QueryFrameTransportMetrics(
+        SwapChainMetricsSnapshot& inoutSnapshot
+        ) const noexcept
+    {
+        (void)inoutSnapshot;
+    }
 };
 
 /// RAII wrapper for driver-owned Win32 handles (e.g., internal events and worker thread).

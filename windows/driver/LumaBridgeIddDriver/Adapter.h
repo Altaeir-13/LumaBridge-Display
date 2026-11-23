@@ -14,6 +14,7 @@ struct DeviceSwapChainHost;
 
 inline constexpr UINT kMaxMonitorsSupported = 1;
 inline constexpr DWORD kAdapterInitSlotWaitTimeoutMs = 5000;
+inline constexpr bool kDefaultFrameExtractionEnabled = false;
 inline constexpr UINT kEndpointMajorVersion = 1;
 inline constexpr UINT kEndpointMinorVersion = 1;
 inline constexpr UINT kEndpointBuildVersion = 0;

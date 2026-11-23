@@ -1,10 +1,13 @@
 #include "Adapter.h"
+#include "FrameExtractor.h"
+#include "FrameTransport.h"
 
 #include <d3d11.h>
 #include <dxgi1_4.h>
 #include <psapi.h>
 #include <wrl/client.h>
 
+#include <memory>
 #include <new>
 
 using Microsoft::WRL::ComPtr;
@@ -22,6 +25,46 @@ namespace lumabridge::driver {
 class D3d11IddCxSwapChainBackend final : public ISwapChainBackend
 {
 public:
+    ~D3d11IddCxSwapChainBackend() override
+    {
+        ShutdownTransport();
+    }
+
+    void SetFrameExtractionEnabled(bool enabled) noexcept
+    {
+        const bool wasEnabled = (InterlockedExchange(&m_frameExtractionEnabled, enabled ? 1 : 0) != 0);
+        if (!enabled)
+        {
+            if (wasEnabled || m_ipcServer.IsRunning())
+            {
+                m_ipcServer.Stop();
+            }
+            return;
+        }
+
+        bool hasBoundSwapChain = false;
+        LUID activeLuid{0, 0};
+        {
+            ExclusiveLockGuard deviceGuard(&m_deviceLock);
+            hasBoundSwapChain = (m_boundSwapChainHandle != nullptr);
+            activeLuid = m_activeRenderAdapterLuid;
+        }
+
+        if (hasBoundSwapChain && !m_ipcServer.IsRunning())
+        {
+            FrameTransportConfig transportConfig{};
+            transportConfig.AdapterLuid = activeLuid;
+            (void)m_ipcServer.Start(transportConfig);
+        }
+    }
+
+    void ShutdownTransport() noexcept
+    {
+        m_ipcServer.Stop();
+        ExclusiveLockGuard deviceGuard(&m_deviceLock);
+        m_extractor.Reset();
+    }
+
     HRESULT InitializeDeviceAndBindSwapChain(
         void* swapChainHandle,
         LUID renderAdapterLuid
@@ -91,8 +134,18 @@ public:
         {
             ExclusiveLockGuard deviceGuard(&m_deviceLock);
             m_boundSwapChainHandle = swapChainHandle;
+            m_activeRenderAdapterLuid = renderAdapterLuid;
             m_d3dDevice = d3dDevice;
             m_d3dContext = d3dContext;
+            m_extractor.SetDevice(d3dDevice.Get(), d3dContext.Get());
+        }
+
+        if (InterlockedCompareExchange(&m_frameExtractionEnabled, 0, 0) != 0 &&
+            !m_ipcServer.IsRunning())
+        {
+            FrameTransportConfig transportConfig{};
+            transportConfig.AdapterLuid = renderAdapterLuid;
+            (void)m_ipcServer.Start(transportConfig);
         }
         return S_OK;
     }
@@ -122,10 +175,10 @@ public:
         ComPtr<IDXGIResource> surface;
         surface.Attach(bufferOut.MetaData.pSurface);
 
+        ComPtr<ID3D11Texture2D> texture;
         bool hasValidSurface = false;
         if (surface != nullptr)
         {
-            ComPtr<ID3D11Texture2D> texture;
             if (SUCCEEDED(surface.As(&texture)) && texture != nullptr)
             {
                 D3D11_TEXTURE2D_DESC desc{};
@@ -140,6 +193,69 @@ public:
         outMetadata.HwProtectedSurface = (bufferOut.MetaData.HwProtectedSurface != FALSE);
         outMetadata.PresentDisplayQPCTime = bufferOut.MetaData.PresentDisplayQPCTime;
         outMetadata.HasValidSurface = hasValidSurface;
+
+        if (InterlockedCompareExchange(&m_frameExtractionEnabled, 0, 0) != 0 && hasValidSurface)
+        {
+            outMetadata.ExtractionAttempted = true;
+            std::unique_ptr<ExtractedFrameBuffer> slot = m_ipcServer.AcquireBufferSlot();
+            if (slot == nullptr)
+            {
+                texture.Reset();
+                surface.Reset();
+                outMetadata.ExtractionHResult = E_OUTOFMEMORY;
+                return S_OK;
+            }
+
+            FrameExtractionInput input{};
+            input.SourceTexture = texture.Get();
+            input.PresentationFrameNumber = outMetadata.PresentationFrameNumber;
+            input.DirtyRectCount = outMetadata.DirtyRectCount;
+            input.MoveRegionCount = outMetadata.MoveRegionCount;
+            input.HwProtectedSurface = outMetadata.HwProtectedSurface;
+            input.PresentDisplayQpcTime = outMetadata.PresentDisplayQPCTime;
+            input.Flags = static_cast<uint32_t>(ipc::FrameIpcFlags::None);
+
+            // Release all COM references to the acquired IddCx surface immediately after GPU copy/extraction.
+            const FrameExtractionResult extractResult = m_extractor.ExtractFrame(input, *slot);
+            texture.Reset();
+            surface.Reset();
+
+            outMetadata.ExtractionAccepted = extractResult.AcceptedForExtraction;
+            outMetadata.PixelsCopied = extractResult.PixelsCopied;
+            outMetadata.ProtectedContentRejected = extractResult.ProtectedContentRejected;
+            outMetadata.ExtractedWidth = extractResult.Width;
+            outMetadata.ExtractedHeight = extractResult.Height;
+            outMetadata.ExtractedFormat = extractResult.Format;
+            outMetadata.FrameSequence = extractResult.FrameSequence;
+            outMetadata.CopyLatencyUs = extractResult.CopyLatencyUs;
+            outMetadata.ExtractionHResult = extractResult.HResult;
+
+            if (extractResult.DeviceRemovedOrReset)
+            {
+                m_ipcServer.RecycleBufferSlot(std::move(slot));
+                return extractResult.HResult;
+            }
+
+            if (extractResult.PixelsCopied)
+            {
+                bool evictedOldest = false;
+                const HRESULT enqueueHr = m_ipcServer.EnqueueFrame(std::move(slot), evictedOldest);
+                outMetadata.EvictedOldestByBackpressure = evictedOldest;
+                if (FAILED(enqueueHr))
+                {
+                    outMetadata.ExtractionHResult = enqueueHr;
+                }
+            }
+            else
+            {
+                m_ipcServer.RecycleBufferSlot(std::move(slot));
+            }
+        }
+        else
+        {
+            texture.Reset();
+            surface.Reset();
+        }
         return S_OK;
     }
 
@@ -165,14 +281,36 @@ public:
             if (m_boundSwapChainHandle == swapChainHandle)
             {
                 m_boundSwapChainHandle = nullptr;
+                m_activeRenderAdapterLuid = LUID{0, 0};
+                m_extractor.Reset();
                 m_d3dContext.Reset();
                 m_d3dDevice.Reset();
             }
         }
+        m_ipcServer.FlushQueue();
         if (swapChainHandle != nullptr)
         {
             WdfObjectDelete(static_cast<IDDCX_SWAPCHAIN>(swapChainHandle));
         }
+    }
+
+    void QueryFrameTransportMetrics(
+        SwapChainMetricsSnapshot& inoutSnapshot
+        ) const noexcept override
+    {
+        inoutSnapshot.FrameExtractionEnabled =
+            (InterlockedCompareExchange(const_cast<volatile LONG*>(&m_frameExtractionEnabled), 0, 0) != 0);
+        const FrameTransportMetricsSnapshot ipcSnap = m_ipcServer.GetMetricsSnapshot();
+        inoutSnapshot.FramesDelivered = ipcSnap.FramesDelivered;
+        inoutSnapshot.FramesDroppedByBackpressure = ipcSnap.FramesDroppedByBackpressure;
+        inoutSnapshot.FrameTransportFailures = ipcSnap.FrameTransportFailures;
+        inoutSnapshot.ActiveHostConnections = ipcSnap.ActiveHostConnections;
+        inoutSnapshot.FrameDeliveryLatencyUs = ipcSnap.LastDeliveryLatencyUs;
+        inoutSnapshot.AvgFrameDeliveryLatencyUs = ipcSnap.AvgDeliveryLatencyUs;
+        inoutSnapshot.MaxFrameDeliveryLatencyUs = ipcSnap.MaxDeliveryLatencyUs;
+        inoutSnapshot.QueueDepth = ipcSnap.QueueDepth;
+        inoutSnapshot.PeakQueueDepth = ipcSnap.PeakQueueDepth;
+        inoutSnapshot.LastTransportError = ipcSnap.LastTransportError;
     }
 
 private:
@@ -204,9 +342,13 @@ private:
     };
 
     SRWLOCK m_deviceLock{SRWLOCK_INIT};
+    volatile LONG m_frameExtractionEnabled{0};
     void* m_boundSwapChainHandle{nullptr};
+    LUID m_activeRenderAdapterLuid{0, 0};
     ComPtr<ID3D11Device> m_d3dDevice;
     ComPtr<ID3D11DeviceContext> m_d3dContext;
+    D3d11FrameExtractor m_extractor{};
+    FrameIpcServer m_ipcServer{};
 };
 
 /// RAII guard for a transient WdfObjectReference/WdfObjectDereference pair.
@@ -539,7 +681,23 @@ EmitHostMetricsSnapshot(
             sc.FatalErrors,
             workingSetKb,
             privateUsageKb,
-            handleCount);
+            handleCount,
+            sc.FrameExtractionEnabled,
+            sc.FramesExtractionAccepted,
+            sc.FramesCopied,
+            sc.FramesDelivered,
+            sc.FramesDroppedByBackpressure,
+            sc.ProtectedFramesRejected,
+            sc.FrameCopyFailures,
+            sc.FrameTransportFailures,
+            sc.ActiveHostConnections,
+            sc.LastFrameSequence,
+            sc.FrameCopyLatencyUs,
+            sc.FrameDeliveryLatencyUs,
+            sc.QueueDepth,
+            sc.PeakQueueDepth,
+            sc.LastExtractionError,
+            sc.LastTransportError);
     }
 }
 
@@ -673,6 +831,26 @@ public:
     ScopedSwapChainHostRef(const ScopedSwapChainHostRef&) = delete;
     ScopedSwapChainHostRef& operator=(const ScopedSwapChainHostRef&) = delete;
 
+    ScopedSwapChainHostRef(ScopedSwapChainHostRef&& other) noexcept
+        : m_host(other.m_host)
+    {
+        other.m_host = nullptr;
+    }
+
+    ScopedSwapChainHostRef& operator=(ScopedSwapChainHostRef&& other) noexcept
+    {
+        if (this != &other)
+        {
+            if (m_host != nullptr)
+            {
+                m_host->Release();
+            }
+            m_host = other.m_host;
+            other.m_host = nullptr;
+        }
+        return *this;
+    }
+
     lumabridge::driver::DeviceSwapChainHost* Get() const noexcept
     {
         return m_host;
@@ -720,9 +898,19 @@ ScopedSwapChainHostRef
 AcquireSwapChainHostForMonitor(
     IDDCX_MONITOR MonitorObject,
     bool allowDuringCleanup = false,
-    lumabridge::driver::ScopedWdfObjectRef* outMonitorPin = nullptr
+    lumabridge::driver::ScopedWdfObjectRef* outMonitorPin = nullptr,
+    WDFDEVICE* outDevice = nullptr,
+    lumabridge::driver::ScopedWdfObjectRef* outDevicePin = nullptr
     ) noexcept
 {
+    if (outDevice != nullptr)
+    {
+        *outDevice = nullptr;
+    }
+    if (outDevicePin != nullptr)
+    {
+        outDevicePin->Reset();
+    }
     if (MonitorObject == nullptr)
     {
         return {};
@@ -747,7 +935,67 @@ AcquireSwapChainHostForMonitor(
         }
     }
 
-    return AcquireSwapChainHostForDevice(device, allowDuringCleanup);
+    ScopedSwapChainHostRef host = AcquireSwapChainHostForDevice(device, allowDuringCleanup);
+    if (host.Get() != nullptr && outDevice != nullptr)
+    {
+        if (outDevicePin != nullptr)
+        {
+            if (lumabridge::driver::TryPinActiveDeviceForCreate(device, *outDevicePin))
+            {
+                *outDevice = device;
+            }
+        }
+        else
+        {
+            *outDevice = device;
+        }
+    }
+    return host;
+}
+
+bool
+LumaBridgeQueryDeviceDwordFlag(
+    WDFDEVICE Device,
+    PCUNICODE_STRING ValueName,
+    bool DefaultValue,
+    bool FallbackToSubkey
+    ) noexcept
+{
+    if (Device == nullptr || ValueName == nullptr)
+    {
+        return DefaultValue;
+    }
+
+    const ULONG flagsToTry[2] = {
+        PLUGPLAY_REGKEY_DEVICE,
+        PLUGPLAY_REGKEY_DEVICE | WDF_REGKEY_DEVICE_SUBKEY};
+    const size_t attemptCount = FallbackToSubkey ? 2U : 1U;
+
+    for (size_t i = 0U; i < attemptCount; ++i)
+    {
+        WDFKEY hardwareKey = nullptr;
+        const NTSTATUS openStatus = WdfDeviceOpenRegistryKey(
+            Device,
+            flagsToTry[i],
+            KEY_READ,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            &hardwareKey);
+        if (!NT_SUCCESS(openStatus) || hardwareKey == nullptr)
+        {
+            continue;
+        }
+
+        ULONG enableValue = 0;
+        const NTSTATUS queryStatus = WdfRegistryQueryULong(hardwareKey, ValueName, &enableValue);
+        WdfRegistryClose(hardwareKey);
+
+        if (NT_SUCCESS(queryStatus))
+        {
+            return enableValue == 1UL;
+        }
+    }
+
+    return DefaultValue;
 }
 
 bool
@@ -755,34 +1003,25 @@ LumaBridgeQueryVirtualMonitorActivationEnabled(
     WDFDEVICE Device
     ) noexcept
 {
-    if (Device == nullptr)
-    {
-        return lumabridge::driver::kDefaultVirtualMonitorActivationEnabled;
-    }
-
-    WDFKEY hardwareKey = nullptr;
-    const NTSTATUS openStatus = WdfDeviceOpenRegistryKey(
-        Device,
-        PLUGPLAY_REGKEY_DEVICE,
-        KEY_READ,
-        WDF_NO_OBJECT_ATTRIBUTES,
-        &hardwareKey);
-    if (!NT_SUCCESS(openStatus) || hardwareKey == nullptr)
-    {
-        return lumabridge::driver::kDefaultVirtualMonitorActivationEnabled;
-    }
-
     DECLARE_CONST_UNICODE_STRING(enableValueName, L"EnableVirtualMonitor");
-    ULONG enableValue = 0;
-    const NTSTATUS queryStatus = WdfRegistryQueryULong(hardwareKey, &enableValueName, &enableValue);
-    WdfRegistryClose(hardwareKey);
+    return LumaBridgeQueryDeviceDwordFlag(
+        Device,
+        &enableValueName,
+        lumabridge::driver::kDefaultVirtualMonitorActivationEnabled,
+        false);
+}
 
-    if (!NT_SUCCESS(queryStatus))
-    {
-        return lumabridge::driver::kDefaultVirtualMonitorActivationEnabled;
-    }
-
-    return enableValue == 1UL;
+bool
+LumaBridgeQueryFrameExtractionEnabled(
+    WDFDEVICE Device
+    ) noexcept
+{
+    DECLARE_CONST_UNICODE_STRING(enableValueName, L"EnableFrameExtraction");
+    return LumaBridgeQueryDeviceDwordFlag(
+        Device,
+        &enableValueName,
+        lumabridge::driver::kDefaultFrameExtractionEnabled,
+        true);
 }
 
 void
@@ -895,6 +1134,8 @@ LumaBridgePersistStartupDiagnostics(
         DECLARE_CONST_UNICODE_STRING(nameHostPid, L"DiagHostProcessId");
         DECLARE_CONST_UNICODE_STRING(nameDllAttach, L"DiagDllAttachCount");
         DECLARE_CONST_UNICODE_STRING(nameBuildStage, L"DiagBuildStage");
+        DECLARE_CONST_UNICODE_STRING(nameTlRegistered, L"DiagTraceLoggingRegistered");
+        DECLARE_CONST_UNICODE_STRING(nameTlStatus, L"DiagTraceLoggingStatus");
 
         AssignUnicodeDiagnosticValue(
             hardwareKey,
@@ -914,6 +1155,9 @@ LumaBridgePersistStartupDiagnostics(
         (void)WdfRegistryAssignULong(hardwareKey, &nameHostPid, GetCurrentProcessId());
         (void)WdfRegistryAssignULong(hardwareKey, &nameDllAttach, LumaBridgeGetDllProcessAttachCount());
         (void)WdfRegistryAssignULong(hardwareKey, &nameBuildStage, lumabridge::driver::kActiveDiagnosticStage);
+        const HRESULT tlRegHr = LumaBridgeGetTraceLoggingRegisterResult();
+        (void)WdfRegistryAssignULong(hardwareKey, &nameTlRegistered, SUCCEEDED(tlRegHr) ? 1UL : 0UL);
+        (void)WdfRegistryAssignULong(hardwareKey, &nameTlStatus, static_cast<ULONG>(tlRegHr));
 
         WdfRegistryClose(hardwareKey);
     }
@@ -1184,6 +1428,7 @@ LumaBridgeInitializeDeviceContext(
         {
             (void)failedHost->MonitorManager.Shutdown();
             (void)failedHost->Processor.Shutdown();
+            failedHost->Backend.ShutdownTransport();
             failedHost->Release();
         }
 
@@ -1276,6 +1521,7 @@ LumaBridgeStartAdapter(
             }
             if (host.Get() != nullptr)
             {
+                host.Get()->Backend.SetFrameExtractionEnabled(LumaBridgeQueryFrameExtractionEnabled(Device));
                 (void)host.Get()->MonitorManager.OnResume();
                 (void)host.Get()->Processor.OnResume();
                 if (adapterHandle != nullptr)
@@ -1302,6 +1548,7 @@ LumaBridgeStartAdapter(
             const ScopedSwapChainHostRef host = AcquireSwapChainHostForDevice(Device);
             if (host.Get() != nullptr)
             {
+                host.Get()->Backend.SetFrameExtractionEnabled(LumaBridgeQueryFrameExtractionEnabled(Device));
                 (void)host.Get()->MonitorManager.OnResume();
                 (void)host.Get()->Processor.OnResume();
             }
@@ -1318,6 +1565,7 @@ LumaBridgeStartAdapter(
             const ScopedSwapChainHostRef host = AcquireSwapChainHostForDevice(Device);
             if (host.Get() != nullptr)
             {
+                host.Get()->Backend.SetFrameExtractionEnabled(LumaBridgeQueryFrameExtractionEnabled(Device));
                 (void)host.Get()->MonitorManager.OnResume();
                 (void)host.Get()->Processor.OnResume();
             }
@@ -1649,6 +1897,7 @@ LumaBridgeStopAdapter(
                     host.Get(),
                     DriverDiagnosticStage::DeviceD0Exit,
                     resultingState);
+                host.Get()->Backend.ShutdownTransport();
             }
         }
 
@@ -1717,6 +1966,7 @@ LumaBridgeEvtDeviceContextCleanup(
             detachedHost,
             DriverDiagnosticStage::DeviceContextCleanup,
             AdapterLifecycleState::Uninitialized);
+        detachedHost->Backend.ShutdownTransport();
         detachedHost->Release();
     }
 
@@ -1785,6 +2035,7 @@ LumaBridgeEvtAdapterContextCleanup(
                 host.Get(),
                 DriverDiagnosticStage::AdapterContextCleanup,
                 resultingState);
+            host.Get()->Backend.ShutdownTransport();
         }
     }
 
@@ -2027,6 +2278,8 @@ LumaBridgeEvtAdapterInitFinished(
                 const ScopedSwapChainHostRef host = AcquireSwapChainHostForDevice(wdfDevice);
                 if (host.Get() != nullptr)
                 {
+                    const bool extractionEnabled = LumaBridgeQueryFrameExtractionEnabled(wdfDevice);
+                    host.Get()->Backend.SetFrameExtractionEnabled(extractionEnabled);
                     const bool activationEnabled = LumaBridgeQueryVirtualMonitorActivationEnabled(wdfDevice);
                     host.Get()->MonitorManager.SetActivationEnabled(activationEnabled);
                     const NTSTATUS monitorStatus = host.Get()->MonitorManager.EnsureMonitorArrived(AdapterObject);
@@ -2339,7 +2592,14 @@ LumaBridgeEvtMonitorAssignSwapChain(
     else
     {
         lumabridge::driver::ScopedWdfObjectRef monitorPin;
-        const ScopedSwapChainHostRef host = AcquireSwapChainHostForMonitor(MonitorObject, false, &monitorPin);
+        lumabridge::driver::ScopedWdfObjectRef devicePin;
+        WDFDEVICE wdfDevice = nullptr;
+        const ScopedSwapChainHostRef host = AcquireSwapChainHostForMonitor(
+            MonitorObject,
+            false,
+            &monitorPin,
+            &wdfDevice,
+            &devicePin);
         if (host.Get() == nullptr)
         {
             LumaBridgeTraceWarn(
@@ -2358,6 +2618,12 @@ LumaBridgeEvtMonitorAssignSwapChain(
                 AdapterLifecycleState::AdapterReady,
                 "EvtIddCxMonitorAssignSwapChain abandoned swapchain for stale or inactive monitor");
             return STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN;
+        }
+
+        if (wdfDevice != nullptr)
+        {
+            host.Get()->Backend.SetFrameExtractionEnabled(
+                LumaBridgeQueryFrameExtractionEnabled(wdfDevice));
         }
 
         const NTSTATUS status = host.Get()->Processor.AssignSwapChain(

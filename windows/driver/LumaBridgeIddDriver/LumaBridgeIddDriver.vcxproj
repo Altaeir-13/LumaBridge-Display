@@ -97,7 +97,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>d3d11.lib;dxgi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d11.lib;dxgi.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -111,12 +111,14 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>d3d11.lib;dxgi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d11.lib;dxgi.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="Adapter.cpp" />
     <ClCompile Include="Driver.cpp" />
+    <ClCompile Include="FrameExtractor.cpp" />
+    <ClCompile Include="FrameTransport.cpp" />
     <ClCompile Include="MonitorModes.cpp" />
     <ClCompile Include="SwapChainProcessor.cpp" />
     <ClCompile Include="VirtualMonitor.cpp" />
@@ -126,6 +128,9 @@
     <ClInclude Include="AdapterStateMachine.h" />
     <ClInclude Include="DiagnosticStageConfig.h" />
     <ClInclude Include="Driver.h" />
+    <ClInclude Include="FrameExtractor.h" />
+    <ClInclude Include="FrameIpcProtocol.h" />
+    <ClInclude Include="FrameTransport.h" />
     <ClInclude Include="MonitorModes.h" />
     <ClInclude Include="SwapChainProcessor.h" />
     <ClInclude Include="Trace.h" />
