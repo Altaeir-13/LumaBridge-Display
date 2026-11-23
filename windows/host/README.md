@@ -17,7 +17,9 @@ cl /nologo /std:c++17 /W4 /WX /EHsc /O2 /Zi /MD /DNDEBUG /DUNICODE /D_UNICODE /I
 - `--max-frames <N>`: encerra antecipadamente apos receber `N` frames validos (`0` = continuo ate `--duration-ms`, Ctrl+C ou desconexao)
 - `--min-frames <N>`: exige no minimo `N` frames validos para retorno `ExitCode=0` mesmo que a meta `--max-frames` nao seja atingida antes de `--duration-ms` (Perfil A — smoke test)
 - `--require-max-frames`: exige atingir a meta integral `--max-frames` para `ExitCode=0` (Perfil B — benchmark continuo)
-- `--duration-ms <ms>`: tempo maximo de execucao em milissegundos
+- `--duration-ms <ms>`: duracao alvo em milissegundos (`0` = ilimitado)
+- `--duration-counts-connected`: contabiliza `--duration-ms` exclusivamente enquanto conectado ao servidor IPC via ticks QPC monotonicos sem overflow (pausa em espera inicial e reconexao)
+- `--max-execution-ms <ms>`: teto de seguranca total de execucao (*wall-clock*) em milissegundos; ao expirar encerra com `SafetyExecutionTimeout` e codigo nao-zero
 - `--connect-timeout-ms <ms>`: timeout de conexao ao pipe (padrao: `3000`)
 - `--io-timeout-ms <ms>`: timeout por operacao I/O overlapped em ms (padrao: `500`)
 - `--verify-synthetic-pattern`: valida padrao sintetico BGRA8 deterministico por pixel (em modo GPU realiza readback diagnostico explicito; em modo normal `CpuStagingReadsPerformed` permanece `0`)
@@ -43,7 +45,7 @@ cl /nologo /std:c++17 /W4 /WX /EHsc /O2 /Zi /MD /DNDEBUG /DUNICODE /D_UNICODE /I
 - `--min-nvenc-encoded-frames <n>`: quantidade minima absoluta de quadros codificados pelo NVENC quando `--require-nvenc`
 - `--min-nvenc-encode-ratio <0..1>`: razao minima `NvencFramesEncoded / FramesValid` exigida quando `--require-nvenc`
 - `--max-nvenc-drop-ratio <0..1>`: teto maximo para `(NvencDroppedFrames + EncodedQueueDrops) / NvencFramesSubmitted` quando `--require-nvenc`
-- `--json-summary <caminho>`: grava resumo JSON nao visual com metricas de GPU pool, breakdown de sub-etapas NVENC (`FormatPrepare`, `EncodePicture`, `BitstreamLockCopy`, `EncodedQueueWait`), cobertura temporal (`TemporalTelemetry`), amostragem por *reservoir sampling* acima de `65.536` amostras (`StoredSampleCount`/`SamplesTruncated`/`ReservoirSampled`), `ResourceUsage` (CPU, RAM, `HandleCount`, VRAM dedicada com `NOT_MEASURED` quando indisponivel), decoder H.264, `GateEvaluation` e status do estimulo
+- `--json-summary <caminho>`: grava resumo JSON nao visual com metricas de GPU pool, breakdown de sub-etapas NVENC (`FormatPrepare`, `EncodePicture`, `BitstreamLockCopy`, `EncodedQueueWait`), cobertura temporal (`TemporalTelemetry`), validacao de relogio e duracao (`QpcClockValid`, `DurationCountsConnected`, `RequestedDurationUs`, `TotalConnectedDurationUs`, `ActiveStreamingDurationUs`, `LiveStreamingDurationUs`, `DurationTargetReached`, `SafetyExecutionTimeoutHit`, `DurationOk`), metodologia explicita de percentis (`PercentilesAvailable`, `PercentilesAreEstimated`, `PercentileMethod` = `NotAvailable` | `ExactPopulation` | `ReservoirSampledEstimate_AlgorithmR`, amostragem uniforme Algorithm R com `StoredSampleCount = 65536` e `SamplesTruncated = true` acima de `65.536` mantendo `MinUs`/`AvgUs`/`MaxUs` exatos sobre todos os `SampleCount`, e `P50Us`/`P95Us`/`P99Us = null` quando `PercentilesAvailable = false`), `ResourceUsage` (CPU, RAM, `HandleCount`, VRAM dedicada com `NOT_MEASURED` quando indisponivel), decoder H.264, `GateEvaluation` e status do estimulo
 - `--quiet`: omite log por frame no stdout
 
 ## Limites e privacidade
