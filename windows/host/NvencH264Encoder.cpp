@@ -247,6 +247,7 @@ NvencH264Encoder::LatencyStatTracker::Summarize() const noexcept
 {
     LatencySummaryStats s = ComputeLatencySummary(Samples, LastVal);
     s.SampleCount = Count;
+    s.Available = (Count > 0ULL);
     if (Count > 0ULL)
     {
         s.MinUs = MinVal;
@@ -500,6 +501,7 @@ NvencH264Encoder::Initialize(
     }
 
     m_qpcFrequency = QueryQpcFreqSafe();
+    const uint64_t initStartQpc = QueryQpcNow();
     m_config = config;
     if (m_config.TargetFps == 0U)
     {
@@ -647,7 +649,12 @@ NvencH264Encoder::Initialize(
     m_forceIdrNextFrame = true;
     m_firstEncodedQpc = 0ULL;
     m_lastEncodedQpc = 0ULL;
+    m_prevFrameInterFrameIntervalUs = 0ULL;
 
+    const uint64_t initEndQpc = QueryQpcNow();
+    m_metrics.SessionInitializeLatencyUs = (initEndQpc >= initStartQpc)
+        ? ((initEndQpc - initStartQpc) * 1000000ULL) / m_qpcFrequency
+        : 0ULL;
     m_metrics.Initialized = true;
     m_metrics.DeviceRemovedOrReset = false;
     m_metrics.Width = m_config.Width;
@@ -951,7 +958,8 @@ NvencH264Encoder::EncodeGpuTexture(
     uint64_t presentDisplayQpcTime,
     uint64_t extractCompleteQpcTime,
     uint64_t qpcFrequency,
-    EncodedFramePacket* outPacketCopy
+    EncodedFramePacket* outPacketCopy,
+    uint64_t hostReceiveQpcTime
     ) noexcept
 {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -1046,6 +1054,7 @@ NvencH264Encoder::EncodeGpuTexture(
         m_metrics.LastHResult = hr;
         return hr;
     }
+    const uint64_t prepDoneQpc = QueryQpcNow();
 
     NV_ENC_MAP_INPUT_RESOURCE mapRes{};
     mapRes.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
@@ -1107,6 +1116,7 @@ NvencH264Encoder::EncodeGpuTexture(
         }
         return m_metrics.LastHResult;
     }
+    const uint64_t encodePicDoneQpc = QueryQpcNow();
 
     m_forceIdrNextFrame = false;
 
@@ -1131,6 +1141,7 @@ NvencH264Encoder::EncodeGpuTexture(
     pkt.IsKeyFrame = (lockBs.pictureType == NV_ENC_PIC_TYPE_IDR || lockBs.pictureType == NV_ENC_PIC_TYPE_I);
     pkt.PresentDisplayQpcTime = presentDisplayQpcTime;
     pkt.ExtractCompleteQpcTime = extractCompleteQpcTime;
+    pkt.HostReceiveQpcTime = hostReceiveQpcTime;
     pkt.QpcFrequency = (qpcFrequency > 0ULL) ? qpcFrequency : m_qpcFrequency;
 
     {
@@ -1150,13 +1161,24 @@ NvencH264Encoder::EncodeGpuTexture(
     unmapGuard.UnmapNow();
 
     const uint64_t bitstreamReadyQpc = QueryQpcNow();
-    const uint64_t effectiveFreq = (pkt.QpcFrequency > 0ULL) ? pkt.QpcFrequency : m_qpcFrequency;
-    const uint64_t encodeLatencyUs = ((bitstreamReadyQpc >= encodeStartQpc)
-        ? ((bitstreamReadyQpc - encodeStartQpc) * 1000000ULL) / effectiveFreq
-        : 0ULL);
+    const uint64_t formatPrepareUs = (prepDoneQpc >= encodeStartQpc)
+        ? ((prepDoneQpc - encodeStartQpc) * 1000000ULL) / m_qpcFrequency
+        : 0ULL;
+    const uint64_t encodePictureUs = (encodePicDoneQpc >= prepDoneQpc)
+        ? ((encodePicDoneQpc - prepDoneQpc) * 1000000ULL) / m_qpcFrequency
+        : 0ULL;
+    const uint64_t bitstreamLockCopyUs = (bitstreamReadyQpc >= encodePicDoneQpc)
+        ? ((bitstreamReadyQpc - encodePicDoneQpc) * 1000000ULL) / m_qpcFrequency
+        : 0ULL;
+    const uint64_t encodeLatencyUs = (bitstreamReadyQpc >= encodeStartQpc)
+        ? ((bitstreamReadyQpc - encodeStartQpc) * 1000000ULL) / m_qpcFrequency
+        : 0ULL;
 
     pkt.BitstreamReadyQpcTime = bitstreamReadyQpc;
     pkt.EncodeLatencyUs = encodeLatencyUs;
+    pkt.FormatPrepareUs = formatPrepareUs;
+    pkt.EncodePictureUs = encodePictureUs;
+    pkt.BitstreamLockCopyUs = bitstreamLockCopyUs;
 
     if (outPacketCopy != nullptr)
     {
@@ -1191,6 +1213,18 @@ NvencH264Encoder::EncodeGpuTexture(
     m_metrics.LastNvencStatus = NV_ENC_SUCCESS;
     m_metrics.LastHResult = S_OK;
 
+    if (m_lastEncodedQpc > 0ULL && bitstreamReadyQpc >= m_lastEncodedQpc)
+    {
+        const uint64_t interFrameUs = ((bitstreamReadyQpc - m_lastEncodedQpc) * 1000000ULL) / m_qpcFrequency;
+        if (m_prevFrameInterFrameIntervalUs > 0ULL)
+        {
+            const uint64_t jitterUs = (interFrameUs >= m_prevFrameInterFrameIntervalUs)
+                ? (interFrameUs - m_prevFrameInterFrameIntervalUs)
+                : (m_prevFrameInterFrameIntervalUs - interFrameUs);
+            m_encodeInterFrameJitterTracker.Record(jitterUs);
+        }
+        m_prevFrameInterFrameIntervalUs = interFrameUs;
+    }
     if (m_firstEncodedQpc == 0ULL)
     {
         m_firstEncodedQpc = bitstreamReadyQpc;
@@ -1199,7 +1233,7 @@ NvencH264Encoder::EncodeGpuTexture(
     if (m_metrics.NvencFramesEncoded >= 2ULL && m_lastEncodedQpc > m_firstEncodedQpc)
     {
         const double spanSec =
-            static_cast<double>(m_lastEncodedQpc - m_firstEncodedQpc) / static_cast<double>(effectiveFreq);
+            static_cast<double>(m_lastEncodedQpc - m_firstEncodedQpc) / static_cast<double>(m_qpcFrequency);
         if (spanSec > 0.001)
         {
             m_metrics.EncoderOutputFps = static_cast<double>(m_metrics.NvencFramesEncoded - 1ULL) / spanSec;
@@ -1209,27 +1243,96 @@ NvencH264Encoder::EncodeGpuTexture(
     }
 
     m_encodeLatencyTracker.Record(encodeLatencyUs);
+    m_formatPrepareTracker.Record(formatPrepareUs);
+    m_encodePictureTracker.Record(encodePictureUs);
+    m_bitstreamLockCopyTracker.Record(bitstreamLockCopyUs);
     m_packetSizeTracker.Record(pktSizeBytes);
-    if (presentDisplayQpcTime > 0ULL && bitstreamReadyQpc >= presentDisplayQpcTime)
+
+    constexpr uint64_t kMaxPlausibleStageDurationUs = 30000000ULL;
+    const bool qpcFreqIncompatible =
+        (qpcFrequency > 0ULL && m_qpcFrequency > 0ULL && qpcFrequency != m_qpcFrequency);
+
+    if (hostReceiveQpcTime > 0ULL)
     {
-        m_presentToBitstreamTracker.Record(((bitstreamReadyQpc - presentDisplayQpcTime) * 1000000ULL) / effectiveFreq);
-    }
-    if (extractCompleteQpcTime > 0ULL && bitstreamReadyQpc >= extractCompleteQpcTime)
-    {
-        m_extractToBitstreamTracker.Record(((bitstreamReadyQpc - extractCompleteQpcTime) * 1000000ULL) / effectiveFreq);
+        if (qpcFreqIncompatible || encodeStartQpc < hostReceiveQpcTime)
+        {
+            ++m_metrics.InvalidTimestampCount;
+        }
+        else
+        {
+            const uint64_t hostRecvToSubmitUs = ((encodeStartQpc - hostReceiveQpcTime) * 1000000ULL) / m_qpcFrequency;
+            if (hostRecvToSubmitUs > kMaxPlausibleStageDurationUs)
+            {
+                ++m_metrics.InvalidTimestampCount;
+            }
+            else
+            {
+                m_hostReceiveToSubmitTracker.Record(hostRecvToSubmitUs);
+            }
+        }
     }
 
-    m_metrics.EncodeLatencyUs = m_encodeLatencyTracker.Summarize();
-    m_metrics.EncodedFrameSizeBytes = m_packetSizeTracker.Summarize();
-    m_metrics.PresentToBitstreamLatencyUs = m_presentToBitstreamTracker.Summarize();
-    m_metrics.ExtractToBitstreamLatencyUs = m_extractToBitstreamTracker.Summarize();
+    if (presentDisplayQpcTime == 0ULL)
+    {
+        ++m_metrics.MissingPresentTimestampCount;
+    }
+    else if (qpcFreqIncompatible || bitstreamReadyQpc < presentDisplayQpcTime)
+    {
+        ++m_metrics.InvalidTimestampCount;
+    }
+    else
+    {
+        const uint64_t presentToBitstreamUs = ((bitstreamReadyQpc - presentDisplayQpcTime) * 1000000ULL) / m_qpcFrequency;
+        if (presentToBitstreamUs > kMaxPlausibleStageDurationUs)
+        {
+            ++m_metrics.InvalidTimestampCount;
+        }
+        else
+        {
+            m_presentToBitstreamTracker.Record(presentToBitstreamUs);
+        }
+    }
+
+    if (extractCompleteQpcTime == 0ULL)
+    {
+        ++m_metrics.MissingExtractTimestampCount;
+    }
+    else if (qpcFreqIncompatible || bitstreamReadyQpc < extractCompleteQpcTime)
+    {
+        ++m_metrics.InvalidTimestampCount;
+    }
+    else
+    {
+        const uint64_t extractToBitstreamUs = ((bitstreamReadyQpc - extractCompleteQpcTime) * 1000000ULL) / m_qpcFrequency;
+        if (extractToBitstreamUs > kMaxPlausibleStageDurationUs)
+        {
+            ++m_metrics.InvalidTimestampCount;
+        }
+        else
+        {
+            m_extractToBitstreamTracker.Record(extractToBitstreamUs);
+        }
+    }
+
     return S_OK;
 }
 
 bool
 NvencH264Encoder::TryPopEncodedFrame(EncodedFramePacket& outPacket) noexcept
 {
-    return m_encodedQueue.TryPop(outPacket);
+    if (!m_encodedQueue.TryPop(outPacket))
+    {
+        return false;
+    }
+    const uint64_t popQpc = QueryQpcNow();
+    if (outPacket.BitstreamReadyQpcTime > 0ULL && popQpc >= outPacket.BitstreamReadyQpcTime)
+    {
+        const uint64_t waitUs = ((popQpc - outPacket.BitstreamReadyQpcTime) * 1000000ULL) / m_qpcFrequency;
+        outPacket.QueuePopWaitUs = waitUs;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_encodedQueueWaitTracker.Record(waitUs);
+    }
+    return true;
 }
 
 void
@@ -1245,6 +1348,33 @@ NvencH264Encoder::GetMetricsSnapshot() const noexcept
     std::lock_guard<std::mutex> lock(m_mutex);
     NvencMetricsSnapshot snap = m_metrics;
     snap.EncodedQueueDepth = m_encodedQueue.Size();
+    snap.EncodeLatencyUs = m_encodeLatencyTracker.Summarize();
+    snap.EncodedFrameSizeBytes = m_packetSizeTracker.Summarize();
+    snap.PresentToBitstreamLatencyUs = m_presentToBitstreamTracker.Summarize();
+    snap.ExtractToBitstreamLatencyUs = m_extractToBitstreamTracker.Summarize();
+    snap.HostReceiveToSubmitLatencyUs = m_hostReceiveToSubmitTracker.Summarize();
+    snap.FormatPrepareLatencyUs = m_formatPrepareTracker.Summarize();
+    snap.EncodePictureLatencyUs = m_encodePictureTracker.Summarize();
+    snap.BitstreamLockCopyLatencyUs = m_bitstreamLockCopyTracker.Summarize();
+    snap.EncodedQueueWaitLatencyUs = m_encodedQueueWaitTracker.Summarize();
+    snap.EncodeInterFrameJitterUs = m_encodeInterFrameJitterTracker.Summarize();
+
+    snap.ValidPresentToBitstreamSamples = snap.PresentToBitstreamLatencyUs.SampleCount;
+    snap.ValidExtractToBitstreamSamples = snap.ExtractToBitstreamLatencyUs.SampleCount;
+    if (snap.NvencFramesEncoded > 0ULL)
+    {
+        snap.PresentToBitstreamCoveragePercent =
+            (static_cast<double>(snap.ValidPresentToBitstreamSamples) * 100.0) /
+            static_cast<double>(snap.NvencFramesEncoded);
+        snap.ExtractToBitstreamCoveragePercent =
+            (static_cast<double>(snap.ValidExtractToBitstreamSamples) * 100.0) /
+            static_cast<double>(snap.NvencFramesEncoded);
+    }
+    else
+    {
+        snap.PresentToBitstreamCoveragePercent = 0.0;
+        snap.ExtractToBitstreamCoveragePercent = 0.0;
+    }
     return snap;
 }
 

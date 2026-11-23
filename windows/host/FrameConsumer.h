@@ -94,6 +94,7 @@ HostExitReasonToString(
 
 struct LatencySummaryStats
 {
+    bool Available{false};
     uint64_t SampleCount{0ULL};
     uint64_t MinUs{0ULL};
     uint64_t AvgUs{0ULL};
@@ -116,8 +117,14 @@ struct HostFpsBreakdown
 struct ValidatedFrameIntervals
 {
     bool Valid{false};
+    bool CoreTimestampsValid{false};
     bool QpcFrequencyMismatch{false};
     bool OutOfOrderTimestamps{false};
+    bool MissingCoreTimestamp{false};
+    bool PresentTimestampMissing{false};
+    bool PresentTimestampAvailable{false};
+    bool FutureTimestampDetected{false};
+    bool IncompatibleTimestampUnits{false};
     bool PreConnectQueued{false};
     bool HasPresentToExtract{false};
     uint64_t PresentToExtractUs{0ULL};
@@ -208,6 +215,19 @@ struct HostConsumerMetricsSnapshot
     uint64_t PartialMessageTimeouts{0ULL};
     uint64_t FatalIpcErrors{0ULL};
     uint64_t TimestampMeasurementErrors{0ULL};
+    uint64_t OutOfOrderSequenceCount{0ULL};
+    uint64_t NonMonotonicTimestampCount{0ULL};
+    uint64_t MissingCoreTimestampCount{0ULL};
+    uint64_t MissingPresentTimestampCount{0ULL};
+    uint64_t FutureTimestampErrorCount{0ULL};
+    uint64_t IncompatibleTimestampUnitsCount{0ULL};
+    uint64_t QpcFrequencyMismatchCount{0ULL};
+    uint64_t ValidCoreTimestampSamples{0ULL};
+    uint64_t ValidLiveTimestampSamples{0ULL};
+    uint64_t ValidPresentTimestampSamples{0ULL};
+    double CoreTimestampCoveragePercent{0.0};
+    double LiveTimestampCoveragePercent{0.0};
+    double PresentTimestampCoveragePercent{0.0};
     uint64_t LastFrameSequence{0ULL};
     uint32_t LastPresentationFrameNumber{0U};
     uint32_t LastFrameWidth{0U};
@@ -247,7 +267,9 @@ struct HostConsumerMetricsSnapshot
     LatencySummaryStats EndToEndLatency{};
     LatencySummaryStats LiveEndToEndLatency{};
     LatencySummaryStats InterFrameInterval{};
+    LatencySummaryStats InterFrameJitter{};
     LatencySummaryStats GpuSyncWaitLatency{};
+    LatencySummaryStats HostGpuCopyLatency{};
 
     ipc::FrameIpcTransportMode NegotiatedTransportMode{ipc::FrameIpcTransportMode::CpuStagingPipe};
     bool FallbackToCpuActivated{false};
@@ -309,6 +331,11 @@ public:
 
     HostConsumerMetricsSnapshot GetMetricsSnapshot() const noexcept;
 
+    /// Pre-initializes the D3D11 device before connecting so Frame 1 avoids cold device setup latency.
+    HRESULT PrewarmD3d11Device() noexcept;
+
+    uint64_t GetLastFrameReceiveQpc() const noexcept { return m_lastFrameRecvQpc; }
+    LUID GetBoundAdapterLuid() const noexcept { return m_boundAdapterLuid; }
     ID3D11Device* GetD3d11Device() const noexcept { return m_d3dDevice.Get(); }
     ID3D11DeviceContext* GetD3d11Context() const noexcept { return m_d3dContext.Get(); }
     ID3D11Texture2D* GetWorkingGpuTexture() const noexcept { return m_hostGpuWorkingTexture.Get(); }
@@ -396,6 +423,7 @@ private:
         {
             LatencySummaryStats summary = ComputeLatencySummary(Samples, LastUs);
             summary.SampleCount = Count;
+            summary.Available = (Count > 0ULL);
             if (Count > 0ULL)
             {
                 summary.MinUs = MinUs;
@@ -408,6 +436,28 @@ private:
 
     void ClosePipeAndResetConnectionState(bool sendDisconnectNotice) noexcept;
     void UpdateDerivedFpsAndLatenciesLocked(uint64_t nowQpc, uint64_t executionStartQpc) noexcept;
+    void PopulateLatencySummariesLocked(HostConsumerMetricsSnapshot& dst) const noexcept;
+    void RecordFrameMetricsAndTimestampsLocked(
+        uint64_t frameSequence,
+        uint32_t presentationFrameNumber,
+        uint32_t width,
+        uint32_t height,
+        uint32_t pixelFormat,
+        uint32_t payloadCrc32,
+        uint64_t bytesReceivedIncrement,
+        bool crcOk,
+        bool patternOk,
+        uint64_t presentDisplayQpc,
+        uint64_t extractCompleteQpc,
+        uint64_t serverSendQpc,
+        uint64_t recvCompleteQpc,
+        uint64_t ackCompleteQpc,
+        const ValidatedFrameIntervals& intervals,
+        bool hasGpuSyncSample,
+        uint64_t gpuSyncWaitUs,
+        bool hasHostGpuCopySample,
+        uint64_t hostGpuCopyUs
+        ) noexcept;
 
     HostConsumerConfig m_config{};
     mutable SRWLOCK m_metricsLock{SRWLOCK_INIT};
@@ -425,6 +475,12 @@ private:
     uint64_t m_firstLiveFrameQpc{0ULL};
     uint64_t m_lastLiveFrameQpc{0ULL};
     uint64_t m_prevValidRecvQpc{0ULL};
+    uint64_t m_prevInterFrameIntervalUs{0ULL};
+    bool m_hasPrevInterFrameInterval{false};
+    uint64_t m_prevSessionExtractQpc{0ULL};
+    uint64_t m_prevSessionServerSendQpc{0ULL};
+    uint64_t m_prevSessionPresentQpc{0ULL};
+    uint64_t m_lastFrameRecvQpc{0ULL};
 
     LatencyAccumulator m_copyLat{};
     LatencyAccumulator m_presentToExtractLat{};
@@ -435,7 +491,9 @@ private:
     LatencyAccumulator m_endToEndLat{};
     LatencyAccumulator m_liveEndToEndLat{};
     LatencyAccumulator m_interFrameLat{};
+    LatencyAccumulator m_interFrameJitterLat{};
     LatencyAccumulator m_gpuSyncWaitLat{};
+    LatencyAccumulator m_hostGpuCopyLat{};
 
     Microsoft::WRL::ComPtr<ID3D11Device> m_d3dDevice{};
     Microsoft::WRL::ComPtr<ID3D11Device1> m_d3dDevice1{};

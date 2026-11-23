@@ -1070,6 +1070,62 @@ H264StreamValidationSession::Configure(
     m_minPsnrDb = minPsnrDb;
     m_summary = {};
     m_summary.Enabled = enabled;
+    m_summary.ValidationMode = !enabled
+        ? std::string("Disabled")
+        : (verifySyntheticPsnr
+            ? std::string("StructuralDecode+SyntheticPsnr")
+            : std::string("StructuralDecodeOnly"));
+}
+
+HRESULT
+H264StreamValidationSession::PrewarmDecoder(
+    uint32_t width,
+    uint32_t height,
+    uint32_t targetFps
+    ) noexcept
+{
+    if (!m_enabled)
+    {
+        return S_OK;
+    }
+    if (width == 0U || height == 0U)
+    {
+        return E_INVALIDARG;
+    }
+
+    const uint32_t effectiveFps = (targetFps > 0U) ? targetFps : m_targetFps;
+    if (m_decoder.IsInitialized() && m_width == width && m_height == height)
+    {
+        m_summary.DecoderInitialized = true;
+        m_summary.DecoderName = m_decoder.GetDecoderName();
+        return S_OK;
+    }
+
+    if (m_decoder.IsInitialized())
+    {
+        std::vector<DecodedNv12Frame> tail;
+        if (SUCCEEDED(m_decoder.Drain(tail)))
+        {
+            ProcessDecodedFrames(tail);
+        }
+        m_decoder.Shutdown();
+        m_width = 0U;
+        m_height = 0U;
+    }
+
+    const HRESULT initHr = m_decoder.Initialize(width, height, effectiveFps);
+    m_summary.DecoderInitialized = SUCCEEDED(initHr) && m_decoder.IsInitialized();
+    m_summary.DecoderName = m_decoder.GetDecoderName();
+    if (SUCCEEDED(initHr) && m_decoder.IsInitialized())
+    {
+        m_width = width;
+        m_height = height;
+    }
+    else
+    {
+        m_summary.LastHResult = initHr;
+    }
+    return initHr;
 }
 
 void
@@ -1093,6 +1149,16 @@ H264StreamValidationSession::ProcessDecodedFrames(
             continue;
         }
 
+        if (m_summary.MatchedColorMatrix == "None" || m_summary.MatchedColorMatrix.empty())
+        {
+            m_summary.MatchedColorMatrix = psnr.MatchedColorMatrix;
+        }
+        else if (m_summary.MatchedColorMatrix != psnr.MatchedColorMatrix &&
+                 m_summary.MatchedColorMatrix != "Mixed")
+        {
+            m_summary.MatchedColorMatrix = "Mixed";
+        }
+
         if (m_psnrSamples == 0ULL || psnr.YPsnrDb < m_summary.MinYPsnrDb)
         {
             m_summary.MinYPsnrDb = psnr.YPsnrDb;
@@ -1101,12 +1167,18 @@ H264StreamValidationSession::ProcessDecodedFrames(
         {
             m_summary.MinUvPsnrDb = psnr.UvPsnrDb;
         }
+        if (m_psnrSamples == 0ULL || psnr.MinPsnrDb < m_summary.MinCombinedPsnrDb)
+        {
+            m_summary.MinCombinedPsnrDb = psnr.MinPsnrDb;
+        }
 
         m_sumYPsnrDb += psnr.YPsnrDb;
         m_sumUvPsnrDb += psnr.UvPsnrDb;
+        m_sumCombinedPsnrDb += psnr.AvgPsnrDb;
         ++m_psnrSamples;
         m_summary.AvgYPsnrDb = m_sumYPsnrDb / static_cast<double>(m_psnrSamples);
         m_summary.AvgUvPsnrDb = m_sumUvPsnrDb / static_cast<double>(m_psnrSamples);
+        m_summary.AvgCombinedPsnrDb = m_sumCombinedPsnrDb / static_cast<double>(m_psnrSamples);
 
         if (psnr.Passed)
         {
@@ -1208,7 +1280,7 @@ H264StreamValidationSession::Finish() noexcept
         }
     }
 
-    m_summary.Passed =
+    const bool structuralOk =
         m_summary.Enabled &&
         m_summary.DecoderInitialized &&
         m_summary.PacketsInspected > 0ULL &&
@@ -1217,9 +1289,17 @@ H264StreamValidationSession::Finish() noexcept
         m_summary.DecodeFailures == 0ULL &&
         m_summary.SpsCount > 0ULL &&
         m_summary.PpsCount > 0ULL &&
-        m_summary.IdrCount > 0ULL &&
-        (!m_verifySyntheticPsnr ||
-         (m_summary.PsnrPassCount > 0ULL && m_summary.PsnrFailCount == 0ULL));
+        m_summary.IdrCount > 0ULL;
+
+    m_summary.StructuralDecodeValidated = structuralOk;
+    m_summary.FidelityPsnrValidated =
+        structuralOk &&
+        m_verifySyntheticPsnr &&
+        m_summary.PsnrPassCount > 0ULL &&
+        m_summary.PsnrFailCount == 0ULL;
+    m_summary.Passed =
+        structuralOk &&
+        (!m_verifySyntheticPsnr || m_summary.FidelityPsnrValidated);
 }
 
 void
@@ -1230,6 +1310,7 @@ H264StreamValidationSession::Shutdown() noexcept
     m_height = 0U;
     m_sumYPsnrDb = 0.0;
     m_sumUvPsnrDb = 0.0;
+    m_sumCombinedPsnrDb = 0.0;
     m_psnrSamples = 0ULL;
 }
 

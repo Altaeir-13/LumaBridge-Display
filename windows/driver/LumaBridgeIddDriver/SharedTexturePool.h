@@ -38,6 +38,10 @@ struct SharedTexturePoolMetricsSnapshot
     uint64_t TotalGpuSyncWaitUs{0ULL};
     uint64_t AvgGpuSyncWaitUs{0ULL};
     uint64_t MaxGpuSyncWaitUs{0ULL};
+    uint64_t LastProducerSlotWaitUs{0ULL};
+    uint64_t TotalProducerSlotWaitUs{0ULL};
+    uint64_t AvgProducerSlotWaitUs{0ULL};
+    uint64_t MaxProducerSlotWaitUs{0ULL};
     HRESULT LastGpuError{S_OK};
 };
 
@@ -57,6 +61,7 @@ struct SharedTextureExtractResult
     uint32_t Height{0U};
     uint32_t Format{0U};
     uint64_t FrameSequence{0ULL};
+    uint64_t ProducerSlotAndMutexWaitUs{0ULL};
     uint64_t GpuCopyLatencyUs{0ULL};
 };
 

@@ -73,6 +73,9 @@ struct SwapChainFrameMetadata
     uint32_t MoveRegionCount{0};
     bool HwProtectedSurface{false};
     uint64_t PresentDisplayQPCTime{0};
+    uint64_t RawIddCxPresentDisplayQPCTime{0};
+    uint64_t SwapChainAcquireQpcTime{0};
+    bool PresentDisplayQpcWasFutureTarget{false};
     bool HasValidSurface{false};
     bool ExtractionAttempted{false};
     bool ExtractionAccepted{false};

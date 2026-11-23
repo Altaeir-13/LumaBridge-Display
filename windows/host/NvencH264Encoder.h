@@ -65,9 +65,14 @@ struct EncodedFramePacket
     bool IsKeyFrame{false};
     uint64_t PresentDisplayQpcTime{0ULL};
     uint64_t ExtractCompleteQpcTime{0ULL};
+    uint64_t HostReceiveQpcTime{0ULL};
     uint64_t BitstreamReadyQpcTime{0ULL};
     uint64_t QpcFrequency{10000000ULL};
     uint64_t EncodeLatencyUs{0ULL};
+    uint64_t FormatPrepareUs{0ULL};
+    uint64_t EncodePictureUs{0ULL};
+    uint64_t BitstreamLockCopyUs{0ULL};
+    uint64_t QueuePopWaitUs{0ULL};
     uint32_t PictureType{0U};
     std::vector<uint8_t> Bitstream{};
 };
@@ -118,10 +123,24 @@ struct NvencMetricsSnapshot
     NVENCSTATUS LastNvencStatus{NV_ENC_SUCCESS};
     HRESULT LastHResult{S_OK};
     NvencCapabilitiesSnapshot Capabilities{};
+    uint64_t SessionInitializeLatencyUs{0ULL};
+    uint64_t MissingPresentTimestampCount{0ULL};
+    uint64_t MissingExtractTimestampCount{0ULL};
+    uint64_t InvalidTimestampCount{0ULL};
+    uint64_t ValidPresentToBitstreamSamples{0ULL};
+    uint64_t ValidExtractToBitstreamSamples{0ULL};
+    double PresentToBitstreamCoveragePercent{0.0};
+    double ExtractToBitstreamCoveragePercent{0.0};
     LatencySummaryStats EncodeLatencyUs{};
     LatencySummaryStats EncodedFrameSizeBytes{};
     LatencySummaryStats PresentToBitstreamLatencyUs{};
     LatencySummaryStats ExtractToBitstreamLatencyUs{};
+    LatencySummaryStats HostReceiveToSubmitLatencyUs{};
+    LatencySummaryStats FormatPrepareLatencyUs{};
+    LatencySummaryStats EncodePictureLatencyUs{};
+    LatencySummaryStats BitstreamLockCopyLatencyUs{};
+    LatencySummaryStats EncodedQueueWaitLatencyUs{};
+    LatencySummaryStats EncodeInterFrameJitterUs{};
 };
 
 /// Testability seam for injecting NVENC runtime faults (encoder busy, device removed, etc.).
@@ -195,7 +214,8 @@ public:
         uint64_t presentDisplayQpcTime,
         uint64_t extractCompleteQpcTime,
         uint64_t qpcFrequency,
-        EncodedFramePacket* outPacketCopy = nullptr
+        EncodedFramePacket* outPacketCopy = nullptr,
+        uint64_t hostReceiveQpcTime = 0ULL
         ) noexcept;
 
     bool TryPopEncodedFrame(EncodedFramePacket& outPacket) noexcept;
@@ -265,6 +285,7 @@ private:
     bool m_forceIdrNextFrame{true};
     uint64_t m_firstEncodedQpc{0ULL};
     uint64_t m_lastEncodedQpc{0ULL};
+    uint64_t m_prevFrameInterFrameIntervalUs{0ULL};
     uint64_t m_qpcFrequency{10000000ULL};
 
     EncodedFrameQueue m_encodedQueue{};
@@ -273,6 +294,12 @@ private:
     LatencyStatTracker m_packetSizeTracker{};
     LatencyStatTracker m_presentToBitstreamTracker{};
     LatencyStatTracker m_extractToBitstreamTracker{};
+    LatencyStatTracker m_hostReceiveToSubmitTracker{};
+    LatencyStatTracker m_formatPrepareTracker{};
+    LatencyStatTracker m_encodePictureTracker{};
+    LatencyStatTracker m_bitstreamLockCopyTracker{};
+    LatencyStatTracker m_encodedQueueWaitTracker{};
+    LatencyStatTracker m_encodeInterFrameJitterTracker{};
 };
 
 } // namespace lumabridge::host

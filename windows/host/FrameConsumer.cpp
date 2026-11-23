@@ -370,6 +370,7 @@ ComputeLatencySummary(
     ) noexcept
 {
     LatencySummaryStats out{};
+    out.Available = false;
     out.LastUs = lastUs;
     if (samples.empty())
     {
@@ -394,6 +395,7 @@ ComputeLatencySummary(
     }
 
     const size_t n = sorted.size();
+    out.Available = (n > 0U);
     out.SampleCount = static_cast<uint64_t>(n);
     out.MinUs = sorted.front();
     out.MaxUs = sorted.back();
@@ -413,6 +415,8 @@ ComputeValidatedFrameIntervals(
     bool sentAck
     ) noexcept
 {
+    static constexpr uint64_t kMaxPlausibleStageDurationUs = 30000000ULL;
+
     ValidatedFrameIntervals out{};
     out.PreConnectQueued =
         ((header.Flags & static_cast<uint32_t>(ipc::FrameIpcFlags::PreConnectQueuedFrame)) != 0U);
@@ -422,42 +426,94 @@ ComputeValidatedFrameIntervals(
         header.QpcFrequency != consumerQpcFreq)
     {
         out.Valid = false;
+        out.CoreTimestampsValid = false;
         out.QpcFrequencyMismatch = true;
+        out.IncompatibleTimestampUnits = true;
         return out;
     }
 
     if (header.ExtractCompleteQpcTime == 0ULL ||
         header.ServerSendQpcTime == 0ULL ||
-        recvPayloadQpc == 0ULL ||
-        header.ServerSendQpcTime < header.ExtractCompleteQpcTime ||
-        recvPayloadQpc < header.ServerSendQpcTime ||
-        (sentAck && ackCompleteQpc < recvPayloadQpc) ||
-        (!sentAck && ackCompleteQpc != 0ULL && ackCompleteQpc < recvPayloadQpc) ||
-        (header.PresentDisplayQpcTime > 0ULL &&
-         header.ExtractCompleteQpcTime < header.PresentDisplayQpcTime))
+        recvPayloadQpc == 0ULL)
     {
         out.Valid = false;
+        out.CoreTimestampsValid = false;
+        out.MissingCoreTimestamp = true;
+        return out;
+    }
+
+    if (header.ServerSendQpcTime < header.ExtractCompleteQpcTime ||
+        recvPayloadQpc < header.ServerSendQpcTime ||
+        (sentAck && ackCompleteQpc < recvPayloadQpc) ||
+        (!sentAck && ackCompleteQpc != 0ULL && ackCompleteQpc < recvPayloadQpc))
+    {
+        out.Valid = false;
+        out.CoreTimestampsValid = false;
+        out.FutureTimestampDetected = true;
         out.OutOfOrderTimestamps = true;
         return out;
     }
 
     const uint64_t freq = consumerQpcFreq;
-    out.Valid = true;
-    out.CopyUs = ipc::UnpackCopyLatencyUsFromFlags(header.Flags);
-    out.QueueWaitUs = ((header.ServerSendQpcTime - header.ExtractCompleteQpcTime) * 1000000ULL) / freq;
-    out.IpcTransitUs = ((recvPayloadQpc - header.ServerSendQpcTime) * 1000000ULL) / freq;
-    if (ackCompleteQpc >= recvPayloadQpc)
+    const uint64_t queueWaitUs = ipc::ComputeQpcElapsedUs(header.ExtractCompleteQpcTime, header.ServerSendQpcTime, freq);
+    const uint64_t ipcTransitUs = ipc::ComputeQpcElapsedUs(header.ServerSendQpcTime, recvPayloadQpc, freq);
+    const uint64_t hostVerifyAckUs = (ackCompleteQpc >= recvPayloadQpc)
+        ? ipc::ComputeQpcElapsedUs(recvPayloadQpc, ackCompleteQpc, freq)
+        : 0ULL;
+    const uint64_t endToEndUs = ipc::ComputeQpcElapsedUs(header.ExtractCompleteQpcTime, recvPayloadQpc, freq);
+
+    if (queueWaitUs > kMaxPlausibleStageDurationUs ||
+        ipcTransitUs > kMaxPlausibleStageDurationUs ||
+        hostVerifyAckUs > kMaxPlausibleStageDurationUs ||
+        endToEndUs > kMaxPlausibleStageDurationUs)
     {
-        out.HostVerifyAckUs = ((ackCompleteQpc - recvPayloadQpc) * 1000000ULL) / freq;
-    }
-    out.EndToEndUs = ((recvPayloadQpc - header.ExtractCompleteQpcTime) * 1000000ULL) / freq;
-    if (header.PresentDisplayQpcTime > 0ULL)
-    {
-        out.HasPresentToExtract = true;
-        out.PresentToExtractUs =
-            ((header.ExtractCompleteQpcTime - header.PresentDisplayQpcTime) * 1000000ULL) / freq;
+        out.Valid = false;
+        out.CoreTimestampsValid = false;
+        out.IncompatibleTimestampUnits = true;
+        return out;
     }
 
+    out.CoreTimestampsValid = true;
+    out.CopyUs = ipc::UnpackCopyLatencyUsFromFlags(header.Flags);
+    out.QueueWaitUs = queueWaitUs;
+    out.IpcTransitUs = ipcTransitUs;
+    out.HostVerifyAckUs = hostVerifyAckUs;
+    out.EndToEndUs = endToEndUs;
+
+    if (header.PresentDisplayQpcTime == 0ULL)
+    {
+        out.PresentTimestampMissing = true;
+        out.PresentTimestampAvailable = false;
+        out.HasPresentToExtract = false;
+        out.Valid = true;
+        return out;
+    }
+
+    if (header.ExtractCompleteQpcTime < header.PresentDisplayQpcTime)
+    {
+        out.FutureTimestampDetected = true;
+        out.OutOfOrderTimestamps = true;
+        out.PresentTimestampAvailable = false;
+        out.HasPresentToExtract = false;
+        out.Valid = false;
+        return out;
+    }
+
+    const uint64_t presentToExtractUs =
+        ipc::ComputeQpcElapsedUs(header.PresentDisplayQpcTime, header.ExtractCompleteQpcTime, freq);
+    if (presentToExtractUs > kMaxPlausibleStageDurationUs)
+    {
+        out.IncompatibleTimestampUnits = true;
+        out.PresentTimestampAvailable = false;
+        out.HasPresentToExtract = false;
+        out.Valid = false;
+        return out;
+    }
+
+    out.PresentTimestampAvailable = true;
+    out.HasPresentToExtract = true;
+    out.PresentToExtractUs = presentToExtractUs;
+    out.Valid = true;
     return out;
 }
 
@@ -623,13 +679,27 @@ FrameConsumer::EnsureD3d11DeviceForAdapterLuid(
             targetAdapter.Get(),
             D3D_DRIVER_TYPE_UNKNOWN,
             nullptr,
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
             kLevels,
             ARRAYSIZE(kLevels),
             D3D11_SDK_VERSION,
             &device,
             &selectedLevel,
             &context);
+        if (FAILED(hr))
+        {
+            hr = D3D11CreateDevice(
+                targetAdapter.Get(),
+                D3D_DRIVER_TYPE_UNKNOWN,
+                nullptr,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                kLevels,
+                ARRAYSIZE(kLevels),
+                D3D11_SDK_VERSION,
+                &device,
+                &selectedLevel,
+                &context);
+        }
     }
     else
     {
@@ -637,13 +707,27 @@ FrameConsumer::EnsureD3d11DeviceForAdapterLuid(
             nullptr,
             D3D_DRIVER_TYPE_HARDWARE,
             nullptr,
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
             kLevels,
             ARRAYSIZE(kLevels),
             D3D11_SDK_VERSION,
             &device,
             &selectedLevel,
             &context);
+        if (FAILED(hr))
+        {
+            hr = D3D11CreateDevice(
+                nullptr,
+                D3D_DRIVER_TYPE_HARDWARE,
+                nullptr,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                kLevels,
+                ARRAYSIZE(kLevels),
+                D3D11_SDK_VERSION,
+                &device,
+                &selectedLevel,
+                &context);
+        }
         if (FAILED(hr) && m_config.AllowWarpAdapterFallbackForSyntheticLuid)
         {
             hr = D3D11CreateDevice(
@@ -672,12 +756,81 @@ FrameConsumer::EnsureD3d11DeviceForAdapterLuid(
         return FAILED(hr) ? hr : E_NOINTERFACE;
     }
 
+    LUID actualBoundLuid = expectedLuid;
+    Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDev;
+    Microsoft::WRL::ComPtr<IDXGIAdapter> boundAdapter;
+    if (SUCCEEDED(device.As(&dxgiDev)) && dxgiDev != nullptr &&
+        SUCCEEDED(dxgiDev->GetAdapter(&boundAdapter)) && boundAdapter != nullptr)
+    {
+        DXGI_ADAPTER_DESC desc{};
+        if (SUCCEEDED(boundAdapter->GetDesc(&desc)))
+        {
+            actualBoundLuid = desc.AdapterLuid;
+        }
+    }
+
     m_d3dDevice = device;
     m_d3dDevice1 = device1;
     m_d3dContext = context;
-    m_boundAdapterLuid = expectedLuid;
+    m_boundAdapterLuid = actualBoundLuid;
     m_hasBoundD3dDevice = true;
     return S_OK;
+}
+
+HRESULT
+FrameConsumer::PrewarmD3d11Device() noexcept
+{
+    if (m_config.TransportPreference == HostTransportPreference::CpuStagingOnly)
+    {
+        return S_FALSE;
+    }
+
+    if (m_hasBoundD3dDevice &&
+        m_d3dDevice != nullptr &&
+        m_d3dDevice1 != nullptr &&
+        m_d3dContext != nullptr &&
+        SUCCEEDED(m_d3dDevice->GetDeviceRemovedReason()))
+    {
+        return S_OK;
+    }
+
+    if (m_config.HasForcedAdapterLuid)
+    {
+        return EnsureD3d11DeviceForAdapterLuid(m_config.ForcedAdapterLuid);
+    }
+
+    Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+    LUID preferredLuid{0, 0};
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) && factory != nullptr)
+    {
+        for (UINT idx = 0U;; ++idx)
+        {
+            Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+            if (factory->EnumAdapters1(idx, &adapter) != S_OK || adapter == nullptr)
+            {
+                break;
+            }
+            DXGI_ADAPTER_DESC1 desc{};
+            if (SUCCEEDED(adapter->GetDesc1(&desc)))
+            {
+                if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0U)
+                {
+                    continue;
+                }
+                if (desc.VendorId == 0x10DEU)
+                {
+                    preferredLuid = desc.AdapterLuid;
+                    break;
+                }
+                if (preferredLuid.LowPart == 0UL && preferredLuid.HighPart == 0L)
+                {
+                    preferredLuid = desc.AdapterLuid;
+                }
+            }
+        }
+    }
+
+    return EnsureD3d11DeviceForAdapterLuid(preferredLuid);
 }
 
 HRESULT
@@ -876,6 +1029,25 @@ FrameConsumer::SendGpuFrameAck(
 }
 
 void
+FrameConsumer::PopulateLatencySummariesLocked(
+    HostConsumerMetricsSnapshot& dst
+    ) const noexcept
+{
+    dst.CopyLatency = m_copyLat.Summarize();
+    dst.PresentToExtractLatency = m_presentToExtractLat.Summarize();
+    dst.QueueWaitLatency = m_queueWaitLat.Summarize();
+    dst.LiveQueueWaitLatency = m_liveQueueWaitLat.Summarize();
+    dst.IpcTransitLatency = m_ipcTransitLat.Summarize();
+    dst.HostVerifyAckLatency = m_hostVerifyAckLat.Summarize();
+    dst.EndToEndLatency = m_endToEndLat.Summarize();
+    dst.LiveEndToEndLatency = m_liveEndToEndLat.Summarize();
+    dst.InterFrameInterval = m_interFrameLat.Summarize();
+    dst.InterFrameJitter = m_interFrameJitterLat.Summarize();
+    dst.GpuSyncWaitLatency = m_gpuSyncWaitLat.Summarize();
+    dst.HostGpuCopyLatency = m_hostGpuCopyLat.Summarize();
+}
+
+void
 FrameConsumer::UpdateDerivedFpsAndLatenciesLocked(
     uint64_t nowQpc,
     uint64_t executionStartQpc
@@ -910,16 +1082,219 @@ FrameConsumer::UpdateDerivedFpsAndLatenciesLocked(
     m_metrics.FpsSampleSufficient = fps.FpsSampleSufficient;
     m_metrics.ReceiveFps = fps.FpsSampleSufficient ? fps.ObservedActiveFps : fps.AverageExecutionFps;
 
-    m_metrics.CopyLatency = m_copyLat.Summarize();
-    m_metrics.PresentToExtractLatency = m_presentToExtractLat.Summarize();
-    m_metrics.QueueWaitLatency = m_queueWaitLat.Summarize();
-    m_metrics.LiveQueueWaitLatency = m_liveQueueWaitLat.Summarize();
-    m_metrics.IpcTransitLatency = m_ipcTransitLat.Summarize();
-    m_metrics.HostVerifyAckLatency = m_hostVerifyAckLat.Summarize();
-    m_metrics.EndToEndLatency = m_endToEndLat.Summarize();
-    m_metrics.LiveEndToEndLatency = m_liveEndToEndLat.Summarize();
-    m_metrics.InterFrameInterval = m_interFrameLat.Summarize();
-    m_metrics.GpuSyncWaitLatency = m_gpuSyncWaitLat.Summarize();
+    m_metrics.CoreTimestampCoveragePercent = (m_metrics.FramesReceived > 0ULL)
+        ? (static_cast<double>(m_metrics.ValidCoreTimestampSamples) * 100.0) / static_cast<double>(m_metrics.FramesReceived)
+        : 0.0;
+    m_metrics.LiveTimestampCoveragePercent = (m_metrics.LiveFramesReceived > 0ULL)
+        ? (static_cast<double>(m_metrics.ValidLiveTimestampSamples) * 100.0) / static_cast<double>(m_metrics.LiveFramesReceived)
+        : 0.0;
+    m_metrics.PresentTimestampCoveragePercent = (m_metrics.FramesReceived > 0ULL)
+        ? (static_cast<double>(m_metrics.ValidPresentTimestampSamples) * 100.0) / static_cast<double>(m_metrics.FramesReceived)
+        : 0.0;
+}
+
+void
+FrameConsumer::RecordFrameMetricsAndTimestampsLocked(
+    uint64_t frameSequence,
+    uint32_t presentationFrameNumber,
+    uint32_t width,
+    uint32_t height,
+    uint32_t pixelFormat,
+    uint32_t payloadCrc32,
+    uint64_t bytesReceivedIncrement,
+    bool crcOk,
+    bool patternOk,
+    uint64_t presentDisplayQpc,
+    uint64_t extractCompleteQpc,
+    uint64_t serverSendQpc,
+    uint64_t recvCompleteQpc,
+    uint64_t ackCompleteQpc,
+    const ValidatedFrameIntervals& intervals,
+    bool hasGpuSyncSample,
+    uint64_t gpuSyncWaitUs,
+    bool hasHostGpuCopySample,
+    uint64_t hostGpuCopyUs
+    ) noexcept
+{
+    if (m_metrics.LastFrameSequence != 0ULL)
+    {
+        if (frameSequence <= m_metrics.LastFrameSequence)
+        {
+            ++m_metrics.OutOfOrderSequenceCount;
+        }
+        else if (frameSequence > (m_metrics.LastFrameSequence + 1ULL))
+        {
+            m_metrics.SequenceGapsDetected += (frameSequence - m_metrics.LastFrameSequence - 1ULL);
+        }
+    }
+
+    ++m_metrics.FramesReceived;
+    ++m_currentSessionFrames;
+    if (m_currentSessionFrames > m_metrics.MaxFramesPerSession)
+    {
+        m_metrics.MaxFramesPerSession = m_currentSessionFrames;
+    }
+    m_metrics.BytesReceived += bytesReceivedIncrement;
+
+    if (!crcOk)
+    {
+        ++m_metrics.ChecksumMismatches;
+        m_metrics.LastProtocolStatus = ipc::FrameIpcStatus::ChecksumMismatch;
+        m_metrics.TransportHealthy = false;
+    }
+    if (!patternOk)
+    {
+        ++m_metrics.SyntheticPatternMismatches;
+        m_metrics.TransportHealthy = false;
+    }
+
+    const bool frameValid = crcOk && patternOk;
+    if (frameValid)
+    {
+        ++m_metrics.FramesValid;
+        if (m_firstValidFrameQpc == 0ULL)
+        {
+            m_firstValidFrameQpc = recvCompleteQpc;
+        }
+        m_lastValidFrameQpc = recvCompleteQpc;
+
+        if (intervals.PreConnectQueued)
+        {
+            ++m_metrics.PreConnectFramesReceived;
+        }
+        else
+        {
+            ++m_metrics.LiveFramesReceived;
+            if (m_firstLiveFrameQpc == 0ULL)
+            {
+                m_firstLiveFrameQpc = recvCompleteQpc;
+            }
+            m_lastLiveFrameQpc = recvCompleteQpc;
+        }
+
+        if (m_prevValidRecvQpc > 0ULL)
+        {
+            if (recvCompleteQpc >= m_prevValidRecvQpc)
+            {
+                const uint64_t intervalUs =
+                    ipc::ComputeQpcElapsedUs(m_prevValidRecvQpc, recvCompleteQpc, m_qpcFreq);
+                m_interFrameLat.Record(intervalUs);
+                if (m_hasPrevInterFrameInterval)
+                {
+                    const uint64_t jitterUs = (intervalUs >= m_prevInterFrameIntervalUs)
+                        ? (intervalUs - m_prevInterFrameIntervalUs)
+                        : (m_prevInterFrameIntervalUs - intervalUs);
+                    m_interFrameJitterLat.Record(jitterUs);
+                }
+                m_prevInterFrameIntervalUs = intervalUs;
+                m_hasPrevInterFrameInterval = true;
+            }
+            else
+            {
+                ++m_metrics.NonMonotonicTimestampCount;
+                ++m_metrics.TimestampMeasurementErrors;
+            }
+        }
+        m_prevValidRecvQpc = recvCompleteQpc;
+    }
+
+    m_metrics.LastFrameSequence = frameSequence;
+    m_metrics.LastPresentationFrameNumber = presentationFrameNumber;
+    m_metrics.LastFrameWidth = width;
+    m_metrics.LastFrameHeight = height;
+    m_metrics.LastPixelFormat = pixelFormat;
+    m_metrics.LastFrameChecksumCrc32 = payloadCrc32;
+    m_lastFrameRecvQpc = recvCompleteQpc;
+
+    if (hasGpuSyncSample)
+    {
+        m_gpuSyncWaitLat.Record(gpuSyncWaitUs);
+    }
+    if (hasHostGpuCopySample)
+    {
+        m_hostGpuCopyLat.Record(hostGpuCopyUs);
+    }
+
+    bool nonMonotonicProducerTs = false;
+    if (intervals.CoreTimestampsValid)
+    {
+        if ((m_prevSessionExtractQpc > 0ULL && extractCompleteQpc < m_prevSessionExtractQpc) ||
+            (m_prevSessionServerSendQpc > 0ULL && serverSendQpc < m_prevSessionServerSendQpc) ||
+            (intervals.PresentTimestampAvailable && m_prevSessionPresentQpc > 0ULL && presentDisplayQpc < m_prevSessionPresentQpc))
+        {
+            nonMonotonicProducerTs = true;
+        }
+        m_prevSessionExtractQpc = extractCompleteQpc;
+        m_prevSessionServerSendQpc = serverSendQpc;
+        if (intervals.PresentTimestampAvailable)
+        {
+            m_prevSessionPresentQpc = presentDisplayQpc;
+        }
+    }
+
+    if (intervals.PresentTimestampMissing)
+    {
+        ++m_metrics.MissingPresentTimestampCount;
+    }
+
+    if (nonMonotonicProducerTs)
+    {
+        ++m_metrics.NonMonotonicTimestampCount;
+    }
+
+    if (!intervals.Valid || nonMonotonicProducerTs)
+    {
+        ++m_metrics.TimestampMeasurementErrors;
+        if (intervals.QpcFrequencyMismatch)
+        {
+            ++m_metrics.QpcFrequencyMismatchCount;
+        }
+        if (intervals.MissingCoreTimestamp)
+        {
+            ++m_metrics.MissingCoreTimestampCount;
+        }
+        if (intervals.FutureTimestampDetected)
+        {
+            ++m_metrics.FutureTimestampErrorCount;
+        }
+        if (intervals.IncompatibleTimestampUnits)
+        {
+            ++m_metrics.IncompatibleTimestampUnitsCount;
+        }
+    }
+    else
+    {
+        ++m_metrics.ValidCoreTimestampSamples;
+        m_copyLat.Record(intervals.CopyUs);
+        if (intervals.HasPresentToExtract)
+        {
+            ++m_metrics.ValidPresentTimestampSamples;
+            m_presentToExtractLat.Record(intervals.PresentToExtractUs);
+        }
+        m_queueWaitLat.Record(intervals.QueueWaitUs);
+        m_ipcTransitLat.Record(intervals.IpcTransitUs);
+        m_hostVerifyAckLat.Record(intervals.HostVerifyAckUs);
+        m_endToEndLat.Record(intervals.EndToEndUs);
+
+        if (!intervals.PreConnectQueued)
+        {
+            ++m_metrics.ValidLiveTimestampSamples;
+            m_liveQueueWaitLat.Record(intervals.QueueWaitUs);
+            m_liveEndToEndLat.Record(intervals.EndToEndUs);
+        }
+
+        m_metrics.LastEndToEndLatencyUs = intervals.EndToEndUs;
+        m_metrics.TotalEndToEndLatencyUs += intervals.EndToEndUs;
+        m_metrics.AvgEndToEndLatencyUs =
+            (m_endToEndLat.Count > 0ULL) ? (m_metrics.TotalEndToEndLatencyUs / m_endToEndLat.Count) : 0ULL;
+        if (intervals.EndToEndUs > m_metrics.MaxEndToEndLatencyUs)
+        {
+            m_metrics.MaxEndToEndLatencyUs = intervals.EndToEndUs;
+        }
+        m_metrics.LastIpcTransitLatencyUs = intervals.IpcTransitUs;
+    }
+
+    UpdateDerivedFpsAndLatenciesLocked(ackCompleteQpc, m_executionStartQpc);
 }
 
 HRESULT
@@ -929,6 +1304,11 @@ FrameConsumer::Connect(
     ) noexcept
 {
     ClosePipeAndResetConnectionState(false);
+
+    if (m_config.TransportPreference != HostTransportPreference::CpuStagingOnly && !m_hasBoundD3dDevice)
+    {
+        (void)PrewarmD3d11Device();
+    }
 
     if (m_ioEvent == nullptr)
     {
@@ -1207,6 +1587,9 @@ FrameConsumer::Connect(
     m_sessionId = serverHello.SessionId;
     m_sessionConnectQpc = QueryCurrentQpc();
     m_currentSessionFrames = 0ULL;
+    m_prevSessionExtractQpc = 0ULL;
+    m_prevSessionServerSendQpc = 0ULL;
+    m_prevSessionPresentQpc = 0ULL;
     m_slotSeenInSession.fill(false);
 
     {
@@ -1632,6 +2015,7 @@ FrameConsumer::ReceiveNextGpuOrCpuFrame(
         }
 
         bool patternOk = true;
+        const uint64_t hostGpuCopyStartQpc = QueryCurrentQpc();
         HRESULT gpuWorkHr = EnsureHostWorkingTexture(
             outGpuHeader.Width,
             outGpuHeader.Height,
@@ -1652,6 +2036,8 @@ FrameConsumer::ReceiveNextGpuOrCpuFrame(
         {
             (void)cacheEntry.KeyedMutex->ReleaseSync(outGpuHeader.KeyedMutexReleaseKey);
         }
+        const uint64_t hostGpuCopyEndQpc = QueryCurrentQpc();
+        const uint64_t hostGpuCopyUs = ipc::ComputeQpcElapsedUs(hostGpuCopyStartQpc, hostGpuCopyEndQpc, m_qpcFreq);
 
         if (FAILED(gpuWorkHr))
         {
@@ -1747,105 +2133,26 @@ FrameConsumer::ReceiveNextGpuOrCpuFrame(
 
         {
             ExclusiveLock lock(&m_metricsLock);
-            if (m_metrics.LastFrameSequence != 0ULL &&
-                outGpuHeader.FrameSequence > (m_metrics.LastFrameSequence + 1ULL))
-            {
-                m_metrics.SequenceGapsDetected += (outGpuHeader.FrameSequence - m_metrics.LastFrameSequence - 1ULL);
-            }
-
-            ++m_metrics.FramesReceived;
-            ++m_currentSessionFrames;
-            if (m_currentSessionFrames > m_metrics.MaxFramesPerSession)
-            {
-                m_metrics.MaxFramesPerSession = m_currentSessionFrames;
-            }
-            m_metrics.BytesReceived += sizeof(outGpuHeader);
-
-            if (!patternOk)
-            {
-                ++m_metrics.SyntheticPatternMismatches;
-                m_metrics.TransportHealthy = false;
-            }
-            else
-            {
-                ++m_metrics.FramesValid;
-                if (m_firstValidFrameQpc == 0ULL)
-                {
-                    m_firstValidFrameQpc = recvCompleteQpc;
-                }
-                m_lastValidFrameQpc = recvCompleteQpc;
-
-                if (intervals.PreConnectQueued)
-                {
-                    ++m_metrics.PreConnectFramesReceived;
-                }
-                else
-                {
-                    ++m_metrics.LiveFramesReceived;
-                    if (m_firstLiveFrameQpc == 0ULL)
-                    {
-                        m_firstLiveFrameQpc = recvCompleteQpc;
-                    }
-                    m_lastLiveFrameQpc = recvCompleteQpc;
-                }
-
-                if (m_prevValidRecvQpc > 0ULL)
-                {
-                    if (recvCompleteQpc >= m_prevValidRecvQpc)
-                    {
-                        m_interFrameLat.Record(
-                            ipc::ComputeQpcElapsedUs(m_prevValidRecvQpc, recvCompleteQpc, m_qpcFreq));
-                    }
-                    else
-                    {
-                        ++m_metrics.TimestampMeasurementErrors;
-                    }
-                }
-                m_prevValidRecvQpc = recvCompleteQpc;
-            }
-
-            m_metrics.LastFrameSequence = outGpuHeader.FrameSequence;
-            m_metrics.LastPresentationFrameNumber = outGpuHeader.PresentationFrameNumber;
-            m_metrics.LastFrameWidth = outGpuHeader.Width;
-            m_metrics.LastFrameHeight = outGpuHeader.Height;
-            m_metrics.LastPixelFormat = outGpuHeader.PixelFormat;
-            m_metrics.LastFrameChecksumCrc32 = 0U;
-            m_gpuSyncWaitLat.Record(syncWaitUs64);
-
-            if (!intervals.Valid)
-            {
-                ++m_metrics.TimestampMeasurementErrors;
-            }
-            else
-            {
-                m_copyLat.Record(intervals.CopyUs);
-                if (intervals.HasPresentToExtract)
-                {
-                    m_presentToExtractLat.Record(intervals.PresentToExtractUs);
-                }
-                m_queueWaitLat.Record(intervals.QueueWaitUs);
-                m_ipcTransitLat.Record(intervals.IpcTransitUs);
-                m_hostVerifyAckLat.Record(intervals.HostVerifyAckUs);
-                m_endToEndLat.Record(intervals.EndToEndUs);
-
-                if (!intervals.PreConnectQueued)
-                {
-                    m_liveQueueWaitLat.Record(intervals.QueueWaitUs);
-                    m_liveEndToEndLat.Record(intervals.EndToEndUs);
-                }
-
-                m_metrics.LastEndToEndLatencyUs = intervals.EndToEndUs;
-                m_metrics.TotalEndToEndLatencyUs += intervals.EndToEndUs;
-                m_metrics.AvgEndToEndLatencyUs =
-                    (m_endToEndLat.Count > 0ULL) ? (m_metrics.TotalEndToEndLatencyUs / m_endToEndLat.Count) : 0ULL;
-                if (intervals.EndToEndUs > m_metrics.MaxEndToEndLatencyUs)
-                {
-                    m_metrics.MaxEndToEndLatencyUs = intervals.EndToEndUs;
-                }
-                m_metrics.LastIpcTransitLatencyUs = intervals.IpcTransitUs;
-            }
-
-            UpdateDerivedFpsAndLatenciesLocked(ackCompleteQpc, m_executionStartQpc);
+            RecordFrameMetricsAndTimestampsLocked(
+                outGpuHeader.FrameSequence,
+                outGpuHeader.PresentationFrameNumber,
+                outGpuHeader.Width,
+                outGpuHeader.Height,
+                outGpuHeader.PixelFormat,
+                0U,
+                static_cast<uint64_t>(sizeof(outGpuHeader)),
+                true,
+                patternOk,
+                outGpuHeader.PresentDisplayQpcTime,
+                outGpuHeader.ExtractCompleteQpcTime,
+                outGpuHeader.ServerSendQpcTime,
+                recvCompleteQpc,
+                ackCompleteQpc,
+                intervals,
+                true,
+                syncWaitUs64,
+                true,
+                hostGpuCopyUs);
         }
 
         outIsGpuFrame = true;
@@ -2026,112 +2333,26 @@ FrameConsumer::ReceiveNextGpuOrCpuFrame(
 
     {
         ExclusiveLock lock(&m_metricsLock);
-        if (m_metrics.LastFrameSequence != 0ULL &&
-            outHeader.FrameSequence > (m_metrics.LastFrameSequence + 1ULL))
-        {
-            m_metrics.SequenceGapsDetected += (outHeader.FrameSequence - m_metrics.LastFrameSequence - 1ULL);
-        }
-
-        ++m_metrics.FramesReceived;
-        ++m_currentSessionFrames;
-        if (m_currentSessionFrames > m_metrics.MaxFramesPerSession)
-        {
-            m_metrics.MaxFramesPerSession = m_currentSessionFrames;
-        }
-        m_metrics.BytesReceived += static_cast<uint64_t>(outPixels.size()) + sizeof(outHeader);
-
-        if (!crcOk)
-        {
-            ++m_metrics.ChecksumMismatches;
-            m_metrics.LastProtocolStatus = ipc::FrameIpcStatus::ChecksumMismatch;
-            m_metrics.TransportHealthy = false;
-        }
-        if (!patternOk)
-        {
-            ++m_metrics.SyntheticPatternMismatches;
-            m_metrics.TransportHealthy = false;
-        }
-
-        const bool frameValid = crcOk && patternOk;
-        if (frameValid)
-        {
-            ++m_metrics.FramesValid;
-            if (m_firstValidFrameQpc == 0ULL)
-            {
-                m_firstValidFrameQpc = recvPayloadQpc;
-            }
-            m_lastValidFrameQpc = recvPayloadQpc;
-
-            if (intervals.PreConnectQueued)
-            {
-                ++m_metrics.PreConnectFramesReceived;
-            }
-            else
-            {
-                ++m_metrics.LiveFramesReceived;
-                if (m_firstLiveFrameQpc == 0ULL)
-                {
-                    m_firstLiveFrameQpc = recvPayloadQpc;
-                }
-                m_lastLiveFrameQpc = recvPayloadQpc;
-            }
-
-            if (m_prevValidRecvQpc > 0ULL)
-            {
-                if (recvPayloadQpc >= m_prevValidRecvQpc)
-                {
-                    m_interFrameLat.Record(
-                        ipc::ComputeQpcElapsedUs(m_prevValidRecvQpc, recvPayloadQpc, m_qpcFreq));
-                }
-                else
-                {
-                    ++m_metrics.TimestampMeasurementErrors;
-                }
-            }
-            m_prevValidRecvQpc = recvPayloadQpc;
-        }
-
-        m_metrics.LastFrameSequence = outHeader.FrameSequence;
-        m_metrics.LastPresentationFrameNumber = outHeader.PresentationFrameNumber;
-        m_metrics.LastFrameWidth = outHeader.Width;
-        m_metrics.LastFrameHeight = outHeader.Height;
-        m_metrics.LastPixelFormat = outHeader.PixelFormat;
-        m_metrics.LastFrameChecksumCrc32 = actualCrc;
-
-        if (!intervals.Valid)
-        {
-            ++m_metrics.TimestampMeasurementErrors;
-        }
-        else
-        {
-            m_copyLat.Record(intervals.CopyUs);
-            if (intervals.HasPresentToExtract)
-            {
-                m_presentToExtractLat.Record(intervals.PresentToExtractUs);
-            }
-            m_queueWaitLat.Record(intervals.QueueWaitUs);
-            m_ipcTransitLat.Record(intervals.IpcTransitUs);
-            m_hostVerifyAckLat.Record(intervals.HostVerifyAckUs);
-            m_endToEndLat.Record(intervals.EndToEndUs);
-
-            if (!intervals.PreConnectQueued)
-            {
-                m_liveQueueWaitLat.Record(intervals.QueueWaitUs);
-                m_liveEndToEndLat.Record(intervals.EndToEndUs);
-            }
-
-            m_metrics.LastEndToEndLatencyUs = intervals.EndToEndUs;
-            m_metrics.TotalEndToEndLatencyUs += intervals.EndToEndUs;
-            m_metrics.AvgEndToEndLatencyUs =
-                (m_endToEndLat.Count > 0ULL) ? (m_metrics.TotalEndToEndLatencyUs / m_endToEndLat.Count) : 0ULL;
-            if (intervals.EndToEndUs > m_metrics.MaxEndToEndLatencyUs)
-            {
-                m_metrics.MaxEndToEndLatencyUs = intervals.EndToEndUs;
-            }
-            m_metrics.LastIpcTransitLatencyUs = intervals.IpcTransitUs;
-        }
-
-        UpdateDerivedFpsAndLatenciesLocked(ackCompleteQpc, m_executionStartQpc);
+        RecordFrameMetricsAndTimestampsLocked(
+            outHeader.FrameSequence,
+            outHeader.PresentationFrameNumber,
+            outHeader.Width,
+            outHeader.Height,
+            outHeader.PixelFormat,
+            actualCrc,
+            static_cast<uint64_t>(outPixels.size()) + sizeof(outHeader),
+            crcOk,
+            patternOk,
+            outHeader.PresentDisplayQpcTime,
+            outHeader.ExtractCompleteQpcTime,
+            outHeader.ServerSendQpcTime,
+            recvPayloadQpc,
+            ackCompleteQpc,
+            intervals,
+            false,
+            0ULL,
+            false,
+            0ULL);
     }
 
     if (!crcOk)
@@ -2314,8 +2535,12 @@ FrameConsumer::RunLoop(
             onFrame(header, pixels);
         }
 
-        const HostConsumerMetricsSnapshot snap = GetMetricsSnapshot();
-        if (m_config.MaxFrames > 0ULL && snap.FramesValid >= m_config.MaxFrames)
+        uint64_t framesValidNow = 0ULL;
+        {
+            SharedLock lock(&m_metricsLock);
+            framesValidNow = m_metrics.FramesValid;
+        }
+        if (m_config.MaxFrames > 0ULL && framesValidNow >= m_config.MaxFrames)
         {
             finalHr = S_OK;
             finalReason = HostExitReason::FrameTargetReached;
@@ -2347,6 +2572,7 @@ FrameConsumer::RunLoop(
     {
         ExclusiveLock lock(&m_metricsLock);
         UpdateDerivedFpsAndLatenciesLocked(endQpc, execStartQpc);
+        PopulateLatencySummariesLocked(m_metrics);
         m_metrics.ExitReason = finalReason;
         m_metrics.HostProcessExitedNormally = normalExit;
         m_metrics.FrameTargetReached =
@@ -2440,6 +2666,7 @@ FrameConsumer::GetMetricsSnapshot() const noexcept
     const uint64_t nowQpc = QueryCurrentQpc();
     SharedLock lock(&m_metricsLock);
     HostConsumerMetricsSnapshot snap = m_metrics;
+    PopulateLatencySummariesLocked(snap);
     if (m_executionStartQpc > 0ULL && nowQpc >= m_executionStartQpc)
     {
         snap.TotalExecutionDurationUs = ipc::ComputeQpcElapsedUs(m_executionStartQpc, nowQpc, m_qpcFreq);

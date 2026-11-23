@@ -49,7 +49,11 @@ struct H264ValidationSummary
 {
     bool Enabled{false};
     bool DecoderInitialized{false};
+    bool StructuralDecodeValidated{false};
+    bool FidelityPsnrValidated{false};
+    std::string ValidationMode{"Disabled"};
     std::string DecoderName{"None"};
+    std::string MatchedColorMatrix{"None"};
     uint64_t PacketsInspected{0ULL};
     uint64_t FramesDecoded{0ULL};
     uint64_t NalParseFailures{0ULL};
@@ -64,6 +68,8 @@ struct H264ValidationSummary
     double AvgYPsnrDb{0.0};
     double MinUvPsnrDb{0.0};
     double AvgUvPsnrDb{0.0};
+    double MinCombinedPsnrDb{0.0};
+    double AvgCombinedPsnrDb{0.0};
     bool Passed{false};
     HRESULT LastHResult{S_OK};
 };
@@ -156,6 +162,13 @@ public:
         double minPsnrDb = 25.0
         ) noexcept;
 
+    /// Pre-warms the independent Media Foundation H.264 decoder before live frames arrive.
+    HRESULT PrewarmDecoder(
+        uint32_t width,
+        uint32_t height,
+        uint32_t targetFps = 0U
+        ) noexcept;
+
     void SubmitPacket(const EncodedFramePacket& packet) noexcept;
     void Finish() noexcept;
     void Shutdown() noexcept;
@@ -173,6 +186,7 @@ private:
     uint32_t m_height{0U};
     double m_sumYPsnrDb{0.0};
     double m_sumUvPsnrDb{0.0};
+    double m_sumCombinedPsnrDb{0.0};
     uint64_t m_psnrSamples{0ULL};
     H264IndependentDecoder m_decoder{};
     H264ValidationSummary m_summary{};

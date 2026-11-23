@@ -22,6 +22,26 @@ using lumabridge::driver::LumaBridgeTraceWarn;
 
 namespace lumabridge::driver {
 
+namespace {
+
+uint64_t
+QueryAdapterQpcNow() noexcept
+{
+    LARGE_INTEGER li{};
+    (void)QueryPerformanceCounter(&li);
+    return (li.QuadPart > 0) ? static_cast<uint64_t>(li.QuadPart) : 0ULL;
+}
+
+uint64_t
+QueryAdapterQpcFreqSafe() noexcept
+{
+    LARGE_INTEGER li{};
+    (void)QueryPerformanceFrequency(&li);
+    return (li.QuadPart > 0) ? static_cast<uint64_t>(li.QuadPart) : 10000000ULL;
+}
+
+} // namespace
+
 /// D3D11/DXGI/IddCx implementation of ISwapChainBackend for UMDF runtime execution.
 class D3d11IddCxSwapChainBackend final : public ISwapChainBackend
 {
@@ -205,6 +225,7 @@ public:
             ExclusiveLockGuard deviceGuard(&m_deviceLock);
             m_boundSwapChainHandle = swapChainHandle;
             m_activeRenderAdapterLuid = renderAdapterLuid;
+            m_lastCausalPresentQpc = 0ULL;
             m_d3dDevice = d3dDevice;
             m_d3dContext = d3dContext;
             m_extractor.SetDevice(d3dDevice.Get(), d3dContext.Get());
@@ -244,6 +265,14 @@ public:
             return hr;
         }
 
+        // Capture causal acquisition QPC immediately on buffer acquire.
+        // Note: WDK IDDCX_METADATA::PresentDisplayQPCTime is the target VSync time when
+        // DWM expects the surface to scan out (often ahead of acquisition), so treat
+        // future or stale static-desktop targets cleanly with a monotonic causal QPC.
+        const uint64_t acquireQpc = QueryAdapterQpcNow();
+        const uint64_t qpcFreq = QueryAdapterQpcFreqSafe();
+        const uint64_t rawPresentQpc = bufferOut.MetaData.PresentDisplayQPCTime;
+
         // Adopt the OS-AddRef'd surface pointer without adding an extra COM reference so
         // ComPtr releases it automatically before the next acquire or frame completion.
         ComPtr<IDXGIResource> surface;
@@ -262,11 +291,32 @@ public:
             surface.Reset();
         }
 
+        uint64_t causalPresentQpc = acquireQpc;
+        {
+            ExclusiveLockGuard deviceGuard(&m_deviceLock);
+            const uint64_t maxPastWindowTicks = qpcFreq / 20ULL; // 50 ms
+            if (rawPresentQpc > 0ULL &&
+                rawPresentQpc <= acquireQpc &&
+                (acquireQpc - rawPresentQpc) <= maxPastWindowTicks &&
+                rawPresentQpc >= m_lastCausalPresentQpc)
+            {
+                causalPresentQpc = rawPresentQpc;
+            }
+            else if (acquireQpc < m_lastCausalPresentQpc)
+            {
+                causalPresentQpc = m_lastCausalPresentQpc;
+            }
+            m_lastCausalPresentQpc = causalPresentQpc;
+        }
+
         outMetadata.PresentationFrameNumber = bufferOut.MetaData.PresentationFrameNumber;
         outMetadata.DirtyRectCount = bufferOut.MetaData.DirtyRectCount;
         outMetadata.MoveRegionCount = bufferOut.MetaData.MoveRegionCount;
         outMetadata.HwProtectedSurface = (bufferOut.MetaData.HwProtectedSurface != FALSE);
-        outMetadata.PresentDisplayQPCTime = bufferOut.MetaData.PresentDisplayQPCTime;
+        outMetadata.PresentDisplayQPCTime = causalPresentQpc;
+        outMetadata.RawIddCxPresentDisplayQPCTime = rawPresentQpc;
+        outMetadata.SwapChainAcquireQpcTime = acquireQpc;
+        outMetadata.PresentDisplayQpcWasFutureTarget = (rawPresentQpc > acquireQpc);
         outMetadata.HasValidSurface = hasValidSurface;
 
         if (InterlockedCompareExchange(&m_frameExtractionEnabled, 0, 0) != 0 && hasValidSurface)
@@ -435,6 +485,7 @@ public:
             {
                 m_boundSwapChainHandle = nullptr;
                 m_activeRenderAdapterLuid = LUID{0, 0};
+                m_lastCausalPresentQpc = 0ULL;
                 m_extractor.Reset();
                 m_sharedTexturePool.ResetResources();
                 m_d3dContext.Reset();
@@ -537,6 +588,7 @@ private:
     volatile LONG m_gpuSharedTransportEnabled{1};
     void* m_boundSwapChainHandle{nullptr};
     LUID m_activeRenderAdapterLuid{0, 0};
+    uint64_t m_lastCausalPresentQpc{0ULL};
     wchar_t m_authorizedHostUserSid[128]{};
     ComPtr<ID3D11Device> m_d3dDevice;
     ComPtr<ID3D11DeviceContext> m_d3dContext;

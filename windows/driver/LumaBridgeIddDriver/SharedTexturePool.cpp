@@ -946,10 +946,20 @@ D3d11SharedTexturePool::ExtractToSharedTexture(
         }
         slot.CurrentMutexKey = ipc::kSharedTextureConsumerMutexKey;
         slot.State = SharedTextureSlotState::QueuedForIpc;
+        const uint64_t slotWaitUs = ipc::ComputeQpcElapsedUs(startQpc, gpuCopyStartQpc, qpcFreq);
+        m_metrics.LastProducerSlotWaitUs = slotWaitUs;
+        m_metrics.TotalProducerSlotWaitUs += slotWaitUs;
+        const uint64_t sampleDiv = m_metrics.GpuFramesShared + m_metrics.QueuedSlots + 1ULL;
+        m_metrics.AvgProducerSlotWaitUs = m_metrics.TotalProducerSlotWaitUs / sampleDiv;
+        if (slotWaitUs > m_metrics.MaxProducerSlotWaitUs)
+        {
+            m_metrics.MaxProducerSlotWaitUs = slotWaitUs;
+        }
         UpdateUsageMetricsLocked();
     }
 
     const uint64_t endQpc = QueryCurrentQpc();
+    const uint64_t producerSlotWaitUs = ipc::ComputeQpcElapsedUs(startQpc, gpuCopyStartQpc, qpcFreq);
     const uint64_t gpuCopyLatencyUs = ipc::ComputeQpcElapsedUs(gpuCopyStartQpc, gpuCopyEndQpc, qpcFreq);
     const uint64_t seq = static_cast<uint64_t>(InterlockedIncrement64(&m_sequenceCounter));
 
@@ -984,6 +994,7 @@ D3d11SharedTexturePool::ExtractToSharedTexture(
     result.SlotIndex = chosenSlotIdx;
     result.SlotGeneration = chosenSlotGen;
     result.FrameSequence = seq;
+    result.ProducerSlotAndMutexWaitUs = producerSlotWaitUs;
     result.GpuCopyLatencyUs = gpuCopyLatencyUs;
     return result;
 }
