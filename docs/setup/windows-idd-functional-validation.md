@@ -17,6 +17,7 @@ Os seguintes scripts modulares automatizam o ciclo de preparacao, diagnostico e 
 | `Install-LumaBridgeDriver.ps1` | Valida pre-requisitos e assinaturas (inclusive com `-AllowUntrustedChain`, sem aceitar arquivos adulterados), desabilita/reinicia monitor antes de atualizar dispositivo existente, confirma driver vinculado, preserva diagnosticos pre-rollback (`DEVPKEY_Device_ProblemStatus`, SetupAPI, eventos, dumps e breadcrumbs `Diag*`) antes de executar rollback em falhas parciais | Sim (exceto `-DryRun`) |
 | `Set-LumaBridgeVirtualMonitor.ps1` | Localiza dinamicamente a instancia PnP via `DEVPKEY_Device_HardwareIds`, ajusta `EnableVirtualMonitor` (`1`/`0`), reinicia o dispositivo e executa rollback para `0` em falha parcial de ativacao | Sim (exceto `-DryRun`) |
 | `Invoke-LumaBridgeEtwTrace.ps1` | Gerencia sessoes ETW separadas via `-pf` (`LumaBridgeIddCore` sequencial `-f bin -max 256` + verificacao `VerifyProviders`, e opcional `LumaBridgeIddDxg` circular `-f bincirc -max 128` via `-IncludeDxgKrnl`), exporta eventos via XPath streaming e executa decodificacao WPP (`DecodeWpp` com `symchk`/`tracepdb`/`tracefmt`) | Sim para `Start`/`Stop` (exceto `-DryRun`); Nao para `Status`/`VerifyProviders`/`ExportSummary`/`DecodeWpp` |
+| `Invoke-LumaBridgeFunctionalValidation.ps1` | Orquestrador ponta a ponta em 11 etapas (pre-checks, branch/artefatos, staging usando `$signResult.StagingDir`, verificacao criptografica/hashes, ETW `VerifyProviders`, instalacao autorizada, monitor virtual, `EnableFrameExtraction=1` + broker `AuthorizedHostUserSid`, execucao limitada do `lumabridge-host.exe`, coleta de metricas/logs e rollback automatico em `finally`) | Sim (exceto `-DryRun`) |
 | `Collect-LumaBridgeDiagnostics.ps1` | Coleta estado PnP (incluindo `DEVPKEY_Device_ProblemStatus` e breadcrumbs `Diag*`), Driver Store, excerto SetupAPI contextualizado, canais/eventos, inventario de crash dumps, resumo ETL em streaming (`LumaBridgeIddCore.etl` e `LumaBridgeIddDxg.etl`), `DecodeWpp` opcional, `StageExecutionSummary`, versoes/hashes de pacote e `WUDFHost.exe` associado ao LumaBridge em JSON/Markdown (sem pixels da tela) | Nao |
 | `Prepare-IddSampleReference.ps1` | Baixa somente `video/IndirectDisplay` de `microsoft/Windows-driver-samples` e compila `IddSampleDriver` + `IddSampleApp` em diretorio isolado fora do repositorio (`-DryRun` nao cria diretorios nem executa comandos), sem instalar no host | Nao |
 | `Uninstall-LumaBridgeDriver.ps1` | Desativa monitor, remove instancias PnP, limpa `oemXX.inf` do Driver Store sem `/force` por padrao (opt-in via `-ForceDriverStoreDelete`) e remove certificado somente por `-CertificateThumbprint` + `-ConfirmCertificateRemoval` | Sim (exceto `-DryRun`) |
@@ -34,17 +35,20 @@ Fluxo recomendado de simulacao antes da execucao real:
 .\windows\driver\scripts\Invoke-LumaBridgeEtwTrace.ps1 -Action Start -IncludeDxgKrnl -DryRun
 .\windows\driver\scripts\Install-LumaBridgeDriver.ps1 -Configuration Release -DryRun
 .\windows\driver\scripts\Set-LumaBridgeVirtualMonitor.ps1 -Action Enable -DryRun
+.\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 -Configuration Release -DryRun
 .\windows\driver\scripts\Collect-LumaBridgeDiagnostics.ps1 -Configuration Release -DryRun
 .\windows\driver\scripts\Uninstall-LumaBridgeDriver.ps1 -RemoveTestCertificate -CertificateThumbprint "<THUMBPRINT_SHA1_40_HEX>" -DryRun
 ```
 
 Fluxo controlado real em Prompt/PowerShell **como Administrador** (apos `bcdedit /set testsigning on` + reboot manuais caso necessario):
 
+> **Nota sobre o objeto retornado por `Invoke-LumaBridgePackageSigning.ps1`:** O campo com o diretorio isolado preparado se chama `$signResult.StagingDir` (e nao `StagingDirectory`).
+
 ```powershell
 $signResult = .\windows\driver\scripts\Invoke-LumaBridgePackageSigning.ps1 -Configuration Release -CreateTestCertificateIfMissing -TrustCertificate
-.\windows\driver\scripts\Install-LumaBridgeDriver.ps1 -Configuration Release
+.\windows\driver\scripts\Install-LumaBridgeDriver.ps1 -Configuration Release -StagingDir $signResult.StagingDir
 .\windows\driver\scripts\Set-LumaBridgeVirtualMonitor.ps1 -Action Enable
-.\windows\driver\scripts\Collect-LumaBridgeDiagnostics.ps1 -Configuration Release
+.\windows\driver\scripts\Collect-LumaBridgeDiagnostics.ps1 -Configuration Release -StagingDir $signResult.StagingDir
 # Rollback completo ao finalizar (remocao de certificado exige thumbprint explicito e -ConfirmCertificateRemoval):
 .\windows\driver\scripts\Uninstall-LumaBridgeDriver.ps1 -RemoveTestCertificate -CertificateThumbprint $signResult.CertificateThumbprint -ConfirmCertificateRemoval
 ```
@@ -137,10 +141,24 @@ Remover os certificados temporarios de teste das stores `CurrentUser\My`, `Local
 
 ## 6. Validacao controlada da extracao M4.1 e rollback especifico
 
+Utilize preferencialmente o script automatizado `Invoke-LumaBridgeFunctionalValidation.ps1`, que executa todas as 11 etapas com `$signResult.StagingDir`, configura o broker `AuthorizedHostUserSid`, valida criterios de aceitacao e executa rollback automatico em bloco `finally`:
+
+```powershell
+# Previa sem efeitos colaterais:
+.\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 -Configuration Release -DryRun
+
+# Execucao real como Administrador (solicita confirmacao manual antes de instalar/alterar dispositivo):
+.\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 -Configuration Release -CreateTestCertificateIfMissing -TrustCertificate
+```
+
+Caso execute manualmente os passos individuais em PowerShell **como Administrador**:
+
 1. **Habilitacao opt-in (Admin, apos instalacao controlada e `EnableVirtualMonitor = 1`):**
    ```powershell
    $dev = Get-PnpDevice | Where-Object { $_.InstanceId -like 'ROOT\DISPLAY\*' -and $_.FriendlyName -like '*LumaBridge*' } | Select-Object -First 1
    $devParams = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($dev.InstanceId)\Device Parameters"
+   $userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+   New-ItemProperty -LiteralPath $devParams -Name 'AuthorizedHostUserSid' -PropertyType String -Value $userSid -Force | Out-Null
    New-ItemProperty -LiteralPath $devParams -Name 'EnableFrameExtraction' -PropertyType DWord -Value 1 -Force | Out-Null
    pnputil /restart-device $dev.InstanceId
    ```
@@ -149,13 +167,14 @@ Remover os certificados temporarios de teste das stores `CurrentUser\My`, `Local
    .\windows\driver\scripts\Invoke-LumaBridgeEtwTrace.ps1 -Action Start -Force
    $verify = .\windows\driver\scripts\Invoke-LumaBridgeEtwTrace.ps1 -Action VerifyProviders
    $verify.AllProvidersVerified # deve retornar True
-   .\windows\driver\x64\Release\lumabridge-host.exe --max-frames 30 --json-summary "$env:TEMP\lb-host-summary.json"
+   .\windows\driver\x64\Release\lumabridge-host.exe --max-frames 30 --duration-ms 15000 --json-summary "$env:TEMP\lb-host-summary.json"
    .\windows\driver\scripts\Invoke-LumaBridgeEtwTrace.ps1 -Action Stop -Force
    .\windows\driver\scripts\Collect-LumaBridgeDiagnostics.ps1 -Configuration Release -EtlPath "$env:LOCALAPPDATA\LumaBridgeDisplay\Diagnostics\Etw\LumaBridgeIddCore.etl"
    ```
 3. **Rollback imediato para modo sem extracao (ou desinstalacao completa):**
    ```powershell
    New-ItemProperty -LiteralPath $devParams -Name 'EnableFrameExtraction' -PropertyType DWord -Value 0 -Force | Out-Null
+   Remove-ItemProperty -LiteralPath $devParams -Name 'AuthorizedHostUserSid' -ErrorAction SilentlyContinue
    pnputil /restart-device $dev.InstanceId
    ```
    Para rollback total do pacote e certificado, utilize `Uninstall-LumaBridgeDriver.ps1`.

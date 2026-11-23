@@ -67,11 +67,20 @@ Foram avaliadas duas abordagens para disponibilizacao de pixels entre `WUDFHost.
 
 Arquivo compartilhado: `windows/driver/LumaBridgeIddDriver/FrameIpcProtocol.h` (`#pragma pack(push, 1)` com `static_assert` de tamanho exato):
 
-- **Endpoint padrao:** `\\.\pipe\LumaBridgeFrameIpc_v1` (`PIPE_TYPE_BYTE`, `PIPE_REJECT_REMOTE_CLIENTS`, `FILE_FLAG_OVERLAPPED`).
-- **Seguranca / ACL:** SDDL `D:P(D;;GA;;;NU)(D;;GA;;;AN)(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)(A;;GRGW;;;IU)` + SID do usuario proprietario (para testes no mesmo usuario) + `S:(ML;;NW;;;ME)` (Medium Mandatory Level, permitindo `lumabridge-host.exe` nao elevado conectar-se ao pipe criado por `WUDFHost.exe` enquanto bloqueia processos Low/AppContainer e acessos de rede/anonimos). Alem da ACL, `FrameIpcServer` valida `ClientAuthToken` (`0x4148424C`) e compara `ClientHello.ClientProcessId` com `GetNamedPipeClientProcessId()`.
+- **Endpoint padrao:** `\\.\pipe\LumaBridgeFrameIpc_v1` (`PIPE_TYPE_BYTE`, `PIPE_REJECT_REMOTE_CLIENTS`, `FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE`).
+- **Seguranca / ACL / Autenticacao sem segredo fixo:**
+  - Quando `REG_SZ AuthorizedHostUserSid` esta configurado em `Device Parameters` (broker confiavel), o driver restringe a DACL do Named Pipe exclusivamente a `(D;;GA;;;NU)(D;;GA;;;AN)(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)(A;;GRGW;;;<AuthorizedHostUserSid>)` (sem `IU`) + `S:(ML;;NW;;;ME)` (`Medium Mandatory Level`).
+  - Sem broker explicito, processos em conta de usuario permitem apenas o proprio SID do servidor + `SY`/`BA`/`LS`; em `WUDFHost.exe` (`LOCAL SERVICE`) sem `AuthorizedHostUserSid`, o fallback de `IU` na DACL e imediatamente filtrado no handshake antes do envio de qualquer frame.
+  - Durante o handshake (`FrameIpcServer::VerifyConnectedClientIdentity`), o servidor valida o token efetivo do cliente no kernel (`ImpersonateNamedPipeClient` + `OpenThreadToken` com `RevertToSelf` RAII e `SECURITY_IDENTIFICATION`), exigindo:
+    1. `ClientHello.ClientProcessId == GetNamedPipeClientProcessId()`.
+    2. Nivel de impersonacao `>= SecurityIdentification`, `TokenIsAppContainer == 0` e ausencia de SIDs `WinNetworkSid`, `WinAnonymousSid`, `WinBuiltinGuestsSid` ou RID `DOMAIN_USER_RID_GUEST`.
+    3. `TokenIntegrityLevel >= SECURITY_MANDATORY_MEDIUM_RID`.
+    4. `TokenSessionId == ClientHello.ClientSessionId`, correspondente a sessao autorizada (ou sessao fisica ativa de console via `WTSGetActiveConsoleSessionId()`, rejeitando sessoes remotas/dormant/Session 0 nao autorizadas).
+    5. Correspondencia com `AuthorizedHostUserSid`, mesmo usuario do servidor (exceto `WUDFHost.exe`), `BUILTIN\Administrators` / `SYSTEM`, ou logon interativo ativo no console físico.
+  - Nenhum segredo embutido estatico existe no protocolo ou nos binarios (`FrameIpcClientHello` trafega `ClientProcessId` e `ClientSessionId`).
 - **Mensagens versionadas (`Magic = 0x4649424C`, `Version = 1.0`):**
   1. `FrameIpcEnvelope` (`16 B`): `Magic`, `VersionMajor`, `VersionMinor`, `MessageType`, `Reserved0`, `HeaderSizeBytes`.
-  2. `FrameIpcClientHello` (`32 B`): `Envelope`, `ClientProcessId`, `ClientAuthToken`, `ClientCapabilities`, `Reserved1`.
+  2. `FrameIpcClientHello` (`32 B`): `Envelope`, `ClientProcessId`, `ClientSessionId`, `ClientCapabilities`, `Reserved1`.
   3. `FrameIpcServerHello` (`48 B`): `Envelope`, `Status`, `ServerProcessId`, `SessionId` (monotonico != 0), `AdapterLuidLow`, `AdapterLuidHigh`, `MaxQueueDepth`, `Reserved1`.
   4. `FrameIpcFrameHeader` (`104 B`): `Envelope`, `SessionId`, `FrameSequence`, `PresentationFrameNumber`, `Width`, `Height`, `RowPitchBytes`, `PixelFormat`, `Flags`, `DirtyRectCount`, `MoveRegionCount`, `PresentDisplayQpcTime`, `ExtractCompleteQpcTime`, `ServerSendQpcTime`, `QpcFrequency`, `PayloadSizeBytes`, `PayloadCrc32` (seguido exatamente por `PayloadSizeBytes` bytes de pixels).
   5. `FrameIpcFrameAck` (`56 B`): `Envelope`, `SessionId`, `FrameSequence`, `PresentationFrameNumber`, `Status`, `HostReceiveQpcTime`, `Reserved1`.
@@ -92,13 +101,14 @@ Restricoes adicionais:
 
 ## 6. Modelo de ownership, concorrencia e backpressure
 
-- **Superficie IddCx:** `ComPtr<IDXGIResource>::Attach(bufferOut.MetaData.pSurface)` adota a referencia do SO. Durante `ExtractFrame`, a copia GPU->staging (`CopyResource`) e disparada e `sourceTexture.Reset()` + `surface.Reset()` liberam **todas** as referencias COM a superficie original antes mesmo de `Map(D3D11_MAP_READ)` e muito antes de `IddCxSwapChainFinishedProcessingFrame`.
+- **Superficie IddCx:** `ComPtr<IDXGIResource>::Attach(bufferOut.MetaData.pSurface)` adota a referencia do SO, consulta `ID3D11Texture2D` e libera `surface.Reset()` imediatamente. Em `ReleaseAndAcquireBuffer`, a extracao ocorre sob `D3d11IddCxSwapChainBackend::m_deviceLock` transferindo a referencia unica via `input.AdoptSourceTexture = texture.Detach()`; durante `ExtractFrame`, a copia GPU->staging (`CopyResource`) e disparada, `sourceTexture.Reset()` libera a referencia antes do `Map(D3D11_MAP_READ)` (e em qualquer caminho de falha antes da copia) e `GetDeviceRemovedReason()` e verificado apos `CreateStagingTexture`, `CopyResource` e `Map`. `m_deviceLock` e liberado antes de `EnqueueFrame`/`RecycleBufferSlot` para manter as travas do `FrameIpcServer` estritamente independentes.
 - **Swapchain (`IDDCX_SWAPCHAIN`) e evento (`hNextSurfaceAvailable`):** preservados integralmente conforme M3 (`AssignSwapChain`, `UnassignSwapChain`, `UnassignSwapChainForMonitor`, `OnSuspend`, `OnResume`, `Shutdown`, `DeleteSwapChainObject` exatamente uma vez).
 - **Hierarquia de locks (sem inversao e sem I/O sob lock):**
   - Pipeline driver: `g_AdapterInitGate` -> `DeviceContext::StateLock` -> `SwapChainProcessor::m_lifecycleLock` -> `SwapChainProcessor::m_metricsLock`.
-  - Transporte IPC: `FrameIpcServer::m_lifecycleLock` -> `m_queueLock` ou `m_metricsLock` (folhas separadas; nenhuma trava e mantida durante `ReadFile`/`WriteFile`/`WaitForMultipleObjects`).
-- **Politica de backpressure (`drop-oldest`):**
-  - Fila limitada a `MaxQueueDepth = 3` (teto maximo configuravel `16`), abastecida por um pool pre-alocado de `5` `ExtractedFrameBuffer` (`PixelByteBuffer` sem excecoes C++, `new (std::nothrow)` compativel com UMDF sem `/EHsc`).
+  - Backend e transporte IPC: `D3d11IddCxSwapChainBackend::m_deviceLock` e folha independente das travas de `FrameIpcServer` (`m_lifecycleLock` -> `m_queueLock` / `m_metricsLock`; nenhuma trava e mantida durante `ReadFile`/`WriteFile`/`WaitForMultipleObjects`).
+- **Politica de backpressure (`drop-oldest`) e limite de memoria do pool:**
+  - Fila limitada a `MaxQueueDepth = 3` (teto maximo configuravel `16`), abastecida por um pool pre-alocado de `5` `ExtractedFrameBuffer` (`PixelByteBuffer` sem excecoes C++, `new (std::nothrow)` compativel com UMDF sem `/EHsc`), com limite de `kMaxRetainedPoolBufferBytes` (`~14.06 MiB`, equivalente a `1440p BGRA8`): buffers maiores que 1440p sao encolhidos/liberados na reciclagem para evitar retencao de ate `320 MiB` (`5 x 64 MiB`), e `FlushQueue()` libera integralmente o armazenamento ao desatribuir a swapchain.
+  - O timeout de I/O IPC e limitado ao intervalo `[50..5000] ms` (padrao `500 ms`).
   - Se a fila atingir `MaxQueueDepth` (host ausente ou lento), o frame mais antigo e removido da frente da fila, tem sua capacidade de memoria reutilizada e incrementa `FramesDroppedByBackpressure`.
   - A thread de aquisicao IddCx **nunca** aguarda IPC; sem host conectado, `FrameIpcServer` permanece bloqueado em `ConnectNamedPipe` overlapped (`INFINITE` com wakeup imediato via `m_stopEvent`), sem busy-wait.
   - Em `OnSuspend` (`D0Exit`), `DeviceContextCleanup` e `AdapterContextCleanup`, `Processor.Shutdown()`/`OnSuspend()` conclui a worker thread antes de `Backend.ShutdownTransport()` cancelar I/O (`CancelIoEx` + `GetOverlappedResult(..., TRUE)`) e encerrar o servidor IPC.

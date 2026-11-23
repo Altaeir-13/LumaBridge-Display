@@ -217,6 +217,51 @@ TestValidHandshakeFrameTransferAndAck()
     EXPECT_TRUE(!server.IsRunning());
 }
 
+DWORD
+QueryCurrentSessionId() noexcept
+{
+    DWORD sid = 0U;
+    (void)ProcessIdToSessionId(GetCurrentProcessId(), &sid);
+    return sid;
+}
+
+bool
+QueryCurrentUserSidWide(
+    wchar_t* outSidBuf,
+    size_t outSidBufChars
+    ) noexcept
+{
+    if (outSidBuf == nullptr || outSidBufChars == 0U)
+    {
+        return false;
+    }
+    outSidBuf[0] = L'\0';
+
+    HANDLE procToken = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &procToken) == FALSE || procToken == nullptr)
+    {
+        return false;
+    }
+    ScopedWin32Handle tokenGuard(procToken);
+
+    uint8_t buf[256]{};
+    DWORD len = sizeof(buf);
+    if (GetTokenInformation(tokenGuard.Get(), TokenUser, buf, len, &len) == FALSE)
+    {
+        return false;
+    }
+
+    const TOKEN_USER* tu = reinterpret_cast<const TOKEN_USER*>(buf);
+    LPWSTR sidStr = nullptr;
+    if (ConvertSidToStringSidW(tu->User.Sid, &sidStr) == FALSE || sidStr == nullptr)
+    {
+        return false;
+    }
+    const errno_t err = wcsncpy_s(outSidBuf, outSidBufChars, sidStr, _TRUNCATE);
+    LocalFree(sidStr);
+    return (err == 0) && (outSidBuf[0] != L'\0');
+}
+
 void
 TestIncompatibleProtocolVersionRejected()
 {
@@ -243,7 +288,7 @@ TestIncompatibleProtocolVersionRejected()
         static_cast<uint32_t>(sizeof(FrameIpcClientHello)));
     badHello.Envelope.VersionMajor = 99U;
     badHello.ClientProcessId = GetCurrentProcessId();
-    badHello.ClientAuthToken = kDefaultClientAuthToken;
+    badHello.ClientSessionId = static_cast<uint32_t>(QueryCurrentSessionId());
     EXPECT_TRUE(WriteAllSync(rawClient.Get(), &badHello, sizeof(badHello)));
 
     FrameIpcServerHello serverHello{};
@@ -276,19 +321,19 @@ TestInvalidMessageLengthAndBadMagicRejected()
     badMagic.Envelope = InitEnvelope(FrameIpcMessageType::ClientHello, sizeof(FrameIpcClientHello));
     badMagic.Envelope.Magic = 0xDEADBEEFU;
     EXPECT_EQ(
-        ValidateClientHello(&badMagic, sizeof(badMagic), kDefaultClientAuthToken),
+        ValidateClientHello(&badMagic, sizeof(badMagic)),
         FrameIpcStatus::InvalidMagic);
 
     FrameIpcClientHello badHdrSize{};
     badHdrSize.Envelope = InitEnvelope(FrameIpcMessageType::ClientHello, sizeof(FrameIpcClientHello) + 8U);
     EXPECT_EQ(
-        ValidateClientHello(&badHdrSize, sizeof(badHdrSize), kDefaultClientAuthToken),
+        ValidateClientHello(&badHdrSize, sizeof(badHdrSize)),
         FrameIpcStatus::InvalidLength);
 
     FrameIpcClientHello wrongType{};
     wrongType.Envelope = InitEnvelope(FrameIpcMessageType::FrameAck, sizeof(FrameIpcClientHello));
     EXPECT_EQ(
-        ValidateClientHello(&wrongType, sizeof(wrongType), kDefaultClientAuthToken),
+        ValidateClientHello(&wrongType, sizeof(wrongType)),
         FrameIpcStatus::InvalidLength);
 
     // Live malformed (bad magic) and truncated ClientHello over Named Pipe.
@@ -389,7 +434,7 @@ TestIncorrectSessionIdRejected()
     FrameIpcClientHello hello{};
     hello.Envelope = InitEnvelope(FrameIpcMessageType::ClientHello, sizeof(FrameIpcClientHello));
     hello.ClientProcessId = GetCurrentProcessId();
-    hello.ClientAuthToken = kDefaultClientAuthToken;
+    hello.ClientSessionId = static_cast<uint32_t>(QueryCurrentSessionId());
     EXPECT_TRUE(WriteAllSync(rawClient.Get(), &hello, sizeof(hello)));
 
     FrameIpcServerHello serverHello{};
@@ -516,40 +561,66 @@ TestUnauthorizedClientRejected()
     FrameIpcServer server;
     EXPECT_EQ(server.Start(serverCfg), S_OK);
 
-    // 1. Bad auth token rejected by FrameConsumer handshake.
-    HostConsumerConfig badTokenCfg;
-    badTokenCfg.PipeName = pipeName;
-    badTokenCfg.AuthToken = 0xBADBAD00U;
-    FrameConsumer badConsumer(badTokenCfg);
-    EXPECT_EQ(badConsumer.Connect(2000U), E_ACCESSDENIED);
-    EXPECT_EQ(badConsumer.GetMetricsSnapshot().LastProtocolStatus, FrameIpcStatus::UnauthorizedClient);
+    // Enqueue a frame before unauthorized attempts to prove zero pixels are transmitted to them.
+    bool evicted = false;
+    EXPECT_EQ(server.EnqueueFrame(MakeSyntheticExtractedFrame(1ULL, 11U, 64U, 64U), evicted), S_OK);
 
-    // 2. Spoofed ClientProcessId rejected by server PID check.
-    ScopedWin32Handle rawClient(CreateFileW(
-        pipeName.c_str(),
-        GENERIC_READ | GENERIC_WRITE,
-        0U,
-        nullptr,
-        OPEN_EXISTING,
-        0U,
-        nullptr));
-    EXPECT_TRUE(rawClient.IsValid());
+    // 1. ClientHello with zero PID rejected cleanly.
+    {
+        ScopedWin32Handle zeroPidClient(CreateFileW(
+            pipeName.c_str(),
+            GENERIC_READ | GENERIC_WRITE,
+            0U,
+            nullptr,
+            OPEN_EXISTING,
+            SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+            nullptr));
+        EXPECT_TRUE(zeroPidClient.IsValid());
 
-    FrameIpcClientHello spoofHello{};
-    spoofHello.Envelope = InitEnvelope(FrameIpcMessageType::ClientHello, sizeof(FrameIpcClientHello));
-    spoofHello.ClientProcessId = GetCurrentProcessId() + 99999U;
-    spoofHello.ClientAuthToken = kDefaultClientAuthToken;
-    EXPECT_TRUE(WriteAllSync(rawClient.Get(), &spoofHello, sizeof(spoofHello)));
+        FrameIpcClientHello zeroHello{};
+        zeroHello.Envelope = InitEnvelope(FrameIpcMessageType::ClientHello, sizeof(FrameIpcClientHello));
+        zeroHello.ClientProcessId = 0U;
+        zeroHello.ClientSessionId = static_cast<uint32_t>(QueryCurrentSessionId());
+        EXPECT_TRUE(WriteAllSync(zeroPidClient.Get(), &zeroHello, sizeof(zeroHello)));
 
-    FrameIpcServerHello srvHello{};
-    EXPECT_TRUE(ReadAllSync(rawClient.Get(), &srvHello, sizeof(srvHello)));
-    EXPECT_EQ(srvHello.Status, static_cast<uint32_t>(FrameIpcStatus::UnauthorizedClient));
-    rawClient.Reset();
+        FrameIpcServerHello srvHello{};
+        EXPECT_TRUE(ReadAllSync(zeroPidClient.Get(), &srvHello, sizeof(srvHello)));
+        EXPECT_EQ(srvHello.Status, static_cast<uint32_t>(FrameIpcStatus::UnauthorizedClient));
+        EXPECT_EQ(srvHello.SessionId, 0ULL);
+    }
 
-    EXPECT_EQ(server.GetMetricsSnapshot().ClientConnectionsRejected, 2ULL);
+    // 2. Spoofed ClientProcessId rejected by kernel GetNamedPipeClientProcessId verification.
+    {
+        ScopedWin32Handle rawClient(CreateFileW(
+            pipeName.c_str(),
+            GENERIC_READ | GENERIC_WRITE,
+            0U,
+            nullptr,
+            OPEN_EXISTING,
+            SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+            nullptr));
+        EXPECT_TRUE(rawClient.IsValid());
 
-    // 3. Verify Named Pipe DACL explicitly denies Network (S-1-5-2) & Anonymous (S-1-5-7)
-    //    and allows SYSTEM, Administrators, LOCAL SERVICE (WUDFHost), and Interactive Users.
+        FrameIpcClientHello spoofHello{};
+        spoofHello.Envelope = InitEnvelope(FrameIpcMessageType::ClientHello, sizeof(FrameIpcClientHello));
+        spoofHello.ClientProcessId = GetCurrentProcessId() + 99999U;
+        spoofHello.ClientSessionId = static_cast<uint32_t>(QueryCurrentSessionId());
+        EXPECT_TRUE(WriteAllSync(rawClient.Get(), &spoofHello, sizeof(spoofHello)));
+
+        FrameIpcServerHello srvHello{};
+        EXPECT_TRUE(ReadAllSync(rawClient.Get(), &srvHello, sizeof(srvHello)));
+        EXPECT_EQ(srvHello.Status, static_cast<uint32_t>(FrameIpcStatus::UnauthorizedClient));
+        EXPECT_EQ(srvHello.SessionId, 0ULL);
+    }
+
+    const auto midSnap = server.GetMetricsSnapshot();
+    EXPECT_EQ(midSnap.ClientConnectionsRejected, 2ULL);
+    EXPECT_EQ(midSnap.FramesDelivered, 0ULL);
+    EXPECT_EQ(midSnap.QueueDepth, 1U);
+
+    // 3. Verify Named Pipe DACL & SACL explicitly deny Network (NU) & Anonymous (AN),
+    //    omit broad Interactive Users (IU), allow SYSTEM/BA/LS + owner user SID,
+    //    and enforce Medium Mandatory Label.
     {
         ScopedWin32Handle aclProbeClient(CreateFileW(
             pipeName.c_str(),
@@ -562,35 +633,35 @@ TestUnauthorizedClientRejected()
         EXPECT_TRUE(aclProbeClient.IsValid());
 
         PACL dacl = nullptr;
+        PACL sacl = nullptr;
         PSECURITY_DESCRIPTOR pipeSd = nullptr;
         const DWORD secErr = GetSecurityInfo(
             aclProbeClient.Get(),
             SE_KERNEL_OBJECT,
-            DACL_SECURITY_INFORMATION,
+            DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION,
             nullptr,
             nullptr,
             &dacl,
-            nullptr,
+            &sacl,
             &pipeSd);
         EXPECT_EQ(secErr, static_cast<DWORD>(ERROR_SUCCESS));
         EXPECT_TRUE(dacl != nullptr);
+        EXPECT_TRUE(sacl != nullptr);
 
-        auto hasAceForWellKnownSid = [dacl](WELL_KNOWN_SID_TYPE sidType, BYTE expectedAceType) noexcept {
-            uint8_t sidBuf[SECURITY_MAX_SID_SIZE]{};
-            DWORD sidSize = sizeof(sidBuf);
-            if (CreateWellKnownSid(sidType, nullptr, sidBuf, &sidSize) == FALSE)
+        auto hasAceForSid = [](PACL acl, PSID targetSid, BYTE expectedAceType) noexcept {
+            if (acl == nullptr || targetSid == nullptr)
             {
                 return false;
             }
             ACL_SIZE_INFORMATION aclInfo{};
-            if (GetAclInformation(dacl, &aclInfo, sizeof(aclInfo), AclSizeInformation) == FALSE)
+            if (GetAclInformation(acl, &aclInfo, sizeof(aclInfo), AclSizeInformation) == FALSE)
             {
                 return false;
             }
             for (DWORD idx = 0U; idx < aclInfo.AceCount; ++idx)
             {
                 LPVOID acePtr = nullptr;
-                if (GetAce(dacl, idx, &acePtr) == FALSE || acePtr == nullptr)
+                if (GetAce(acl, idx, &acePtr) == FALSE || acePtr == nullptr)
                 {
                     continue;
                 }
@@ -608,7 +679,11 @@ TestUnauthorizedClientRejected()
                 {
                     aceSid = &(static_cast<PACCESS_ALLOWED_ACE>(acePtr)->SidStart);
                 }
-                if (aceSid != nullptr && EqualSid(aceSid, sidBuf) != FALSE)
+                else if (hdr->AceType == SYSTEM_MANDATORY_LABEL_ACE_TYPE)
+                {
+                    aceSid = &(static_cast<PSYSTEM_MANDATORY_LABEL_ACE>(acePtr)->SidStart);
+                }
+                if (aceSid != nullptr && EqualSid(aceSid, targetSid) != FALSE)
                 {
                     return true;
                 }
@@ -616,14 +691,39 @@ TestUnauthorizedClientRejected()
             return false;
         };
 
+        auto hasAceForWellKnownSid = [&hasAceForSid](PACL acl, WELL_KNOWN_SID_TYPE sidType, BYTE expectedAceType) noexcept {
+            uint8_t sidBuf[SECURITY_MAX_SID_SIZE]{};
+            DWORD sidSize = sizeof(sidBuf);
+            if (CreateWellKnownSid(sidType, nullptr, sidBuf, &sidSize) == FALSE)
+            {
+                return false;
+            }
+            return hasAceForSid(acl, sidBuf, expectedAceType);
+        };
+
         if (dacl != nullptr)
         {
-            EXPECT_TRUE(hasAceForWellKnownSid(WinNetworkSid, ACCESS_DENIED_ACE_TYPE));
-            EXPECT_TRUE(hasAceForWellKnownSid(WinAnonymousSid, ACCESS_DENIED_ACE_TYPE));
-            EXPECT_TRUE(hasAceForWellKnownSid(WinLocalSystemSid, ACCESS_ALLOWED_ACE_TYPE));
-            EXPECT_TRUE(hasAceForWellKnownSid(WinBuiltinAdministratorsSid, ACCESS_ALLOWED_ACE_TYPE));
-            EXPECT_TRUE(hasAceForWellKnownSid(WinLocalServiceSid, ACCESS_ALLOWED_ACE_TYPE));
-            EXPECT_TRUE(hasAceForWellKnownSid(WinInteractiveSid, ACCESS_ALLOWED_ACE_TYPE));
+            EXPECT_TRUE(hasAceForWellKnownSid(dacl, WinNetworkSid, ACCESS_DENIED_ACE_TYPE));
+            EXPECT_TRUE(hasAceForWellKnownSid(dacl, WinAnonymousSid, ACCESS_DENIED_ACE_TYPE));
+            EXPECT_TRUE(hasAceForWellKnownSid(dacl, WinLocalSystemSid, ACCESS_ALLOWED_ACE_TYPE));
+            EXPECT_TRUE(hasAceForWellKnownSid(dacl, WinBuiltinAdministratorsSid, ACCESS_ALLOWED_ACE_TYPE));
+            EXPECT_TRUE(hasAceForWellKnownSid(dacl, WinLocalServiceSid, ACCESS_ALLOWED_ACE_TYPE));
+            EXPECT_TRUE(!hasAceForWellKnownSid(dacl, WinInteractiveSid, ACCESS_ALLOWED_ACE_TYPE));
+
+            wchar_t curUserSidStr[128]{};
+            EXPECT_TRUE(QueryCurrentUserSidWide(curUserSidStr, ARRAYSIZE(curUserSidStr)));
+            PSID curUserSid = nullptr;
+            EXPECT_TRUE(ConvertStringSidToSidW(curUserSidStr, &curUserSid) != FALSE);
+            EXPECT_TRUE(hasAceForSid(dacl, curUserSid, ACCESS_ALLOWED_ACE_TYPE));
+            if (curUserSid != nullptr)
+            {
+                LocalFree(curUserSid);
+            }
+        }
+
+        if (sacl != nullptr)
+        {
+            EXPECT_TRUE(hasAceForWellKnownSid(sacl, WinMediumLabelSid, SYSTEM_MANDATORY_LABEL_ACE_TYPE));
         }
 
         if (pipeSd != nullptr)
@@ -633,11 +733,17 @@ TestUnauthorizedClientRejected()
     }
     Sleep(30U);
 
-    // Valid client still succeeds.
+    // Valid client connects and receives the still-queued frame intact.
     HostConsumerConfig okCfg;
     okCfg.PipeName = pipeName;
+    okCfg.VerifySyntheticPattern = true;
     FrameConsumer okConsumer(okCfg);
     EXPECT_EQ(okConsumer.Connect(2000U), S_OK);
+    FrameIpcFrameHeader hdr{};
+    std::vector<uint8_t> pixels;
+    EXPECT_EQ(okConsumer.ReceiveNextFrame(hdr, pixels, 2000U), S_OK);
+    EXPECT_EQ(hdr.FrameSequence, 1ULL);
+    EXPECT_EQ(hdr.PresentationFrameNumber, 11U);
     okConsumer.Disconnect();
     server.Stop();
 }
@@ -668,7 +774,7 @@ TestHostDisconnectReconnectAndMidFrameDisconnect()
         FrameIpcClientHello hello{};
         hello.Envelope = InitEnvelope(FrameIpcMessageType::ClientHello, sizeof(FrameIpcClientHello));
         hello.ClientProcessId = GetCurrentProcessId();
-        hello.ClientAuthToken = kDefaultClientAuthToken;
+        hello.ClientSessionId = static_cast<uint32_t>(QueryCurrentSessionId());
         EXPECT_TRUE(WriteAllSync(rawClient.Get(), &hello, sizeof(hello)));
 
         FrameIpcServerHello srvHello{};
@@ -867,6 +973,326 @@ TestConcurrentShutdownSuspendAndResourceCleanup()
     EXPECT_EQ(finalSnap.QueueDepth, 0U);
 }
 
+void
+TestCrossUserSidAuthorizationAndRestrictedDaclRejection()
+{
+    static constexpr wchar_t kOtherUserSid[] = L"S-1-5-21-999999999-888888888-777777777-1001";
+
+    // Subcase A: Token SID enforcement rejects mismatched user before sending any queued frame.
+    {
+        const std::wstring pipeName = MakeUniquePipeName(11U);
+        FrameTransportConfig serverCfg;
+        serverCfg.SetPipeName(pipeName.c_str());
+        serverCfg.SetAuthorizedUserSid(kOtherUserSid);
+        serverCfg.RestrictDaclToAuthorizedSid = false;
+        serverCfg.AllowSameUserAccess = true;
+        serverCfg.AllowBuiltinAdmins = false;
+
+        FrameIpcServer server;
+        EXPECT_EQ(server.Start(serverCfg), S_OK);
+
+        bool evicted = false;
+        EXPECT_EQ(server.EnqueueFrame(MakeSyntheticExtractedFrame(1ULL, 1U, 64U, 64U), evicted), S_OK);
+
+        HostConsumerConfig clientCfg;
+        clientCfg.PipeName = pipeName;
+        FrameConsumer consumer(clientCfg);
+        EXPECT_EQ(consumer.Connect(2000U), E_ACCESSDENIED);
+        EXPECT_EQ(consumer.GetMetricsSnapshot().LastProtocolStatus, FrameIpcStatus::UnauthorizedClient);
+
+        const auto snap = server.GetMetricsSnapshot();
+        EXPECT_EQ(snap.ClientConnectionsRejected, 1ULL);
+        EXPECT_EQ(snap.ClientConnectionsAccepted, 0ULL);
+        EXPECT_EQ(snap.FramesDelivered, 0ULL);
+        EXPECT_EQ(snap.QueueDepth, 1U);
+        server.Stop();
+    }
+
+    // Subcase B: Kernel DACL restriction blocks unauthorized user when RestrictDaclToAuthorizedSid is enabled.
+    {
+        const std::wstring pipeName = MakeUniquePipeName(12U);
+        FrameTransportConfig serverCfg;
+        serverCfg.SetPipeName(pipeName.c_str());
+        serverCfg.SetAuthorizedUserSid(kOtherUserSid);
+        serverCfg.RestrictDaclToAuthorizedSid = true;
+        serverCfg.AllowSameUserAccess = false;
+        serverCfg.AllowBuiltinAdmins = false;
+
+        FrameIpcServer server;
+        EXPECT_EQ(server.Start(serverCfg), S_OK);
+
+        bool evicted = false;
+        EXPECT_EQ(server.EnqueueFrame(MakeSyntheticExtractedFrame(1ULL, 1U, 64U, 64U), evicted), S_OK);
+
+        HostConsumerConfig clientCfg;
+        clientCfg.PipeName = pipeName;
+        FrameConsumer consumer(clientCfg);
+        EXPECT_EQ(consumer.Connect(2000U), E_ACCESSDENIED);
+
+        const auto snap = server.GetMetricsSnapshot();
+        EXPECT_EQ(snap.ClientConnectionsAccepted, 0ULL);
+        EXPECT_EQ(snap.FramesDelivered, 0ULL);
+        EXPECT_EQ(snap.QueueDepth, 1U);
+        server.Stop();
+    }
+
+    // Subcase C: Exact current user SID with RestrictDaclToAuthorizedSid succeeds cleanly.
+    {
+        wchar_t currentUserSid[128]{};
+        EXPECT_TRUE(QueryCurrentUserSidWide(currentUserSid, ARRAYSIZE(currentUserSid)));
+
+        const std::wstring pipeName = MakeUniquePipeName(13U);
+        FrameTransportConfig serverCfg;
+        serverCfg.SetPipeName(pipeName.c_str());
+        serverCfg.SetAuthorizedUserSid(currentUserSid);
+        serverCfg.RestrictDaclToAuthorizedSid = true;
+        serverCfg.AllowSameUserAccess = false;
+
+        FrameIpcServer server;
+        EXPECT_EQ(server.Start(serverCfg), S_OK);
+
+        bool evicted = false;
+        EXPECT_EQ(server.EnqueueFrame(MakeSyntheticExtractedFrame(1ULL, 77U, 64U, 64U), evicted), S_OK);
+
+        HostConsumerConfig clientCfg;
+        clientCfg.PipeName = pipeName;
+        clientCfg.VerifySyntheticPattern = true;
+        FrameConsumer consumer(clientCfg);
+        EXPECT_EQ(consumer.Connect(2000U), S_OK);
+
+        FrameIpcFrameHeader hdr{};
+        std::vector<uint8_t> pixels;
+        EXPECT_EQ(consumer.ReceiveNextFrame(hdr, pixels, 2000U), S_OK);
+        EXPECT_EQ(hdr.PresentationFrameNumber, 77U);
+        consumer.Disconnect();
+        server.Stop();
+    }
+}
+
+void
+TestCrossSessionAndSpoofedSessionRejection()
+{
+    const DWORD currentSessionId = QueryCurrentSessionId();
+
+    // 1. Server expects a different Terminal Services session ID -> rejects token session mismatch.
+    {
+        const std::wstring pipeName = MakeUniquePipeName(14U);
+        FrameTransportConfig serverCfg;
+        serverCfg.SetPipeName(pipeName.c_str());
+        serverCfg.SetAllowedClientSessionId(currentSessionId + 17U);
+
+        FrameIpcServer server;
+        EXPECT_EQ(server.Start(serverCfg), S_OK);
+
+        bool evicted = false;
+        EXPECT_EQ(server.EnqueueFrame(MakeSyntheticExtractedFrame(1ULL, 1U, 64U, 64U), evicted), S_OK);
+
+        HostConsumerConfig clientCfg;
+        clientCfg.PipeName = pipeName;
+        FrameConsumer consumer(clientCfg);
+        EXPECT_EQ(consumer.Connect(2000U), E_ACCESSDENIED);
+        EXPECT_EQ(consumer.GetMetricsSnapshot().LastProtocolStatus, FrameIpcStatus::UnauthorizedClient);
+
+        const auto snap = server.GetMetricsSnapshot();
+        EXPECT_EQ(snap.ClientConnectionsRejected, 1ULL);
+        EXPECT_EQ(snap.FramesDelivered, 0ULL);
+        server.Stop();
+    }
+
+    // 2. ClientHello claims wrong ClientSessionId compared to kernel TokenSessionId -> rejected.
+    {
+        const std::wstring pipeName = MakeUniquePipeName(15U);
+        FrameTransportConfig serverCfg;
+        serverCfg.SetPipeName(pipeName.c_str());
+
+        FrameIpcServer server;
+        EXPECT_EQ(server.Start(serverCfg), S_OK);
+
+        bool evicted = false;
+        EXPECT_EQ(server.EnqueueFrame(MakeSyntheticExtractedFrame(1ULL, 1U, 64U, 64U), evicted), S_OK);
+
+        ScopedWin32Handle rawClient(CreateFileW(
+            pipeName.c_str(),
+            GENERIC_READ | GENERIC_WRITE,
+            0U,
+            nullptr,
+            OPEN_EXISTING,
+            SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+            nullptr));
+        EXPECT_TRUE(rawClient.IsValid());
+
+        FrameIpcClientHello spoofSessionHello{};
+        spoofSessionHello.Envelope = InitEnvelope(FrameIpcMessageType::ClientHello, sizeof(FrameIpcClientHello));
+        spoofSessionHello.ClientProcessId = GetCurrentProcessId();
+        spoofSessionHello.ClientSessionId = static_cast<uint32_t>(currentSessionId + 1U);
+        EXPECT_TRUE(WriteAllSync(rawClient.Get(), &spoofSessionHello, sizeof(spoofSessionHello)));
+
+        FrameIpcServerHello srvHello{};
+        EXPECT_TRUE(ReadAllSync(rawClient.Get(), &srvHello, sizeof(srvHello)));
+        EXPECT_EQ(srvHello.Status, static_cast<uint32_t>(FrameIpcStatus::UnauthorizedClient));
+        EXPECT_EQ(srvHello.SessionId, 0ULL);
+        rawClient.Reset();
+
+        const auto snap = server.GetMetricsSnapshot();
+        EXPECT_EQ(snap.ClientConnectionsRejected, 1ULL);
+        EXPECT_EQ(snap.FramesDelivered, 0ULL);
+        server.Stop();
+    }
+}
+
+void
+TestProcessIntegrityAndAnonymousSqosRejectionBeforePixels()
+{
+    // 1. Server requiring higher integrity level rejects standard process token before any frame transfer.
+    {
+        const std::wstring pipeName = MakeUniquePipeName(16U);
+        FrameTransportConfig serverCfg;
+        serverCfg.SetPipeName(pipeName.c_str());
+        serverCfg.MinimumIntegrityRid = SECURITY_MANDATORY_SYSTEM_RID;
+
+        FrameIpcServer server;
+        EXPECT_EQ(server.Start(serverCfg), S_OK);
+
+        bool evicted = false;
+        EXPECT_EQ(server.EnqueueFrame(MakeSyntheticExtractedFrame(1ULL, 1U, 64U, 64U), evicted), S_OK);
+
+        HostConsumerConfig clientCfg;
+        clientCfg.PipeName = pipeName;
+        FrameConsumer consumer(clientCfg);
+        EXPECT_EQ(consumer.Connect(2000U), E_ACCESSDENIED);
+        EXPECT_EQ(consumer.GetMetricsSnapshot().LastProtocolStatus, FrameIpcStatus::UnauthorizedClient);
+        EXPECT_EQ(server.GetMetricsSnapshot().FramesDelivered, 0ULL);
+        server.Stop();
+    }
+
+    // 2. Anonymous SQOS client and real Low-Integrity token client are both blocked prior to frame delivery.
+    {
+        const std::wstring pipeName = MakeUniquePipeName(17U);
+        FrameTransportConfig serverCfg;
+        serverCfg.SetPipeName(pipeName.c_str());
+
+        FrameIpcServer server;
+        EXPECT_EQ(server.Start(serverCfg), S_OK);
+
+        bool evicted = false;
+        EXPECT_EQ(server.EnqueueFrame(MakeSyntheticExtractedFrame(1ULL, 55U, 64U, 64U), evicted), S_OK);
+
+        // 2a. SECURITY_ANONYMOUS client cannot pass VerifyConnectedClientIdentity.
+        {
+            ScopedWin32Handle anonClient(CreateFileW(
+                pipeName.c_str(),
+                GENERIC_READ | GENERIC_WRITE,
+                0U,
+                nullptr,
+                OPEN_EXISTING,
+                SECURITY_SQOS_PRESENT | SECURITY_ANONYMOUS,
+                nullptr));
+            if (anonClient.IsValid())
+            {
+                FrameIpcClientHello anonHello{};
+                anonHello.Envelope = InitEnvelope(FrameIpcMessageType::ClientHello, sizeof(FrameIpcClientHello));
+                anonHello.ClientProcessId = GetCurrentProcessId();
+                anonHello.ClientSessionId = static_cast<uint32_t>(QueryCurrentSessionId());
+                if (WriteAllSync(anonClient.Get(), &anonHello, sizeof(anonHello)))
+                {
+                    FrameIpcServerHello srvHello{};
+                    if (ReadAllSync(anonClient.Get(), &srvHello, sizeof(srvHello)))
+                    {
+                        EXPECT_EQ(srvHello.Status, static_cast<uint32_t>(FrameIpcStatus::UnauthorizedClient));
+                        EXPECT_EQ(srvHello.SessionId, 0ULL);
+                    }
+                }
+            }
+        }
+
+        // 2b. Duplicated Low Mandatory Integrity token (S-1-16-4096) blocked by kernel Medium Mandatory Label.
+        std::atomic<DWORD> lowOpenError{ERROR_SUCCESS};
+        std::atomic<bool> lowTokenTested{false};
+        std::thread lowThread([&]() {
+            HANDLE procToken = nullptr;
+            if (OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &procToken) == FALSE)
+            {
+                return;
+            }
+            ScopedWin32Handle procTokenGuard(procToken);
+
+            HANDLE dupLowToken = nullptr;
+            if (DuplicateTokenEx(
+                    procTokenGuard.Get(),
+                    TOKEN_ALL_ACCESS,
+                    nullptr,
+                    SecurityImpersonation,
+                    TokenImpersonation,
+                    &dupLowToken) == FALSE)
+            {
+                return;
+            }
+            ScopedWin32Handle lowTokenGuard(dupLowToken);
+
+            SID_IDENTIFIER_AUTHORITY mlAuth = SECURITY_MANDATORY_LABEL_AUTHORITY;
+            PSID lowSid = nullptr;
+            if (AllocateAndInitializeSid(&mlAuth, 1U, SECURITY_MANDATORY_LOW_RID, 0, 0, 0, 0, 0, 0, 0, &lowSid) == FALSE)
+            {
+                return;
+            }
+
+            TOKEN_MANDATORY_LABEL tml{};
+            tml.Label.Attributes = SE_GROUP_INTEGRITY;
+            tml.Label.Sid = lowSid;
+            const BOOL setIlOk = SetTokenInformation(
+                lowTokenGuard.Get(),
+                TokenIntegrityLevel,
+                &tml,
+                sizeof(tml) + GetLengthSid(lowSid));
+            FreeSid(lowSid);
+            if (setIlOk == FALSE)
+            {
+                return;
+            }
+
+            if (ImpersonateLoggedOnUser(lowTokenGuard.Get()) != FALSE)
+            {
+                lowTokenTested.store(true, std::memory_order_release);
+                const HANDLE h = CreateFileW(
+                    pipeName.c_str(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0U,
+                    nullptr,
+                    OPEN_EXISTING,
+                    SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                    nullptr);
+                if (h == INVALID_HANDLE_VALUE)
+                {
+                    lowOpenError.store(GetLastError(), std::memory_order_release);
+                }
+                else
+                {
+                    CloseHandle(h);
+                }
+                (void)RevertToSelf();
+            }
+        });
+        lowThread.join();
+
+        EXPECT_TRUE(lowTokenTested.load(std::memory_order_acquire));
+        EXPECT_EQ(lowOpenError.load(std::memory_order_acquire), static_cast<DWORD>(ERROR_ACCESS_DENIED));
+        EXPECT_EQ(server.GetMetricsSnapshot().FramesDelivered, 0ULL);
+
+        // Authorized client still receives the untouched queued frame.
+        HostConsumerConfig okCfg;
+        okCfg.PipeName = pipeName;
+        okCfg.VerifySyntheticPattern = true;
+        FrameConsumer okConsumer(okCfg);
+        EXPECT_EQ(okConsumer.Connect(2000U), S_OK);
+        FrameIpcFrameHeader hdr{};
+        std::vector<uint8_t> pixels;
+        EXPECT_EQ(okConsumer.ReceiveNextFrame(hdr, pixels, 2000U), S_OK);
+        EXPECT_EQ(hdr.PresentationFrameNumber, 55U);
+        okConsumer.Disconnect();
+        server.Stop();
+    }
+}
+
 template <typename Fn>
 void
 RunTest(
@@ -902,6 +1328,9 @@ main()
     RunTest("HostDisconnectReconnectAndMidFrameDisconnect", TestHostDisconnectReconnectAndMidFrameDisconnect);
     RunTest("BoundedQueueBackpressureSlowConsumerAndNoBusyWait", TestBoundedQueueBackpressureSlowConsumerAndNoBusyWait);
     RunTest("ConcurrentShutdownSuspendAndResourceCleanup", TestConcurrentShutdownSuspendAndResourceCleanup);
+    RunTest("CrossUserSidAuthorizationAndRestrictedDaclRejection", TestCrossUserSidAuthorizationAndRestrictedDaclRejection);
+    RunTest("CrossSessionAndSpoofedSessionRejection", TestCrossSessionAndSpoofedSessionRejection);
+    RunTest("ProcessIntegrityAndAnonymousSqosRejectionBeforePixels", TestProcessIntegrityAndAnonymousSqosRejectionBeforePixels);
 
     std::printf("Summary: %d tests run, %d assertion failures.\n", g_TestsRun, g_TestsFailed);
     return (g_TestsFailed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;

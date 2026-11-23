@@ -16,6 +16,8 @@ $script:LumaBridgeDriverConstants = [pscustomobject]@{
     SupportedInf2CatOsList      = '10_CO_X64,10_NI_X64,10_GE_X64'
     MinimumWindows11Build       = 22000
     RegistryValueEnableMon      = 'EnableVirtualMonitor'
+    RegistryValueEnableExt      = 'EnableFrameExtraction'
+    RegistryValueAuthorizedSid  = 'AuthorizedHostUserSid'
     EtwSessionName              = 'LumaBridgeIddCore'
     EtwDxgSessionName           = 'LumaBridgeIddDxg'
     EtwLegacySessionName        = 'LumaBridgeIddTrace'
@@ -819,6 +821,119 @@ function Invoke-LumaBridgeExternalCommand {
     }
 }
 
+function Invoke-LumaBridgeHostProcess {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ExecutablePath,
+
+        [string[]]$Arguments = @(),
+
+        [ValidateRange(500, 600000)]
+        [int]$HardTimeoutMs = 30000,
+
+        [switch]$DryRun
+    )
+
+    $escapedArgs = ($Arguments | ForEach-Object {
+        if ($_ -match '[\s"]') {
+            '"' + ($_ -replace '"', '\"') + '"'
+        }
+        else {
+            $_
+        }
+    }) -join ' '
+
+    if ($DryRun) {
+        Write-Host ("[DRY-RUN] Would run host process (timeout={0}ms): `"{1}`" {2}" -f $HardTimeoutMs, $ExecutablePath, $escapedArgs) -ForegroundColor Cyan
+        return [pscustomobject]@{
+            ExitCode   = 0
+            TimedOut   = $false
+            Output     = @()
+            StdErr     = @()
+            DryRun     = $true
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $ExecutablePath -PathType Leaf)) {
+        throw ("Host consumer executable not found: {0}" -f $ExecutablePath)
+    }
+
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $ExecutablePath
+    $psi.Arguments = $escapedArgs
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+
+    $stdoutLines = New-Object System.Collections.Generic.List[string]
+    $stderrLines = New-Object System.Collections.Generic.List[string]
+    $proc = [System.Diagnostics.Process]::new()
+    $proc.StartInfo = $psi
+
+    $outSub = $null
+    $errSub = $null
+    try {
+        $outSub = Register-ObjectEvent -InputObject $proc -EventName 'OutputDataReceived' -Action {
+            if ($null -ne $EventArgs.Data) {
+                $Event.MessageData.Add($EventArgs.Data)
+            }
+        } -MessageData $stdoutLines
+        $errSub = Register-ObjectEvent -InputObject $proc -EventName 'ErrorDataReceived' -Action {
+            if ($null -ne $EventArgs.Data) {
+                $Event.MessageData.Add($EventArgs.Data)
+            }
+        } -MessageData $stderrLines
+
+        if (-not $proc.Start()) {
+            throw ("Failed to start host consumer executable: {0}" -f $ExecutablePath)
+        }
+        $proc.BeginOutputReadLine()
+        $proc.BeginErrorReadLine()
+
+        $exited = $proc.WaitForExit($HardTimeoutMs)
+        $timedOut = $false
+        if (-not $exited) {
+            $timedOut = $true
+            try { $proc.Kill() } catch { }
+            try { $proc.WaitForExit(3000) } catch { }
+        }
+        else {
+            # Flush remaining async output buffers once process exits cleanly.
+            $proc.WaitForExit()
+        }
+
+        $exitCode = if ($timedOut) { -1 } else { [int]$proc.ExitCode }
+        return [pscustomobject]@{
+            ExitCode = $exitCode
+            TimedOut = $timedOut
+            Output   = @($stdoutLines.ToArray())
+            StdErr   = @($stderrLines.ToArray())
+            DryRun   = $false
+        }
+    }
+    finally {
+        if ($null -ne $outSub) {
+            try { Unregister-Event -SubscriptionId $outSub.Id -ErrorAction SilentlyContinue } catch { }
+            try { Remove-Job -Id $outSub.Id -Force -ErrorAction SilentlyContinue } catch { }
+        }
+        if ($null -ne $errSub) {
+            try { Unregister-Event -SubscriptionId $errSub.Id -ErrorAction SilentlyContinue } catch { }
+            try { Remove-Job -Id $errSub.Id -Force -ErrorAction SilentlyContinue } catch { }
+        }
+        if ($null -ne $proc) {
+            try {
+                if (-not $proc.HasExited) {
+                    $proc.Kill()
+                }
+            }
+            catch { }
+            $proc.Dispose()
+        }
+    }
+}
+
 function Get-LumaBridgeDeviceParametersRegistryPath {
     [CmdletBinding()]
     param(
@@ -864,6 +979,98 @@ function Set-LumaBridgeDeviceEnableVirtualMonitor {
     }
 
     New-ItemProperty -LiteralPath $DeviceParametersPath -Name $script:LumaBridgeDriverConstants.RegistryValueEnableMon -PropertyType DWord -Value $Value -Force | Out-Null
+}
+
+function Get-LumaBridgeDeviceEnableFrameExtraction {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DeviceParametersPath
+    )
+
+    if (-not (Test-Path -LiteralPath $DeviceParametersPath)) {
+        return $null
+    }
+
+    $propName = $script:LumaBridgeDriverConstants.RegistryValueEnableExt
+    $regProps = Get-ItemProperty -LiteralPath $DeviceParametersPath -Name $propName -ErrorAction SilentlyContinue
+    if ($null -ne $regProps -and ($regProps.PSObject.Properties.Name -contains $propName)) {
+        return $regProps.$propName
+    }
+
+    return $null
+}
+
+function Set-LumaBridgeDeviceEnableFrameExtraction {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DeviceParametersPath,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet(0, 1)]
+        [int]$Value
+    )
+
+    if (-not (Test-Path -LiteralPath $DeviceParametersPath)) {
+        New-Item -Path $DeviceParametersPath -Force | Out-Null
+    }
+
+    New-ItemProperty -LiteralPath $DeviceParametersPath -Name $script:LumaBridgeDriverConstants.RegistryValueEnableExt -PropertyType DWord -Value $Value -Force | Out-Null
+}
+
+function Get-LumaBridgeDeviceAuthorizedHostUserSid {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DeviceParametersPath
+    )
+
+    if (-not (Test-Path -LiteralPath $DeviceParametersPath)) {
+        return $null
+    }
+
+    $propName = $script:LumaBridgeDriverConstants.RegistryValueAuthorizedSid
+    $regProps = Get-ItemProperty -LiteralPath $DeviceParametersPath -Name $propName -ErrorAction SilentlyContinue
+    if ($null -ne $regProps -and ($regProps.PSObject.Properties.Name -contains $propName)) {
+        $raw = [string]$regProps.$propName
+        if (-not [string]::IsNullOrWhiteSpace($raw)) {
+            return $raw.Trim()
+        }
+    }
+
+    return $null
+}
+
+function Set-LumaBridgeDeviceAuthorizedHostUserSid {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DeviceParametersPath,
+
+        [string]$SidString,
+
+        [switch]$Clear
+    )
+
+    $propName = $script:LumaBridgeDriverConstants.RegistryValueAuthorizedSid
+    if ($Clear -or [string]::IsNullOrWhiteSpace($SidString)) {
+        if (Test-Path -LiteralPath $DeviceParametersPath) {
+            Remove-ItemProperty -LiteralPath $DeviceParametersPath -Name $propName -ErrorAction SilentlyContinue
+        }
+        return
+    }
+
+    $trimmedSid = $SidString.Trim()
+    if ($trimmedSid -notmatch '^S-1-[0-9-]+$') {
+        throw ("Invalid Windows SID format '{0}' for AuthorizedHostUserSid." -f $SidString)
+    }
+
+    if (-not (Test-Path -LiteralPath $DeviceParametersPath)) {
+        New-Item -Path $DeviceParametersPath -Force | Out-Null
+    }
+
+    New-ItemProperty -LiteralPath $DeviceParametersPath -Name $propName -PropertyType String -Value $trimmedSid -Force | Out-Null
 }
 
 function Get-LumaBridgeDevicePropertyData {
@@ -1089,27 +1296,31 @@ function Get-LumaBridgePnpInstances {
 
                 $regParamsPath = Get-LumaBridgeDeviceParametersRegistryPath -InstanceId $dev.InstanceId
                 $enableVal = Get-LumaBridgeDeviceEnableVirtualMonitor -DeviceParametersPath $regParamsPath
+                $enableExtractionVal = Get-LumaBridgeDeviceEnableFrameExtraction -DeviceParametersPath $regParamsPath
+                $authorizedSidVal = Get-LumaBridgeDeviceAuthorizedHostUserSid -DeviceParametersPath $regParamsPath
                 $startupDiag = Get-LumaBridgeDeviceStartupDiagnostics -DeviceParametersPath $regParamsPath
 
                 $results.Add([pscustomobject]@{
-                    InstanceId           = $dev.InstanceId
-                    FriendlyName         = $dev.FriendlyName
-                    Status               = $dev.Status
-                    ProblemCode          = $probCode
-                    ProblemStatus        = $probStatus
-                    ProblemStatusHex     = $probStatusHex
-                    Present              = [bool]$dev.Present
-                    HardwareIds          = @($effectiveHardwareIds)
-                    DriverInfPath        = $driverInfPath
-                    DriverProvider       = $driverProvider
-                    DriverVersion        = $driverVersion
-                    DriverService        = $driverService
-                    UpperFilters         = @($upperFilters)
-                    LowerFilters         = @($lowerFilters)
-                    ConfigurationId      = $configurationId
-                    DeviceParametersPath = $regParamsPath
-                    EnableVirtualMonitor = $enableVal
-                    StartupDiagnostics   = $startupDiag
+                    InstanceId            = $dev.InstanceId
+                    FriendlyName          = $dev.FriendlyName
+                    Status                = $dev.Status
+                    ProblemCode           = $probCode
+                    ProblemStatus         = $probStatus
+                    ProblemStatusHex      = $probStatusHex
+                    Present               = [bool]$dev.Present
+                    HardwareIds           = @($effectiveHardwareIds)
+                    DriverInfPath         = $driverInfPath
+                    DriverProvider        = $driverProvider
+                    DriverVersion         = $driverVersion
+                    DriverService         = $driverService
+                    UpperFilters          = @($upperFilters)
+                    LowerFilters          = @($lowerFilters)
+                    ConfigurationId       = $configurationId
+                    DeviceParametersPath  = $regParamsPath
+                    EnableVirtualMonitor  = $enableVal
+                    EnableFrameExtraction = $enableExtractionVal
+                    AuthorizedHostUserSid = $authorizedSidVal
+                    StartupDiagnostics    = $startupDiag
                 })
             }
         }
@@ -1123,27 +1334,31 @@ function Get-LumaBridgePnpInstances {
             if ($seenIds.Add($ent.PNPDeviceID)) {
                 $regParamsPath = Get-LumaBridgeDeviceParametersRegistryPath -InstanceId $ent.PNPDeviceID
                 $enableVal = Get-LumaBridgeDeviceEnableVirtualMonitor -DeviceParametersPath $regParamsPath
+                $enableExtractionVal = Get-LumaBridgeDeviceEnableFrameExtraction -DeviceParametersPath $regParamsPath
+                $authorizedSidVal = Get-LumaBridgeDeviceAuthorizedHostUserSid -DeviceParametersPath $regParamsPath
                 $startupDiag = Get-LumaBridgeDeviceStartupDiagnostics -DeviceParametersPath $regParamsPath
 
                 $results.Add([pscustomobject]@{
-                    InstanceId           = $ent.PNPDeviceID
-                    FriendlyName         = $ent.Name
-                    Status               = $ent.Status
-                    ProblemCode          = $ent.ConfigManagerErrorCode
-                    ProblemStatus        = $null
-                    ProblemStatusHex     = $null
-                    Present              = ($ent.ConfigManagerErrorCode -eq 0)
-                    HardwareIds          = @($ent.HardwareID)
-                    DriverInfPath        = $null
-                    DriverProvider       = $null
-                    DriverVersion        = $null
-                    DriverService        = $ent.Service
-                    UpperFilters         = @()
-                    LowerFilters         = @()
-                    ConfigurationId      = $null
-                    DeviceParametersPath = $regParamsPath
-                    EnableVirtualMonitor = $enableVal
-                    StartupDiagnostics   = $startupDiag
+                    InstanceId            = $ent.PNPDeviceID
+                    FriendlyName          = $ent.Name
+                    Status                = $ent.Status
+                    ProblemCode           = $ent.ConfigManagerErrorCode
+                    ProblemStatus         = $null
+                    ProblemStatusHex      = $null
+                    Present               = ($ent.ConfigManagerErrorCode -eq 0)
+                    HardwareIds           = @($ent.HardwareID)
+                    DriverInfPath         = $null
+                    DriverProvider        = $null
+                    DriverVersion         = $null
+                    DriverService         = $ent.Service
+                    UpperFilters          = @()
+                    LowerFilters          = @()
+                    ConfigurationId       = $null
+                    DeviceParametersPath  = $regParamsPath
+                    EnableVirtualMonitor  = $enableVal
+                    EnableFrameExtraction = $enableExtractionVal
+                    AuthorizedHostUserSid = $authorizedSidVal
+                    StartupDiagnostics    = $startupDiag
                 })
             }
         }
@@ -3612,10 +3827,15 @@ Export-ModuleMember -Function @(
     'Assert-LumaBridgeAdministrator',
     'Confirm-LumaBridgeAction',
     'Invoke-LumaBridgeExternalCommand',
+    'Invoke-LumaBridgeHostProcess',
     'Format-LumaBridgeNtStatusHex',
     'Get-LumaBridgeDeviceParametersRegistryPath',
     'Get-LumaBridgeDeviceEnableVirtualMonitor',
     'Set-LumaBridgeDeviceEnableVirtualMonitor',
+    'Get-LumaBridgeDeviceEnableFrameExtraction',
+    'Set-LumaBridgeDeviceEnableFrameExtraction',
+    'Get-LumaBridgeDeviceAuthorizedHostUserSid',
+    'Set-LumaBridgeDeviceAuthorizedHostUserSid',
     'Get-LumaBridgeDeviceStartupDiagnostics',
     'Get-LumaBridgeDevicePropertyData',
     'Get-LumaBridgePnpInstances',

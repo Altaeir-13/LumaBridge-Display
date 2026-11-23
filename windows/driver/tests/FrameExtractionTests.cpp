@@ -874,9 +874,99 @@ TestAcquiredSurfaceComReferenceLifetimeReleasedBeforeReturn()
     EXPECT_EQ(hooks.ObservedRefCountDuringMap, 1UL);
     EXPECT_EQ(tracked->GetRefCount(), 1UL);
 
+    // Subcase B: When AdoptSourceTexture is supplied via ComPtr::Detach() (matching Adapter.cpp usage),
+    // the caller's ownership transfers cleanly and ExtractFrame releases it BEFORE MapStagingTexture runs.
+    ComPtr<ID3D11Texture2D> ownerTex = tracked->AsTexture2D();
+    EXPECT_EQ(tracked->GetRefCount(), 2UL);
+    FrameExtractionInput inOwned{};
+    inOwned.AdoptSourceTexture = ownerTex.Detach();
+    inOwned.PresentationFrameNumber = 14U;
+    EXPECT_TRUE(ownerTex.Get() == nullptr);
+    EXPECT_EQ(tracked->GetRefCount(), 2UL);
+    hooks.ObservedRefCountDuringCopy = 0UL;
+    hooks.ObservedRefCountDuringMap = 0UL;
+
+    const FrameExtractionResult resOwned = extractor.ExtractFrame(inOwned, frameBuf);
+    EXPECT_EQ(resOwned.HResult, S_OK);
+    EXPECT_TRUE(resOwned.PixelsCopied);
+    EXPECT_EQ(hooks.ObservedRefCountDuringCopy, 2UL);
+    EXPECT_EQ(hooks.ObservedRefCountDuringMap, 1UL);
+    EXPECT_EQ(tracked->GetRefCount(), 1UL);
+
     extractor.Reset();
     EXPECT_EQ(tracked->GetRefCount(), 1UL);
     EXPECT_EQ(tracked.Reset(), 0UL);
+}
+
+void
+TestPoolBufferMemoryBoundsAndFlushStorageRelease()
+{
+    // 1. Buffers <= kMaxRetainedPoolBufferBytes (e.g. 1080p) retain capacity for zero-churn reuse.
+    ExtractedFrameBuffer buf;
+    constexpr size_t k1080pBytes = 1920U * 1080U * 4U;
+    EXPECT_TRUE(buf.Pixels.Resize(k1080pBytes));
+    EXPECT_EQ(buf.Pixels.size(), k1080pBytes);
+    buf.ResetMetadataKeepCapacity();
+    EXPECT_EQ(buf.Pixels.size(), 0U);
+    EXPECT_TRUE(buf.Pixels.capacity() >= k1080pBytes);
+
+    // 2. Oversized peak buffers (> 1440p, e.g. 4096x4096 = 64 MiB) must NOT permanently retain
+    //    5 x 64 MiB = 320 MiB in the driver pool across slot recycling.
+    constexpr size_t kMax4kBytes = static_cast<size_t>(kMaxFramePayloadBytes);
+    EXPECT_TRUE(buf.Pixels.Resize(kMax4kBytes));
+    EXPECT_EQ(buf.Pixels.size(), kMax4kBytes);
+    buf.ResetMetadataKeepCapacity();
+    EXPECT_EQ(buf.Pixels.size(), 0U);
+    EXPECT_EQ(buf.Pixels.capacity(), 0U);
+
+    // 3. Reject allocations exceeding kMaxFramePayloadBytes.
+    EXPECT_TRUE(!buf.Pixels.Resize(kMax4kBytes + 4U));
+    EXPECT_EQ(buf.Pixels.size(), 0U);
+
+    // 4. Shrinking from oversized (> 14.06 MiB) down to 720p shrinks backing allocation.
+    constexpr size_t k720pBytes = 1280U * 720U * 4U;
+    EXPECT_TRUE(buf.Pixels.Resize(kMax4kBytes));
+    EXPECT_TRUE(buf.Pixels.Resize(k720pBytes));
+    EXPECT_EQ(buf.Pixels.size(), k720pBytes);
+    EXPECT_TRUE(buf.Pixels.capacity() <= kMaxRetainedPoolBufferBytes);
+
+    // 5. FrameIpcServer::FlushQueue() releases all pixel allocations back to 0 bytes.
+    wchar_t pipeBuf[128]{};
+    _snwprintf_s(
+        pipeBuf,
+        ARRAYSIZE(pipeBuf),
+        _TRUNCATE,
+        L"\\\\.\\pipe\\LumaBridgeExtPoolTest_%lu",
+        GetCurrentProcessId());
+    FrameTransportConfig cfg;
+    cfg.SetPipeName(pipeBuf);
+    cfg.MaxQueueDepth = 3U;
+    cfg.BufferPoolSize = 5U;
+
+    FrameIpcServer server;
+    EXPECT_EQ(server.Start(cfg), S_OK);
+    auto slot = server.AcquireBufferSlot();
+    EXPECT_TRUE(slot != nullptr);
+    EXPECT_TRUE(slot->Pixels.Resize(k1080pBytes));
+    slot->FrameSequence = 1ULL;
+    slot->Width = 1920U;
+    slot->Height = 1080U;
+    slot->RowPitchBytes = 1920U * 4U;
+    slot->Format = static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
+    bool evicted = false;
+    EXPECT_EQ(server.EnqueueFrame(std::move(slot), evicted), S_OK);
+    EXPECT_EQ(server.GetMetricsSnapshot().QueueDepth, 1U);
+
+    server.FlushQueue();
+    EXPECT_EQ(server.GetMetricsSnapshot().QueueDepth, 0U);
+    for (size_t i = 0U; i < 5U; ++i)
+    {
+        auto s = server.AcquireBufferSlot();
+        EXPECT_TRUE(s != nullptr);
+        EXPECT_EQ(s->Pixels.capacity(), 0U);
+        server.RecycleBufferSlot(std::move(s));
+    }
+    server.Stop();
 }
 
 class RealD3d11SwapChainHarnessBackend final : public ISwapChainBackend
@@ -1197,6 +1287,7 @@ main()
     RunTest("MapAndCopyFailureHandledCleanly", TestMapAndCopyFailureHandledCleanly);
     RunTest("DeviceRemovedAndResetPropagated", TestDeviceRemovedAndResetPropagated);
     RunTest("AcquiredSurfaceComReferenceLifetimeReleasedBeforeReturn", TestAcquiredSurfaceComReferenceLifetimeReleasedBeforeReturn);
+    RunTest("PoolBufferMemoryBoundsAndFlushStorageRelease", TestPoolBufferMemoryBoundsAndFlushStorageRelease);
     RunTest("SwapChainProcessorIntegrationWithExtractionAndIddCxFinish", TestSwapChainProcessorIntegrationWithExtractionAndIddCxFinish);
 
     std::printf("Summary: %d tests run, %d assertion failures.\n", g_TestsRun, g_TestsFailed);

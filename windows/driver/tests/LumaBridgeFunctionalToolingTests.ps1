@@ -2128,6 +2128,222 @@ Invoke-UnitTest -Name 'ObservabilityVerifyProvidersAndUnclampedEtlTraceLoggingRe
     }
 }
 
+# 30. Functional validation orchestrator DryRun, StagingDir handling, and guaranteed finally rollback on failure
+Invoke-UnitTest -Name 'FunctionalValidationScriptDryRunAndFinallyRollbackOnFailure' -TestBody {
+    param($caseDir)
+
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+    $scriptText = Get-Content -LiteralPath $valScript -Raw
+    Assert-True ($scriptText -match '\$signResult\.StagingDir\b') 'Validation script references StagingDir property'
+    Assert-True ($scriptText -notmatch '\$signResult\.StagingDirectory\b') 'Validation script must not reference non-existent StagingDirectory property'
+
+    $docsValPath = Join-Path (Get-LumaBridgeRepoRoot) 'docs\setup\windows-idd-functional-validation.md'
+    $docsText = Get-Content -LiteralPath $docsValPath -Raw
+    Assert-True ($docsText -match '\$signResult\.StagingDir\b') 'Validation documentation references StagingDir property'
+    Assert-True ($docsText -notmatch '-StagingDir\s+\$signResult\.StagingDirectory\b') 'Validation documentation must not pass StagingDirectory'
+
+    $dryStg = Join-Path $caseDir 'dry_stg'
+    $dryOut = Join-Path $caseDir 'dry_out'
+    $dryRes = & $valScript -Configuration Release -StagingDir $dryStg -OutputDir $dryOut -AllowAnyBranch -DryRun
+    Assert-Equal $dryRes.DryRun $true 'Invoke-LumaBridgeFunctionalValidation -DryRun returns DryRun=true'
+    Assert-Equal (Test-Path -LiteralPath $dryStg) $false 'DryRun must not create StagingDir'
+    Assert-Equal (Test-Path -LiteralPath $dryOut) $false 'DryRun must not create OutputDir'
+
+    # Live failure simulation: host consumer fails in Stage 9 -> finally must revert flags, stop ETW, restart device, and persist report
+    $certInfo = New-EphemeralTestCertificate -OutDirectory (Join-Path $caseDir 'certs') -NamePrefix 'valrb'
+    $liveStg = Join-Path $caseDir 'live_stg'
+    $liveOut = Join-Path $caseDir 'live_out'
+    $fakeHostExe = Join-Path $caseDir 'lumabridge-host.exe'
+    [System.IO.File]::WriteAllBytes($fakeHostExe, [byte[]]@(0x4D, 0x5A, 0x90, 0x00))
+
+    $c = Get-LumaBridgeDriverConstants
+    $mockLogmanLines = @(
+        'Name:                 LumaBridgeIddCore',
+        ('Provider:             {0}' -f $c.LumaBridgeTraceProviderGuid),
+        ('Provider:             {0}' -f $c.IddCxManifestProviderGuid),
+        ('Provider:             {0}' -f $c.IddCxWppProviderGuid),
+        ('Provider:             {0}' -f $c.UmdfOperationalProviderGuid),
+        ('Provider:             {0}' -f $c.WdfCoreWppProviderGuid),
+        ('Provider:             {0}' -f $c.WerKernelProviderGuid)
+    )
+
+    $global:LbTestState['ValMock'] = [ordered]@{
+        CertInfo         = $certInfo
+        Signtool         = Get-LumaBridgeWdkToolPath -ToolName 'signtool.exe'
+        LogmanLines      = $mockLogmanLines
+        EnableMon        = 0
+        EnableExt        = 0
+        AuthSid          = $null
+        EtwRunning       = $false
+        EtwStopCalls     = 0
+        RestartCount     = 0
+        InjectStage8Fail = $false
+    }
+
+    $mockGetInstances = {
+        [CmdletBinding()] param([string]$HardwareId)
+        $st = $global:LbTestState['ValMock']
+        return @([pscustomobject]@{
+            InstanceId            = 'ROOT\DISPLAY\0000'
+            FriendlyName          = 'LumaBridge Indirect Display Adapter'
+            Status                = 'OK'
+            ProblemCode           = 0
+            ProblemStatus         = 0
+            ProblemStatusHex      = '0x00000000'
+            Present               = $true
+            HardwareIds           = @('Root\LumaBridgeIddDriver')
+            DriverInfPath         = 'oem99.inf'
+            DriverProvider        = 'LumaBridge'
+            DriverVersion         = '22.0.0.1'
+            DriverService         = 'WUDFRd'
+            UpperFilters          = @('IndirectKmd')
+            LowerFilters          = @()
+            ConfigurationId       = 'oem99.inf:Root\LumaBridgeIddDriver'
+            DeviceParametersPath  = 'MOCK:\ROOT\DISPLAY\0000\Device Parameters'
+            EnableVirtualMonitor  = $st.EnableMon
+            EnableFrameExtraction = $st.EnableExt
+            AuthorizedHostUserSid = $st.AuthSid
+            StartupDiagnostics    = [pscustomobject]@{
+                LastStage           = 'AdapterInitFinished'
+                LastSuccessfulStage = 'AdapterInitFinished'
+                LastStatusHex       = '0x00000000'
+                LastErrorStatusHex  = '0x00000000'
+            }
+        })
+    }
+
+    $mockExternalCmd = {
+        [CmdletBinding()] param([string]$FilePath, [string[]]$Arguments = @(), [switch]$DryRun)
+        $st = $global:LbTestState['ValMock']
+        if ($FilePath -like '*git*') {
+            return [pscustomobject]@{ ExitCode = 0; Output = @('feature/windows-frame-extraction-ipc'); DryRun = $false }
+        }
+        if ($FilePath -ieq $st.Signtool -and $Arguments.Count -ge 1 -and $Arguments[0] -eq 'sign') {
+            $targetFile = $Arguments[$Arguments.Count - 1]
+            $ci = $st.CertInfo
+            $out = & $FilePath sign /fd SHA256 /f $ci.PfxPath /p $ci.Password $targetFile 2>&1
+            if ($LASTEXITCODE -ne 0) { throw ("Mock signtool failed: {0}" -f ($out -join ' ')) }
+            return [pscustomobject]@{ ExitCode = 0; Output = @($out); DryRun = $false }
+        }
+        if ($FilePath -like '*Inf2Cat*' -or ($FilePath -ieq $st.Signtool -and $Arguments[0] -eq 'verify')) {
+            $out = & $FilePath @Arguments 2>&1
+            if ($LASTEXITCODE -ne 0) { throw ("Tool failed: {0}" -f ($out -join ' ')) }
+            return [pscustomobject]@{ ExitCode = 0; Output = @($out); DryRun = $false }
+        }
+        if ($FilePath -like '*logman*') {
+            if ($Arguments[0] -eq 'create') {
+                if ($Arguments.Count -ge 3 -and $Arguments[2] -eq 'LumaBridgeIddCore') {
+                    $st.EtwRunning = $true
+                }
+                return [pscustomobject]@{ ExitCode = 0; Output = @('The command completed successfully.'); DryRun = $false }
+            }
+            if ($Arguments[0] -eq 'query') {
+                if ($Arguments.Count -ge 2 -and $Arguments[1] -eq 'LumaBridgeIddDxg') {
+                    throw 'Data Collector Set was not found.'
+                }
+                return [pscustomobject]@{ ExitCode = 0; Output = $st.LogmanLines; DryRun = $false }
+            }
+            if ($Arguments[0] -eq 'stop') {
+                if ($Arguments.Count -ge 2 -and $Arguments[1] -eq 'LumaBridgeIddCore') {
+                    $st.EtwRunning = $false
+                    $st.EtwStopCalls++
+                }
+                return [pscustomobject]@{ ExitCode = 0; Output = @('The command completed successfully.'); DryRun = $false }
+            }
+        }
+        if ($FilePath -like '*pnputil*' -and $Arguments[0] -eq '/restart-device') {
+            $st.RestartCount++
+            if ($st.InjectStage8Fail -and $st.EnableExt -eq 1 -and $st.RestartCount -eq 2) {
+                throw 'Simulated Stage 8 pnputil restart failure'
+            }
+            return [pscustomobject]@{ ExitCode = 0; Output = @('Device restarted.'); DryRun = $false }
+        }
+        return [pscustomobject]@{ ExitCode = 0; Output = @('OK'); DryRun = $false }
+    }
+
+    $sharedMocks = @{
+        'Assert-LumaBridgeAdministrator'              = { [CmdletBinding()] param([string]$OperationName, [switch]$DryRun) return $true }
+        'Get-LumaBridgeHostSecurityState'             = { [CmdletBinding()] param() return [pscustomobject]@{ SecureBoot = 'Disabled'; TestSigning = 'Enabled' } }
+        'Find-LumaBridgeSigningCertificate'           = { [CmdletBinding()] param([string]$CertificateThumbprint, [string]$CertificateSubject) return $global:LbTestState['ValMock'].CertInfo.Certificate }
+        'Export-LumaBridgeCertificateFile'            = { [CmdletBinding()] param($Certificate, [string]$FilePath) [System.IO.File]::WriteAllBytes($FilePath, $Certificate.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)) }
+        'Get-LumaBridgePnpInstances'                  = $mockGetInstances
+        'Set-LumaBridgeDeviceEnableVirtualMonitor'    = { [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value) $global:LbTestState['ValMock'].EnableMon = $Value }
+        'Get-LumaBridgeDeviceEnableVirtualMonitor'    = { [CmdletBinding()] param([string]$DeviceParametersPath) return $global:LbTestState['ValMock'].EnableMon }
+        'Set-LumaBridgeDeviceEnableFrameExtraction'   = { [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value) $global:LbTestState['ValMock'].EnableExt = $Value }
+        'Get-LumaBridgeDeviceEnableFrameExtraction'   = { [CmdletBinding()] param([string]$DeviceParametersPath) return $global:LbTestState['ValMock'].EnableExt }
+        'Set-LumaBridgeDeviceAuthorizedHostUserSid'   = { [CmdletBinding()] param([string]$DeviceParametersPath, [string]$SidString, [switch]$Clear) if ($Clear -or [string]::IsNullOrWhiteSpace($SidString)) { $global:LbTestState['ValMock'].AuthSid = $null } else { $global:LbTestState['ValMock'].AuthSid = $SidString } }
+        'Get-LumaBridgeDeviceAuthorizedHostUserSid'   = { [CmdletBinding()] param([string]$DeviceParametersPath) return $global:LbTestState['ValMock'].AuthSid }
+        'Invoke-LumaBridgeExternalCommand'            = $mockExternalCmd
+        'Get-LumaBridgeWudfHostProcesses'             = { [CmdletBinding()] param([object[]]$PnpInstances, [object[]]$RecentEvents, [string[]]$DebugTraceLines) return @([pscustomobject]@{ Id = 8768; IsLumaBridgeHost = $true; AssociationMethod = 'LoadedModule'; WorkingSetMB = 30.0; PrivateMemoryMB = 15.0; HandleCount = 400 }) }
+        'Get-LumaBridgeCrashDumpInventory'            = { [CmdletBinding()] param([int]$LookbackMinutes) return [pscustomobject]@{ LookbackMinutes = $LookbackMinutes; Locations = @(); Files = @(); TotalFoundCount = 0 } }
+        'Get-LumaBridgeEventChannelStatus'            = { [CmdletBinding()] param([string[]]$ChannelNames) return @() }
+        'Get-LumaBridgeDiagnosticEvents'              = { [CmdletBinding()] param([int]$LookbackMinutes, [string[]]$InstanceIds, [string[]]$PublishedInfNames, [object[]]$ChannelStatus) return @() }
+        'Get-LumaBridgeSetupApiLogExcerpt'            = { [CmdletBinding()] param([string]$SetupApiLogPath, [string[]]$InstanceIds, [string[]]$PublishedInfNames, [int]$MaxMatchedSections) return [pscustomobject]@{ LogPath = $SetupApiLogPath; Exists = $false; AccessDenied = $false; Error = ''; MatchedSectionCount = 0; WdfSchemaWarnings = @(); DeviceStartProblemLines = @(); Sections = @(); RawExcerptText = '' } }
+        'Get-LumaBridgeDriverStorePackages'           = { [CmdletBinding()] param([string]$InfFilter) return @() }
+        'Get-LumaBridgeEtlEventSummary'               = { [CmdletBinding()] param([string]$EtlPath, $StartTimeUtc, $EndTimeUtc, $ProcessId, [int]$MaxMatchedEvents = 500, [switch]$ExcludeHighVolumeGraphics) return [pscustomobject]@{ EtlPath = $EtlPath; Exists = $true; EventCount = 1; MatchedEventCount = 1; MatchedLimitReached = $false; FilteredOutHighVolume = $true; XPathUsed = '*'; TraceStats = $null; CircularWrapWarning = $null; LumaBridgeEvents = @(); Providers = @(); Events = @(); Error = '' } }
+        'Invoke-LumaBridgeHostProcess'                = {
+            [CmdletBinding()] param([string]$ExecutablePath, [string[]]$Arguments = @(), [int]$HardTimeoutMs = 30000, [switch]$DryRun)
+            return [pscustomobject]@{ ExitCode = 1; TimedOut = $false; Output = @('Simulated host connect timeout'); StdErr = @(); DryRun = $false }
+        }
+    }
+
+    Invoke-WithModuleMocks -GlobalMocks $sharedMocks -ModuleMocks $sharedMocks -Body {
+        Assert-Throws {
+            & $valScript `
+                -Configuration Release `
+                -StagingDir $liveStg `
+                -OutputDir $liveOut `
+                -HostExecutablePath $fakeHostExe `
+                -CertificateThumbprint $certInfo.Thumbprint `
+                -AllowUntrustedChain `
+                -SkipDriverInstall `
+                -Force
+        } -ExpectedPattern 'RollbackClean=True' -Message 'Simulated host failure must trigger clean finally rollback'
+    }
+
+    $stAfterHostFail = $global:LbTestState['ValMock']
+    Assert-Equal $stAfterHostFail.EnableExt 0 'finally reverted EnableFrameExtraction to 0 after host failure'
+    Assert-Equal $stAfterHostFail.AuthSid $null 'finally cleared AuthorizedHostUserSid after host failure'
+    Assert-Equal $stAfterHostFail.EnableMon 0 'finally restored EnableVirtualMonitor to 0 after host failure'
+    Assert-Equal $stAfterHostFail.EtwRunning $false 'ETW stopped cleanly after host failure'
+    Assert-True ($stAfterHostFail.RestartCount -ge 3) 'Device restarted on enable + finally rollback'
+    Assert-True (Test-Path -LiteralPath (Join-Path $liveOut 'functional-validation-report.json') -PathType Leaf) 'Validation report JSON persisted on failure'
+    $failReport = Get-Content -LiteralPath (Join-Path $liveOut 'functional-validation-report.json') -Raw | ConvertFrom-Json
+    Assert-Equal $failReport.RollbackClean $true 'Report records RollbackClean=true'
+    Assert-Equal $failReport.SignedStagingDir $liveStg 'Report records StagingDir'
+
+    # Case B: Mid-flight Stage 8 exception (before Stage 10 stops ETW) -> finally must stop active ETW and revert state
+    $liveOut2 = Join-Path $caseDir 'live_out2'
+    $st2 = $global:LbTestState['ValMock']
+    $st2.EnableMon = 0
+    $st2.EnableExt = 0
+    $st2.AuthSid = $null
+    $st2.EtwRunning = $false
+    $st2.EtwStopCalls = 0
+    $st2.RestartCount = 0
+    $st2.InjectStage8Fail = $true
+
+    Invoke-WithModuleMocks -GlobalMocks $sharedMocks -ModuleMocks $sharedMocks -Body {
+        Assert-Throws {
+            & $valScript `
+                -Configuration Release `
+                -StagingDir $liveStg `
+                -OutputDir $liveOut2 `
+                -HostExecutablePath $fakeHostExe `
+                -CertificateThumbprint $certInfo.Thumbprint `
+                -AllowUntrustedChain `
+                -SkipDriverInstall `
+                -Force
+        } -ExpectedPattern 'Simulated Stage 8 pnputil restart failure.*RollbackClean=True' -Message 'Mid-flight Stage 8 crash triggers finally ETW stop and registry rollback'
+    }
+
+    Assert-Equal $st2.EtwRunning $false 'finally stopped ETW after Stage 8 exception'
+    Assert-Equal $st2.EtwStopCalls 1 'finally invoked ETW Stop exactly once on mid-flight exception'
+    Assert-Equal $st2.EnableExt 0 'finally reverted EnableFrameExtraction=0 after Stage 8 exception'
+    Assert-Equal $st2.AuthSid $null 'finally cleared AuthorizedHostUserSid after Stage 8 exception'
+    Assert-Equal $st2.EnableMon 0 'finally reverted EnableVirtualMonitor=0 after Stage 8 exception'
+}
+
 try {
     Write-Host ("Summary: {0} tests run, {1} assertion failures." -f $script:TestsRun, $script:TestsFailed)
 }
