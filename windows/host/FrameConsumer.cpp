@@ -397,6 +397,9 @@ ComputeLatencySummary(
     const size_t n = sorted.size();
     out.Available = (n > 0U);
     out.SampleCount = static_cast<uint64_t>(n);
+    out.StoredSampleCount = static_cast<uint64_t>(n);
+    out.SamplesTruncated = false;
+    out.ReservoirSampled = false;
     out.MinUs = sorted.front();
     out.MaxUs = sorted.back();
     out.AvgUs = sum / n;
@@ -404,6 +407,24 @@ ComputeLatencySummary(
     out.P95Us = sorted[NearestRankIndex(n, 95U)];
     out.P99Us = sorted[NearestRankIndex(n, 99U)];
     return out;
+}
+
+LatencySummaryStats
+ReservoirLatencyAccumulator::Summarize() const noexcept
+{
+    LatencySummaryStats summary = ComputeLatencySummary(Samples, LastUs);
+    summary.SampleCount = Count;
+    summary.StoredSampleCount = static_cast<uint64_t>(Samples.size());
+    summary.SamplesTruncated = (Count > static_cast<uint64_t>(Samples.size()));
+    summary.ReservoirSampled = UsedReservoirSampling;
+    summary.Available = (Count > 0ULL);
+    if (Count > 0ULL)
+    {
+        summary.MinUs = MinUs;
+        summary.MaxUs = MaxUs;
+        summary.AvgUs = TotalUs / Count;
+    }
+    return summary;
 }
 
 ValidatedFrameIntervals

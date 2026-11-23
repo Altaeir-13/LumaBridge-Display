@@ -244,19 +244,7 @@ private:
         ) noexcept;
     void ReleaseSessionObjectsPreserveStats() noexcept;
 
-    struct LatencyStatTracker
-    {
-        std::vector<uint64_t> Samples{};
-        uint64_t Count{0ULL};
-        uint64_t Total{0ULL};
-        uint64_t MinVal{0ULL};
-        uint64_t MaxVal{0ULL};
-        uint64_t LastVal{0ULL};
-
-        void Record(uint64_t v) noexcept;
-        LatencySummaryStats Summarize() const noexcept;
-        void Reset() noexcept;
-    };
+    using LatencyStatTracker = ReservoirLatencyAccumulator;
 
     mutable std::mutex m_mutex{};
     INvencApiHooks* m_hooks{nullptr};

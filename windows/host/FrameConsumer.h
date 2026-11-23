@@ -96,6 +96,9 @@ struct LatencySummaryStats
 {
     bool Available{false};
     uint64_t SampleCount{0ULL};
+    uint64_t StoredSampleCount{0ULL};
+    bool SamplesTruncated{false};
+    bool ReservoirSampled{false};
     uint64_t MinUs{0ULL};
     uint64_t AvgUs{0ULL};
     uint64_t MaxUs{0ULL};
@@ -103,6 +106,80 @@ struct LatencySummaryStats
     uint64_t P95Us{0ULL};
     uint64_t P99Us{0ULL};
     uint64_t LastUs{0ULL};
+};
+
+/// Bounded-memory latency tracker with deterministic Algorithm R reservoir sampling for long runs.
+struct ReservoirLatencyAccumulator
+{
+    static constexpr size_t kDefaultMaxStoredSamples = 65536U;
+
+    std::vector<uint64_t> Samples{};
+    uint64_t Count{0ULL};
+    uint64_t TotalUs{0ULL};
+    uint64_t MinUs{0ULL};
+    uint64_t MaxUs{0ULL};
+    uint64_t LastUs{0ULL};
+    uint64_t RngState{0x9E3779B97F4A7C15ULL};
+    bool UsedReservoirSampling{false};
+
+    static uint64_t NextSplitMix64(uint64_t& state) noexcept
+    {
+        state += 0x9E3779B97F4A7C15ULL;
+        uint64_t z = state;
+        z = (z ^ (z >> 30U)) * 0xBF58476D1CE4E5B9ULL;
+        z = (z ^ (z >> 27U)) * 0x94D049BB133111EBULL;
+        return z ^ (z >> 31U);
+    }
+
+    void Record(uint64_t valueUs) noexcept
+    {
+        if (Count == 0ULL || valueUs < MinUs)
+        {
+            MinUs = valueUs;
+        }
+        if (valueUs > MaxUs)
+        {
+            MaxUs = valueUs;
+        }
+        TotalUs += valueUs;
+        LastUs = valueUs;
+        ++Count;
+
+        if (Samples.size() < kDefaultMaxStoredSamples)
+        {
+            try
+            {
+                Samples.push_back(valueUs);
+            }
+            catch (...)
+            {
+            }
+        }
+        else if (!Samples.empty())
+        {
+            // Reservoir sample beyond 65,536 entries so percentiles remain representative across 3600s runs.
+            const uint64_t idx = NextSplitMix64(RngState) % Count;
+            if (idx < static_cast<uint64_t>(Samples.size()))
+            {
+                Samples[static_cast<size_t>(idx)] = valueUs;
+            }
+            UsedReservoirSampling = true;
+        }
+    }
+
+    LatencySummaryStats Summarize() const noexcept;
+
+    void Reset() noexcept
+    {
+        Samples.clear();
+        Count = 0ULL;
+        TotalUs = 0ULL;
+        MinUs = 0ULL;
+        MaxUs = 0ULL;
+        LastUs = 0ULL;
+        RngState = 0x9E3779B97F4A7C15ULL;
+        UsedReservoirSampling = false;
+    }
 };
 
 struct HostFpsBreakdown
@@ -341,7 +418,7 @@ public:
     ID3D11Texture2D* GetWorkingGpuTexture() const noexcept { return m_hostGpuWorkingTexture.Get(); }
 
 private:
-    static constexpr size_t kMaxStoredLatencySamples = 65536U;
+    static constexpr size_t kMaxStoredLatencySamples = ReservoirLatencyAccumulator::kDefaultMaxStoredSamples;
 
     struct HostSharedSlotCacheEntry
     {
@@ -384,55 +461,7 @@ private:
         HANDLE stopEvent
         ) noexcept;
 
-    struct LatencyAccumulator
-    {
-        std::vector<uint64_t> Samples{};
-        uint64_t Count{0ULL};
-        uint64_t TotalUs{0ULL};
-        uint64_t MinUs{0ULL};
-        uint64_t MaxUs{0ULL};
-        uint64_t LastUs{0ULL};
-
-        void Record(uint64_t valueUs) noexcept
-        {
-            if (Count == 0ULL || valueUs < MinUs)
-            {
-                MinUs = valueUs;
-            }
-            if (valueUs > MaxUs)
-            {
-                MaxUs = valueUs;
-            }
-            TotalUs += valueUs;
-            LastUs = valueUs;
-            ++Count;
-
-            if (Samples.size() < kMaxStoredLatencySamples)
-            {
-                try
-                {
-                    Samples.push_back(valueUs);
-                }
-                catch (...)
-                {
-                }
-            }
-        }
-
-        LatencySummaryStats Summarize() const noexcept
-        {
-            LatencySummaryStats summary = ComputeLatencySummary(Samples, LastUs);
-            summary.SampleCount = Count;
-            summary.Available = (Count > 0ULL);
-            if (Count > 0ULL)
-            {
-                summary.MinUs = MinUs;
-                summary.MaxUs = MaxUs;
-                summary.AvgUs = TotalUs / Count;
-            }
-            return summary;
-        }
-    };
+    using LatencyAccumulator = ReservoirLatencyAccumulator;
 
     void ClosePipeAndResetConnectionState(bool sendDisconnectNotice) noexcept;
     void UpdateDerivedFpsAndLatenciesLocked(uint64_t nowQpc, uint64_t executionStartQpc) noexcept;

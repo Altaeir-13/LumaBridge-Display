@@ -2369,6 +2369,49 @@ TestM421TimestampValidationAndRegressionScenarios()
     }
 }
 
+void
+TestReservoirLatencySamplingForLongRuns()
+{
+    lumabridge::host::ReservoirLatencyAccumulator exactAcc;
+    for (uint64_t i = 1ULL; i <= 100U; ++i)
+    {
+        exactAcc.Record(i * 10ULL);
+    }
+    const auto exactSnap = exactAcc.Summarize();
+    EXPECT_TRUE(exactSnap.Available);
+    EXPECT_EQ(exactSnap.SampleCount, 100ULL);
+    EXPECT_EQ(exactSnap.StoredSampleCount, 100ULL);
+    EXPECT_TRUE(!exactSnap.SamplesTruncated);
+    EXPECT_TRUE(!exactSnap.ReservoirSampled);
+    EXPECT_EQ(exactSnap.MinUs, 10ULL);
+    EXPECT_EQ(exactSnap.MaxUs, 1000ULL);
+    EXPECT_EQ(exactSnap.AvgUs, 505ULL);
+    EXPECT_EQ(exactSnap.P50Us, 500ULL);
+    EXPECT_EQ(exactSnap.P95Us, 950ULL);
+    EXPECT_EQ(exactSnap.P99Us, 990ULL);
+
+    // Simulate a 3600s 60FPS run (216,000 samples > 65,536 storage cap):
+    // Algorithm R keeps full-run distribution representative instead of silently frozen at minute 18.
+    lumabridge::host::ReservoirLatencyAccumulator longAcc;
+    for (uint64_t i = 0ULL; i < 216000ULL; ++i)
+    {
+        const uint64_t val = (i < 65536ULL) ? 100ULL : 10000ULL;
+        longAcc.Record(val);
+    }
+    const auto longSnap = longAcc.Summarize();
+    EXPECT_TRUE(longSnap.Available);
+    EXPECT_EQ(longSnap.SampleCount, 216000ULL);
+    EXPECT_EQ(longSnap.StoredSampleCount, lumabridge::host::ReservoirLatencyAccumulator::kDefaultMaxStoredSamples);
+    EXPECT_TRUE(longSnap.SamplesTruncated);
+    EXPECT_TRUE(longSnap.ReservoirSampled);
+    EXPECT_EQ(longSnap.MinUs, 100ULL);
+    EXPECT_EQ(longSnap.MaxUs, 10000ULL);
+    // True proportion of 10000us values is ~69.7%, so P50 and P95 must reflect 10000us (old truncated vector had P95=100!).
+    EXPECT_EQ(longSnap.P50Us, 10000ULL);
+    EXPECT_EQ(longSnap.P95Us, 10000ULL);
+    EXPECT_EQ(longSnap.P99Us, 10000ULL);
+}
+
 template <typename Fn>
 void
 RunTest(
@@ -2416,6 +2459,7 @@ main()
     RunTest("GpuSharedTextureDelayedAckAndMidUseClientDisconnectRecovery", TestGpuSharedTextureDelayedAckAndMidUseClientDisconnectRecovery);
     RunTest("GpuSharedTextureIncompatibleAdapterAndInvalidHandleAckHandling", TestGpuSharedTextureIncompatibleAdapterAndInvalidHandleAckHandling);
     RunTest("M421TimestampValidationAndRegressionScenarios", TestM421TimestampValidationAndRegressionScenarios);
+    RunTest("ReservoirLatencySamplingForLongRuns", TestReservoirLatencySamplingForLongRuns);
 
     std::printf("Summary: %d tests run, %d assertion failures.\n", g_TestsRun, g_TestsFailed);
     return (g_TestsFailed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;

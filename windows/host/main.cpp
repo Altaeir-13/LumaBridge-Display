@@ -6,6 +6,7 @@
 #include <psapi.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cwchar>
@@ -106,6 +107,48 @@ ParseUnsigned64(
     return true;
 }
 
+bool
+ParseDouble(
+    const wchar_t* text,
+    double& outValue
+    ) noexcept
+{
+    if (text == nullptr || text[0] == L'\0')
+    {
+        return false;
+    }
+    wchar_t* endPtr = nullptr;
+    const double parsed = std::wcstod(text, &endPtr);
+    if (endPtr == text || *endPtr != L'\0' || !std::isfinite(parsed))
+    {
+        return false;
+    }
+    outValue = parsed;
+    return true;
+}
+
+void
+FormatUtcIso8601Now(
+    char* dst,
+    size_t dstSize
+    ) noexcept
+{
+    SYSTEMTIME st{};
+    GetSystemTime(&st);
+    _snprintf_s(
+        dst,
+        dstSize,
+        _TRUNCATE,
+        "%04u-%02u-%02uT%02u:%02u:%02u.%03uZ",
+        static_cast<unsigned int>(st.wYear),
+        static_cast<unsigned int>(st.wMonth),
+        static_cast<unsigned int>(st.wDay),
+        static_cast<unsigned int>(st.wHour),
+        static_cast<unsigned int>(st.wMinute),
+        static_cast<unsigned int>(st.wSecond),
+        static_cast<unsigned int>(st.wMilliseconds));
+}
+
 const char*
 TransportModeToString(
     lumabridge::ipc::FrameIpcTransportMode mode
@@ -154,6 +197,13 @@ PrintUsage()
         "  --require-virtual-stimulus       Fail if --visual-stimulus cannot identify the virtual display\n"
         "  --stimulus-fps <fps>             Stimulus refresh frequency in Hz (default: 60, range 1..120)\n"
         "  --stimulus-display <gdiName>     Optional explicit GDI display device (e.g. \\\\.\\DISPLAY2)\n"
+        "  --run-id <id>                    Associate execution RunId in JSON telemetry summary\n"
+        "  --require-valid-timestamps       Fail if TimestampMeasurementErrors > 0 or coverage < 95%%\n"
+        "  --require-width <px>             Require exact LastFrameWidth (and NVENC width if active)\n"
+        "  --require-height <px>            Require exact LastFrameHeight (and NVENC height if active)\n"
+        "  --min-nvenc-encoded-frames <n>   Minimum NVENC encoded frames required when --require-nvenc\n"
+        "  --min-nvenc-encode-ratio <r>     Minimum NvencFramesEncoded/FramesValid ratio [0..1] when --require-nvenc\n"
+        "  --max-nvenc-drop-ratio <r>       Maximum drop ratio (Dropped+QueueDrops)/Submitted [0..1] when --require-nvenc\n"
         "  --json-summary <path>            Write non-visual telemetry summary JSON to file\n"
         "  --quiet                          Suppress per-frame console output\n"
         "  --help                           Show this help message\n");
@@ -169,6 +219,10 @@ struct ProcessResourceSample
     uint64_t KernelTime100Ns{0ULL};
     uint64_t UserTime100Ns{0ULL};
     uint64_t SampleQpc{0ULL};
+    bool HandleCountAvailable{false};
+    uint32_t HandleCount{0U};
+    bool VramAvailable{false};
+    uint64_t DedicatedVramUsageBytes{0ULL};
 };
 
 struct ProcessResourceReport
@@ -182,7 +236,50 @@ struct ProcessResourceReport
     int64_t PrivateBytesDeltaBytes{0LL};
     uint64_t CpuTimeMs{0ULL};
     double CpuUsagePercent{0.0};
+    bool HandleCountAvailable{false};
+    uint32_t HandleCount{0U};
+    int64_t HandleCountDelta{0LL};
+    bool VramAvailable{false};
+    uint64_t DedicatedVramUsageBytes{0ULL};
+    int64_t DedicatedVramDeltaBytes{0LL};
 };
+
+bool
+QueryProcessDedicatedVramBytes(
+    ID3D11Device* d3dDevice,
+    uint64_t& outUsageBytes
+    ) noexcept
+{
+    outUsageBytes = 0ULL;
+    if (d3dDevice == nullptr)
+    {
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;
+    if (FAILED(d3dDevice->QueryInterface(IID_PPV_ARGS(&dxgiDevice))) || dxgiDevice == nullptr)
+    {
+        return false;
+    }
+    Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+    if (FAILED(dxgiDevice->GetAdapter(&adapter)) || adapter == nullptr)
+    {
+        return false;
+    }
+    Microsoft::WRL::ComPtr<IDXGIAdapter3> adapter3;
+    if (FAILED(adapter.As(&adapter3)) || adapter3 == nullptr)
+    {
+        return false;
+    }
+
+    DXGI_QUERY_VIDEO_MEMORY_INFO vmi{};
+    if (FAILED(adapter3->QueryVideoMemoryInfo(0U, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vmi)))
+    {
+        return false;
+    }
+    outUsageBytes = static_cast<uint64_t>(vmi.CurrentUsage);
+    return true;
+}
 
 uint64_t
 QueryHostQpcNow() noexcept
@@ -210,7 +307,10 @@ FileTimeTo100Ns(const FILETIME& ft) noexcept
 }
 
 ProcessResourceSample
-SampleProcessResources(DWORD pid) noexcept
+SampleProcessResources(
+    DWORD pid,
+    ID3D11Device* d3dDevice = nullptr
+    ) noexcept
 {
     ProcessResourceSample sample{};
     sample.Pid = pid;
@@ -250,6 +350,9 @@ SampleProcessResources(DWORD pid) noexcept
     FILETIME userFt{};
     const BOOL timeOk = GetProcessTimes(procHandle, &createFt, &exitFt, &kernelFt, &userFt);
 
+    DWORD handleCount = 0U;
+    const BOOL handleOk = GetProcessHandleCount(procHandle, &handleCount);
+
     if (ownHandle)
     {
         CloseHandle(procHandle);
@@ -267,6 +370,21 @@ SampleProcessResources(DWORD pid) noexcept
         sample.Available = true;
         sample.KernelTime100Ns = FileTimeTo100Ns(kernelFt);
         sample.UserTime100Ns = FileTimeTo100Ns(userFt);
+    }
+    if (handleOk != FALSE)
+    {
+        sample.Available = true;
+        sample.HandleCountAvailable = true;
+        sample.HandleCount = static_cast<uint32_t>(handleCount);
+    }
+    if (d3dDevice != nullptr && pid == GetCurrentProcessId())
+    {
+        uint64_t vramBytes = 0ULL;
+        if (QueryProcessDedicatedVramBytes(d3dDevice, vramBytes))
+        {
+            sample.VramAvailable = true;
+            sample.DedicatedVramUsageBytes = vramBytes;
+        }
     }
     return sample;
 }
@@ -291,6 +409,10 @@ ComputeProcessResourceReport(
     report.WorkingSetBytes = endSample.WorkingSetBytes;
     report.PeakWorkingSetBytes = endSample.PeakWorkingSetBytes;
     report.PrivateBytes = endSample.PrivateBytes;
+    report.HandleCountAvailable = endSample.HandleCountAvailable;
+    report.HandleCount = endSample.HandleCount;
+    report.VramAvailable = endSample.VramAvailable;
+    report.DedicatedVramUsageBytes = endSample.DedicatedVramUsageBytes;
 
     const uint64_t endCpu100Ns = endSample.KernelTime100Ns + endSample.UserTime100Ns;
     uint64_t deltaCpu100Ns = endCpu100Ns;
@@ -302,6 +424,17 @@ ComputeProcessResourceReport(
             static_cast<int64_t>(endSample.WorkingSetBytes) - static_cast<int64_t>(startSample.WorkingSetBytes);
         report.PrivateBytesDeltaBytes =
             static_cast<int64_t>(endSample.PrivateBytes) - static_cast<int64_t>(startSample.PrivateBytes);
+        if (startSample.HandleCountAvailable && endSample.HandleCountAvailable)
+        {
+            report.HandleCountDelta =
+                static_cast<int64_t>(endSample.HandleCount) - static_cast<int64_t>(startSample.HandleCount);
+        }
+        if (startSample.VramAvailable && endSample.VramAvailable)
+        {
+            report.DedicatedVramDeltaBytes =
+                static_cast<int64_t>(endSample.DedicatedVramUsageBytes) -
+                static_cast<int64_t>(startSample.DedicatedVramUsageBytes);
+        }
 
         const uint64_t startCpu100Ns = startSample.KernelTime100Ns + startSample.UserTime100Ns;
         deltaCpu100Ns = (endCpu100Ns >= startCpu100Ns) ? (endCpu100Ns - startCpu100Ns) : 0ULL;
@@ -338,8 +471,34 @@ WriteProcessResourceJson(
         << "      \"WorkingSetDeltaBytes\": " << report.WorkingSetDeltaBytes << ",\n"
         << "      \"PrivateBytesDeltaBytes\": " << report.PrivateBytesDeltaBytes << ",\n"
         << "      \"CpuTimeMs\": " << report.CpuTimeMs << ",\n"
-        << "      \"CpuUsagePercent\": " << report.CpuUsagePercent << "\n"
-        << "    }" << (trailingComma ? "," : "") << "\n";
+        << "      \"CpuUsagePercent\": " << report.CpuUsagePercent << ",\n"
+        << "      \"HandleCountAvailable\": " << (report.HandleCountAvailable ? "true" : "false") << ",\n"
+        << "      \"HandleCountStatus\": \"" << (report.HandleCountAvailable ? "MEASURED" : "NOT_MEASURED") << "\",\n"
+        << "      \"HandleCount\": ";
+    if (report.HandleCountAvailable)
+    {
+        out << report.HandleCount << ",\n"
+            << "      \"HandleCountDelta\": " << report.HandleCountDelta << ",\n";
+    }
+    else
+    {
+        out << "null,\n"
+            << "      \"HandleCountDelta\": null,\n";
+    }
+    out << "      \"VramAvailable\": " << (report.VramAvailable ? "true" : "false") << ",\n"
+        << "      \"DedicatedVramStatus\": \"" << (report.VramAvailable ? "MEASURED" : "NOT_MEASURED") << "\",\n"
+        << "      \"DedicatedVramUsageBytes\": ";
+    if (report.VramAvailable)
+    {
+        out << report.DedicatedVramUsageBytes << ",\n"
+            << "      \"DedicatedVramDeltaBytes\": " << report.DedicatedVramDeltaBytes << "\n";
+    }
+    else
+    {
+        out << "null,\n"
+            << "      \"DedicatedVramDeltaBytes\": null\n";
+    }
+    out << "    }" << (trailingComma ? "," : "") << "\n";
 }
 
 void
@@ -354,6 +513,9 @@ WriteLatencyStatsJsonWithIndent(
     out << indent << "\"" << name << "\": {\n"
         << indent << "  \"Available\": " << (stats.Available ? "true" : "false") << ",\n"
         << indent << "  \"SampleCount\": " << stats.SampleCount << ",\n"
+        << indent << "  \"StoredSampleCount\": " << stats.StoredSampleCount << ",\n"
+        << indent << "  \"SamplesTruncated\": " << (stats.SamplesTruncated ? "true" : "false") << ",\n"
+        << indent << "  \"ReservoirSampled\": " << (stats.ReservoirSampled ? "true" : "false") << ",\n"
         << indent << "  \"MinUs\": " << stats.MinUs << ",\n"
         << indent << "  \"AvgUs\": " << stats.AvgUs << ",\n"
         << indent << "  \"MaxUs\": " << stats.MaxUs << ",\n"
@@ -362,6 +524,153 @@ WriteLatencyStatsJsonWithIndent(
         << indent << "  \"P99Us\": " << stats.P99Us << ",\n"
         << indent << "  \"LastUs\": " << stats.LastUs << "\n"
         << indent << "}" << (trailingComma ? "," : "") << "\n";
+}
+
+struct HostGateConfig
+{
+    std::wstring RunId{};
+    bool RequireGpuShared{false};
+    bool EnableNvenc{false};
+    bool RequireNvenc{false};
+    bool VerifyH264Decode{false};
+    bool VerifyH264Psnr{false};
+    bool RequireVirtualStimulus{false};
+    bool RequireValidTimestamps{false};
+    uint32_t RequireWidth{0U};
+    uint32_t RequireHeight{0U};
+    double MinNvencEncodeRatio{0.0};
+    double MaxNvencDropRatio{1.0};
+    uint64_t MinNvencEncodedFrames{0ULL};
+};
+
+struct HostGateEvaluation
+{
+    bool IntegrityOk{false};
+    bool MinFramesOk{false};
+    bool MaxTargetOk{false};
+    bool StimulusOk{false};
+    bool GpuTransportOk{false};
+    bool NvencOk{false};
+    bool H264DecodeOk{false};
+    bool H264PsnrOk{false};
+    bool TimestampsOk{false};
+    bool ResolutionOk{false};
+    bool OverallExitOk{false};
+};
+
+HostGateEvaluation
+EvaluateHostGates(
+    const lumabridge::host::HostConsumerConfig& config,
+    const lumabridge::host::HostConsumerMetricsSnapshot& metrics,
+    const lumabridge::host::StimulusMetricsSnapshot& stimSnap,
+    const lumabridge::host::NvencMetricsSnapshot& nvencSnap,
+    const lumabridge::host::H264ValidationSummary& h264Snap,
+    const HostGateConfig& gateCfg,
+    bool nvencInitFatal,
+    HRESULT nvencLastHr,
+    HRESULT runHr
+    ) noexcept
+{
+    HostGateEvaluation eval{};
+    eval.IntegrityOk =
+        (metrics.ChecksumMismatches == 0ULL) &&
+        (metrics.SyntheticPatternMismatches == 0ULL) &&
+        (metrics.ProtocolErrors == 0ULL);
+    eval.MinFramesOk = (metrics.FramesValid >= config.MinFrames);
+    eval.MaxTargetOk = (!config.RequireFrameTarget) || metrics.FrameTargetReached;
+    eval.StimulusOk = (!gateCfg.RequireVirtualStimulus) || (stimSnap.VirtualDisplayIdentified && stimSnap.Started);
+    eval.GpuTransportOk =
+        (!gateCfg.RequireGpuShared) ||
+        (metrics.NegotiatedTransportMode == lumabridge::ipc::FrameIpcTransportMode::GpuSharedNtHandle &&
+         !metrics.FallbackToCpuActivated &&
+         metrics.GpuFramesOpened > 0ULL &&
+         metrics.GpuSharedOpenFailures == 0ULL &&
+         metrics.GpuSyncTimeouts == 0ULL &&
+         metrics.AdapterMismatchErrors == 0ULL &&
+         (config.VerifySyntheticPattern || metrics.CpuStagingReadsPerformed == 0ULL));
+
+    bool nvencOk = !gateCfg.RequireNvenc;
+    if (gateCfg.RequireNvenc)
+    {
+        const uint64_t minEncoded = (std::max)(1ULL, gateCfg.MinNvencEncodedFrames);
+        const bool baseNvencOk =
+            !nvencInitFatal &&
+            SUCCEEDED(nvencLastHr) &&
+            nvencSnap.NvencFramesEncoded >= minEncoded &&
+            nvencSnap.TotalBitstreamBytes > 0ULL;
+        const bool ratioOk =
+            (gateCfg.MinNvencEncodeRatio <= 0.0) ||
+            (metrics.FramesValid > 0ULL &&
+             (static_cast<double>(nvencSnap.NvencFramesEncoded) / static_cast<double>(metrics.FramesValid)) >=
+                 gateCfg.MinNvencEncodeRatio);
+        const uint64_t totalDrops = nvencSnap.NvencDroppedFrames + nvencSnap.EncodedQueueDrops;
+        const bool dropsOk =
+            (gateCfg.MaxNvencDropRatio >= 1.0) ||
+            (nvencSnap.NvencFramesSubmitted > 0ULL &&
+             (static_cast<double>(totalDrops) / static_cast<double>(nvencSnap.NvencFramesSubmitted)) <=
+                 gateCfg.MaxNvencDropRatio);
+        nvencOk = baseNvencOk && ratioOk && dropsOk;
+    }
+    eval.NvencOk = nvencOk;
+    eval.H264DecodeOk = (!gateCfg.VerifyH264Decode) || h264Snap.Passed;
+    eval.H264PsnrOk = (!gateCfg.VerifyH264Psnr) || h264Snap.FidelityPsnrValidated;
+
+    bool timestampsOk = true;
+    if (gateCfg.RequireValidTimestamps)
+    {
+        const bool liveSamplesOk =
+            (metrics.LiveFramesReceived == 0ULL) ||
+            (metrics.LiveTimestampCoveragePercent >= 95.0 &&
+             metrics.LiveEndToEndLatency.Available &&
+             metrics.LiveEndToEndLatency.SampleCount > 0ULL);
+        const bool nvencTsOk =
+            (nvencSnap.NvencFramesEncoded == 0ULL) ||
+            (nvencSnap.InvalidTimestampCount == 0ULL &&
+             nvencSnap.ExtractToBitstreamCoveragePercent >= 95.0);
+        timestampsOk =
+            (metrics.TimestampMeasurementErrors == 0ULL) &&
+            (metrics.OutOfOrderSequenceCount == 0ULL) &&
+            (metrics.NonMonotonicTimestampCount == 0ULL) &&
+            (metrics.MissingCoreTimestampCount == 0ULL) &&
+            (metrics.FutureTimestampErrorCount == 0ULL) &&
+            (metrics.IncompatibleTimestampUnitsCount == 0ULL) &&
+            (metrics.QpcFrequencyMismatchCount == 0ULL) &&
+            (metrics.CoreTimestampCoveragePercent >= 95.0) &&
+            liveSamplesOk &&
+            nvencTsOk;
+    }
+    eval.TimestampsOk = timestampsOk;
+
+    bool resolutionOk = true;
+    if (gateCfg.RequireWidth > 0U || gateCfg.RequireHeight > 0U)
+    {
+        const bool frameDimOk =
+            (metrics.FramesValid > 0ULL) &&
+            (gateCfg.RequireWidth == 0U || metrics.LastFrameWidth == gateCfg.RequireWidth) &&
+            (gateCfg.RequireHeight == 0U || metrics.LastFrameHeight == gateCfg.RequireHeight);
+        const bool nvencDimOk =
+            (!gateCfg.EnableNvenc || !nvencSnap.Initialized) ||
+            ((gateCfg.RequireWidth == 0U || nvencSnap.Width == gateCfg.RequireWidth) &&
+             (gateCfg.RequireHeight == 0U || nvencSnap.Height == gateCfg.RequireHeight));
+        resolutionOk = frameDimOk && nvencDimOk;
+    }
+    eval.ResolutionOk = resolutionOk;
+
+    eval.OverallExitOk =
+        SUCCEEDED(runHr) &&
+        metrics.HostProcessExitedNormally &&
+        metrics.TransportHealthy &&
+        eval.IntegrityOk &&
+        eval.MinFramesOk &&
+        eval.MaxTargetOk &&
+        eval.StimulusOk &&
+        eval.GpuTransportOk &&
+        eval.NvencOk &&
+        eval.H264DecodeOk &&
+        eval.H264PsnrOk &&
+        eval.TimestampsOk &&
+        eval.ResolutionOk;
+    return eval;
 }
 
 void
@@ -386,7 +695,8 @@ WriteJsonSummary(
     const ProcessResourceReport& hostResources,
     const ProcessResourceReport& serverResources,
     DWORD logicalProcessorCount,
-    bool nvencRequested,
+    const HostGateConfig& gateConfig,
+    const HostGateEvaluation& gateEval,
     HRESULT runResult
     )
 {
@@ -424,7 +734,13 @@ WriteJsonSummary(
     char h264HrBuf[16]{};
     _snprintf_s(h264HrBuf, sizeof(h264HrBuf), _TRUNCATE, "0x%08lX", static_cast<unsigned long>(h264Validation.LastHResult));
 
+    char utcNowBuf[40]{};
+    FormatUtcIso8601Now(utcNowBuf, sizeof(utcNowBuf));
+
     out << "{\n"
+        << "  \"RunId\": \"" << EscapeJsonString(NarrowAsciiFromWide(gateConfig.RunId.c_str())) << "\",\n"
+        << "  \"HostProcessId\": " << GetCurrentProcessId() << ",\n"
+        << "  \"GeneratedAtUtc\": \"" << utcNowBuf << "\",\n"
         << "  \"PipeName\": \"" << EscapeJsonString(NarrowAsciiFromWide(config.PipeName.c_str())) << "\",\n"
         << "  \"RunHResult\": \"" << hrBuf << "\",\n"
         << "  \"LastErrorHResult\": \"" << errBuf << "\",\n"
@@ -536,7 +852,7 @@ WriteJsonSummary(
     WriteLatencyStatsJson(out, "InterFrameJitter", metrics.InterFrameJitter, true);
 
     out << "  \"Nvenc\": {\n"
-        << "    \"Requested\": " << (nvencRequested ? "true" : "false") << ",\n"
+        << "    \"Requested\": " << (gateConfig.EnableNvenc ? "true" : "false") << ",\n"
         << "    \"Initialized\": " << (nvenc.Initialized ? "true" : "false") << ",\n"
         << "    \"DeviceRemovedOrReset\": " << (nvenc.DeviceRemovedOrReset ? "true" : "false") << ",\n"
         << "    \"Width\": " << nvenc.Width << ",\n"
@@ -636,7 +952,30 @@ WriteJsonSummary(
         << "    \"BoundsHeight\": " << stimulus.BoundsHeight << ",\n"
         << "    \"IdentificationSource\": \"" << EscapeJsonString(stimulus.IdentificationSource) << "\",\n"
         << "    \"ErrorMessage\": \"" << EscapeJsonString(stimulus.ErrorMessage) << "\"\n"
-        << "  }\n"
+        << "  },\n"
+        << "  \"GateEvaluation\": {\n"
+        << "    \"RequireGpuShared\": " << (gateConfig.RequireGpuShared ? "true" : "false") << ",\n"
+        << "    \"RequireNvenc\": " << (gateConfig.RequireNvenc ? "true" : "false") << ",\n"
+        << "    \"VerifyH264Decode\": " << (gateConfig.VerifyH264Decode ? "true" : "false") << ",\n"
+        << "    \"RequireValidTimestamps\": " << (gateConfig.RequireValidTimestamps ? "true" : "false") << ",\n"
+        << "    \"RequireWidth\": " << gateConfig.RequireWidth << ",\n"
+        << "    \"RequireHeight\": " << gateConfig.RequireHeight << ",\n"
+        << "    \"MinNvencEncodedFrames\": " << gateConfig.MinNvencEncodedFrames << ",\n"
+        << "    \"MinNvencEncodeRatio\": " << gateConfig.MinNvencEncodeRatio << ",\n"
+        << "    \"MaxNvencDropRatio\": " << gateConfig.MaxNvencDropRatio << ",\n"
+        << "    \"IntegrityOk\": " << (gateEval.IntegrityOk ? "true" : "false") << ",\n"
+        << "    \"MinFramesOk\": " << (gateEval.MinFramesOk ? "true" : "false") << ",\n"
+        << "    \"MaxTargetOk\": " << (gateEval.MaxTargetOk ? "true" : "false") << ",\n"
+        << "    \"StimulusOk\": " << (gateEval.StimulusOk ? "true" : "false") << ",\n"
+        << "    \"GpuTransportOk\": " << (gateEval.GpuTransportOk ? "true" : "false") << ",\n"
+        << "    \"NvencOk\": " << (gateEval.NvencOk ? "true" : "false") << ",\n"
+        << "    \"H264DecodeOk\": " << (gateEval.H264DecodeOk ? "true" : "false") << ",\n"
+        << "    \"H264PsnrOk\": " << (gateEval.H264PsnrOk ? "true" : "false") << ",\n"
+        << "    \"TimestampsOk\": " << (gateEval.TimestampsOk ? "true" : "false") << ",\n"
+        << "    \"ResolutionOk\": " << (gateEval.ResolutionOk ? "true" : "false") << ",\n"
+        << "    \"OverallExitOk\": " << (gateEval.OverallExitOk ? "true" : "false") << "\n"
+        << "  },\n"
+        << "  \"SummaryComplete\": true\n"
         << "}\n";
 
     return out.good();
@@ -670,6 +1009,7 @@ wmain(
     bool verifyH264Psnr = false;
     uint32_t prewarmWidth = 1920U;
     uint32_t prewarmHeight = 1080U;
+    HostGateConfig gateConfig{};
 
     for (int i = 1; i < argc; ++i)
     {
@@ -887,6 +1227,64 @@ wmain(
         {
             stimulusDisplayName = argv[++i];
         }
+        else if (arg == L"--run-id" && (i + 1) < argc)
+        {
+            gateConfig.RunId = argv[++i];
+        }
+        else if (arg == L"--require-valid-timestamps")
+        {
+            gateConfig.RequireValidTimestamps = true;
+        }
+        else if (arg == L"--require-width" && (i + 1) < argc)
+        {
+            uint64_t val = 0ULL;
+            if (!ParseUnsigned64(argv[++i], val) || val == 0ULL || val > 7680ULL)
+            {
+                std::fprintf(stderr, "Invalid --require-width value.\n");
+                return EXIT_FAILURE;
+            }
+            gateConfig.RequireWidth = static_cast<uint32_t>(val);
+        }
+        else if (arg == L"--require-height" && (i + 1) < argc)
+        {
+            uint64_t val = 0ULL;
+            if (!ParseUnsigned64(argv[++i], val) || val == 0ULL || val > 4320ULL)
+            {
+                std::fprintf(stderr, "Invalid --require-height value.\n");
+                return EXIT_FAILURE;
+            }
+            gateConfig.RequireHeight = static_cast<uint32_t>(val);
+        }
+        else if (arg == L"--min-nvenc-encoded-frames" && (i + 1) < argc)
+        {
+            uint64_t val = 0ULL;
+            if (!ParseUnsigned64(argv[++i], val))
+            {
+                std::fprintf(stderr, "Invalid --min-nvenc-encoded-frames value.\n");
+                return EXIT_FAILURE;
+            }
+            gateConfig.MinNvencEncodedFrames = val;
+        }
+        else if (arg == L"--min-nvenc-encode-ratio" && (i + 1) < argc)
+        {
+            double val = 0.0;
+            if (!ParseDouble(argv[++i], val) || val < 0.0 || val > 1.0)
+            {
+                std::fprintf(stderr, "Invalid --min-nvenc-encode-ratio value (must be 0.0..1.0).\n");
+                return EXIT_FAILURE;
+            }
+            gateConfig.MinNvencEncodeRatio = val;
+        }
+        else if (arg == L"--max-nvenc-drop-ratio" && (i + 1) < argc)
+        {
+            double val = 1.0;
+            if (!ParseDouble(argv[++i], val) || val < 0.0 || val > 1.0)
+            {
+                std::fprintf(stderr, "Invalid --max-nvenc-drop-ratio value (must be 0.0..1.0).\n");
+                return EXIT_FAILURE;
+            }
+            gateConfig.MaxNvencDropRatio = val;
+        }
         else if (arg == L"--json-summary" && (i + 1) < argc)
         {
             jsonSummaryPath = argv[++i];
@@ -912,6 +1310,17 @@ wmain(
         config.MinFrames = config.MaxFrames;
     }
 
+    if (verifyH264Decode || verifyH264Psnr)
+    {
+        enableNvenc = true;
+    }
+    gateConfig.RequireGpuShared = requireGpuShared;
+    gateConfig.EnableNvenc = enableNvenc;
+    gateConfig.RequireNvenc = requireNvenc;
+    gateConfig.VerifyH264Decode = verifyH264Decode;
+    gateConfig.VerifyH264Psnr = verifyH264Psnr;
+    gateConfig.RequireVirtualStimulus = requireVirtualStimulus;
+
     SYSTEM_INFO sysInfo{};
     GetSystemInfo(&sysInfo);
     const DWORD logicalCpuCount = (sysInfo.dwNumberOfProcessors > 0U) ? sysInfo.dwNumberOfProcessors : 1U;
@@ -931,6 +1340,16 @@ wmain(
             const lumabridge::host::NvencMetricsSnapshot emptyNvenc{};
             const lumabridge::host::H264ValidationSummary emptyH264{};
             const ProcessResourceReport emptyRes{};
+            const HostGateEvaluation preGateEval = EvaluateHostGates(
+                config,
+                emptyMetrics,
+                stimPreSnap,
+                emptyNvenc,
+                emptyH264,
+                gateConfig,
+                false,
+                S_OK,
+                E_FAIL);
             (void)WriteJsonSummary(
                 jsonSummaryPath,
                 config,
@@ -941,7 +1360,8 @@ wmain(
                 emptyRes,
                 emptyRes,
                 logicalCpuCount,
-                enableNvenc,
+                gateConfig,
+                preGateEval,
                 E_FAIL);
             std::fflush(stdout);
             std::fflush(stderr);
@@ -1035,7 +1455,7 @@ wmain(
     }
 
     const uint64_t hostQpcFreq = QueryHostQpcFreqSafe();
-    const ProcessResourceSample hostStartSample = SampleProcessResources(GetCurrentProcessId());
+    const ProcessResourceSample hostStartSample = SampleProcessResources(GetCurrentProcessId(), consumer.GetD3d11Device());
     ProcessResourceSample serverStartSample{};
     bool serverBaselineCaptured = false;
 
@@ -1225,7 +1645,7 @@ wmain(
     const lumabridge::host::NvencMetricsSnapshot nvencSnap = nvencEncoder.GetMetricsSnapshot();
     const lumabridge::host::H264ValidationSummary h264Snap = h264Validator.GetSummary();
 
-    const ProcessResourceSample hostEndSample = SampleProcessResources(GetCurrentProcessId());
+    const ProcessResourceSample hostEndSample = SampleProcessResources(GetCurrentProcessId(), consumer.GetD3d11Device());
     const ProcessResourceSample serverEndSample = SampleProcessResources(metrics.ServerProcessId);
     const ProcessResourceReport hostResReport = ComputeProcessResourceReport(
         hostStartSample,
@@ -1243,6 +1663,17 @@ wmain(
     h264Validator.Shutdown();
     nvencEncoder.Shutdown();
 
+    const HostGateEvaluation gateEval = EvaluateHostGates(
+        config,
+        metrics,
+        stimSnap,
+        nvencSnap,
+        h264Snap,
+        gateConfig,
+        nvencInitFatal,
+        nvencLastHr,
+        runHr);
+
     const bool jsonOk = WriteJsonSummary(
         jsonSummaryPath,
         config,
@@ -1253,7 +1684,8 @@ wmain(
         hostResReport,
         serverResReport,
         logicalCpuCount,
-        enableNvenc,
+        gateConfig,
+        gateEval,
         runHr);
 
     std::printf(
@@ -1400,42 +1832,5 @@ wmain(
         return EXIT_FAILURE;
     }
 
-    const bool integrityOk =
-        (metrics.ChecksumMismatches == 0ULL) &&
-        (metrics.SyntheticPatternMismatches == 0ULL) &&
-        (metrics.ProtocolErrors == 0ULL);
-    const bool minFramesOk = (metrics.FramesValid >= config.MinFrames);
-    const bool maxTargetOk = (!config.RequireFrameTarget) || metrics.FrameTargetReached;
-    const bool stimulusOk = (!requireVirtualStimulus) || (stimSnap.VirtualDisplayIdentified && stimSnap.Started);
-    const bool gpuTransportOk =
-        (!requireGpuShared) ||
-        (metrics.NegotiatedTransportMode == lumabridge::ipc::FrameIpcTransportMode::GpuSharedNtHandle &&
-         !metrics.FallbackToCpuActivated &&
-         metrics.GpuFramesOpened > 0ULL &&
-         metrics.GpuSharedOpenFailures == 0ULL &&
-         metrics.GpuSyncTimeouts == 0ULL &&
-         metrics.AdapterMismatchErrors == 0ULL &&
-         (config.VerifySyntheticPattern || metrics.CpuStagingReadsPerformed == 0ULL));
-    const bool nvencOk =
-        (!requireNvenc) ||
-        (!nvencInitFatal &&
-         SUCCEEDED(nvencLastHr) &&
-         nvencSnap.NvencFramesEncoded > 0ULL &&
-         nvencSnap.TotalBitstreamBytes > 0ULL);
-    const bool h264DecodeOk = (!verifyH264Decode) || h264Snap.Passed;
-    const bool h264PsnrOk = (!verifyH264Psnr) || h264Snap.FidelityPsnrValidated;
-
-    return (SUCCEEDED(runHr) &&
-            metrics.HostProcessExitedNormally &&
-            metrics.TransportHealthy &&
-            integrityOk &&
-            minFramesOk &&
-            maxTargetOk &&
-            stimulusOk &&
-            gpuTransportOk &&
-            nvencOk &&
-            h264DecodeOk &&
-            h264PsnrOk)
-        ? EXIT_SUCCESS
-        : EXIT_FAILURE;
+    return gateEval.OverallExitOk ? EXIT_SUCCESS : EXIT_FAILURE;
 }

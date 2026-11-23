@@ -216,58 +216,6 @@ EncodedFrameQueue::Clear() noexcept
     m_queue.clear();
 }
 
-void
-NvencH264Encoder::LatencyStatTracker::Record(uint64_t v) noexcept
-{
-    if (Count == 0ULL || v < MinVal)
-    {
-        MinVal = v;
-    }
-    if (v > MaxVal)
-    {
-        MaxVal = v;
-    }
-    Total += v;
-    LastVal = v;
-    ++Count;
-    if (Samples.size() < 65536U)
-    {
-        try
-        {
-            Samples.push_back(v);
-        }
-        catch (...)
-        {
-        }
-    }
-}
-
-LatencySummaryStats
-NvencH264Encoder::LatencyStatTracker::Summarize() const noexcept
-{
-    LatencySummaryStats s = ComputeLatencySummary(Samples, LastVal);
-    s.SampleCount = Count;
-    s.Available = (Count > 0ULL);
-    if (Count > 0ULL)
-    {
-        s.MinUs = MinVal;
-        s.MaxUs = MaxVal;
-        s.AvgUs = Total / Count;
-    }
-    return s;
-}
-
-void
-NvencH264Encoder::LatencyStatTracker::Reset() noexcept
-{
-    Samples.clear();
-    Count = 0ULL;
-    Total = 0ULL;
-    MinVal = 0ULL;
-    MaxVal = 0ULL;
-    LastVal = 0ULL;
-}
-
 NvencH264Encoder::~NvencH264Encoder()
 {
     Shutdown();
