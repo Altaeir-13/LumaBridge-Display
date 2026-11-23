@@ -341,6 +341,7 @@ D3d11FrameExtractor::ExtractFrame(
         result.StagingRecreated = true;
     }
 
+    const uint64_t gpuCopyStartQpc = QueryCurrentQpc();
     HRESULT copyHr = m_hooks->CopyTextureResource(
         m_d3dContext.Get(),
         m_stagingTexture.Get(),
@@ -349,6 +350,7 @@ D3d11FrameExtractor::ExtractFrame(
     // Release ALL COM references to the acquired IddCx surface immediately after GPU copy submission
     // so the OS surface never survives into Map(D3D11_MAP_READ) or beyond extraction.
     releaseAcquiredSurfaceRefs();
+    const uint64_t gpuCopyEndQpc = QueryCurrentQpc();
 
     const HRESULT postCopyRemovedReason = m_d3dDevice->GetDeviceRemovedReason();
     if (FAILED(copyHr) || IsDeviceRemovedOrResetHResult(postCopyRemovedReason))
@@ -370,6 +372,7 @@ D3d11FrameExtractor::ExtractFrame(
         return result;
     }
 
+    const uint64_t mapCpuStartQpc = QueryCurrentQpc();
     D3D11_MAPPED_SUBRESOURCE mapped{};
     HRESULT mapHr = m_hooks->MapStagingTexture(m_d3dContext.Get(), m_stagingTexture.Get(), mapped);
     if (FAILED(mapHr))
@@ -418,9 +421,14 @@ D3d11FrameExtractor::ExtractFrame(
         }
     }
 
+    const uint64_t mapCpuEndQpc = QueryCurrentQpc();
+    const uint32_t payloadCrc = ipc::ComputeFrameCrc32(outFrame.Pixels.data(), outFrame.Pixels.size());
     const uint64_t endQpc = QueryCurrentQpc();
-    const uint64_t copyTicks = (endQpc >= startQpc) ? (endQpc - startQpc) : 0ULL;
-    const uint64_t copyLatencyUs = (copyTicks * 1000000ULL) / qpcFreq;
+
+    const uint64_t gpuCopyLatencyUs = ipc::ComputeQpcElapsedUs(gpuCopyStartQpc, gpuCopyEndQpc, qpcFreq);
+    const uint64_t mapAndCpuCopyLatencyUs = ipc::ComputeQpcElapsedUs(mapCpuStartQpc, mapCpuEndQpc, qpcFreq);
+    const uint64_t crcComputeLatencyUs = ipc::ComputeQpcElapsedUs(mapCpuEndQpc, endQpc, qpcFreq);
+    const uint64_t copyLatencyUs = ipc::ComputeQpcElapsedUs(startQpc, mapCpuEndQpc, qpcFreq);
 
     const uint64_t seq = static_cast<uint64_t>(InterlockedIncrement64(&m_sequenceCounter));
     outFrame.FrameSequence = seq;
@@ -433,15 +441,24 @@ D3d11FrameExtractor::ExtractFrame(
     outFrame.MoveRegionCount = input.MoveRegionCount;
     outFrame.Flags = input.Flags;
     outFrame.PresentDisplayQpcTime = input.PresentDisplayQpcTime;
+    outFrame.ExtractStartQpcTime = startQpc;
+    outFrame.GpuCopyCompleteQpcTime = gpuCopyEndQpc;
     outFrame.ExtractCompleteQpcTime = endQpc;
+    outFrame.EnqueueQpcTime = 0ULL;
     outFrame.QpcFrequency = qpcFreq;
     outFrame.CopyLatencyUs = copyLatencyUs;
-    outFrame.PayloadCrc32 = ipc::ComputeFrameCrc32(outFrame.Pixels.data(), outFrame.Pixels.size());
+    outFrame.GpuCopyLatencyUs = gpuCopyLatencyUs;
+    outFrame.MapAndCpuCopyLatencyUs = mapAndCpuCopyLatencyUs;
+    outFrame.CrcComputeLatencyUs = crcComputeLatencyUs;
+    outFrame.PayloadCrc32 = payloadCrc;
 
     result.HResult = S_OK;
     result.PixelsCopied = true;
     result.FrameSequence = seq;
     result.CopyLatencyUs = copyLatencyUs;
+    result.GpuCopyLatencyUs = gpuCopyLatencyUs;
+    result.MapAndCpuCopyLatencyUs = mapAndCpuCopyLatencyUs;
+    result.CrcComputeLatencyUs = crcComputeLatencyUs;
     return result;
 }
 

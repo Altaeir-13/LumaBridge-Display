@@ -53,7 +53,56 @@ enum class FrameIpcFlags : uint32_t
 {
     None = 0U,
     SyntheticTestFrame = 1U << 0,
+    PreConnectQueuedFrame = 1U << 1,
 };
+
+inline constexpr uint32_t kFrameIpcFlagBitMask = 0x000000FFU;
+inline constexpr uint32_t kFrameIpcCopyLatencyUsShift = 8U;
+inline constexpr uint32_t kFrameIpcMaxEncodedCopyLatencyUs = 0x00FFFFFFU;
+
+inline constexpr uint32_t
+PackFrameFlags(
+    uint32_t baseFlags,
+    uint64_t copyLatencyUs
+    ) noexcept
+{
+    const uint32_t lowFlags = (baseFlags & kFrameIpcFlagBitMask);
+    const uint32_t encodedCopyUs = (copyLatencyUs >= static_cast<uint64_t>(kFrameIpcMaxEncodedCopyLatencyUs))
+        ? kFrameIpcMaxEncodedCopyLatencyUs
+        : static_cast<uint32_t>(copyLatencyUs);
+    return lowFlags | (encodedCopyUs << kFrameIpcCopyLatencyUsShift);
+}
+
+inline constexpr uint64_t
+UnpackCopyLatencyUsFromFlags(
+    uint32_t flags
+    ) noexcept
+{
+    return static_cast<uint64_t>((flags >> kFrameIpcCopyLatencyUsShift) & kFrameIpcMaxEncodedCopyLatencyUs);
+}
+
+inline constexpr uint64_t
+ComputeQpcElapsedUs(
+    uint64_t startQpc,
+    uint64_t endQpc,
+    uint64_t qpcFreq,
+    bool* outOrderValid = nullptr
+    ) noexcept
+{
+    if (startQpc == 0ULL || endQpc == 0ULL || qpcFreq == 0ULL || endQpc < startQpc)
+    {
+        if (outOrderValid != nullptr)
+        {
+            *outOrderValid = false;
+        }
+        return 0ULL;
+    }
+    if (outOrderValid != nullptr)
+    {
+        *outOrderValid = true;
+    }
+    return ((endQpc - startQpc) * 1000000ULL) / qpcFreq;
+}
 
 inline const char*
 FrameIpcStatusToString(

@@ -125,10 +125,19 @@ struct ExtractedFrameBuffer
     uint32_t MoveRegionCount{0};
     uint32_t Flags{0};
     uint64_t PresentDisplayQpcTime{0};
+    uint64_t ExtractStartQpcTime{0};
+    uint64_t GpuCopyCompleteQpcTime{0};
     uint64_t ExtractCompleteQpcTime{0};
+    uint64_t EnqueueQpcTime{0};
     uint64_t QpcFrequency{0};
     uint64_t CopyLatencyUs{0};
+    uint64_t GpuCopyLatencyUs{0};
+    uint64_t MapAndCpuCopyLatencyUs{0};
+    uint64_t CrcComputeLatencyUs{0};
     uint32_t PayloadCrc32{0};
+    bool PooledSlot{false};
+    bool InFlightFromPool{false};
+    uint64_t PoolEpoch{0ULL};
     PixelByteBuffer Pixels{};
 
     void ResetMetadataKeepCapacity() noexcept
@@ -143,9 +152,15 @@ struct ExtractedFrameBuffer
         MoveRegionCount = 0U;
         Flags = 0U;
         PresentDisplayQpcTime = 0ULL;
+        ExtractStartQpcTime = 0ULL;
+        GpuCopyCompleteQpcTime = 0ULL;
         ExtractCompleteQpcTime = 0ULL;
+        EnqueueQpcTime = 0ULL;
         QpcFrequency = 0ULL;
         CopyLatencyUs = 0ULL;
+        GpuCopyLatencyUs = 0ULL;
+        MapAndCpuCopyLatencyUs = 0ULL;
+        CrcComputeLatencyUs = 0ULL;
         PayloadCrc32 = 0U;
         Pixels.ClearKeepCapacity(ipc::kMaxRetainedPoolBufferBytes);
     }
@@ -187,6 +202,9 @@ struct FrameExtractionResult
     uint32_t Format{0};
     uint64_t FrameSequence{0};
     uint64_t CopyLatencyUs{0};
+    uint64_t GpuCopyLatencyUs{0};
+    uint64_t MapAndCpuCopyLatencyUs{0};
+    uint64_t CrcComputeLatencyUs{0};
 };
 
 /// Testability seam over D3D11 staging allocation, copy, and map/unmap operations.

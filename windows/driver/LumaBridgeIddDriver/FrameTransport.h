@@ -56,6 +56,7 @@ struct FrameTransportConfig
     size_t BufferPoolSize{ipc::kDefaultFrameBufferPoolSize};
     DWORD IoTimeoutMs{ipc::kDefaultIpcIoTimeoutMs};
     LUID AdapterLuid{0, 0};
+    bool PreallocatePoolOnStart{true};
     bool RequireClientAck{true};
     bool RestrictDaclToAuthorizedSid{false};
     bool AllowSameUserAccess{true};
@@ -73,16 +74,28 @@ struct FrameTransportMetricsSnapshot
     bool Running{false};
     uint32_t QueueDepth{0U};
     uint32_t PeakQueueDepth{0U};
+    uint32_t TotalPoolSlots{0U};
+    uint32_t FreePoolSlots{0U};
+    uint32_t InFlightSlots{0U};
+    uint32_t PeakInFlightSlots{0U};
     uint32_t ActiveHostConnections{0U};
     uint64_t ActiveSessionId{0ULL};
     uint64_t FramesEnqueued{0ULL};
     uint64_t FramesDroppedByBackpressure{0ULL};
+    uint64_t QueueEvictionsByBackpressure{0ULL};
+    uint64_t PoolExhaustionDrops{0ULL};
+    uint64_t PoolAllocationFailures{0ULL};
     uint64_t FramesDelivered{0ULL};
+    uint64_t PreConnectFramesDelivered{0ULL};
     uint64_t FrameTransportFailures{0ULL};
     uint64_t ClientConnectionsAccepted{0ULL};
     uint64_t ClientConnectionsRejected{0ULL};
     uint64_t ClientDisconnects{0ULL};
     uint64_t LastDeliveredFrameSequence{0ULL};
+    uint64_t LastQueueWaitLatencyUs{0ULL};
+    uint64_t TotalQueueWaitLatencyUs{0ULL};
+    uint64_t AvgQueueWaitLatencyUs{0ULL};
+    uint64_t MaxQueueWaitLatencyUs{0ULL};
     uint64_t LastDeliveryLatencyUs{0ULL};
     uint64_t TotalDeliveryLatencyUs{0ULL};
     uint64_t AvgDeliveryLatencyUs{0ULL};
@@ -196,6 +209,11 @@ public:
     /// Returns a synchronized snapshot of queue and IPC delivery metrics.
     FrameTransportMetricsSnapshot GetMetricsSnapshot() const noexcept;
 
+    /// Fault-injection seam for deterministic unit testing of slot allocation failures.
+    void SetSimulateSlotAllocationFailureForTesting(
+        bool simulateFailure
+        ) noexcept;
+
 private:
     static DWORD WINAPI WorkerThreadProc(LPVOID context) noexcept;
 
@@ -205,6 +223,7 @@ private:
         std::unique_ptr<ExtractedFrameBuffer>& outFrame
         ) noexcept;
 
+    void UpdatePoolMetricsLocked() noexcept;
     void ClearAllBuffersLocked() noexcept;
 
     HRESULT CreateSecuredPipeHandle(
@@ -225,9 +244,12 @@ private:
     size_t m_effectiveMaxQueueDepth{ipc::kDefaultMaxFrameQueueDepth};
     size_t m_effectiveMaxPoolSize{ipc::kDefaultFrameBufferPoolSize};
     size_t m_totalPoolSlots{0U};
+    size_t m_inFlightSlots{0U};
+    uint64_t m_poolEpoch{0ULL};
 
     volatile LONG m_running{0};
     volatile LONG m_stopRequested{0};
+    volatile LONG m_simulateSlotAllocationFailure{0};
     volatile LONG64 m_nextSessionId{0};
 
     ScopedWin32Handle m_pipeHandle{};

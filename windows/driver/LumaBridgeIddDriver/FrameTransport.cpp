@@ -367,7 +367,7 @@ WaitOverlappedWithStop(
     // Drain any in-flight overlapped IRP before OVERLAPPED goes out of scope.
     (void)CancelIoEx(pipeHandle, &ov);
     DWORD cancelledBytes = 0U;
-    (void)GetOverlappedResult(pipeHandle, &ov, &cancelledBytes, TRUE);
+    const BOOL gotCancelledResult = GetOverlappedResult(pipeHandle, &ov, &cancelledBytes, TRUE);
 
     if (waitResult == WAIT_OBJECT_0 + 1)
     {
@@ -375,6 +375,11 @@ WaitOverlappedWithStop(
     }
     if (waitResult == WAIT_TIMEOUT)
     {
+        if (gotCancelledResult != FALSE && cancelledBytes > 0U)
+        {
+            outBytesTransferred = cancelledBytes;
+            return ERROR_SUCCESS;
+        }
         return ERROR_TIMEOUT;
     }
     return ERROR_GEN_FAILURE;
@@ -941,15 +946,21 @@ FrameIpcServer::Start(
         return E_INVALIDARG;
     }
 
-    const size_t clampedQueueDepth = (config.MaxQueueDepth == 0U)
+    size_t clampedQueueDepth = (config.MaxQueueDepth == 0U)
         ? 1U
         : ((config.MaxQueueDepth > kMaxSupportedQueueDepth) ? kMaxSupportedQueueDepth : config.MaxQueueDepth);
-    size_t clampedPoolSize = (config.BufferPoolSize < clampedQueueDepth + 2U)
-        ? (clampedQueueDepth + 2U)
-        : config.BufferPoolSize;
+    size_t clampedPoolSize = config.BufferPoolSize;
+    if (clampedPoolSize == 0U)
+    {
+        clampedPoolSize = clampedQueueDepth + 2U;
+    }
     if (clampedPoolSize > kMaxSupportedPoolSize)
     {
         clampedPoolSize = kMaxSupportedPoolSize;
+    }
+    if (clampedQueueDepth > clampedPoolSize)
+    {
+        clampedQueueDepth = clampedPoolSize;
     }
 
     ScopedWin32Handle pipeHandle;
@@ -975,23 +986,42 @@ FrameIpcServer::Start(
 
     {
         ExclusiveLock queueGuard(&m_queueLock);
+        ++m_poolEpoch;
         ClearAllBuffersLocked();
-
-        for (size_t i = 0U; i < clampedPoolSize; ++i)
-        {
-            std::unique_ptr<ExtractedFrameBuffer> slot(new (std::nothrow) ExtractedFrameBuffer());
-            if (slot == nullptr || !m_freePool.PushBack(std::move(slot)))
-            {
-                ClearAllBuffersLocked();
-                return E_OUTOFMEMORY;
-            }
-        }
 
         m_effectiveMaxQueueDepth = clampedQueueDepth;
         m_effectiveMaxPoolSize = clampedPoolSize;
-        m_totalPoolSlots = clampedPoolSize;
         m_queueMetrics = {};
         m_queueMetrics.Running = true;
+
+        if (config.PreallocatePoolOnStart)
+        {
+            for (size_t i = 0U; i < clampedPoolSize; ++i)
+            {
+                std::unique_ptr<ExtractedFrameBuffer> slot(
+                    (InterlockedCompareExchange(&m_simulateSlotAllocationFailure, 0, 0) != 0)
+                        ? nullptr
+                        : new (std::nothrow) ExtractedFrameBuffer());
+                if (slot == nullptr)
+                {
+                    ClearAllBuffersLocked();
+                    m_queueMetrics.Running = false;
+                    ++m_queueMetrics.PoolAllocationFailures;
+                    return E_OUTOFMEMORY;
+                }
+                slot->PooledSlot = true;
+                slot->InFlightFromPool = false;
+                slot->PoolEpoch = m_poolEpoch;
+                if (!m_freePool.PushBack(std::move(slot)))
+                {
+                    ClearAllBuffersLocked();
+                    m_queueMetrics.Running = false;
+                    return E_OUTOFMEMORY;
+                }
+            }
+            m_totalPoolSlots = clampedPoolSize;
+        }
+        UpdatePoolMetricsLocked();
     }
 
     {
@@ -1081,9 +1111,10 @@ FrameIpcServer::Stop() noexcept
 
     {
         ExclusiveLock queueGuard(&m_queueLock);
+        ++m_poolEpoch;
         ClearAllBuffersLocked();
         m_queueMetrics.Running = false;
-        m_queueMetrics.QueueDepth = 0U;
+        UpdatePoolMetricsLocked();
     }
 
     {
@@ -1101,16 +1132,37 @@ FrameIpcServer::IsRunning() const noexcept
            InterlockedCompareExchange(const_cast<volatile LONG*>(&m_stopRequested), 0, 0) == 0;
 }
 
+void
+FrameIpcServer::SetSimulateSlotAllocationFailureForTesting(
+    bool simulateFailure
+    ) noexcept
+{
+    InterlockedExchange(&m_simulateSlotAllocationFailure, simulateFailure ? 1 : 0);
+}
+
 std::unique_ptr<ExtractedFrameBuffer>
 FrameIpcServer::AcquireBufferSlot() noexcept
 {
+    bool needDynamicAlloc = false;
+    uint64_t acquiredEpoch = 0ULL;
+
     {
         ExclusiveLock queueGuard(&m_queueLock);
+        if (!IsRunning())
+        {
+            return nullptr;
+        }
+
         if (!m_freePool.Empty())
         {
             auto slot = m_freePool.PopFront();
             if (slot != nullptr)
             {
+                slot->PooledSlot = true;
+                slot->InFlightFromPool = true;
+                slot->PoolEpoch = m_poolEpoch;
+                ++m_inFlightSlots;
+                UpdatePoolMetricsLocked();
                 slot->ResetMetadataKeepCapacity();
                 return slot;
             }
@@ -1119,21 +1171,109 @@ FrameIpcServer::AcquireBufferSlot() noexcept
         if (m_totalPoolSlots < m_effectiveMaxPoolSize)
         {
             ++m_totalPoolSlots;
+            ++m_inFlightSlots;
+            acquiredEpoch = m_poolEpoch;
+            UpdatePoolMetricsLocked();
+            needDynamicAlloc = true;
         }
         else if (!m_queue.Empty())
         {
-            auto evicted = m_queue.PopFront();
-            ++m_queueMetrics.FramesDroppedByBackpressure;
-            m_queueMetrics.QueueDepth = static_cast<uint32_t>(m_queue.Size());
-            if (evicted != nullptr)
+            while (!m_queue.Empty())
             {
-                evicted->ResetMetadataKeepCapacity();
-                return evicted;
+                auto evicted = m_queue.PopFront();
+                ++m_queueMetrics.FramesDroppedByBackpressure;
+                ++m_queueMetrics.QueueEvictionsByBackpressure;
+                if (evicted == nullptr)
+                {
+                    continue;
+                }
+                if (evicted->PooledSlot)
+                {
+                    evicted->InFlightFromPool = true;
+                    evicted->PoolEpoch = m_poolEpoch;
+                    ++m_inFlightSlots;
+                    UpdatePoolMetricsLocked();
+                    evicted->ResetMetadataKeepCapacity();
+                    return evicted;
+                }
+                if (m_totalPoolSlots < m_effectiveMaxPoolSize &&
+                    m_inFlightSlots < m_effectiveMaxPoolSize)
+                {
+                    evicted->PooledSlot = true;
+                    evicted->InFlightFromPool = true;
+                    evicted->PoolEpoch = m_poolEpoch;
+                    ++m_totalPoolSlots;
+                    ++m_inFlightSlots;
+                    UpdatePoolMetricsLocked();
+                    evicted->ResetMetadataKeepCapacity();
+                    return evicted;
+                }
             }
+
+            ++m_queueMetrics.PoolExhaustionDrops;
+            UpdatePoolMetricsLocked();
+            return nullptr;
+        }
+        else
+        {
+            ++m_queueMetrics.FramesDroppedByBackpressure;
+            ++m_queueMetrics.PoolExhaustionDrops;
+            UpdatePoolMetricsLocked();
+            return nullptr;
         }
     }
 
-    return std::unique_ptr<ExtractedFrameBuffer>(new (std::nothrow) ExtractedFrameBuffer());
+    if (needDynamicAlloc)
+    {
+        std::unique_ptr<ExtractedFrameBuffer> allocated(
+            (InterlockedCompareExchange(&m_simulateSlotAllocationFailure, 0, 0) != 0)
+                ? nullptr
+                : new (std::nothrow) ExtractedFrameBuffer());
+        if (allocated == nullptr)
+        {
+            ExclusiveLock queueGuard(&m_queueLock);
+            if (m_poolEpoch == acquiredEpoch)
+            {
+                if (m_inFlightSlots > 0U)
+                {
+                    --m_inFlightSlots;
+                }
+                if (m_totalPoolSlots > 0U)
+                {
+                    --m_totalPoolSlots;
+                }
+                ++m_queueMetrics.PoolAllocationFailures;
+                ++m_queueMetrics.FramesDroppedByBackpressure;
+                UpdatePoolMetricsLocked();
+            }
+            return nullptr;
+        }
+
+        ExclusiveLock queueGuard(&m_queueLock);
+        if (!IsRunning() || m_poolEpoch != acquiredEpoch)
+        {
+            if (m_poolEpoch == acquiredEpoch)
+            {
+                if (m_inFlightSlots > 0U)
+                {
+                    --m_inFlightSlots;
+                }
+                if (m_totalPoolSlots > 0U)
+                {
+                    --m_totalPoolSlots;
+                }
+                UpdatePoolMetricsLocked();
+            }
+            return nullptr;
+        }
+
+        allocated->PooledSlot = true;
+        allocated->InFlightFromPool = true;
+        allocated->PoolEpoch = acquiredEpoch;
+        return allocated;
+    }
+
+    return nullptr;
 }
 
 void
@@ -1149,15 +1289,54 @@ FrameIpcServer::RecycleBufferSlot(
     slot->ResetMetadataKeepCapacity();
 
     ExclusiveLock queueGuard(&m_queueLock);
-    if (InterlockedCompareExchange(&m_running, 0, 0) == 0)
+    const bool matchesActiveEpoch = (slot->PoolEpoch == m_poolEpoch);
+    const bool wasPooled = slot->PooledSlot;
+    const bool wasInFlightFromPool = (wasPooled && slot->InFlightFromPool);
+
+    if (matchesActiveEpoch && wasInFlightFromPool && m_inFlightSlots > 0U)
     {
+        --m_inFlightSlots;
+    }
+    slot->InFlightFromPool = false;
+
+    if (!IsRunning() || (wasPooled && !matchesActiveEpoch))
+    {
+        if (matchesActiveEpoch && wasPooled && m_totalPoolSlots > 0U)
+        {
+            --m_totalPoolSlots;
+        }
+        UpdatePoolMetricsLocked();
         return;
     }
 
-    if (m_freePool.Size() < m_effectiveMaxPoolSize)
+    if (wasPooled)
     {
-        (void)m_freePool.PushBack(std::move(slot));
+        if (m_freePool.Size() < m_effectiveMaxPoolSize &&
+            m_freePool.PushBack(std::move(slot)))
+        {
+            UpdatePoolMetricsLocked();
+            return;
+        }
+        if (m_totalPoolSlots > 0U)
+        {
+            --m_totalPoolSlots;
+        }
+        UpdatePoolMetricsLocked();
+        return;
     }
+
+    // Adopt non-pooled external buffer only if pool capacity still has headroom.
+    if (m_totalPoolSlots < m_effectiveMaxPoolSize &&
+        m_freePool.Size() < m_effectiveMaxPoolSize)
+    {
+        slot->PooledSlot = true;
+        slot->PoolEpoch = m_poolEpoch;
+        if (m_freePool.PushBack(std::move(slot)))
+        {
+            ++m_totalPoolSlots;
+        }
+    }
+    UpdatePoolMetricsLocked();
 }
 
 HRESULT
@@ -1172,6 +1351,8 @@ FrameIpcServer::EnqueueFrame(
         return E_INVALIDARG;
     }
 
+    frame->EnqueueQpcTime = QueryCurrentQpc();
+
     if (!IsRunning())
     {
         RecycleBufferSlot(std::move(frame));
@@ -1181,34 +1362,65 @@ FrameIpcServer::EnqueueFrame(
     HANDLE eventToSignal = nullptr;
     {
         ExclusiveLock queueGuard(&m_queueLock);
-        if (!IsRunning())
+        if (!IsRunning() || (frame->PooledSlot && frame->PoolEpoch != m_poolEpoch))
         {
+            if (frame->PooledSlot && frame->PoolEpoch == m_poolEpoch)
+            {
+                if (frame->InFlightFromPool && m_inFlightSlots > 0U)
+                {
+                    --m_inFlightSlots;
+                }
+                if (m_totalPoolSlots > 0U)
+                {
+                    --m_totalPoolSlots;
+                }
+                UpdatePoolMetricsLocked();
+            }
             return E_ABORT;
         }
+
+        const bool wasInFlightFromPool = (frame->PooledSlot && frame->InFlightFromPool);
+        if (wasInFlightFromPool && m_inFlightSlots > 0U)
+        {
+            --m_inFlightSlots;
+        }
+        frame->InFlightFromPool = false;
 
         while (m_queue.Size() >= m_effectiveMaxQueueDepth)
         {
             auto evicted = m_queue.PopFront();
             ++m_queueMetrics.FramesDroppedByBackpressure;
+            ++m_queueMetrics.QueueEvictionsByBackpressure;
             outEvictedOldest = true;
 
-            if (evicted != nullptr && m_freePool.Size() < m_effectiveMaxPoolSize)
+            if (evicted != nullptr)
             {
-                evicted->ResetMetadataKeepCapacity();
-                (void)m_freePool.PushBack(std::move(evicted));
+                if (evicted->PooledSlot && evicted->PoolEpoch == m_poolEpoch)
+                {
+                    evicted->InFlightFromPool = false;
+                    evicted->ResetMetadataKeepCapacity();
+                    if (m_freePool.Size() >= m_effectiveMaxPoolSize ||
+                        !m_freePool.PushBack(std::move(evicted)))
+                    {
+                        if (m_totalPoolSlots > 0U)
+                        {
+                            --m_totalPoolSlots;
+                        }
+                    }
+                }
             }
         }
 
         if (!m_queue.PushBack(std::move(frame)))
         {
+            UpdatePoolMetricsLocked();
             return E_OUTOFMEMORY;
         }
 
-        const uint32_t depth = static_cast<uint32_t>(m_queue.Size());
-        m_queueMetrics.QueueDepth = depth;
-        if (depth > m_queueMetrics.PeakQueueDepth)
+        UpdatePoolMetricsLocked();
+        if (m_queueMetrics.QueueDepth > m_queueMetrics.PeakQueueDepth)
         {
-            m_queueMetrics.PeakQueueDepth = depth;
+            m_queueMetrics.PeakQueueDepth = m_queueMetrics.QueueDepth;
         }
         ++m_queueMetrics.FramesEnqueued;
         eventToSignal = m_frameAvailableEvent.Get();
@@ -1229,14 +1441,25 @@ FrameIpcServer::FlushQueue() noexcept
     while (!m_queue.Empty())
     {
         auto item = m_queue.PopFront();
-        if (item != nullptr && m_freePool.Size() < m_effectiveMaxPoolSize)
+        if (item != nullptr)
         {
             item->ResetMetadataAndFreePixels();
-            (void)m_freePool.PushBack(std::move(item));
+            if (item->PooledSlot && item->PoolEpoch == m_poolEpoch)
+            {
+                item->InFlightFromPool = false;
+                if (m_freePool.Size() >= m_effectiveMaxPoolSize ||
+                    !m_freePool.PushBack(std::move(item)))
+                {
+                    if (m_totalPoolSlots > 0U)
+                    {
+                        --m_totalPoolSlots;
+                    }
+                }
+            }
         }
     }
     m_freePool.FreeAllPixelStorage();
-    m_queueMetrics.QueueDepth = 0U;
+    UpdatePoolMetricsLocked();
 }
 
 FrameTransportMetricsSnapshot
@@ -1257,8 +1480,15 @@ FrameIpcServer::GetMetricsSnapshot() const noexcept
     combined.Running = queueSnap.Running;
     combined.QueueDepth = queueSnap.QueueDepth;
     combined.PeakQueueDepth = queueSnap.PeakQueueDepth;
+    combined.TotalPoolSlots = queueSnap.TotalPoolSlots;
+    combined.FreePoolSlots = queueSnap.FreePoolSlots;
+    combined.InFlightSlots = queueSnap.InFlightSlots;
+    combined.PeakInFlightSlots = queueSnap.PeakInFlightSlots;
     combined.FramesEnqueued = queueSnap.FramesEnqueued;
     combined.FramesDroppedByBackpressure = queueSnap.FramesDroppedByBackpressure;
+    combined.QueueEvictionsByBackpressure = queueSnap.QueueEvictionsByBackpressure;
+    combined.PoolExhaustionDrops = queueSnap.PoolExhaustionDrops;
+    combined.PoolAllocationFailures = queueSnap.PoolAllocationFailures;
     return combined;
 }
 
@@ -1271,13 +1501,31 @@ FrameIpcServer::PopNextQueuedFrame(
     ExclusiveLock queueGuard(&m_queueLock);
     if (m_queue.Empty())
     {
-        m_queueMetrics.QueueDepth = 0U;
+        UpdatePoolMetricsLocked();
         return false;
     }
 
     outFrame = m_queue.PopFront();
-    m_queueMetrics.QueueDepth = static_cast<uint32_t>(m_queue.Size());
+    if (outFrame != nullptr && outFrame->PooledSlot && outFrame->PoolEpoch == m_poolEpoch)
+    {
+        outFrame->InFlightFromPool = true;
+        ++m_inFlightSlots;
+    }
+    UpdatePoolMetricsLocked();
     return outFrame != nullptr;
+}
+
+void
+FrameIpcServer::UpdatePoolMetricsLocked() noexcept
+{
+    m_queueMetrics.QueueDepth = static_cast<uint32_t>(m_queue.Size());
+    m_queueMetrics.TotalPoolSlots = static_cast<uint32_t>(m_totalPoolSlots);
+    m_queueMetrics.FreePoolSlots = static_cast<uint32_t>(m_freePool.Size());
+    m_queueMetrics.InFlightSlots = static_cast<uint32_t>(m_inFlightSlots);
+    if (m_queueMetrics.InFlightSlots > m_queueMetrics.PeakInFlightSlots)
+    {
+        m_queueMetrics.PeakInFlightSlots = m_queueMetrics.InFlightSlots;
+    }
 }
 
 void
@@ -1286,6 +1534,8 @@ FrameIpcServer::ClearAllBuffersLocked() noexcept
     m_queue.Clear();
     m_freePool.Clear();
     m_totalPoolSlots = 0U;
+    m_inFlightSlots = 0U;
+    UpdatePoolMetricsLocked();
 }
 
 DWORD WINAPI
@@ -1428,6 +1678,8 @@ FrameIpcServer::WorkerLoop() noexcept
             continue;
         }
 
+        const uint64_t sessionConnectQpc = QueryCurrentQpc();
+
         {
             ExclusiveLock metricsGuard(&m_metricsLock);
             ++m_transportMetrics.ClientConnectionsAccepted;
@@ -1482,6 +1734,19 @@ FrameIpcServer::WorkerLoop() noexcept
                 continue;
             }
 
+            const uint64_t sendStartQpc = QueryCurrentQpc();
+            const uint64_t frameQpcFreq = (frame->QpcFrequency > 0ULL) ? frame->QpcFrequency : qpcFreq;
+            const uint64_t queueOriginQpc =
+                (frame->EnqueueQpcTime > 0ULL) ? frame->EnqueueQpcTime : frame->ExtractCompleteQpcTime;
+            const uint64_t queueWaitUs = ipc::ComputeQpcElapsedUs(queueOriginQpc, sendStartQpc, frameQpcFreq);
+            const bool isPreConnectFrame =
+                (frame->ExtractCompleteQpcTime > 0ULL && frame->ExtractCompleteQpcTime < sessionConnectQpc);
+            uint32_t frameFlags = frame->Flags;
+            if (isPreConnectFrame)
+            {
+                frameFlags |= static_cast<uint32_t>(ipc::FrameIpcFlags::PreConnectQueuedFrame);
+            }
+
             ipc::FrameIpcFrameHeader header{};
             header.Envelope = ipc::InitEnvelope(
                 ipc::FrameIpcMessageType::FrameHeader,
@@ -1493,19 +1758,18 @@ FrameIpcServer::WorkerLoop() noexcept
             header.Height = frame->Height;
             header.RowPitchBytes = frame->RowPitchBytes;
             header.PixelFormat = frame->Format;
-            header.Flags = frame->Flags;
+            header.Flags = ipc::PackFrameFlags(frameFlags, frame->CopyLatencyUs);
             header.DirtyRectCount = frame->DirtyRectCount;
             header.MoveRegionCount = frame->MoveRegionCount;
             header.PresentDisplayQpcTime = frame->PresentDisplayQpcTime;
             header.ExtractCompleteQpcTime = frame->ExtractCompleteQpcTime;
-            header.ServerSendQpcTime = QueryCurrentQpc();
-            header.QpcFrequency = (frame->QpcFrequency > 0ULL) ? frame->QpcFrequency : qpcFreq;
+            header.ServerSendQpcTime = sendStartQpc;
+            header.QpcFrequency = frameQpcFreq;
             header.PayloadSizeBytes = static_cast<uint32_t>(payloadBytes);
             header.PayloadCrc32 = frame->PayloadCrc32;
 
             const uint64_t sentSeq = frame->FrameSequence;
             const uint64_t extractQpc = frame->ExtractCompleteQpcTime;
-            const uint64_t frameQpcFreq = header.QpcFrequency;
 
             DWORD ioErr = WriteExactOverlapped(
                 pipeHandle,
@@ -1581,14 +1845,24 @@ FrameIpcServer::WorkerLoop() noexcept
             }
 
             const uint64_t deliveredQpc = QueryCurrentQpc();
-            const uint64_t deliveryTicks = (deliveredQpc >= extractQpc) ? (deliveredQpc - extractQpc) : 0ULL;
-            const uint64_t deliveryLatencyUs =
-                (deliveryTicks * 1000000ULL) / ((frameQpcFreq > 0ULL) ? frameQpcFreq : qpcFreq);
+            const uint64_t deliveryLatencyUs = ipc::ComputeQpcElapsedUs(extractQpc, deliveredQpc, frameQpcFreq);
 
             {
                 ExclusiveLock metricsGuard(&m_metricsLock);
                 ++m_transportMetrics.FramesDelivered;
+                if (isPreConnectFrame)
+                {
+                    ++m_transportMetrics.PreConnectFramesDelivered;
+                }
                 m_transportMetrics.LastDeliveredFrameSequence = sentSeq;
+                m_transportMetrics.LastQueueWaitLatencyUs = queueWaitUs;
+                m_transportMetrics.TotalQueueWaitLatencyUs += queueWaitUs;
+                m_transportMetrics.AvgQueueWaitLatencyUs =
+                    m_transportMetrics.TotalQueueWaitLatencyUs / m_transportMetrics.FramesDelivered;
+                if (queueWaitUs > m_transportMetrics.MaxQueueWaitLatencyUs)
+                {
+                    m_transportMetrics.MaxQueueWaitLatencyUs = queueWaitUs;
+                }
                 m_transportMetrics.LastDeliveryLatencyUs = deliveryLatencyUs;
                 m_transportMetrics.TotalDeliveryLatencyUs += deliveryLatencyUs;
                 m_transportMetrics.AvgDeliveryLatencyUs =
