@@ -17,6 +17,7 @@ $script:LumaBridgeDriverConstants = [pscustomobject]@{
     MinimumWindows11Build       = 22000
     RegistryValueEnableMon      = 'EnableVirtualMonitor'
     RegistryValueEnableExt      = 'EnableFrameExtraction'
+    RegistryValueEnableGpuTrans = 'EnableGpuSharedTransport'
     RegistryValueAuthorizedSid  = 'AuthorizedHostUserSid'
     EtwSessionName              = 'LumaBridgeIddCore'
     EtwDxgSessionName           = 'LumaBridgeIddDxg'
@@ -1030,6 +1031,53 @@ function Set-LumaBridgeDeviceEnableFrameExtraction {
     New-ItemProperty -LiteralPath $DeviceParametersPath -Name $script:LumaBridgeDriverConstants.RegistryValueEnableExt -PropertyType DWord -Value $Value -Force | Out-Null
 }
 
+function Get-LumaBridgeDeviceEnableGpuSharedTransport {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DeviceParametersPath
+    )
+
+    if (-not (Test-Path -LiteralPath $DeviceParametersPath)) {
+        return $null
+    }
+
+    $propName = $script:LumaBridgeDriverConstants.RegistryValueEnableGpuTrans
+    $regProps = Get-ItemProperty -LiteralPath $DeviceParametersPath -Name $propName -ErrorAction SilentlyContinue
+    if ($null -ne $regProps -and ($regProps.PSObject.Properties.Name -contains $propName)) {
+        return $regProps.$propName
+    }
+
+    return $null
+}
+
+function Set-LumaBridgeDeviceEnableGpuSharedTransport {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DeviceParametersPath,
+
+        [ValidateSet(0, 1)]
+        [int]$Value = 1,
+
+        [switch]$Clear
+    )
+
+    $propName = $script:LumaBridgeDriverConstants.RegistryValueEnableGpuTrans
+    if ($Clear) {
+        if (Test-Path -LiteralPath $DeviceParametersPath) {
+            Remove-ItemProperty -LiteralPath $DeviceParametersPath -Name $propName -ErrorAction SilentlyContinue
+        }
+        return
+    }
+
+    if (-not (Test-Path -LiteralPath $DeviceParametersPath)) {
+        New-Item -Path $DeviceParametersPath -Force | Out-Null
+    }
+
+    New-ItemProperty -LiteralPath $DeviceParametersPath -Name $propName -PropertyType DWord -Value $Value -Force | Out-Null
+}
+
 function Get-LumaBridgeDeviceAuthorizedHostUserSid {
     [CmdletBinding()]
     param(
@@ -1308,30 +1356,32 @@ function Get-LumaBridgePnpInstances {
                 $regParamsPath = Get-LumaBridgeDeviceParametersRegistryPath -InstanceId $dev.InstanceId
                 $enableVal = Get-LumaBridgeDeviceEnableVirtualMonitor -DeviceParametersPath $regParamsPath
                 $enableExtractionVal = Get-LumaBridgeDeviceEnableFrameExtraction -DeviceParametersPath $regParamsPath
+                $enableGpuTransportVal = Get-LumaBridgeDeviceEnableGpuSharedTransport -DeviceParametersPath $regParamsPath
                 $authorizedSidVal = Get-LumaBridgeDeviceAuthorizedHostUserSid -DeviceParametersPath $regParamsPath
                 $startupDiag = Get-LumaBridgeDeviceStartupDiagnostics -DeviceParametersPath $regParamsPath
 
                 $results.Add([pscustomobject]@{
-                    InstanceId            = $dev.InstanceId
-                    FriendlyName          = $dev.FriendlyName
-                    Status                = $dev.Status
-                    ProblemCode           = $probCode
-                    ProblemStatus         = $probStatus
-                    ProblemStatusHex      = $probStatusHex
-                    Present               = [bool]$dev.Present
-                    HardwareIds           = @($effectiveHardwareIds)
-                    DriverInfPath         = $driverInfPath
-                    DriverProvider        = $driverProvider
-                    DriverVersion         = $driverVersion
-                    DriverService         = $driverService
-                    UpperFilters          = @($upperFilters)
-                    LowerFilters          = @($lowerFilters)
-                    ConfigurationId       = $configurationId
-                    DeviceParametersPath  = $regParamsPath
-                    EnableVirtualMonitor  = $enableVal
-                    EnableFrameExtraction = $enableExtractionVal
-                    AuthorizedHostUserSid = $authorizedSidVal
-                    StartupDiagnostics    = $startupDiag
+                    InstanceId               = $dev.InstanceId
+                    FriendlyName             = $dev.FriendlyName
+                    Status                   = $dev.Status
+                    ProblemCode              = $probCode
+                    ProblemStatus            = $probStatus
+                    ProblemStatusHex         = $probStatusHex
+                    Present                  = [bool]$dev.Present
+                    HardwareIds              = @($effectiveHardwareIds)
+                    DriverInfPath            = $driverInfPath
+                    DriverProvider           = $driverProvider
+                    DriverVersion            = $driverVersion
+                    DriverService            = $driverService
+                    UpperFilters             = @($upperFilters)
+                    LowerFilters             = @($lowerFilters)
+                    ConfigurationId          = $configurationId
+                    DeviceParametersPath     = $regParamsPath
+                    EnableVirtualMonitor     = $enableVal
+                    EnableFrameExtraction    = $enableExtractionVal
+                    EnableGpuSharedTransport = $enableGpuTransportVal
+                    AuthorizedHostUserSid    = $authorizedSidVal
+                    StartupDiagnostics       = $startupDiag
                 })
             }
         }
@@ -1346,30 +1396,32 @@ function Get-LumaBridgePnpInstances {
                 $regParamsPath = Get-LumaBridgeDeviceParametersRegistryPath -InstanceId $ent.PNPDeviceID
                 $enableVal = Get-LumaBridgeDeviceEnableVirtualMonitor -DeviceParametersPath $regParamsPath
                 $enableExtractionVal = Get-LumaBridgeDeviceEnableFrameExtraction -DeviceParametersPath $regParamsPath
+                $enableGpuTransportVal = Get-LumaBridgeDeviceEnableGpuSharedTransport -DeviceParametersPath $regParamsPath
                 $authorizedSidVal = Get-LumaBridgeDeviceAuthorizedHostUserSid -DeviceParametersPath $regParamsPath
                 $startupDiag = Get-LumaBridgeDeviceStartupDiagnostics -DeviceParametersPath $regParamsPath
 
                 $results.Add([pscustomobject]@{
-                    InstanceId            = $ent.PNPDeviceID
-                    FriendlyName          = $ent.Name
-                    Status                = $ent.Status
-                    ProblemCode           = $ent.ConfigManagerErrorCode
-                    ProblemStatus         = $null
-                    ProblemStatusHex      = $null
-                    Present               = ($ent.ConfigManagerErrorCode -eq 0)
-                    HardwareIds           = @($ent.HardwareID)
-                    DriverInfPath         = $null
-                    DriverProvider        = $null
-                    DriverVersion         = $null
-                    DriverService         = $ent.Service
-                    UpperFilters          = @()
-                    LowerFilters          = @()
-                    ConfigurationId       = $null
-                    DeviceParametersPath  = $regParamsPath
-                    EnableVirtualMonitor  = $enableVal
-                    EnableFrameExtraction = $enableExtractionVal
-                    AuthorizedHostUserSid = $authorizedSidVal
-                    StartupDiagnostics    = $startupDiag
+                    InstanceId               = $ent.PNPDeviceID
+                    FriendlyName             = $ent.Name
+                    Status                   = $ent.Status
+                    ProblemCode              = $ent.ConfigManagerErrorCode
+                    ProblemStatus            = $null
+                    ProblemStatusHex         = $null
+                    Present                  = ($ent.ConfigManagerErrorCode -eq 0)
+                    HardwareIds              = @($ent.HardwareID)
+                    DriverInfPath            = $null
+                    DriverProvider           = $null
+                    DriverVersion            = $null
+                    DriverService            = $ent.Service
+                    UpperFilters             = @()
+                    LowerFilters             = @()
+                    ConfigurationId          = $null
+                    DeviceParametersPath     = $regParamsPath
+                    EnableVirtualMonitor     = $enableVal
+                    EnableFrameExtraction    = $enableExtractionVal
+                    EnableGpuSharedTransport = $enableGpuTransportVal
+                    AuthorizedHostUserSid    = $authorizedSidVal
+                    StartupDiagnostics       = $startupDiag
                 })
             }
         }
@@ -3845,6 +3897,8 @@ Export-ModuleMember -Function @(
     'Set-LumaBridgeDeviceEnableVirtualMonitor',
     'Get-LumaBridgeDeviceEnableFrameExtraction',
     'Set-LumaBridgeDeviceEnableFrameExtraction',
+    'Get-LumaBridgeDeviceEnableGpuSharedTransport',
+    'Set-LumaBridgeDeviceEnableGpuSharedTransport',
     'Get-LumaBridgeDeviceAuthorizedHostUserSid',
     'Set-LumaBridgeDeviceAuthorizedHostUserSid',
     'Get-LumaBridgeDeviceStartupDiagnostics',

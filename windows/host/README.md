@@ -1,14 +1,14 @@
-# `lumabridge-host` — Processo Consumidor Local de Frames (`M4.1` / `M4.1.1`)
+# `lumabridge-host` — Processo Consumidor GPU/IPC e Codificador NVENC H.264 (`M4.1` / `M4.2`)
 
-Processo Windows separado de `WUDFHost.exe` que se conecta ao endpoint IPC local de `LumaBridgeIddDriver` (`SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`, validado no servidor por token de acesso Windows, SID/broker `AuthorizedHostUserSid`, `TokenSessionId` e integridade `>= Medium`, sem segredo estatico), recebe os frames BGRA8/RGBA8 extraidos da swapchain virtual, verifica integridade de framing e CRC-32 (e padrao sintetico quando solicitado), envia confirmacoes (`FrameIpcFrameAck`) e expoe telemetria granular por estagio sem gravar pixels em disco.
+Processo Windows separado de `WUDFHost.exe` que se conecta ao endpoint IPC local de `LumaBridgeIddDriver` (`SECURITY_SQOS_PRESENT | SECURITY_IMPERSONATION`, validado no servidor por token de acesso Windows, SID/broker `AuthorizedHostUserSid`, `TokenSessionId` e integridade `>= Medium`, sem segredo estatico). Suporta tanto o protocolo `1.1` residente em GPU (`D3D11_RESOURCE_MISC_SHARED_NTHANDLE` + `IDXGIKeyedMutex` + validacao de `AdapterLuid` + codificacao `NVENC H.264` em GPU com `NvEncodeAPI64.dll` em runtime e fila limitada `EncodedFrameQueue`) quanto fallback diagnostico `1.0` (`CpuStagingPipe`), emitindo `FrameIpcFrameAck` e telemetria JSON granular sem gravar frames em disco.
 
 ## Compilacao
 
-Em ambiente `x64` do Visual Studio (`VsDevCmd.bat -arch=x64 -host_arch=x64`):
+Em ambiente `x64` do Visual Studio (`VsDevCmd.bat -arch=amd64 -host_arch=amd64`):
 
 ```bat
-cl /nologo /std:c++17 /W4 /WX /EHsc windows\host\main.cpp windows\host\FrameConsumer.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\lumabridge-host.exe /link advapi32.lib user32.lib gdi32.lib
-cl /nologo /std:c++17 /W4 /WX /EHsc /O2 windows\host\main.cpp windows\host\FrameConsumer.cpp /Fowindows\driver\x64\Release\ /Fe:windows\driver\x64\Release\lumabridge-host.exe /link advapi32.lib user32.lib gdi32.lib
+cl /nologo /std:c++17 /W4 /WX /EHsc /Od /Zi /MDd /DUNICODE /D_UNICODE /Iwindows\host /Iwindows\driver\LumaBridgeIddDriver windows\host\main.cpp windows\host\FrameConsumer.cpp windows\host\NvencH264Encoder.cpp windows\host\H264BitstreamValidator.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\lumabridge-host.exe /link d3d11.lib dxgi.lib advapi32.lib user32.lib gdi32.lib mfplat.lib mfuuid.lib wmcodecdspuuid.lib ole32.lib
+cl /nologo /std:c++17 /W4 /WX /EHsc /O2 /Zi /MD /DNDEBUG /DUNICODE /D_UNICODE /Iwindows\host /Iwindows\driver\LumaBridgeIddDriver windows\host\main.cpp windows\host\FrameConsumer.cpp windows\host\NvencH264Encoder.cpp windows\host\H264BitstreamValidator.cpp /Fowindows\driver\x64\Release\ /Fe:windows\driver\x64\Release\lumabridge-host.exe /link d3d11.lib dxgi.lib advapi32.lib user32.lib gdi32.lib mfplat.lib mfuuid.lib wmcodecdspuuid.lib ole32.lib
 ```
 
 ## Opcoes de linha de comando
@@ -20,18 +20,26 @@ cl /nologo /std:c++17 /W4 /WX /EHsc /O2 windows\host\main.cpp windows\host\Frame
 - `--duration-ms <ms>`: tempo maximo de execucao em milissegundos
 - `--connect-timeout-ms <ms>`: timeout de conexao ao pipe (padrao: `3000`)
 - `--io-timeout-ms <ms>`: timeout por operacao I/O overlapped em ms (padrao: `500`)
-- `--verify-synthetic-pattern`: valida padrao sintetico BGRA8 deterministico por pixel sem depender de imagens da area de trabalho
+- `--verify-synthetic-pattern`: valida padrao sintetico BGRA8 deterministico por pixel (em modo GPU realiza readback diagnostico explicito; em modo normal `CpuStagingReadsPerformed` permanece `0`)
 - `--reconnect`: reconecta automaticamente em caso de desconexao ou troca de modo/swapchain
-- `--visual-stimulus`: renderiza janela de movimento sintetico diretamente no monitor virtual LumaBridge ativo (sem capturar pixels do desktop e recusando exibir em monitores fisicos caso o virtual nao seja identificado)
+- `--transport <gpu|cpu|auto>`: selecao de transporte IPC (`auto` negocia `1.1 GpuSharedNtHandle` com fallback `1.0`, `gpu` exige GPU, `cpu` forca `CpuStagingPipe`)
+- `--require-gpu-shared`: falha se o pipe nao negociar `GpuSharedNtHandle`, se ocorrer fallback CPU, ou se houver leitura CPU de pixels em operacao normal
+- `--nvenc`: habilita codificacao NVENC H.264 na GPU sobre as texturas recebidas
+- `--require-nvenc`: exige `NvencFramesEncoded > 0` e bitstream valido para `ExitCode=0`
+- `--nvenc-bitrate-bps <bps>`: bitrate CBR do codificador NVENC (padrao: `15000000`)
+- `--nvenc-gop <frames>`: intervalo de GOP / IDR em frames (padrao: `120`)
+- `--nvenc-force-idr-every <N>`: solicita keyframe IDR explicitamente a cada `N` frames codificados
+- `--nvenc-color-format <auto|argb|nv12>`: seleciona entrada direta `ARGB/ABGR` ou conversao GPU `ID3D11VideoProcessor` (`BGRA8 -> NV12`)
+- `--verify-h264-decode`: inspeciona NALs Annex-B (`SPS`/`PPS`/`IDR`) e decodifica via `Microsoft H.264 Video Decoder MFT` (Media Foundation), calculando PSNR quando `--verify-synthetic-pattern` estiver ativo
+- `--visual-stimulus`: renderiza janela de movimento sintetico com timer de alta resolucao (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`) diretamente no monitor virtual LumaBridge ativo
 - `--require-virtual-stimulus`: falha com codigo de saida nao-zero se o estimulo visual nao conseguir identificar o display virtual
 - `--stimulus-fps <fps>`: taxa alvo de atualizacao do estimulo visual (`1..120`, padrao `60`)
 - `--stimulus-display <gdiName>`: override explicito opcional do display GDI (ex.: `\\.\DISPLAY2`)
-- `--json-summary <caminho>`: grava resumo JSON nao visual com motivo de saida, breakdown QPC (min/avg/p50/p95/p99/max), separacao de frames pre-conexao vs. live, metricas de FPS e status do estimulo
+- `--json-summary <caminho>`: grava resumo JSON nao visual com metricas de GPU pool, NVENC, decoder H.264, breakdown QPC e status do estimulo
 - `--quiet`: omite log por frame no stdout
 
 ## Limites e privacidade
 
 - Nenhum frame, screenshot ou buffer de pixels e salvo em disco nem lido da area de trabalho pelo estimulo diagnostico.
-- Payload maximo por frame limitado a `4096 x 4096 x 4` bytes (`64 MiB`), com validacao de versao, sessao e CRC-32 por frame.
-- Timeouts de espera ociosa no inicio de `FrameIpcEnvelope` (`0` bytes lidos) sao recuperaveis (`RecoverableIoTimeouts`); timeouts apos consumo parcial de cabecalho, payload ou ACK fecham o pipe imediatamente para impedir dessincronizacao do fluxo (`FatalIoTimeouts` / `PartialMessageTimeouts`).
-- Em ambiente D3D11/staging + Named Pipe (`M4.1`/`M4.1.1`), frames enfileirados antes da conexao do cliente (`PreConnectQueuedFrame`) acumulam tempo de permanencia em fila (`QueueWaitLatency`), enquanto frames ao vivo apos a conexao medem a latencia real do pipeline (`LiveEndToEndLatency`). O caminho definitivo de zero-copy GPU (`HANDLE` NT compartilhado + `NVENC`) pertence a etapa `M4.2`.
+- Payload CPU fallback limitado a `4096 x 4096 x 4` bytes (`64 MiB`). Em transporte GPU (`M4.2`), trafegam pelo Named Pipe apenas `136` bytes por frame (`FrameIpcGpuFrameHeader`) contendo o `HANDLE` NT duplicado para o PID autenticado do host, mantendo `CpuStagingReadsPerformed = 0` durante operacao normal.
+- Consulte [windows-gpu-shared-textures-nvenc.md](../../docs/architecture/windows-gpu-shared-textures-nvenc.md) para detalhes do modelo de sincronizacao, seguranca e licenca MIT do cabeçalho `nvEncodeAPI.h`.

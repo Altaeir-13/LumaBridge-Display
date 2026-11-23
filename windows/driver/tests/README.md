@@ -150,11 +150,20 @@
 12. `CrossSessionAndSpoofedSessionRejection` — rejeicao de cliente fora da sessao permitida (`AllowedClientSessionId`) e de `ClientSessionId` adulterado no handshake em desacordo com `TokenSessionId` do kernel;
 13. `ProcessIntegrityAndAnonymousSqosRejectionBeforePixels` — rejeicao por `MinimumIntegrityRid` insuficiente, bloqueio de `SECURITY_ANONYMOUS` SQOS e bloqueio real no kernel de thread com token duplicado em `SECURITY_MANDATORY_LOW_RID` (`ERROR_ACCESS_DENIED`), mantendo frame enfileirado intacto para consumidor autorizado.
 
-`FrameEndToEndIntegrationTests.cpp` executa **3 testes de integracao multiprocesso reais** com D3D11 real + `FrameIpcServer` + processo filho `lumabridge-host.exe` lancado via `CreateProcessW`:
+`FrameEndToEndIntegrationTests.cpp` executa **8 testes de integracao multiprocesso reais** com D3D11 real + `D3d11SharedTexturePool` + `FrameIpcServer` + processo filho `lumabridge-host.exe` lancado via `CreateProcessW`:
 
 1. `EndToEndRealD3d11ExtractionToSeparateHostProcess720pAnd1080p` — extrai texturas D3D11 reais `1280x720` e `1920x1080` com padrao sintetico, envia pelo pipe local e valida recebimento de 6/6 frames e CRC-32/pixels no processo separado `lumabridge-host.exe`;
 2. `EndToEndHostDisconnectAndReconnectDuringActiveSwapChainLoop` — executa `SwapChainProcessor` ativo enquanto dois processos `lumabridge-host.exe` conectam, desconectam e reconectam com janela intermediaria de backpressure;
-3. `EndToEndThroughputAndLatencyBenchmark720pAnd1080p` — mede throughput e latencia reais para 30 frames `1280x720` e 30 frames `1920x1080` entregues ao `lumabridge-host.exe`.
+3. `EndToEndSmokeDurationExitAndMinFramesVsTargetCli` — valida perfis CLI de smoke (`--min-frames`) vs target (`--require-max-frames`);
+4. `EndToEndThroughputAndLatencyBenchmark720pAnd1080p` — mede throughput e latencia reais M4.1.1 para 30 frames `1280x720` e `1920x1080`;
+5. `VirtualDisplayStimulusHighResTimer60FpsVerification` — valida `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` atingindo ~60 FPS reais no `VirtualDisplayStimulus`;
+6. `EndToEndPhaseAGpuSharedTextureSeparateHostProcess720pAnd1080p` — comprova todos os 7 criterios da Fase A em processos separados (`CpuStagingReadsPerformed == 0` no modo normal, integridade visual no modo sintetico, `GpuFramesOpened`, `IDXGIKeyedMutex` e liberacao limpa pos-ACK);
+7. `EndToEndPhaseBGpuSharedTexturePlusNvencAndIndependentDecode720pAnd1080p` — valida pipeline completo GPU Shared -> NVENC H.264 -> decodificador Media Foundation independente em 720p e 1080p;
+8. `EndToEndControlledThreeWayBenchmark720pAnd1080p` — benchmark controlado comparando M4.1.1 (CPU Staging), M4.2 Fase A (GPU Shared) e M4.2 Fase B (GPU Shared + NVENC H.264) para 120 frames em `1280x720` e `1920x1080`.
+
+`GpuSharedTextureTests.cpp` executa **8 testes deterministas da Fase A** (criacao NT handle/KeyedMutex, sincronizacao GPU sem leitura CPU, backpressure/pool esgotado, LUID incompativel, DACL restrita/SDDL, desconexao durante mutex ativo, timeout e `DXGI_ERROR_DEVICE_REMOVED` / `ReconstructSession`).
+
+`NvencEncoderTests.cpp` executa **7 testes reais de hardware NVIDIA NVENC H.264** (`ProbeAvailability`, sessao 720p/1080p, `DirectArgb` vs `ID3D11VideoProcessor` GPU `NV12`, rejeicao de formato DXGI incompativel, IDR periodico/forcado, injecao de `NV_ENC_ERR_ENCODER_BUSY` / `DEVICE_REMOVED` + `ReconstructSession`, e validacao independente de PSNR com `Microsoft H.264 Video Decoder MFT`).
 
 ## Fronteira com validacao em runtime WDF/IddCx
 
@@ -162,7 +171,7 @@ Estes testes validam exclusivamente a logica deterministica de transicoes de est
 
 ## Como compilar e executar
 
-Em ambiente x64 do Visual Studio (`VsDevCmd.bat -arch=x64 -host_arch=x64`), apos o rebuild de `Debug|x64` e `Release|x64` da solucao, os artefatos de teste sao direcionados para `windows/driver/x64/Debug/` (ignorado por `windows/driver/.gitignore`):
+Em ambiente x64 do Visual Studio (`VsDevCmd.bat -arch=amd64 -host_arch=amd64`), apos o rebuild de `Debug|x64` e `Release|x64` da solucao, os artefatos de teste sao direcionados para `windows/driver/x64/Debug/` (ignorado por `windows/driver/.gitignore`):
 
 ```bat
 cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\AdapterLifecycleTests.cpp /Fowindows\driver\x64\Debug\AdapterLifecycleTests.obj /Fe:windows\driver\x64\Debug\AdapterLifecycleTests.exe
@@ -180,14 +189,20 @@ windows\driver\x64\Debug\SwapChainLifecycleTests.exe
 cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\VirtualMonitorLifecycleTests.cpp windows\driver\LumaBridgeIddDriver\VirtualMonitor.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\VirtualMonitorLifecycleTests.exe
 windows\driver\x64\Debug\VirtualMonitorLifecycleTests.exe
 
-cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\FrameExtractionTests.cpp windows\driver\LumaBridgeIddDriver\FrameExtractor.cpp windows\driver\LumaBridgeIddDriver\FrameTransport.cpp windows\driver\LumaBridgeIddDriver\SwapChainProcessor.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\FrameExtractionTests.exe /link d3d11.lib dxgi.lib advapi32.lib
+cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\FrameExtractionTests.cpp windows\driver\LumaBridgeIddDriver\FrameExtractor.cpp windows\driver\LumaBridgeIddDriver\FrameTransport.cpp windows\driver\LumaBridgeIddDriver\SharedTexturePool.cpp windows\driver\LumaBridgeIddDriver\SwapChainProcessor.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\FrameExtractionTests.exe /link d3d11.lib dxgi.lib advapi32.lib
 windows\driver\x64\Debug\FrameExtractionTests.exe
 
-cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\FrameIpcTests.cpp windows\driver\LumaBridgeIddDriver\FrameTransport.cpp windows\host\FrameConsumer.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\FrameIpcTests.exe /link advapi32.lib user32.lib gdi32.lib
+cl /nologo /std:c++17 /W4 /WX /EHsc /DUNICODE /D_UNICODE /Iwindows\driver\LumaBridgeIddDriver windows\driver\tests\GpuSharedTextureTests.cpp windows\driver\LumaBridgeIddDriver\SharedTexturePool.cpp windows\driver\LumaBridgeIddDriver\FrameTransport.cpp windows\driver\LumaBridgeIddDriver\SwapChainProcessor.cpp windows\host\FrameConsumer.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\GpuSharedTextureTests.exe /link d3d11.lib dxgi.lib advapi32.lib user32.lib gdi32.lib
+windows\driver\x64\Debug\GpuSharedTextureTests.exe
+
+cl /nologo /std:c++17 /W4 /WX /EHsc /DUNICODE /D_UNICODE windows\driver\tests\FrameIpcTests.cpp windows\driver\LumaBridgeIddDriver\SharedTexturePool.cpp windows\driver\LumaBridgeIddDriver\FrameTransport.cpp windows\host\FrameConsumer.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\FrameIpcTests.exe /link d3d11.lib dxgi.lib advapi32.lib user32.lib gdi32.lib
 windows\driver\x64\Debug\FrameIpcTests.exe
 
-cl /nologo /std:c++17 /W4 /WX /EHsc /O2 windows\host\main.cpp windows\host\FrameConsumer.cpp /Fowindows\driver\x64\Release\ /Fe:windows\driver\x64\Release\lumabridge-host.exe /link advapi32.lib user32.lib gdi32.lib
-cl /nologo /std:c++17 /W4 /WX /EHsc /O2 windows\driver\tests\FrameEndToEndIntegrationTests.cpp windows\driver\LumaBridgeIddDriver\FrameExtractor.cpp windows\driver\LumaBridgeIddDriver\FrameTransport.cpp windows\driver\LumaBridgeIddDriver\SwapChainProcessor.cpp /Fowindows\driver\x64\Release\ /Fe:windows\driver\x64\Release\FrameEndToEndIntegrationTests.exe /link d3d11.lib dxgi.lib advapi32.lib
+cl /nologo /std:c++17 /W4 /WX /EHsc /DUNICODE /D_UNICODE /Iwindows\host /Iwindows\driver\LumaBridgeIddDriver windows\driver\tests\NvencEncoderTests.cpp windows\host\NvencH264Encoder.cpp windows\host\H264BitstreamValidator.cpp windows\host\FrameConsumer.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\NvencEncoderTests.exe /link d3d11.lib dxgi.lib advapi32.lib user32.lib gdi32.lib mfplat.lib mfuuid.lib wmcodecdspuuid.lib ole32.lib
+windows\driver\x64\Debug\NvencEncoderTests.exe
+
+cl /nologo /std:c++17 /W4 /WX /EHsc /O2 /DUNICODE /D_UNICODE /Iwindows\driver\LumaBridgeIddDriver /Iwindows\host windows\host\main.cpp windows\host\FrameConsumer.cpp windows\host\NvencH264Encoder.cpp windows\host\H264BitstreamValidator.cpp /Fowindows\driver\x64\Release\ /Fe:windows\driver\x64\Release\lumabridge-host.exe /link d3d11.lib dxgi.lib advapi32.lib user32.lib gdi32.lib mfplat.lib mfuuid.lib wmcodecdspuuid.lib ole32.lib
+cl /nologo /std:c++17 /W4 /WX /EHsc /O2 /DUNICODE /D_UNICODE /Iwindows\driver\LumaBridgeIddDriver /Iwindows\host windows\driver\tests\FrameEndToEndIntegrationTests.cpp windows\driver\LumaBridgeIddDriver\SharedTexturePool.cpp windows\driver\LumaBridgeIddDriver\FrameExtractor.cpp windows\driver\LumaBridgeIddDriver\FrameTransport.cpp windows\driver\LumaBridgeIddDriver\SwapChainProcessor.cpp /Fowindows\driver\x64\Release\ /Fe:windows\driver\x64\Release\FrameEndToEndIntegrationTests.exe /link d3d11.lib dxgi.lib advapi32.lib user32.lib gdi32.lib
 windows\driver\x64\Release\FrameEndToEndIntegrationTests.exe
 ```
 

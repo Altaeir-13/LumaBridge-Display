@@ -62,7 +62,21 @@ param(
     [ValidateRange(1000, 300000)]
     [int]$HostHardTimeoutMs = 30000,
 
-    [string]$ExpectedBranch = 'feature/windows-frame-extraction-ipc',
+    [ValidateSet('Auto', 'Gpu', 'Cpu')]
+    [string]$TransportMode = 'Auto',
+
+    [switch]$RequireGpuShared,
+
+    [switch]$EnableNvenc,
+
+    [switch]$RequireNvenc,
+
+    [ValidateRange(100000, 200000000)]
+    [int]$NvencBitrateBps = 15000000,
+
+    [switch]$VerifyH264Decode,
+
+    [string]$ExpectedBranch = 'feature/windows-gpu-shared-textures-nvenc',
 
     [switch]$AllowAnyBranch,
 
@@ -199,22 +213,24 @@ $preValidationState = if ($null -ne $preExistingInstance) {
         ProblemCode           = $preExistingInstance.ProblemCode
         DriverInfPath         = Get-LumaBridgeValidationOptionalProp -InputObject $preExistingInstance -PropertyName 'DriverInfPath'
         DriverVersion         = Get-LumaBridgeValidationOptionalProp -InputObject $preExistingInstance -PropertyName 'DriverVersion'
-        EnableVirtualMonitor  = Get-LumaBridgeValidationOptionalProp -InputObject $preExistingInstance -PropertyName 'EnableVirtualMonitor'
-        EnableFrameExtraction = Get-LumaBridgeValidationOptionalProp -InputObject $preExistingInstance -PropertyName 'EnableFrameExtraction'
-        AuthorizedHostUserSid = Get-LumaBridgeValidationOptionalProp -InputObject $preExistingInstance -PropertyName 'AuthorizedHostUserSid'
+        EnableVirtualMonitor     = Get-LumaBridgeValidationOptionalProp -InputObject $preExistingInstance -PropertyName 'EnableVirtualMonitor'
+        EnableFrameExtraction    = Get-LumaBridgeValidationOptionalProp -InputObject $preExistingInstance -PropertyName 'EnableFrameExtraction'
+        EnableGpuSharedTransport = Get-LumaBridgeValidationOptionalProp -InputObject $preExistingInstance -PropertyName 'EnableGpuSharedTransport'
+        AuthorizedHostUserSid    = Get-LumaBridgeValidationOptionalProp -InputObject $preExistingInstance -PropertyName 'AuthorizedHostUserSid'
     }
 }
 else {
     [pscustomobject]@{
-        ExistedBeforeRun      = $false
-        InstanceId            = $null
-        Status                = $null
-        ProblemCode           = $null
-        DriverInfPath         = $null
-        DriverVersion         = $null
-        EnableVirtualMonitor  = $null
-        EnableFrameExtraction = $null
-        AuthorizedHostUserSid = $null
+        ExistedBeforeRun         = $false
+        InstanceId               = $null
+        Status                   = $null
+        ProblemCode              = $null
+        DriverInfPath            = $null
+        DriverVersion            = $null
+        EnableVirtualMonitor     = $null
+        EnableFrameExtraction    = $null
+        EnableGpuSharedTransport = $null
+        AuthorizedHostUserSid    = $null
     }
 }
 
@@ -227,7 +243,16 @@ $initialDumpCount = [int](Get-LumaBridgeValidationOptionalProp -InputObject $ini
 # -------------------------------------------------------------------------
 $gitBranchResult = Invoke-LumaBridgeExternalCommand -FilePath 'git.exe' -Arguments @('-C', $repoRoot, 'rev-parse', '--abbrev-ref', 'HEAD')
 $currentBranch = if (@($gitBranchResult.Output).Count -gt 0) { ([string]$gitBranchResult.Output[0]).Trim() } else { '' }
-if (-not $AllowAnyBranch -and $currentBranch -ne $ExpectedBranch) {
+$branchAllowed = if ($AllowAnyBranch) {
+    $true
+}
+elseif ($PSBoundParameters.ContainsKey('ExpectedBranch')) {
+    $currentBranch -eq $ExpectedBranch
+}
+else {
+    $currentBranch -in @('feature/windows-gpu-shared-textures-nvenc', 'feature/windows-frame-extraction-ipc')
+}
+if (-not $branchAllowed) {
     throw ("Active Git branch is '{0}', expected '{1}'. Switch branch or pass -AllowAnyBranch." -f $currentBranch, $ExpectedBranch)
 }
 
@@ -247,9 +272,40 @@ $preBuildHashes = [ordered]@{
     HostSha256 = (Get-FileHash -LiteralPath $HostExecutablePath -Algorithm SHA256).Hash
 }
 
+function Add-LumaBridgeM42HostArgs {
+    param([System.Collections.Generic.List[string]]$ArgList)
+    if ($RequireGpuShared) {
+        $ArgList.Add('--transport')
+        $ArgList.Add('gpu')
+        $ArgList.Add('--require-gpu-shared')
+    }
+    elseif ($TransportMode -eq 'Gpu') {
+        $ArgList.Add('--transport')
+        $ArgList.Add('gpu')
+    }
+    elseif ($TransportMode -eq 'Cpu') {
+        $ArgList.Add('--transport')
+        $ArgList.Add('cpu')
+    }
+
+    if ($EnableNvenc -or $RequireNvenc) {
+        $ArgList.Add('--nvenc')
+        if ($RequireNvenc) {
+            $ArgList.Add('--require-nvenc')
+        }
+        $ArgList.Add('--nvenc-bitrate-bps')
+        $ArgList.Add("$NvencBitrateBps")
+    }
+
+    if ($VerifyH264Decode) {
+        $ArgList.Add('--verify-h264-decode')
+    }
+}
+
 function Build-SmokeHostArgs {
     param([string]$JsonOut)
-    return @(
+    $list = New-Object System.Collections.Generic.List[string]
+    foreach ($item in @(
         '--pipe', '\\.\pipe\LumaBridgeFrameIpc_v1',
         '--min-frames', "$SmokeMinFrames",
         '--max-frames', "$MaxFrames",
@@ -258,7 +314,11 @@ function Build-SmokeHostArgs {
         '--io-timeout-ms', "$IoTimeoutMs",
         '--reconnect',
         '--json-summary', $JsonOut
-    )
+    )) {
+        $list.Add($item)
+    }
+    Add-LumaBridgeM42HostArgs -ArgList $list
+    return @($list.ToArray())
 }
 
 function Build-PerfHostArgs {
@@ -283,6 +343,7 @@ function Build-PerfHostArgs {
         $list.Add('--stimulus-display')
         $list.Add($StimulusDisplayName)
     }
+    Add-LumaBridgeM42HostArgs -ArgList $list
     return @($list.ToArray())
 }
 
@@ -302,7 +363,8 @@ if ($DryRun) {
     }
     $dryInstId = if ($null -ne $preExistingInstance) { $preExistingInstance.InstanceId } else { 'ROOT\DISPLAY\<instance>' }
     $null = & $virtMonScript -Action Enable -InstanceId $dryInstId -DryRun
-    Write-Host ("[DRY-RUN] Stage 8: Would set REG_SZ AuthorizedHostUserSid='{0}' and REG_DWORD EnableFrameExtraction=1 on '{1}' then restart PnP device" -f $effectiveAuthorizedUserSid, $dryInstId) -ForegroundColor Cyan
+    $dryGpuMsg = if ($TransportMode -eq 'Cpu') { ' and REG_DWORD EnableGpuSharedTransport=0' } elseif ($TransportMode -eq 'Gpu' -or $RequireGpuShared) { ' and REG_DWORD EnableGpuSharedTransport=1' } else { '' }
+    Write-Host ("[DRY-RUN] Stage 8: Would set REG_SZ AuthorizedHostUserSid='{0}', REG_DWORD EnableFrameExtraction=1{1} on '{2}' then restart PnP device" -f $effectiveAuthorizedUserSid, $dryGpuMsg, $dryInstId) -ForegroundColor Cyan
 
     $smokeDry = $null
     if ($runSmokeProfile) {
@@ -397,9 +459,11 @@ $targetInstance = $preExistingInstance
 $didFreshDriverInstall = $false
 $driverInstallCompleted = $false
 $hadPreExistingVirtMon = ($null -ne $preExistingInstance -and $null -ne $preExistingInstance.EnableVirtualMonitor -and [int]$preExistingInstance.EnableVirtualMonitor -eq 1)
+$hadPreExistingGpuTrans = if ($null -ne $preExistingInstance) { Get-LumaBridgeValidationOptionalProp -InputObject $preExistingInstance -PropertyName 'EnableGpuSharedTransport' -DefaultValue $null } else { $null }
 $hadPreExistingAuthSid = if ($null -ne $preExistingInstance) { Get-LumaBridgeValidationOptionalProp -InputObject $preExistingInstance -PropertyName 'AuthorizedHostUserSid' -DefaultValue $null } else { $null }
 $modifiedVirtMon = $false
 $modifiedExtraction = $false
+$modifiedGpuTrans = $false
 $modifiedAuthSid = $false
 
 $etwStartResult = $null
@@ -496,10 +560,18 @@ try {
     }
 
     # ---------------------------------------------------------------------
-    # Stage 8: Temporary EnableFrameExtraction=1 & brokered AuthorizedHostUserSid
+    # Stage 8: Temporary EnableFrameExtraction=1, EnableGpuSharedTransport & AuthorizedHostUserSid
     # ---------------------------------------------------------------------
     Set-LumaBridgeDeviceAuthorizedHostUserSid -DeviceParametersPath $targetInstance.DeviceParametersPath -SidString $effectiveAuthorizedUserSid
     $modifiedAuthSid = $true
+    if ($TransportMode -eq 'Cpu') {
+        Set-LumaBridgeDeviceEnableGpuSharedTransport -DeviceParametersPath $targetInstance.DeviceParametersPath -Value 0
+        $modifiedGpuTrans = $true
+    }
+    elseif ($TransportMode -eq 'Gpu' -or $RequireGpuShared) {
+        Set-LumaBridgeDeviceEnableGpuSharedTransport -DeviceParametersPath $targetInstance.DeviceParametersPath -Value 1
+        $modifiedGpuTrans = $true
+    }
     Set-LumaBridgeDeviceEnableFrameExtraction -DeviceParametersPath $targetInstance.DeviceParametersPath -Value 1
     $modifiedExtraction = $true
 
@@ -662,7 +734,29 @@ try {
 
     $smokeGateOk = (-not $runSmokeProfile) -or $functionalSmokePassed
     $perfGateOk = (-not $runPerfProfile) -or $perfTargetReached
-    $allPassed = ($cmProbNone -and $adapterInitFinishedOk -and $virtualMonitorActive -and $noUnauthorizedIpcClients -and $noNewCrashDumps -and $wudfProcessHealthy -and $smokeGateOk -and $perfGateOk)
+
+    $evalGpuMode = if ($null -ne $primaryEvalSummary) { [string](Get-LumaBridgeValidationOptionalProp -InputObject $primaryEvalSummary -PropertyName 'NegotiatedTransportMode' -DefaultValue 'CpuStagingPipe') } else { 'CpuStagingPipe' }
+    $evalFallback = if ($null -ne $primaryEvalSummary) { [bool](Get-LumaBridgeValidationOptionalProp -InputObject $primaryEvalSummary -PropertyName 'FallbackToCpuActivated' -DefaultValue $false) } else { $false }
+    $evalGpuOpened = if ($null -ne $primaryEvalSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $primaryEvalSummary -PropertyName 'GpuFramesOpened' -DefaultValue 0) } else { [uint64]0 }
+    $evalCpuReads = if ($null -ne $primaryEvalSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $primaryEvalSummary -PropertyName 'CpuStagingReadsPerformed' -DefaultValue 0) } else { [uint64]0 }
+    $evalOpenFailures = if ($null -ne $primaryEvalSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $primaryEvalSummary -PropertyName 'GpuSharedOpenFailures' -DefaultValue 0) } else { [uint64]0 }
+    $evalSyncTimeouts = if ($null -ne $primaryEvalSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $primaryEvalSummary -PropertyName 'GpuSyncTimeouts' -DefaultValue 0) } else { [uint64]0 }
+    $evalLuidErrors = if ($null -ne $primaryEvalSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $primaryEvalSummary -PropertyName 'AdapterMismatchErrors' -DefaultValue 0) } else { [uint64]0 }
+    $evalNvenc = if ($null -ne $primaryEvalSummary) { Get-LumaBridgeValidationOptionalProp -InputObject $primaryEvalSummary -PropertyName 'Nvenc' -DefaultValue $null } else { $null }
+    $evalNvencEncoded = if ($null -ne $evalNvenc) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $evalNvenc -PropertyName 'NvencFramesEncoded' -DefaultValue 0) } else { [uint64]0 }
+    $evalNvencBytes = if ($null -ne $evalNvenc) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $evalNvenc -PropertyName 'TotalBitstreamBytes' -DefaultValue 0) } else { [uint64]0 }
+    $evalH264 = if ($null -ne $primaryEvalSummary) { Get-LumaBridgeValidationOptionalProp -InputObject $primaryEvalSummary -PropertyName 'H264DecodeValidation' -DefaultValue $null } else { $null }
+    $evalH264Passed = if ($null -ne $evalH264) { [bool](Get-LumaBridgeValidationOptionalProp -InputObject $evalH264 -PropertyName 'Passed' -DefaultValue $false) } else { $false }
+
+    $gpuSharedPassed = ($evalGpuMode -eq 'GpuSharedNtHandle' -and (-not $evalFallback) -and $evalGpuOpened -ge 1 -and $evalOpenFailures -eq 0 -and $evalSyncTimeouts -eq 0 -and $evalLuidErrors -eq 0 -and $evalCpuReads -eq 0)
+    $nvencPassed = ($evalNvencEncoded -ge 1 -and $evalNvencBytes -ge 1)
+    $h264DecodePassed = $evalH264Passed
+
+    $gpuGateOk = (-not $RequireGpuShared) -or $gpuSharedPassed
+    $nvencGateOk = (-not $RequireNvenc) -or $nvencPassed
+    $h264GateOk = (-not $VerifyH264Decode) -or $h264DecodePassed
+
+    $allPassed = ($cmProbNone -and $adapterInitFinishedOk -and $virtualMonitorActive -and $noUnauthorizedIpcClients -and $noNewCrashDumps -and $wudfProcessHealthy -and $smokeGateOk -and $perfGateOk -and $gpuGateOk -and $nvencGateOk -and $h264GateOk)
 
     $acceptanceCriteria = [pscustomobject]@{
         CmProbNone                      = $cmProbNone
@@ -679,6 +773,9 @@ try {
         PerformanceTestExecuted         = $perfExecuted
         PerformanceTargetReached        = $perfTargetReached
         TransportHealthy                = $transportHealthy
+        GpuSharedPassed                 = $gpuSharedPassed
+        NvencPassed                     = $nvencPassed
+        H264DecodePassed                = $h264DecodePassed
         Crc32Valid                      = $crc32Valid
         SequenceAndTimestampsConsistent = $sequenceAndTimestampsOk
         NoUnauthorizedIpcClients        = $noUnauthorizedIpcClients
@@ -689,9 +786,18 @@ try {
     }
 
     if (-not $allPassed) {
-        $failedFlags = @($acceptanceCriteria.PSObject.Properties | Where-Object { $_.Name -notin @('AllPassed', 'RollbackClean', 'FramesReceived', 'FramesValid', 'FrameTargetReached', 'PerformanceTestExecuted', 'PerformanceTargetReached') -and -not [bool]$_.Value } | ForEach-Object { $_.Name })
+        $failedFlags = @($acceptanceCriteria.PSObject.Properties | Where-Object { $_.Name -notin @('AllPassed', 'RollbackClean', 'FramesReceived', 'FramesValid', 'FrameTargetReached', 'PerformanceTestExecuted', 'PerformanceTargetReached', 'GpuSharedPassed', 'NvencPassed', 'H264DecodePassed') -and -not [bool]$_.Value } | ForEach-Object { $_.Name })
         if ($runPerfProfile -and -not $perfTargetReached) {
             $failedFlags += 'PerformanceTargetReached'
+        }
+        if ($RequireGpuShared -and -not $gpuSharedPassed) {
+            $failedFlags += 'GpuSharedPassed'
+        }
+        if ($RequireNvenc -and -not $nvencPassed) {
+            $failedFlags += 'NvencPassed'
+        }
+        if ($VerifyH264Decode -and -not $h264DecodePassed) {
+            $failedFlags += 'H264DecodePassed'
         }
         throw ("Functional validation acceptance criteria not satisfied: {0}" -f ($failedFlags -join ', '))
     }
@@ -747,6 +853,24 @@ finally {
             }
         }
 
+        if ($modifiedGpuTrans) {
+            try {
+                if ($null -eq $hadPreExistingGpuTrans) {
+                    Set-LumaBridgeDeviceEnableGpuSharedTransport -DeviceParametersPath $targetInstance.DeviceParametersPath -Clear
+                    $rollbackActions.Add(("Cleared temporary EnableGpuSharedTransport on '{0}'" -f $targetInstance.InstanceId))
+                }
+                else {
+                    Set-LumaBridgeDeviceEnableGpuSharedTransport -DeviceParametersPath $targetInstance.DeviceParametersPath -Value ([int]$hadPreExistingGpuTrans)
+                    $rollbackActions.Add(("Restored prior EnableGpuSharedTransport={0} on '{1}'" -f [int]$hadPreExistingGpuTrans, $targetInstance.InstanceId))
+                }
+            }
+            catch {
+                $msg = ("Failed reverting EnableGpuSharedTransport on '{0}': {1}" -f $targetInstance.InstanceId, $_.Exception.Message)
+                $rollbackActions.Add($msg)
+                $rollbackIncompleteReasons.Add($msg)
+            }
+        }
+
         $shouldFullUninstall = ($FullUninstallOnExit -or ($didFreshDriverInstall -and -not $driverInstallCompleted))
         if ($shouldFullUninstall) {
             try {
@@ -778,7 +902,7 @@ finally {
                 }
             }
 
-            if ($modifiedExtraction -or $modifiedAuthSid -or ($modifiedVirtMon -and -not $hadPreExistingVirtMon)) {
+            if ($modifiedExtraction -or $modifiedAuthSid -or $modifiedGpuTrans -or ($modifiedVirtMon -and -not $hadPreExistingVirtMon)) {
                 try {
                     $null = Invoke-LumaBridgeExternalCommand -FilePath 'pnputil.exe' -Arguments @('/restart-device', $targetInstance.InstanceId)
                     $rollbackActions.Add(("Restarted device '{0}' to apply rolled-back parameters" -f $targetInstance.InstanceId))
@@ -821,12 +945,23 @@ finally {
             else {
                 (Get-LumaBridgeValidationOptionalProp -InputObject $rbInst -PropertyName 'AuthorizedHostUserSid' -DefaultValue '') -eq $hadPreExistingAuthSid
             }
+            $rbGpuTrans = Get-LumaBridgeValidationOptionalProp -InputObject $rbInst -PropertyName 'EnableGpuSharedTransport' -DefaultValue $null
+            $gpuTransReset = if (-not $modifiedGpuTrans) {
+                $true
+            }
+            elseif ($null -eq $hadPreExistingGpuTrans) {
+                ($null -eq $rbGpuTrans)
+            }
+            else {
+                ($null -ne $rbGpuTrans -and [int]$rbGpuTrans -eq [int]$hadPreExistingGpuTrans)
+            }
             $devHealthy = ($rbInst.Status -ieq 'OK' -and ($null -eq $rbInst.ProblemCode -or [int]$rbInst.ProblemCode -eq 0))
             if (-not $extReset) { $rollbackIncompleteReasons.Add(("EnableFrameExtraction remained {0} after rollback" -f $rbInst.EnableFrameExtraction)) }
             if (-not $monReset) { $rollbackIncompleteReasons.Add(("EnableVirtualMonitor remained {0} after rollback" -f $rbInst.EnableVirtualMonitor)) }
             if (-not $sidReset) { $rollbackIncompleteReasons.Add('AuthorizedHostUserSid did not match pre-validation value after rollback') }
+            if (-not $gpuTransReset) { $rollbackIncompleteReasons.Add('EnableGpuSharedTransport did not match pre-validation value after rollback') }
             if (-not $devHealthy) { $rollbackIncompleteReasons.Add(("Post-rollback device unhealthy (Status='{0}', ProblemCode={1})" -f $rbInst.Status, $rbInst.ProblemCode)) }
-            $rollbackClean = ($extReset -and $monReset -and $sidReset -and $devHealthy -and ($rollbackIncompleteReasons.Count -eq 0))
+            $rollbackClean = ($extReset -and $monReset -and $sidReset -and $gpuTransReset -and $devHealthy -and ($rollbackIncompleteReasons.Count -eq 0))
         }
         else {
             $rollbackClean = ($null -eq $preExistingInstance) -and ($rollbackIncompleteReasons.Count -eq 0)

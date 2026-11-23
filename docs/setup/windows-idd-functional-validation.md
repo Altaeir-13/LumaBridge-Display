@@ -139,22 +139,23 @@ Remover os certificados temporarios de teste das stores `CurrentUser\My`, `Local
 | 9 | **Ausencia de monitores fantasmas e leaks** | Desabilitar `EnableVirtualMonitor = 0`, reiniciar e executar `pnputil /remove-device` + `/delete-driver`. | Nenhum monitor fantasma permanece listado em *Gerenciador de Dispositivos -> Monitores* ou Configuracoes de Tela; `WUDFHost.exe` encerra sem handles abertos ou crash dump. |
 | 10 | **Extracao M4.1 opt-in e consumo em `lumabridge-host.exe`** | Com `EnableVirtualMonitor = 1`, definir `REG_DWORD EnableFrameExtraction = 1` na chave `Device Parameters` (ou `Device Parameters\LumaBridgeIddDriver`), reiniciar o dispositivo, executar `lumabridge-host.exe --max-frames 30 --json-summary <temp.json>` e testar desconexao/reconexao. | `lumabridge-host.exe` autentica no Named Pipe `\\.\pipe\LumaBridgeFrameIpc_v1`, recebe frames reais (`FramesDelivered` == `FramesReceived`, `ChecksumMismatches = 0`, `ProtocolErrors = 0`), desconexao nao trava o driver (`FramesDroppedByBackpressure` atua normalmente) e `EnableFrameExtraction = 0` restaura o modo sem copia. |
 
-## 6. Validacao controlada da extracao M4.1 / M4.1.1 (Perfis A e B) e rollback
+## 6. Validacao controlada GPU + NVENC H.264 (M4.2) e Perfis A/B com rollback
 
-Utilize preferencialmente o script automatizado `Invoke-LumaBridgeFunctionalValidation.ps1`, que separa formalmente dois perfis usando `$signResult.StagingDir`:
+Utilize preferencialmente o script automatizado `Invoke-LumaBridgeFunctionalValidation.ps1`, que separa formalmente dois perfis usando `$signResult.StagingDir` e suporta o pipeline residente em GPU + NVENC H.264 (`M4.2`) ou fallback diagnostico CPU (`M4.1.1`):
 
 - **Perfil A (`-TestProfile Smoke`):** valida integridade ponta a ponta do driver instalado exigindo no minimo `1` frame real valido (`--min-frames 1 --max-frames 60 --duration-ms 5000`), sem exigir 60 frames em desktop estatico nem confundir termino normal por duracao ou timeouts recuperaveis de ociosidade com falha de transporte.
-- **Perfil B (`-TestProfile Performance` ou `Both`):** executa estimulo visual diagnostico controlado exclusivamente no display virtual identificado (`--visual-stimulus --require-virtual-stimulus --require-max-frames`) para medir entrega continua real, breakdown de latencia QPC (`min`/`avg`/`p50`/`p95`/`p99`/`max`), separacao entre `QueueWaitLatency` pre-conexao e `LiveEndToEndLatency`, FPS medio total vs. FPS ativo sustentado.
+- **Perfil B (`-TestProfile Performance` ou `Both`):** executa estimulo visual diagnostico controlado com timer de alta resolucao (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`) exclusivamente no display virtual identificado (`--visual-stimulus --require-virtual-stimulus --require-max-frames`) para medir entrega continua real, breakdown QPC e metricas GPU/NVENC.
+- **Modo GPU Shared + NVENC (`M4.2`):** utilize `-TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc [-VerifyH264Decode]` para exigir texturas compartilhadas (`D3D11_RESOURCE_MISC_SHARED_NTHANDLE | KEYEDMUTEX`, `CpuStagingReadsPerformed = 0`), codificacao NVENC H.264 e validacao opcional via `CLSID_CMSH264DecoderMFT`. Para fallback diagnostico CPU (`M4.1.1`), utilize `-TransportMode Cpu`.
 
 ```powershell
-# Previa sem efeitos colaterais (dois perfis):
-.\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 -Configuration Release -TestProfile Both -DryRun
+# Previa sem efeitos colaterais (M4.2 GPU Shared + NVENC + decodificacao independente):
+.\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 -Configuration Release -TestProfile Both -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -DryRun
 
 # Execucao real como Administrador (solicita confirmacao manual antes de atualizar/instalar driver e habilitar extracao):
-.\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 -Configuration Release -TestProfile Both -CreateTestCertificateIfMissing -TrustCertificate
+.\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 -Configuration Release -TestProfile Both -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -CreateTestCertificateIfMissing -TrustCertificate
 ```
 
-> **Escopo do rollback em `finally`:** o runner reverte deterministicamente a sessao ETW, `EnableFrameExtraction=0`, `AuthorizedHostUserSid` e `EnableVirtualMonitor` ao estado anterior (e remove o dispositivo caso `-FullUninstallOnExit` ou falha na primeira instalacao), registrando em `RollbackIncompleteReasons` qualquer pendencia pos-rollback. Se o dispositivo ja possuia uma versao anterior instalada e `-SkipDriverInstall` nao foi usado, o rollback restaura parametros/registro, mas **nao realiza downgrade automatico do binario de driver anterior** (remocao completa requer `-FullUninstallOnExit`).
+> **Escopo do rollback em `finally`:** o runner reverte deterministicamente a sessao ETW, `EnableFrameExtraction=0`, `EnableGpuSharedTransport` (removendo se inexistente ou restaurando o valor anterior), `AuthorizedHostUserSid` e `EnableVirtualMonitor` ao estado anterior (e remove o dispositivo caso `-FullUninstallOnExit` ou falha na primeira instalacao), registrando em `RollbackIncompleteReasons` qualquer pendencia pos-rollback. Se o dispositivo ja possuia uma versao anterior instalada e `-SkipDriverInstall` nao foi usado, o rollback restaura parametros/registro, mas **nao realiza downgrade automatico do binario de driver anterior** (remocao completa requer `-FullUninstallOnExit`).
 
 Caso execute manualmente os passos individuais em PowerShell **como Administrador**:
 
@@ -164,26 +165,28 @@ Caso execute manualmente os passos individuais em PowerShell **como Administrado
    $devParams = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($dev.InstanceId)\Device Parameters"
    $userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
    New-ItemProperty -LiteralPath $devParams -Name 'AuthorizedHostUserSid' -PropertyType String -Value $userSid -Force | Out-Null
+   New-ItemProperty -LiteralPath $devParams -Name 'EnableGpuSharedTransport' -PropertyType DWord -Value 1 -Force | Out-Null
    New-ItemProperty -LiteralPath $devParams -Name 'EnableFrameExtraction' -PropertyType DWord -Value 1 -Force | Out-Null
    pnputil /restart-device $dev.InstanceId
    ```
-2. **Captura ETW + execucao do host consumidor em processo separado:**
+2. **Captura ETW + execucao do host consumidor GPU + NVENC em processo separado:**
    ```powershell
    .\windows\driver\scripts\Invoke-LumaBridgeEtwTrace.ps1 -Action Start -Force
    $verify = .\windows\driver\scripts\Invoke-LumaBridgeEtwTrace.ps1 -Action VerifyProviders
    $verify.AllProvidersVerified # deve retornar True
-   .\windows\driver\x64\Release\lumabridge-host.exe --max-frames 30 --duration-ms 15000 --json-summary "$env:TEMP\lb-host-summary.json"
+   .\windows\driver\x64\Release\lumabridge-host.exe --transport gpu --require-gpu-shared --nvenc --require-nvenc --max-frames 30 --duration-ms 15000 --json-summary "$env:TEMP\lb-host-summary.json"
    .\windows\driver\scripts\Invoke-LumaBridgeEtwTrace.ps1 -Action Stop -Force
    .\windows\driver\scripts\Collect-LumaBridgeDiagnostics.ps1 -Configuration Release -EtlPath "$env:LOCALAPPDATA\LumaBridgeDisplay\Diagnostics\Etw\LumaBridgeIddCore.etl"
    ```
 3. **Rollback imediato para modo sem extracao (ou desinstalacao completa):**
    ```powershell
    New-ItemProperty -LiteralPath $devParams -Name 'EnableFrameExtraction' -PropertyType DWord -Value 0 -Force | Out-Null
+   Remove-ItemProperty -LiteralPath $devParams -Name 'EnableGpuSharedTransport' -ErrorAction SilentlyContinue
    Remove-ItemProperty -LiteralPath $devParams -Name 'AuthorizedHostUserSid' -ErrorAction SilentlyContinue
    pnputil /restart-device $dev.InstanceId
    ```
    Para rollback total do pacote e certificado, utilize `Uninstall-LumaBridgeDriver.ps1`.
 
-4. **Riscos ainda nao resolvidos na etapa M4.1:**
-   - O caminho atual de M4.1 utiliza staging D3D11 + copia CPU via Named Pipe (em vez de NT shared handles GPU-to-GPU), atingindo ~48.63 FPS em `1920x1080` com verificacao CRC/padrao ativa no hardware RTX 3060 Ti; 1080p60 sustentado para streaming interativo dependera do path GPU compartilhado + NVENC em M4.2.
-   - A execucao dentro do `WUDFHost.exe` real em sistema operacional com `EnableFrameExtraction = 1` depende de instalacao controlada autorizada e nao foi executada automaticamente neste ambiente.
+4. **Status M4.2 e proximos passos:**
+   - A arquitetura detalhada, modelo de sincronizacao `IDXGIKeyedMutex`, modelo de seguranca `PROCESS_DUP_HANDLE`, benchmark controlado 3-way (CPU vs GPU Shared vs GPU+NVENC) e caminho para transmissao Linux estao documentados em [windows-gpu-shared-textures-nvenc.md](../architecture/windows-gpu-shared-textures-nvenc.md).
+   - Validacao ao vivo dentro de `WUDFHost.exe` com `EnableFrameExtraction = 1` + `EnableGpuSharedTransport = 1` depende de autorizacao explicita do operador no host Windows 11.

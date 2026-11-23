@@ -2510,6 +2510,158 @@ Invoke-UnitTest -Name 'HostProcessOutputCaptureGlobalTimeoutAndTwoProfileRunner'
     Assert-Equal $failBothReport.RollbackClean $true 'RollbackClean=true after Perf failure'
 }
 
+Invoke-UnitTest -Name 'M42GpuTransportNvencGatesAndRollback' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+    $certInfo = New-EphemeralTestCertificate -OutDirectory (Join-Path $caseDir 'certs') -NamePrefix 'm42'
+    $stgDir = Join-Path $caseDir 'stg_m42'
+    $outCpuRollback = Join-Path $caseDir 'out_cpu_rollback'
+    $outGpuNvencPass = Join-Path $caseDir 'out_gpu_nvenc_pass'
+    $outGpuCpuReadFail = Join-Path $caseDir 'out_gpu_cpuread_fail'
+    $fakeHostExe = Join-Path $caseDir 'lumabridge-host.exe'
+    [System.IO.File]::WriteAllBytes($fakeHostExe, [byte[]]@(0x4D, 0x5A, 0x90, 0x00))
+
+    $c = Get-LumaBridgeDriverConstants
+    Assert-Equal $c.RegistryValueEnableGpuTrans 'EnableGpuSharedTransport' 'Constant RegistryValueEnableGpuTrans matches driver REG_DWORD name'
+
+    $mockLogmanLines = @(
+        'Name:                 LumaBridgeIddCore',
+        ('Provider:             {0}' -f $c.LumaBridgeTraceProviderGuid),
+        ('Provider:             {0}' -f $c.IddCxManifestProviderGuid),
+        ('Provider:             {0}' -f $c.IddCxWppProviderGuid),
+        ('Provider:             {0}' -f $c.UmdfOperationalProviderGuid),
+        ('Provider:             {0}' -f $c.WdfCoreWppProviderGuid),
+        ('Provider:             {0}' -f $c.WerKernelProviderGuid)
+    )
+
+    $global:LbTestState['M42Mock'] = [ordered]@{
+        CertInfo       = $certInfo
+        Signtool       = Get-LumaBridgeWdkToolPath -ToolName 'signtool.exe'
+        LogmanLines    = $mockLogmanLines
+        EnableMon      = 0
+        EnableExt      = 0
+        EnableGpuTrans = $null
+        ObservedGpuDuringStage8 = $null
+        AuthSid        = $null
+        EtwRunning     = $false
+        SimulateCpuReadViolation = $false
+    }
+
+    $m42Mocks = @{
+        'Assert-LumaBridgeAdministrator'               = { [CmdletBinding()] param([string]$OperationName, [switch]$DryRun) return $true }
+        'Get-LumaBridgeHostSecurityState'              = { [CmdletBinding()] param() return [pscustomobject]@{ SecureBoot = 'Disabled'; TestSigning = 'Enabled' } }
+        'Find-LumaBridgeSigningCertificate'            = { [CmdletBinding()] param([string]$CertificateThumbprint, [string]$CertificateSubject) return $global:LbTestState['M42Mock'].CertInfo.Certificate }
+        'Export-LumaBridgeCertificateFile'             = { [CmdletBinding()] param($Certificate, [string]$FilePath) [System.IO.File]::WriteAllBytes($FilePath, $Certificate.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)) }
+        'Get-LumaBridgePnpInstances'                   = {
+            [CmdletBinding()] param([string]$HardwareId)
+            $st = $global:LbTestState['M42Mock']
+            return @([pscustomobject]@{
+                InstanceId = 'ROOT\DISPLAY\0000'; FriendlyName = 'LumaBridge Indirect Display Adapter'; Status = 'OK';
+                ProblemCode = 0; ProblemStatus = 0; ProblemStatusHex = '0x00000000'; Present = $true;
+                HardwareIds = @('Root\LumaBridgeIddDriver'); DriverInfPath = 'oem99.inf'; DriverProvider = 'LumaBridge';
+                DriverVersion = '22.0.0.1'; DriverService = 'WUDFRd'; UpperFilters = @('IndirectKmd'); LowerFilters = @();
+                ConfigurationId = 'oem99.inf:Root\LumaBridgeIddDriver'; DeviceParametersPath = 'MOCK:\ROOT\DISPLAY\0000\Device Parameters';
+                EnableVirtualMonitor = $st.EnableMon; EnableFrameExtraction = $st.EnableExt;
+                EnableGpuSharedTransport = $st.EnableGpuTrans; AuthorizedHostUserSid = $st.AuthSid;
+                StartupDiagnostics = [pscustomobject]@{ LastStage = 'AdapterInitFinished'; LastSuccessfulStage = 'AdapterInitFinished'; LastStatusHex = '0x00000000'; LastErrorStatusHex = '0x00000000' }
+            })
+        }
+        'Set-LumaBridgeDeviceEnableVirtualMonitor'     = { [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value) $global:LbTestState['M42Mock'].EnableMon = $Value }
+        'Get-LumaBridgeDeviceEnableVirtualMonitor'     = { [CmdletBinding()] param([string]$DeviceParametersPath) return $global:LbTestState['M42Mock'].EnableMon }
+        'Set-LumaBridgeDeviceEnableFrameExtraction'    = { [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value) $global:LbTestState['M42Mock'].EnableExt = $Value }
+        'Get-LumaBridgeDeviceEnableFrameExtraction'    = { [CmdletBinding()] param([string]$DeviceParametersPath) return $global:LbTestState['M42Mock'].EnableExt }
+        'Set-LumaBridgeDeviceEnableGpuSharedTransport' = {
+            [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value = 1, [switch]$Clear)
+            $st = $global:LbTestState['M42Mock']
+            if ($Clear) { $st.EnableGpuTrans = $null } else { $st.EnableGpuTrans = $Value; $st.ObservedGpuDuringStage8 = $Value }
+        }
+        'Get-LumaBridgeDeviceEnableGpuSharedTransport' = { [CmdletBinding()] param([string]$DeviceParametersPath) return $global:LbTestState['M42Mock'].EnableGpuTrans }
+        'Set-LumaBridgeDeviceAuthorizedHostUserSid'    = { [CmdletBinding()] param([string]$DeviceParametersPath, [string]$SidString, [switch]$Clear) if ($Clear -or [string]::IsNullOrWhiteSpace($SidString)) { $global:LbTestState['M42Mock'].AuthSid = $null } else { $global:LbTestState['M42Mock'].AuthSid = $SidString } }
+        'Get-LumaBridgeDeviceAuthorizedHostUserSid'    = { [CmdletBinding()] param([string]$DeviceParametersPath) return $global:LbTestState['M42Mock'].AuthSid }
+        'Get-LumaBridgeWudfHostProcesses'              = { [CmdletBinding()] param($PnpInstances, $RecentEvents, $DebugTraceLines) return @([pscustomobject]@{ Id = 8768; IsLumaBridgeHost = $true; AssociationMethod = 'LoadedModule'; WorkingSetMB = 30.0; PrivateMemoryMB = 15.0; HandleCount = 400 }) }
+        'Get-LumaBridgeCrashDumpInventory'             = { [CmdletBinding()] param([int]$LookbackMinutes) return [pscustomobject]@{ LookbackMinutes = $LookbackMinutes; Locations = @(); Files = @(); TotalFoundCount = 0 } }
+        'Get-LumaBridgeEventChannelStatus'             = { [CmdletBinding()] param($ChannelNames) return @() }
+        'Get-LumaBridgeDiagnosticEvents'               = { [CmdletBinding()] param($LookbackMinutes, $InstanceIds, $PublishedInfNames, $ChannelStatus) return @() }
+        'Get-LumaBridgeSetupApiLogExcerpt'             = { [CmdletBinding()] param($SetupApiLogPath, $InstanceIds, $PublishedInfNames, $MaxMatchedSections) return [pscustomobject]@{ LogPath = $SetupApiLogPath; Exists = $false; AccessDenied = $false; Error = ''; MatchedSectionCount = 0; WdfSchemaWarnings = @(); DeviceStartProblemLines = @(); Sections = @(); RawExcerptText = '' } }
+        'Get-LumaBridgeDriverStorePackages'            = { [CmdletBinding()] param($InfFilter) return @() }
+        'Get-LumaBridgeEtlEventSummary'                = { [CmdletBinding()] param($EtlPath, $StartTimeUtc, $EndTimeUtc, $ProcessId, [int]$MaxMatchedEvents = 500, [switch]$ExcludeHighVolumeGraphics) return [pscustomobject]@{ EtlPath = $EtlPath; Exists = $true; EventCount = 1; MatchedEventCount = 1; MatchedLimitReached = $false; FilteredOutHighVolume = $true; XPathUsed = '*'; TraceStats = $null; CircularWrapWarning = $null; LumaBridgeEvents = @(); Providers = @(); Events = @(); Error = '' } }
+        'Invoke-LumaBridgeExternalCommand'             = {
+            [CmdletBinding()] param([string]$FilePath, [string[]]$Arguments = @(), [switch]$DryRun)
+            $st = $global:LbTestState['M42Mock']
+            if ($FilePath -like '*git*') { return [pscustomobject]@{ ExitCode = 0; Output = @('feature/windows-gpu-shared-textures-nvenc'); DryRun = $false } }
+            if ($DryRun) { return [pscustomobject]@{ ExitCode = 0; Output = @('[DRY-RUN]'); DryRun = $true } }
+            if ($FilePath -ieq $st.Signtool -and $Arguments[0] -eq 'sign') {
+                $out = & $FilePath sign /fd SHA256 /f $st.CertInfo.PfxPath /p $st.CertInfo.Password $Arguments[-1] 2>&1
+                if ($LASTEXITCODE -ne 0) { throw 'mock signtool sign error' }
+                return [pscustomobject]@{ ExitCode = 0; Output = @($out); DryRun = $false }
+            }
+            if ($FilePath -like '*Inf2Cat*' -or ($FilePath -ieq $st.Signtool -and $Arguments[0] -eq 'verify')) {
+                $out = & $FilePath @Arguments 2>&1
+                if ($LASTEXITCODE -ne 0) { throw 'mock verify error' }
+                return [pscustomobject]@{ ExitCode = 0; Output = @($out); DryRun = $false }
+            }
+            if ($FilePath -like '*logman*') {
+                if ($Arguments[0] -eq 'query' -and $Arguments[1] -eq 'LumaBridgeIddDxg') { throw 'not found' }
+                if ($Arguments[0] -eq 'query') { return [pscustomobject]@{ ExitCode = 0; Output = $st.LogmanLines; DryRun = $false } }
+            }
+            return [pscustomobject]@{ ExitCode = 0; Output = @('OK'); DryRun = $false }
+        }
+        'Invoke-LumaBridgeHostProcess'                 = {
+            [CmdletBinding()] param([string]$ExecutablePath, [string[]]$Arguments = @(), [int]$HardTimeoutMs = 30000, [switch]$DryRun)
+            if ($DryRun) {
+                $stDry = $global:LbTestState['M42Mock']
+                $stDry.LastDryRunArgs = @($Arguments)
+                return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Output = @('[DRY-RUN] host'); StdErr = @(); DryRun = $true }
+            }
+            $jsonIdx = [Array]::IndexOf($Arguments, '--json-summary')
+            $jsonPath = $Arguments[$jsonIdx + 1]
+            $st = $global:LbTestState['M42Mock']
+            $isGpu = ($Arguments -contains '--require-gpu-shared')
+            $cpuReads = if ($st.SimulateCpuReadViolation) { 5 } else { 0 }
+            $payload = [pscustomobject]@{
+                ExitReason = 'FrameTargetReached'; HostProcessExitedNormally = $true; TransportHealthy = $true;
+                NegotiatedTransportMode = $(if ($isGpu) { 'GpuSharedNtHandle' } else { 'CpuStagingPipe' });
+                FallbackToCpuActivated = $false; GpuFramesOpened = $(if ($isGpu) { 3 } else { 0 });
+                GpuSharedOpenFailures = 0; GpuSyncTimeouts = 0; AdapterMismatchErrors = 0; CpuStagingReadsPerformed = $cpuReads;
+                ConnectCount = 1; FramesReceived = 60; FramesValid = 60; FrameTargetReached = $true; MinFramesReached = $true;
+                ChecksumMismatches = 0; ProtocolErrors = 0; FatalIoTimeouts = 0; FatalIpcErrors = 0;
+                LastFrameSequence = 60; LastProtocolStatus = 'Ok'; AvgEndToEndLatencyUs = 450; ReceiveFps = 240.0;
+                Nvenc = [pscustomobject]@{ NvencFramesEncoded = 60; TotalBitstreamBytes = 2500000 };
+                H264DecodeValidation = [pscustomobject]@{ Passed = $true };
+                VisualStimulus = [pscustomobject]@{ VirtualDisplayIdentified = $true; Started = $true }
+            }
+            $payload | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+            return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Output = @('[LB-HOST] Summary'); StdErr = @(); DryRun = $false }
+        }
+    }
+
+    Invoke-WithModuleMocks -GlobalMocks $m42Mocks -ModuleMocks $m42Mocks -Body {
+        $dryRes = & $valScript -Configuration Release -TestProfile Both -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -NvencBitrateBps 20000000 -VerifyH264Decode -StagingDir $stgDir -OutputDir $outGpuNvencPass -HostExecutablePath $fakeHostExe -CertificateThumbprint $certInfo.Thumbprint -SkipDriverInstall -DryRun
+        Assert-Equal $dryRes.DryRun $true 'M4.2 DryRun succeeded on feature/windows-gpu-shared-textures-nvenc branch'
+        Assert-True ($global:LbTestState['M42Mock']['LastDryRunArgs'] -contains '--require-gpu-shared') 'DryRun forwards --require-gpu-shared'
+        Assert-True ($global:LbTestState['M42Mock']['LastDryRunArgs'] -contains '--require-nvenc') 'DryRun forwards --require-nvenc'
+        Assert-True ($global:LbTestState['M42Mock']['LastDryRunArgs'] -contains '--verify-h264-decode') 'DryRun forwards --verify-h264-decode'
+
+        $cpuModeRes = & $valScript -Configuration Release -TestProfile Smoke -TransportMode Cpu -StagingDir $stgDir -OutputDir $outCpuRollback -HostExecutablePath $fakeHostExe -CertificateThumbprint $certInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        Assert-Equal $cpuModeRes.ValidationSucceeded $true 'M4.2 -TransportMode Cpu validation succeeded'
+        Assert-Equal $global:LbTestState['M42Mock'].ObservedGpuDuringStage8 0 'EnableGpuSharedTransport temporarily forced to 0 for -TransportMode Cpu'
+        Assert-Equal $global:LbTestState['M42Mock'].EnableGpuTrans $null 'EnableGpuSharedTransport restored back to absent ($null) on rollback'
+        Assert-Equal $cpuModeRes.RollbackClean $true 'RollbackClean after -TransportMode Cpu'
+
+        $gpuNvencRes = & $valScript -Configuration Release -TestProfile Both -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $stgDir -OutputDir $outGpuNvencPass -HostExecutablePath $fakeHostExe -CertificateThumbprint $certInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        Assert-Equal $gpuNvencRes.ValidationSucceeded $true 'M4.2 GPU+NVENC+H264 validation passed'
+        Assert-Equal $gpuNvencRes.AcceptanceCriteria.GpuSharedPassed $true 'GpuSharedPassed gate true'
+        Assert-Equal $gpuNvencRes.AcceptanceCriteria.NvencPassed $true 'NvencPassed gate true'
+        Assert-Equal $gpuNvencRes.AcceptanceCriteria.H264DecodePassed $true 'H264DecodePassed gate true'
+        Assert-Equal $gpuNvencRes.RollbackClean $true 'RollbackClean after GPU+NVENC'
+
+        $global:LbTestState['M42Mock'].SimulateCpuReadViolation = $true
+        Assert-Throws {
+            & $valScript -Configuration Release -TestProfile Smoke -TransportMode Gpu -RequireGpuShared -StagingDir $stgDir -OutputDir $outGpuCpuReadFail -HostExecutablePath $fakeHostExe -CertificateThumbprint $certInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        } -ExpectedPattern 'GpuSharedPassed.*RollbackClean=True' -Message 'CpuStagingReadsPerformed > 0 violates RequireGpuShared GpuSharedPassed gate'
+    }
+}
+
 try {
     Write-Host ("Summary: {0} tests run, {1} assertion failures." -f $script:TestsRun, $script:TestsFailed)
 }
