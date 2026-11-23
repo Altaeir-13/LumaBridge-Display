@@ -934,7 +934,9 @@ function Get-LumaBridgeDeviceStartupDiagnostics {
         'DiagIddCxVersion',
         'DiagHostProcessId',
         'DiagDllAttachCount',
-        'DiagBuildStage'
+        'DiagBuildStage',
+        'DiagTraceLoggingRegistered',
+        'DiagTraceLoggingStatus'
     )
 
     $candidatePaths = @(
@@ -998,21 +1000,25 @@ function Get-LumaBridgeDeviceStartupDiagnostics {
     $lastStatusRaw = & $getProp 'DiagLastStatus'
     $lastErrorStatusRaw = & $getProp 'DiagLastErrorStatus'
     $iddCxVersionRaw = & $getProp 'DiagIddCxVersion'
+    $tlStatusRaw = & $getProp 'DiagTraceLoggingStatus'
 
     return [pscustomobject]@{
-        RegistryPath        = $resolvedPath
-        LastStage           = & $getProp 'DiagLastStage'
-        LastSuccessfulStage = & $getProp 'DiagLastSuccessfulStage'
-        LastStatus          = $lastStatusRaw
-        LastStatusHex       = Format-LumaBridgeNtStatusHex -StatusValue $lastStatusRaw
-        LastErrorStage      = & $getProp 'DiagLastErrorStage'
-        LastErrorStatus     = $lastErrorStatusRaw
-        LastErrorStatusHex  = Format-LumaBridgeNtStatusHex -StatusValue $lastErrorStatusRaw
-        IddCxRuntimeVersion = $iddCxVersionRaw
-        IddCxRuntimeVerHex  = Format-LumaBridgeNtStatusHex -StatusValue $iddCxVersionRaw
-        HostProcessId       = & $getProp 'DiagHostProcessId'
-        DllAttachCount      = & $getProp 'DiagDllAttachCount'
-        BuildStage          = & $getProp 'DiagBuildStage'
+        RegistryPath           = $resolvedPath
+        LastStage              = & $getProp 'DiagLastStage'
+        LastSuccessfulStage    = & $getProp 'DiagLastSuccessfulStage'
+        LastStatus             = $lastStatusRaw
+        LastStatusHex          = Format-LumaBridgeNtStatusHex -StatusValue $lastStatusRaw
+        LastErrorStage         = & $getProp 'DiagLastErrorStage'
+        LastErrorStatus        = $lastErrorStatusRaw
+        LastErrorStatusHex     = Format-LumaBridgeNtStatusHex -StatusValue $lastErrorStatusRaw
+        IddCxRuntimeVersion    = $iddCxVersionRaw
+        IddCxRuntimeVerHex     = Format-LumaBridgeNtStatusHex -StatusValue $iddCxVersionRaw
+        HostProcessId          = & $getProp 'DiagHostProcessId'
+        DllAttachCount         = & $getProp 'DiagDllAttachCount'
+        BuildStage             = & $getProp 'DiagBuildStage'
+        TraceLoggingRegistered = & $getProp 'DiagTraceLoggingRegistered'
+        TraceLoggingStatus     = $tlStatusRaw
+        TraceLoggingStatusHex  = Format-LumaBridgeNtStatusHex -StatusValue $tlStatusRaw
     }
 }
 
@@ -2899,6 +2905,11 @@ function Invoke-LumaBridgeEtlXPathReader {
 
                 $prov = if ($null -ne $ev.ProviderName) { [string]$ev.ProviderName } else { '' }
                 $provId = if ($null -ne $ev.ProviderId) { ('{' + $ev.ProviderId.ToString().ToLowerInvariant() + '}') } else { '' }
+                $lbGuidLowerReader = '{' + (($script:LumaBridgeDriverConstants.LumaBridgeTraceProviderGuid -replace '[{}]', '').ToLowerInvariant()) + '}'
+                if ([string]::IsNullOrWhiteSpace($prov) -and ($provId -ieq $lbGuidLowerReader)) {
+                    $prov = 'LumaBridgeIddDriver'
+                }
+
                 $evMsg = ''
                 try {
                     $desc = $ev.FormatDescription()
@@ -2922,6 +2933,18 @@ function Invoke-LumaBridgeEtlXPathReader {
                         else {
                             $propValues.Add('')
                         }
+                    }
+                }
+
+                if ([string]::IsNullOrWhiteSpace($evMsg) -and ($prov -ieq 'LumaBridgeIddDriver')) {
+                    if ($propValues.Count -eq 8 -and ($propValues[0] -in @('INFO', 'WARN', 'ERROR'))) {
+                        $statusFmt = Format-LumaBridgeNtStatusHex -StatusValue $propValues[4]
+                        if ([string]::IsNullOrWhiteSpace($statusFmt)) { $statusFmt = [string]$propValues[4] }
+                        $evMsg = ('[LB-DRIVER] [{0}] pid={1} tid={2} stage={3} status={4} state={5} lastOk={6} msg="{7}"' -f `
+                            $propValues[0], $propValues[1], $propValues[2], $propValues[3], $statusFmt, $propValues[5], $propValues[6], $propValues[7])
+                    }
+                    elseif ($propValues.Count -gt 0) {
+                        $evMsg = ('[LB-DRIVER] [METRICS/ETL] stage={0} fields={1}' -f $propValues[0], $propValues.Count)
                     }
                 }
 
@@ -3030,8 +3053,57 @@ function Get-LumaBridgeEtlEventSummary {
         $_.Message -match '\[LB-DRIVER\]'
     })
 
+    $targetedLumaBridgeQueryUsed = $false
+    if ($limitReached -and (@($lbEvents).Count -eq 0) -and (@($ProviderGuids).Count -eq 0) -and (@($ProviderNames).Count -eq 0) -and [string]::IsNullOrEmpty($err)) {
+        $targetedLumaBridgeQueryUsed = $true
+        $lbTargetedXPath = Get-LumaBridgeEtlXPathQuery `
+            -ProviderGuids @($script:LumaBridgeDriverConstants.LumaBridgeTraceProviderGuid) `
+            -StartTimeUtc $StartTimeUtc `
+            -EndTimeUtc $EndTimeUtc `
+            -ProcessId $ProcessId
+        try {
+            $targetedOut = Invoke-LumaBridgeEtlXPathReader -EtlPath $EtlPath -XPath $lbTargetedXPath -MaxMatchedEvents $MaxMatchedEvents
+            $recovered = @($targetedOut.Events)
+            if ($recovered.Count -gt 0) {
+                $merged = New-Object System.Collections.Generic.List[object]
+                $seenKeys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+                foreach ($existingEv in @($events)) {
+                    $merged.Add($existingEv)
+                    $t = if ($existingEv.PSObject.Properties.Name -contains 'TimeCreated') { [string]$existingEv.TimeCreated } else { '' }
+                    $p = if ($existingEv.PSObject.Properties.Name -contains 'ProviderId') { [string]$existingEv.ProviderId } else { '' }
+                    $i = if ($existingEv.PSObject.Properties.Name -contains 'Id') { [string]$existingEv.Id } else { '' }
+                    $th = if ($existingEv.PSObject.Properties.Name -contains 'ThreadId') { [string]$existingEv.ThreadId } else { '' }
+                    $null = $seenKeys.Add(("{0}|{1}|{2}|{3}" -f $t, $p, $i, $th))
+                }
+                foreach ($recEv in $recovered) {
+                    $t = if ($recEv.PSObject.Properties.Name -contains 'TimeCreated') { [string]$recEv.TimeCreated } else { '' }
+                    $p = if ($recEv.PSObject.Properties.Name -contains 'ProviderId') { [string]$recEv.ProviderId } else { '' }
+                    $i = if ($recEv.PSObject.Properties.Name -contains 'Id') { [string]$recEv.Id } else { '' }
+                    $th = if ($recEv.PSObject.Properties.Name -contains 'ThreadId') { [string]$recEv.ThreadId } else { '' }
+                    $key = "{0}|{1}|{2}|{3}" -f $t, $p, $i, $th
+                    if (-not $seenKeys.Contains($key)) {
+                        $null = $seenKeys.Add($key)
+                        $merged.Add($recEv)
+                    }
+                }
+                $events = @($merged.ToArray())
+                $lbEvents = @($events | Where-Object {
+                    $_.ProviderName -ieq 'LumaBridgeIddDriver' -or
+                    (($_.PSObject.Properties.Name -contains 'ProviderId') -and ($_.ProviderId -ieq $lbGuidLower)) -or
+                    $_.Message -match '\[LB-DRIVER\]'
+                })
+            }
+        }
+        catch {
+            if ([string]::IsNullOrEmpty($err)) {
+                $err = $_.Exception.Message
+            }
+        }
+    }
+
     $providerCounts = @($events | Group-Object -Property {
         if (-not [string]::IsNullOrWhiteSpace($_.ProviderName)) { $_.ProviderName }
+        elseif (($_.PSObject.Properties.Name -contains 'ProviderId') -and ($_.ProviderId -ieq $lbGuidLower)) { 'LumaBridgeIddDriver' }
         elseif (($_.PSObject.Properties.Name -contains 'ProviderId') -and -not [string]::IsNullOrWhiteSpace($_.ProviderId)) { $_.ProviderId }
         else { 'ClassicOrWpp' }
     } | ForEach-Object {
@@ -3044,19 +3116,20 @@ function Get-LumaBridgeEtlEventSummary {
     $wrapWarning = if ($null -ne $traceStats) { $traceStats.CircularWrapWarning } else { $null }
 
     return [pscustomobject]@{
-        EtlPath               = $EtlPath
-        Exists                = $true
-        EventCount            = $events.Count
-        MatchedEventCount     = $events.Count
-        MatchedLimitReached   = $limitReached
-        FilteredOutHighVolume = $excludeHighVol
-        XPathUsed             = $xpath
-        TraceStats            = $traceStats
-        CircularWrapWarning   = $wrapWarning
-        LumaBridgeEvents      = $lbEvents
-        Providers             = $providerCounts
-        Events                = $events
-        Error                 = $err
+        EtlPath                     = $EtlPath
+        Exists                      = $true
+        EventCount                  = $events.Count
+        MatchedEventCount           = $events.Count
+        MatchedLimitReached         = $limitReached
+        TargetedLumaBridgeQueryUsed = $targetedLumaBridgeQueryUsed
+        FilteredOutHighVolume       = $excludeHighVol
+        XPathUsed                   = $xpath
+        TraceStats                  = $traceStats
+        CircularWrapWarning         = $wrapWarning
+        LumaBridgeEvents            = $lbEvents
+        Providers                   = $providerCounts
+        Events                      = $events
+        Error                       = $err
     }
 }
 
@@ -3420,15 +3493,17 @@ function Get-LumaBridgeDriverTraceStageSummary {
         $sourcesUsed.Add('DebugView')
     }
 
+    $lbGuidLowerStage = '{' + (($script:LumaBridgeDriverConstants.LumaBridgeTraceProviderGuid -replace '[{}]', '').ToLowerInvariant()) + '}'
     $etwAdded = 0
     foreach ($ev in @($EtlEvents)) {
         if ($null -eq $ev) { continue }
         $prov = if ($ev.PSObject.Properties.Name -contains 'ProviderName') { [string]$ev.ProviderName } else { '' }
-        if ($prov -ine 'LumaBridgeIddDriver') { continue }
+        $evProvId = if ($ev.PSObject.Properties.Name -contains 'ProviderId') { [string]$ev.ProviderId } else { '' }
+        if (($prov -ine 'LumaBridgeIddDriver') -and ($evProvId -ine $lbGuidLowerStage)) { continue }
 
         $props = if ($ev.PSObject.Properties.Name -contains 'Properties') { @($ev.Properties) } else { @() }
         $props = @($props)
-        if ($props.Count -ge 8) {
+        if ($props.Count -eq 8 -and ([string]$props[0] -in @('INFO', 'WARN', 'ERROR'))) {
             ++$etwAdded
             $records.Add([pscustomobject]@{
                 Source              = 'TraceLoggingEtl'

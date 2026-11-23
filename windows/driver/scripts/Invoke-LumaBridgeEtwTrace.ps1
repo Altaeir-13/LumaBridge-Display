@@ -159,6 +159,9 @@ switch ($Action) {
             RdpIddAutoLoggerAccessDenied = $rdpAutoLoggerAccessDenied
             QueryOutput                  = $queryOutput
             QueryError                   = $queryError
+            AllProvidersVerified         = if ($null -ne $providerVerification) { [bool]$providerVerification.AllProvidersVerified } else { $false }
+            FoundProviderGuids           = if ($null -ne $providerVerification) { @($providerVerification.FoundProviderGuids) } else { @() }
+            MissingProviderGuids         = if ($null -ne $providerVerification) { @($providerVerification.MissingProviderGuids) } else { @() }
             ProviderVerification         = $providerVerification
             EventChannels                = $channels
             CoreProviders                = $coreProviders
@@ -192,6 +195,9 @@ switch ($Action) {
             SessionRunning       = $sessionRunning
             QueryOutput          = $queryOutput
             QueryError           = $queryError
+            AllProvidersVerified = if ($null -ne $verification) { [bool]$verification.AllProvidersVerified } else { $false }
+            FoundProviderGuids   = if ($null -ne $verification) { @($verification.FoundProviderGuids) } else { @() }
+            MissingProviderGuids = if ($null -ne $verification) { @($verification.MissingProviderGuids) } else { @() }
             ProviderVerification = $verification
         }
     }
@@ -292,6 +298,9 @@ switch ($Action) {
             CoreProviders        = $coreProviders
             DxgProviders         = if ($IncludeDxgKrnl) { $dxgProviders } else { @() }
             Providers            = $coreProviders
+            AllProvidersVerified = if ($null -ne $providerVerification) { [bool]$providerVerification.AllProvidersVerified } else { $false }
+            FoundProviderGuids   = if ($null -ne $providerVerification) { @($providerVerification.FoundProviderGuids) } else { @() }
+            MissingProviderGuids = if ($null -ne $providerVerification) { @($providerVerification.MissingProviderGuids) } else { @() }
             ProviderVerification = $providerVerification
             ExecutedCommands     = @($executedCommands.ToArray())
         }

@@ -202,41 +202,40 @@ $crashDumpInventory = Get-LumaBridgeCrashDumpInventory -LookbackMinutes $EventLo
 $etlEventSummary = $null
 $wppDecodeSummary = $null
 $dxgEtlStats = $null
+$inferredPnpAnchorStartUtc = $null
+$inferredPnpAnchorEndUtc = $null
 
 if (-not [string]::IsNullOrWhiteSpace($DxgEtlPath)) {
     $dxgEtlStats = Get-LumaBridgeEtlTraceStats -EtlPath $DxgEtlPath
 }
 
 if (-not [string]::IsNullOrWhiteSpace($EtlPath)) {
-    $effectiveEtlStart = $EtlStartTimeUtc
-    $effectiveEtlEnd = $EtlEndTimeUtc
-
-    if ($null -eq $effectiveEtlStart -and $null -eq $effectiveEtlEnd) {
-        $anchorTimes = New-Object System.Collections.Generic.List[DateTime]
-        foreach ($ev in $recentEvents) {
-            if ($null -eq $ev) { continue }
-            $ln = [string](Get-LumaBridgeOptionalPropertyValue -InputObject $ev -PropertyName 'LogName' -DefaultValue '')
-            $evId = Get-LumaBridgeOptionalPropertyValue -InputObject $ev -PropertyName 'Id' -DefaultValue 0
-            $tsStr = [string](Get-LumaBridgeOptionalPropertyValue -InputObject $ev -PropertyName 'TimeCreated' -DefaultValue '')
-            if (($ln -match 'Kernel-PnP|DriverFrameworks-UserMode' -or $evId -in @(400, 411, 2006, 2103)) -and
-                -not [string]::IsNullOrWhiteSpace($tsStr) -and $evId -ne 0) {
-                $dt = [DateTime]::MinValue
-                if ([DateTime]::TryParse($tsStr, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal, [ref]$dt)) {
-                    $anchorTimes.Add($dt.ToUniversalTime())
-                }
+    # Compute PnP event timestamps strictly as diagnostic context without clamping ETL queries,
+    # because older PnP events within EventLookbackMinutes can precede a newer runtime ETW capture.
+    $anchorTimes = New-Object System.Collections.Generic.List[DateTime]
+    foreach ($ev in $recentEvents) {
+        if ($null -eq $ev) { continue }
+        $ln = [string](Get-LumaBridgeOptionalPropertyValue -InputObject $ev -PropertyName 'LogName' -DefaultValue '')
+        $evId = Get-LumaBridgeOptionalPropertyValue -InputObject $ev -PropertyName 'Id' -DefaultValue 0
+        $tsStr = [string](Get-LumaBridgeOptionalPropertyValue -InputObject $ev -PropertyName 'TimeCreated' -DefaultValue '')
+        if (($ln -match 'Kernel-PnP|DriverFrameworks-UserMode' -or $evId -in @(400, 411, 2006, 2103)) -and
+            -not [string]::IsNullOrWhiteSpace($tsStr) -and $evId -ne 0) {
+            $dt = [DateTime]::MinValue
+            if ([DateTime]::TryParse($tsStr, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal, [ref]$dt)) {
+                $anchorTimes.Add($dt.ToUniversalTime())
             }
         }
-        if ($anchorTimes.Count -gt 0) {
-            $sortedAnchors = @($anchorTimes.ToArray() | Sort-Object)
-            $effectiveEtlStart = $sortedAnchors[0].AddSeconds(-30)
-            $effectiveEtlEnd = $sortedAnchors[$sortedAnchors.Count - 1].AddSeconds(30)
-        }
+    }
+    if ($anchorTimes.Count -gt 0) {
+        $sortedAnchors = @($anchorTimes.ToArray() | Sort-Object)
+        $inferredPnpAnchorStartUtc = $sortedAnchors[0].AddSeconds(-30).ToString('o')
+        $inferredPnpAnchorEndUtc = $sortedAnchors[$sortedAnchors.Count - 1].AddSeconds(30).ToString('o')
     }
 
     $etlEventSummary = Get-LumaBridgeEtlEventSummary `
         -EtlPath $EtlPath `
-        -StartTimeUtc $effectiveEtlStart `
-        -EndTimeUtc $effectiveEtlEnd `
+        -StartTimeUtc $EtlStartTimeUtc `
+        -EndTimeUtc $EtlEndTimeUtc `
         -ProcessId $EtlProcessId
 
     if ($DecodeWpp -and (Test-Path -LiteralPath $EtlPath -PathType Leaf)) {
@@ -306,6 +305,8 @@ $summary = [pscustomobject]@{
     SetupApiExcerpt           = $setupApiExcerpt
     CrashDumpInventory        = $crashDumpInventory
     EtlEventSummary           = $etlEventSummary
+    InferredPnpAnchorStartUtc = $inferredPnpAnchorStartUtc
+    InferredPnpAnchorEndUtc   = $inferredPnpAnchorEndUtc
     WppDecodeSummary          = $wppDecodeSummary
     DxgEtlStats               = $dxgEtlStats
     LumaBridgeWudfHostProcess = $primaryLumaBridgeWudf
@@ -387,7 +388,7 @@ else {
 
         $sDiag = Get-LumaBridgeOptionalPropertyValue -InputObject $inst -PropertyName 'StartupDiagnostics'
         if ($null -ne $sDiag) {
-            $mdLines.Add(("  - StartupBreadcrumbs: LastStage=``{0}``, LastSuccessfulStage=``{1}``, LastStatus=``{2}``, LastErrorStage=``{3}``, LastErrorStatus=``{4}``, IddCxVersion=``{5}``, HostPID=``{6}``, DllAttachCount=``{7}``, BuildStage=``{8}``" -f `
+            $mdLines.Add(("  - StartupBreadcrumbs: LastStage=``{0}``, LastSuccessfulStage=``{1}``, LastStatus=``{2}``, LastErrorStage=``{3}``, LastErrorStatus=``{4}``, IddCxVersion=``{5}``, HostPID=``{6}``, DllAttachCount=``{7}``, BuildStage=``{8}``, TraceLoggingRegistered=``{9}``, TraceLoggingStatus=``{10}``" -f `
                 (Get-LumaBridgeOptionalPropertyValue -InputObject $sDiag -PropertyName 'LastStage'), `
                 (Get-LumaBridgeOptionalPropertyValue -InputObject $sDiag -PropertyName 'LastSuccessfulStage'), `
                 (Get-LumaBridgeOptionalPropertyValue -InputObject $sDiag -PropertyName 'LastStatusHex'), `
@@ -396,7 +397,9 @@ else {
                 (Get-LumaBridgeOptionalPropertyValue -InputObject $sDiag -PropertyName 'IddCxRuntimeVerHex'), `
                 (Get-LumaBridgeOptionalPropertyValue -InputObject $sDiag -PropertyName 'HostProcessId'), `
                 (Get-LumaBridgeOptionalPropertyValue -InputObject $sDiag -PropertyName 'DllAttachCount'), `
-                (Get-LumaBridgeOptionalPropertyValue -InputObject $sDiag -PropertyName 'BuildStage')))
+                (Get-LumaBridgeOptionalPropertyValue -InputObject $sDiag -PropertyName 'BuildStage'), `
+                (Get-LumaBridgeOptionalPropertyValue -InputObject $sDiag -PropertyName 'TraceLoggingRegistered'), `
+                (Get-LumaBridgeOptionalPropertyValue -InputObject $sDiag -PropertyName 'TraceLoggingStatusHex')))
         }
     }
 }
