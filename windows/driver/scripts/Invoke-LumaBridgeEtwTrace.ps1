@@ -26,6 +26,9 @@ param(
 
     [switch]$DecodeWpp,
 
+    [ValidateRange(64, 4096)]
+    [int]$CoreMaxFileSizeMb = 256,
+
     [string]$SymbolCacheDir,
 
     [string]$TmfCacheDir,
@@ -250,7 +253,7 @@ switch ($Action) {
             '-nb', '16', '64',
             '-ct', 'perf',
             '-f', 'bin',
-            '-max', '256',
+            '-max', ("{0}" -f $CoreMaxFileSizeMb),
             '-ets'
         )
         $null = Invoke-LumaBridgeExternalCommand -FilePath 'logman.exe' -Arguments $coreCreateArgs -DryRun:$DryRun
@@ -287,6 +290,7 @@ switch ($Action) {
             DryRun               = [bool]$DryRun
             SessionName          = $SessionName
             DxgSessionName       = $DxgSessionName
+            CoreMaxFileSizeMb    = $CoreMaxFileSizeMb
             OutputDir            = $OutputDir
             EtlPath              = $EtlPath
             DxgEtlPath           = if ($IncludeDxgKrnl) { $DxgEtlPath } else { $null }

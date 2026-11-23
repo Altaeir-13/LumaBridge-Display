@@ -268,11 +268,9 @@ if (-not [string]::IsNullOrWhiteSpace($DebugLogPath)) {
     }
 }
 
-$etlLumaBridgeEvents = if ($null -ne $etlEventSummary -and $null -ne $etlEventSummary.LumaBridgeEvents) {
-    @($etlEventSummary.LumaBridgeEvents)
-}
-else {
-    @()
+$etlLumaBridgeEvents = @()
+if ($null -ne $etlEventSummary -and $null -ne $etlEventSummary.LumaBridgeEvents) {
+    $etlLumaBridgeEvents = @($etlEventSummary.LumaBridgeEvents)
 }
 
 $stageExecutionSummary = Get-LumaBridgeDriverTraceStageSummary `
@@ -351,7 +349,11 @@ if (-not [string]::IsNullOrWhiteSpace($FailureContext)) {
     $mdLines.Add(("- Failure Context: ``{0}``" -f $FailureContext))
 }
 $mdLines.Add(("- Windows Build: ``{0}.{1}`` (Supported Win11: ``{2}``)" -f $prereq.HostOs.CurrentBuildNumber, $prereq.HostOs.UBR, $prereq.HostOs.IsSupportedWindows11))
-$mdLines.Add(("- TestSigning: ``{0}`` | SecureBoot: ``{1}``" -f $prereq.SecurityState.TestSigning, $prereq.SecurityState.SecureBoot))
+$mdLines.Add(("- TestSigning: ``{0}`` | SecureBoot: ``{1}`` | VBS: ``{2}`` | HVCI: ``{3}``" -f `
+    $prereq.SecurityState.TestSigning, `
+    $prereq.SecurityState.SecureBoot, `
+    (Get-LumaBridgeOptionalPropertyValue -InputObject $prereq.SecurityState -PropertyName 'VbsStatus' -DefaultValue 'NOT_MEASURED'), `
+    (Get-LumaBridgeOptionalPropertyValue -InputObject $prereq.SecurityState -PropertyName 'HvciStatus' -DefaultValue 'NOT_MEASURED')))
 $mdLines.Add(("- PnP Instances: ``{0}`` | DriverStore Packages: ``{1}`` | LumaBridge WUDFHost Matches: ``{2}`` / Total ``{3}``" -f @($prereq.PnpInstances).Count, @($prereq.DriverStorePackages).Count, $lumaBridgeWudfProcesses.Count, $wudfProcesses.Count))
 $mdLines.Add($wudfLine)
 $mdLines.Add(("- Parsed Driver Trace Lines: ``{0}`` | Metrics Snapshots: ``{1}``" -f $parsedDriverEvents.Count, $parsedMetrics.Count))

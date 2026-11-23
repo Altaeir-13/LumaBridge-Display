@@ -830,8 +830,13 @@ function Invoke-LumaBridgeHostProcess {
 
         [string[]]$Arguments = @(),
 
-        [ValidateRange(500, 600000)]
+        [ValidateRange(500, 4200000)]
         [int]$HardTimeoutMs = 30000,
+
+        [ValidateRange(0, 300)]
+        [int]$ResourceSampleIntervalSec = 0,
+
+        [Nullable[int]]$WudfProcessId = $null,
 
         [switch]$DryRun
     )
@@ -846,13 +851,17 @@ function Invoke-LumaBridgeHostProcess {
     }) -join ' '
 
     if ($DryRun) {
-        Write-Host ("[DRY-RUN] Would run host process (timeout={0}ms): `"{1}`" {2}" -f $HardTimeoutMs, $ExecutablePath, $escapedArgs) -ForegroundColor Cyan
+        Write-Host ("[DRY-RUN] Would run host process (timeout={0}ms, sampleIntervalSec={1}): `"{2}`" {3}" -f $HardTimeoutMs, $ResourceSampleIntervalSec, $ExecutablePath, $escapedArgs) -ForegroundColor Cyan
         return [pscustomobject]@{
-            ExitCode   = 0
-            TimedOut   = $false
-            Output     = @()
-            StdErr     = @()
-            DryRun     = $true
+            ExitCode                  = 0
+            TimedOut                  = $false
+            ProcessId                 = $null
+            HardTimeoutMs             = $HardTimeoutMs
+            ResourceSampleIntervalSec = $ResourceSampleIntervalSec
+            ResourceTelemetry         = $null
+            Output                    = @()
+            StdErr                    = @()
+            DryRun                    = $true
         }
     }
 
@@ -871,16 +880,51 @@ function Invoke-LumaBridgeHostProcess {
     $proc = [System.Diagnostics.Process]::new()
     $proc.StartInfo = $psi
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $samplesList = New-Object System.Collections.Generic.List[object]
+    $wudfExitedDuringRun = $false
+    $startedHostPid = $null
 
     try {
         if (-not $proc.Start()) {
             throw ("Failed to start host consumer executable: {0}" -f $ExecutablePath)
         }
+        $startedHostPid = [int]$proc.Id
 
         $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
         $stderrTask = $proc.StandardError.ReadToEndAsync()
 
-        $exited = $proc.WaitForExit($HardTimeoutMs)
+        $exited = $false
+        if ($ResourceSampleIntervalSec -gt 0) {
+            $sampleIntervalMs = $ResourceSampleIntervalSec * 1000
+            $initSnap = Get-LumaBridgeProcessResourceSnapshot -HostPid $startedHostPid -WudfPid $WudfProcessId -Phase 'Start'
+            $samplesList.Add($initSnap)
+            if ($null -ne $WudfProcessId -and $null -ne $initSnap.WudfHost -and -not $initSnap.WudfHost.Available) {
+                $wudfExitedDuringRun = $true
+            }
+
+            while ($true) {
+                $elapsedMs = [int64]$stopwatch.ElapsedMilliseconds
+                $remainingMs = [int64]$HardTimeoutMs - $elapsedMs
+                if ($remainingMs -le 0) {
+                    $exited = $proc.WaitForExit(0)
+                    break
+                }
+                $sliceMs = [int][Math]::Min([int64]$sampleIntervalMs, $remainingMs)
+                if ($proc.WaitForExit($sliceMs)) {
+                    $exited = $true
+                    break
+                }
+                $activeSnap = Get-LumaBridgeProcessResourceSnapshot -HostPid $startedHostPid -WudfPid $WudfProcessId -Phase 'Active'
+                $samplesList.Add($activeSnap)
+                if ($null -ne $WudfProcessId -and $null -ne $activeSnap.WudfHost -and -not $activeSnap.WudfHost.Available) {
+                    $wudfExitedDuringRun = $true
+                }
+            }
+        }
+        else {
+            $exited = $proc.WaitForExit($HardTimeoutMs)
+        }
+
         $timedOut = $false
         if (-not $exited) {
             $timedOut = $true
@@ -892,6 +936,14 @@ function Invoke-LumaBridgeHostProcess {
             $proc.WaitForExit()
         }
         $stopwatch.Stop()
+
+        if ($ResourceSampleIntervalSec -gt 0) {
+            $endSnap = Get-LumaBridgeProcessResourceSnapshot -HostPid $startedHostPid -WudfPid $WudfProcessId -Phase 'End'
+            $samplesList.Add($endSnap)
+            if ($null -ne $WudfProcessId -and $null -ne $endSnap.WudfHost -and -not $endSnap.WudfHost.Available) {
+                $wudfExitedDuringRun = $true
+            }
+        }
 
         $rawStdout = ''
         $rawStderr = ''
@@ -921,16 +973,35 @@ function Invoke-LumaBridgeHostProcess {
             @($rawStderr -split "\r?\n" | Where-Object { $_ -ne '' })
         }
 
+        $resourceTelemetry = $null
+        if ($ResourceSampleIntervalSec -gt 0) {
+            $sampledArray = @($samplesList.ToArray())
+            $resourceTelemetry = [pscustomobject]@{
+                SampleIntervalSec          = $ResourceSampleIntervalSec
+                SampleCount                = $sampledArray.Count
+                HostProcessId              = $startedHostPid
+                WudfProcessId              = $WudfProcessId
+                WudfProcessExitedDuringRun = $wudfExitedDuringRun
+                HostSummary                = Measure-LumaBridgeResourceSeriesSummary -Samples $sampledArray -Role 'Host'
+                WudfSummary                = Measure-LumaBridgeResourceSeriesSummary -Samples $sampledArray -Role 'WudfHost'
+                Samples                    = $sampledArray
+            }
+        }
+
         $exitCode = if ($timedOut) { -1 } else { [int]$proc.ExitCode }
         return [pscustomobject]@{
-            ExitCode   = $exitCode
-            TimedOut   = $timedOut
-            DurationMs = [Math]::Round($stopwatch.Elapsed.TotalMilliseconds, 2)
-            Output     = $stdoutLines
-            StdErr     = $stderrLines
-            RawStdOut  = $rawStdout
-            RawStdErr  = $rawStderr
-            DryRun     = $false
+            ExitCode                  = $exitCode
+            TimedOut                  = $timedOut
+            ProcessId                 = $startedHostPid
+            DurationMs                = [Math]::Round($stopwatch.Elapsed.TotalMilliseconds, 2)
+            HardTimeoutMs             = $HardTimeoutMs
+            ResourceSampleIntervalSec = $ResourceSampleIntervalSec
+            ResourceTelemetry         = $resourceTelemetry
+            Output                    = $stdoutLines
+            StdErr                    = $stderrLines
+            RawStdOut                 = $rawStdout
+            RawStdErr                 = $rawStderr
+            DryRun                    = $false
         }
     }
     finally {
@@ -943,6 +1014,420 @@ function Invoke-LumaBridgeHostProcess {
             catch { }
             $proc.Dispose()
         }
+    }
+}
+
+function Get-LumaBridgeValidationHostTimeoutMs {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [int64]$RequestedDurationMs,
+
+        [int64]$ConnectTimeoutMs = 5000,
+
+        [int64]$PrewarmMarginMs = 15000,
+
+        [int64]$ShutdownMarginMs = 30000,
+
+        [int64]$MinimumHardTimeoutMs = 30000,
+
+        [int64]$MaxAllowedDurationMs = 3600000,
+
+        [int64]$MaxHardTimeoutMs = 4200000
+    )
+
+    if ($RequestedDurationMs -lt 500 -or $RequestedDurationMs -gt $MaxAllowedDurationMs) {
+        throw ("RequestedDurationMs {0} is out of valid range [500..{1}] (unit must be milliseconds; max 3600s)." -f $RequestedDurationMs, $MaxAllowedDurationMs)
+    }
+    if ($ConnectTimeoutMs -lt 0 -or $PrewarmMarginMs -lt 0 -or $ShutdownMarginMs -lt 0 -or $MinimumHardTimeoutMs -lt 500) {
+        throw ("Invalid negative or sub-minimum timeout component (Connect={0}, Prewarm={1}, Shutdown={2}, MinHard={3})." -f $ConnectTimeoutMs, $PrewarmMarginMs, $ShutdownMarginMs, $MinimumHardTimeoutMs)
+    }
+    if ($ConnectTimeoutMs -gt 300000 -or $PrewarmMarginMs -gt 300000 -or $ShutdownMarginMs -gt 300000 -or $MinimumHardTimeoutMs -gt $MaxHardTimeoutMs) {
+        throw ("Timeout margin component exceeds safe bounds (Connect={0}, Prewarm={1}, Shutdown={2}, MinHard={3})." -f $ConnectTimeoutMs, $PrewarmMarginMs, $ShutdownMarginMs, $MinimumHardTimeoutMs)
+    }
+
+    $computed64 = [int64]$RequestedDurationMs + [int64]$ConnectTimeoutMs + [int64]$PrewarmMarginMs + [int64]$ShutdownMarginMs
+    $effective64 = [int64][Math]::Max([int64]$MinimumHardTimeoutMs, $computed64)
+    if ($effective64 -gt [int64][int]::MaxValue -or $effective64 -gt $MaxHardTimeoutMs) {
+        throw ("Computed HardTimeoutMs {0} overflows safe upper bound ({1}ms)." -f $effective64, $MaxHardTimeoutMs)
+    }
+
+    return [pscustomobject]@{
+        HardTimeoutMs        = [int]$effective64
+        RequestedDurationMs  = [int64]$RequestedDurationMs
+        ConnectTimeoutMs     = [int64]$ConnectTimeoutMs
+        PrewarmMarginMs      = [int64]$PrewarmMarginMs
+        ShutdownMarginMs     = [int64]$ShutdownMarginMs
+        MinimumHardTimeoutMs = [int64]$MinimumHardTimeoutMs
+        FormulaNote          = 'max(MinimumHardTimeoutMs, RequestedDurationMs + ConnectTimeoutMs + PrewarmMarginMs + ShutdownMarginMs)'
+    }
+}
+
+function Get-LumaBridgeGpuPerfCounterSamples {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CounterPath
+    )
+
+    if (-not (Get-Command -Name 'Get-Counter' -ErrorAction SilentlyContinue)) {
+        return [pscustomobject]@{
+            Available = $false
+            Samples   = @()
+            Reason    = 'Get-Counter cmdlet unavailable'
+        }
+    }
+
+    try {
+        $counter = Get-Counter -Counter $CounterPath -ErrorAction Stop
+        $samples = @($counter.CounterSamples)
+        if ($samples.Count -eq 0) {
+            return [pscustomobject]@{
+                Available = $false
+                Samples   = @()
+                Reason    = ("No counter samples returned for '{0}'" -f $CounterPath)
+            }
+        }
+        return [pscustomobject]@{
+            Available = $true
+            Samples   = $samples
+            Reason    = $null
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            Available = $false
+            Samples   = @()
+            Reason    = $_.Exception.Message
+        }
+    }
+}
+
+function Get-LumaBridgeProcessMetricsByPid {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$ProcessId
+    )
+
+    if ($ProcessId -le 0) {
+        return [pscustomobject]@{
+            Available       = $false
+            ProcessId       = $ProcessId
+            ProcessName     = $null
+            HasExited       = $true
+            CpuTimeSec      = $null
+            WorkingSetMB    = $null
+            PrivateMemoryMB = $null
+            HandleCount     = $null
+            ThreadCount     = $null
+            Reason          = ("Invalid PID {0}" -f $ProcessId)
+        }
+    }
+
+    try {
+        $proc = Get-Process -Id $ProcessId -ErrorAction Stop
+        $hasExited = $false
+        try {
+            $hasExited = [bool]$proc.HasExited
+        }
+        catch {
+            $hasExited = $false
+        }
+        if ($hasExited) {
+            return [pscustomobject]@{
+                Available       = $false
+                ProcessId       = $ProcessId
+                ProcessName     = $proc.ProcessName
+                HasExited       = $true
+                CpuTimeSec      = $null
+                WorkingSetMB    = $null
+                PrivateMemoryMB = $null
+                HandleCount     = $null
+                ThreadCount     = $null
+                Reason          = ("Process PID {0} has exited" -f $ProcessId)
+            }
+        }
+
+        $cpuSec = $null
+        try { $cpuSec = [Math]::Round($proc.TotalProcessorTime.TotalSeconds, 3) } catch { $cpuSec = $null }
+        $wsMb = $null
+        try { $wsMb = [Math]::Round($proc.WorkingSet64 / 1MB, 3) } catch { $wsMb = $null }
+        $privMb = $null
+        try { $privMb = [Math]::Round($proc.PrivateMemorySize64 / 1MB, 3) } catch { $privMb = $null }
+        $handles = $null
+        try { $handles = [int]$proc.HandleCount } catch { $handles = $null }
+        $threads = $null
+        try { $threads = [int]$proc.Threads.Count } catch { $threads = $null }
+
+        return [pscustomobject]@{
+            Available       = $true
+            ProcessId       = $ProcessId
+            ProcessName     = $proc.ProcessName
+            HasExited       = $false
+            CpuTimeSec      = $cpuSec
+            WorkingSetMB    = $wsMb
+            PrivateMemoryMB = $privMb
+            HandleCount     = $handles
+            ThreadCount     = $threads
+            Reason          = $null
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            Available       = $false
+            ProcessId       = $ProcessId
+            ProcessName     = $null
+            HasExited       = $true
+            CpuTimeSec      = $null
+            WorkingSetMB    = $null
+            PrivateMemoryMB = $null
+            HandleCount     = $null
+            ThreadCount     = $null
+            Reason          = $_.Exception.Message
+        }
+    }
+}
+
+function Get-LumaBridgeProcessResourceSnapshot {
+    [CmdletBinding()]
+    param(
+        [Nullable[int]]$HostPid = $null,
+
+        [Nullable[int]]$WudfPid = $null,
+
+        [string]$Phase = 'Active',
+
+        [switch]$SkipGpuCounters
+    )
+
+    $gpuEngineRaw = if ($SkipGpuCounters) {
+        [pscustomobject]@{ Available = $false; Samples = @(); Reason = 'GPU counter sampling skipped' }
+    }
+    else {
+        Get-LumaBridgeGpuPerfCounterSamples -CounterPath '\GPU Engine(*)\Utilization Percentage'
+    }
+
+    $gpuVramRaw = if ($SkipGpuCounters) {
+        [pscustomobject]@{ Available = $false; Samples = @(); Reason = 'GPU VRAM counter sampling skipped' }
+    }
+    else {
+        Get-LumaBridgeGpuPerfCounterSamples -CounterPath '\GPU Process Memory(*)\Dedicated Usage'
+    }
+
+    $extractRoleSample = {
+        param([Nullable[int]]$TargetPid, [string]$RoleName)
+        if ($null -eq $TargetPid -or [int]$TargetPid -le 0) {
+            return [pscustomobject]@{
+                Role                  = $RoleName
+                Available             = $false
+                ProcessId             = $TargetPid
+                Status                = 'NOT_MEASURED'
+                Reason                = ("No verified {0} PID provided" -f $RoleName)
+                CpuTimeSec            = $null
+                WorkingSetMB          = $null
+                PrivateMemoryMB       = $null
+                HandleCount           = $null
+                ThreadCount           = $null
+                DedicatedVramStatus   = 'NOT_MEASURED'
+                DedicatedVramMB       = $null
+                DedicatedVramReason   = ("No verified {0} PID provided" -f $RoleName)
+                GpuEngineStatus       = 'NOT_MEASURED'
+                GpuEngineTotalPercent = $null
+                GpuEngineByType       = $null
+                GpuEngineReason       = ("No verified {0} PID provided" -f $RoleName)
+            }
+        }
+
+        $procM = Get-LumaBridgeProcessMetricsByPid -ProcessId ([int]$TargetPid)
+        $procStatus = if ($procM.Available) { 'MEASURED' } else { 'NOT_MEASURED' }
+
+        $vramStatus = 'NOT_MEASURED'
+        $vramMb = $null
+        $vramReason = $null
+        if (-not $procM.Available) {
+            $vramReason = $procM.Reason
+        }
+        elseif (-not $gpuVramRaw.Available) {
+            $vramReason = $gpuVramRaw.Reason
+        }
+        else {
+            $matchedVram = @($gpuVramRaw.Samples | Where-Object {
+                $instName = if ($_.PSObject.Properties.Name -contains 'InstanceName') { [string]$_.InstanceName } else { '' }
+                $cPath = if ($_.PSObject.Properties.Name -contains 'Path') { [string]$_.Path } else { '' }
+                ($instName -match ("(?i)^pid_{0}(?:_|$)" -f [int]$TargetPid)) -or
+                ($cPath -match ("(?i)\(pid_{0}(?:_|\))" -f [int]$TargetPid))
+            })
+            if ($matchedVram.Count -gt 0) {
+                $sumVramBytes = 0.0
+                foreach ($vs in $matchedVram) {
+                    $sumVramBytes += [double]$vs.CookedValue
+                }
+                $vramStatus = 'MEASURED'
+                $vramMb = [Math]::Round(($sumVramBytes / 1MB), 3)
+            }
+            else {
+                $vramReason = ("No GPU Process Memory counter instance matched pid_{0}" -f [int]$TargetPid)
+            }
+        }
+
+        $gpuStatus = 'NOT_MEASURED'
+        $gpuTotal = $null
+        $gpuByType = $null
+        $gpuReason = $null
+        if (-not $procM.Available) {
+            $gpuReason = $procM.Reason
+        }
+        elseif (-not $gpuEngineRaw.Available) {
+            $gpuReason = $gpuEngineRaw.Reason
+        }
+        else {
+            $matchedEng = @($gpuEngineRaw.Samples | Where-Object {
+                $instName = if ($_.PSObject.Properties.Name -contains 'InstanceName') { [string]$_.InstanceName } else { '' }
+                $cPath = if ($_.PSObject.Properties.Name -contains 'Path') { [string]$_.Path } else { '' }
+                ($instName -match ("(?i)^pid_{0}(?:_|$)" -f [int]$TargetPid)) -or
+                ($cPath -match ("(?i)\(pid_{0}(?:_|\))" -f [int]$TargetPid))
+            })
+            if ($matchedEng.Count -gt 0) {
+                $engSum = 0.0
+                $engBuckets = @{}
+                foreach ($es in $matchedEng) {
+                    $val = [double]$es.CookedValue
+                    $engSum += $val
+                    $instName = if ($es.PSObject.Properties.Name -contains 'InstanceName') { [string]$es.InstanceName } else { '' }
+                    $cPath = if ($es.PSObject.Properties.Name -contains 'Path') { [string]$es.Path } else { '' }
+                    $srcText = if (-not [string]::IsNullOrWhiteSpace($instName)) { $instName } else { $cPath }
+                    $engType = 'Other'
+                    if ($srcText -match '(?i)engtype_([A-Za-z0-9_]+)') {
+                        $engType = $matches[1]
+                    }
+                    if (-not $engBuckets.ContainsKey($engType)) {
+                        $engBuckets[$engType] = 0.0
+                    }
+                    $engBuckets[$engType] = [Math]::Round(([double]$engBuckets[$engType] + $val), 2)
+                }
+                $gpuStatus = 'MEASURED'
+                $gpuTotal = [Math]::Round($engSum, 2)
+                $gpuByType = [pscustomobject]$engBuckets
+            }
+            else {
+                $gpuReason = ("No GPU Engine counter instance matched pid_{0}" -f [int]$TargetPid)
+            }
+        }
+
+        return [pscustomobject]@{
+            Role                  = $RoleName
+            Available             = [bool]$procM.Available
+            ProcessId             = [int]$TargetPid
+            Status                = $procStatus
+            Reason                = $procM.Reason
+            CpuTimeSec            = $procM.CpuTimeSec
+            WorkingSetMB          = $procM.WorkingSetMB
+            PrivateMemoryMB       = $procM.PrivateMemoryMB
+            HandleCount           = $procM.HandleCount
+            ThreadCount           = $procM.ThreadCount
+            DedicatedVramStatus   = $vramStatus
+            DedicatedVramMB       = $vramMb
+            DedicatedVramReason   = $vramReason
+            GpuEngineStatus       = $gpuStatus
+            GpuEngineTotalPercent = $gpuTotal
+            GpuEngineByType       = $gpuByType
+            GpuEngineReason       = $gpuReason
+        }
+    }
+
+    return [pscustomobject]@{
+        CapturedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+        Phase         = $Phase
+        Host          = (& $extractRoleSample $HostPid 'Host')
+        WudfHost      = (& $extractRoleSample $WudfPid 'WudfHost')
+    }
+}
+
+function Measure-LumaBridgeMetricAggregate {
+    param(
+        [object[]]$RoleSamples = @(),
+        [Parameter(Mandatory = $true)]
+        [string]$PropertyName,
+        [string]$StatusPropertyName,
+        [string]$ReasonPropertyName
+    )
+
+    $measuredValues = New-Object System.Collections.Generic.List[double]
+    $reasons = New-Object System.Collections.Generic.List[string]
+    foreach ($rs in @($RoleSamples)) {
+        if ($null -eq $rs) { continue }
+        $isMeasured = $true
+        if (-not [string]::IsNullOrWhiteSpace($StatusPropertyName) -and ($rs.PSObject.Properties.Name -contains $StatusPropertyName)) {
+            $isMeasured = ([string]$rs.$StatusPropertyName -eq 'MEASURED')
+        }
+        $val = if ($rs.PSObject.Properties.Name -contains $PropertyName) { $rs.$PropertyName } else { $null }
+        if ($isMeasured -and $null -ne $val) {
+            $measuredValues.Add([double]$val)
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($ReasonPropertyName) -and ($rs.PSObject.Properties.Name -contains $ReasonPropertyName)) {
+            $r = [string]$rs.$ReasonPropertyName
+            if (-not [string]::IsNullOrWhiteSpace($r) -and ($reasons -notcontains $r)) {
+                $reasons.Add($r)
+            }
+        }
+    }
+
+    if ($measuredValues.Count -eq 0) {
+        return [pscustomobject]@{
+            Status      = 'NOT_MEASURED'
+            SampleCount = 0
+            Start       = $null
+            Peak        = $null
+            End         = $null
+            Delta       = $null
+            Reason      = if ($reasons.Count -gt 0) { ($reasons -join '; ') } else { ("No measured samples for {0}" -f $PropertyName) }
+        }
+    }
+
+    $startVal = $measuredValues[0]
+    $endVal = $measuredValues[$measuredValues.Count - 1]
+    $peakVal = ($measuredValues | Measure-Object -Maximum).Maximum
+    return [pscustomobject]@{
+        Status      = 'MEASURED'
+        SampleCount = $measuredValues.Count
+        Start       = [Math]::Round($startVal, 3)
+        Peak        = [Math]::Round($peakVal, 3)
+        End         = [Math]::Round($endVal, 3)
+        Delta       = [Math]::Round(($endVal - $startVal), 3)
+        Reason      = $null
+    }
+}
+
+function Measure-LumaBridgeResourceSeriesSummary {
+    [CmdletBinding()]
+    param(
+        [object[]]$Samples = @(),
+
+        [ValidateSet('Host', 'WudfHost')]
+        [string]$Role = 'Host'
+    )
+
+    $roleSamples = @($Samples | ForEach-Object {
+        if ($null -ne $_ -and ($_.PSObject.Properties.Name -contains $Role)) { $_.$Role } else { $null }
+    } | Where-Object { $null -ne $_ })
+
+    $availableCount = @($roleSamples | Where-Object { $_.Available }).Count
+    $roleReasons = @($roleSamples | Where-Object { -not [string]::IsNullOrWhiteSpace($_.Reason) } | ForEach-Object { $_.Reason } | Select-Object -Unique)
+
+    return [pscustomobject]@{
+        Role                  = $Role
+        Status                = if ($availableCount -gt 0) { 'MEASURED' } else { 'NOT_MEASURED' }
+        TotalSnapshots        = $roleSamples.Count
+        AvailableSnapshots    = $availableCount
+        UnmeasuredReason      = if ($availableCount -gt 0) { $null } elseif ($roleReasons.Count -gt 0) { ($roleReasons -join '; ') } else { 'Process did not return valid samples' }
+        CpuTimeSec            = Measure-LumaBridgeMetricAggregate -RoleSamples $roleSamples -PropertyName 'CpuTimeSec' -StatusPropertyName 'Status' -ReasonPropertyName 'Reason'
+        WorkingSetMB          = Measure-LumaBridgeMetricAggregate -RoleSamples $roleSamples -PropertyName 'WorkingSetMB' -StatusPropertyName 'Status' -ReasonPropertyName 'Reason'
+        PrivateMemoryMB       = Measure-LumaBridgeMetricAggregate -RoleSamples $roleSamples -PropertyName 'PrivateMemoryMB' -StatusPropertyName 'Status' -ReasonPropertyName 'Reason'
+        HandleCount           = Measure-LumaBridgeMetricAggregate -RoleSamples $roleSamples -PropertyName 'HandleCount' -StatusPropertyName 'Status' -ReasonPropertyName 'Reason'
+        ThreadCount           = Measure-LumaBridgeMetricAggregate -RoleSamples $roleSamples -PropertyName 'ThreadCount' -StatusPropertyName 'Status' -ReasonPropertyName 'Reason'
+        DedicatedVramMB       = Measure-LumaBridgeMetricAggregate -RoleSamples $roleSamples -PropertyName 'DedicatedVramMB' -StatusPropertyName 'DedicatedVramStatus' -ReasonPropertyName 'DedicatedVramReason'
+        GpuEngineTotalPercent = Measure-LumaBridgeMetricAggregate -RoleSamples $roleSamples -PropertyName 'GpuEngineTotalPercent' -StatusPropertyName 'GpuEngineStatus' -ReasonPropertyName 'GpuEngineReason'
     }
 }
 
@@ -975,22 +1460,91 @@ function Get-LumaBridgeDeviceEnableVirtualMonitor {
     return $null
 }
 
+function Get-LumaBridgeRegistryValueState {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$LiteralPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    if ([string]::IsNullOrWhiteSpace($LiteralPath)) {
+        return [pscustomobject]@{
+            KeyExists   = $false
+            ValueExists = $false
+            Value       = $null
+        }
+    }
+
+    $keyExists = $false
+    try {
+        $keyExists = [bool](Test-Path -LiteralPath $LiteralPath -ErrorAction SilentlyContinue)
+    }
+    catch {
+        $keyExists = $false
+    }
+    if (-not $keyExists) {
+        return [pscustomobject]@{
+            KeyExists   = $false
+            ValueExists = $false
+            Value       = $null
+        }
+    }
+
+    $props = $null
+    try {
+        $props = Get-ItemProperty -LiteralPath $LiteralPath -Name $Name -ErrorAction SilentlyContinue
+    }
+    catch {
+        $props = $null
+    }
+
+    if ($null -ne $props -and ($props.PSObject.Properties.Name -contains $Name)) {
+        return [pscustomobject]@{
+            KeyExists   = $true
+            ValueExists = $true
+            Value       = $props.$Name
+        }
+    }
+
+    return [pscustomobject]@{
+        KeyExists   = $true
+        ValueExists = $false
+        Value       = $null
+    }
+}
+
 function Set-LumaBridgeDeviceEnableVirtualMonitor {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [string]$DeviceParametersPath,
 
-        [Parameter(Mandatory = $true)]
         [ValidateSet(0, 1)]
-        [int]$Value
+        [int]$Value = 0,
+
+        [switch]$Clear
     )
+
+    $propName = $script:LumaBridgeDriverConstants.RegistryValueEnableMon
+    if ($Clear) {
+        if (Test-Path -LiteralPath $DeviceParametersPath) {
+            Remove-ItemProperty -LiteralPath $DeviceParametersPath -Name $propName -ErrorAction SilentlyContinue
+        }
+        return
+    }
+
+    if (-not $PSBoundParameters.ContainsKey('Value')) {
+        throw 'Specify -Value 0|1 or -Clear for Set-LumaBridgeDeviceEnableVirtualMonitor.'
+    }
 
     if (-not (Test-Path -LiteralPath $DeviceParametersPath)) {
         New-Item -Path $DeviceParametersPath -Force | Out-Null
     }
 
-    New-ItemProperty -LiteralPath $DeviceParametersPath -Name $script:LumaBridgeDriverConstants.RegistryValueEnableMon -PropertyType DWord -Value $Value -Force | Out-Null
+    New-ItemProperty -LiteralPath $DeviceParametersPath -Name $propName -PropertyType DWord -Value $Value -Force | Out-Null
 }
 
 function Get-LumaBridgeDeviceEnableFrameExtraction {
@@ -1019,16 +1573,29 @@ function Set-LumaBridgeDeviceEnableFrameExtraction {
         [Parameter(Mandatory = $true)]
         [string]$DeviceParametersPath,
 
-        [Parameter(Mandatory = $true)]
         [ValidateSet(0, 1)]
-        [int]$Value
+        [int]$Value = 0,
+
+        [switch]$Clear
     )
+
+    $propName = $script:LumaBridgeDriverConstants.RegistryValueEnableExt
+    if ($Clear) {
+        if (Test-Path -LiteralPath $DeviceParametersPath) {
+            Remove-ItemProperty -LiteralPath $DeviceParametersPath -Name $propName -ErrorAction SilentlyContinue
+        }
+        return
+    }
+
+    if (-not $PSBoundParameters.ContainsKey('Value')) {
+        throw 'Specify -Value 0|1 or -Clear for Set-LumaBridgeDeviceEnableFrameExtraction.'
+    }
 
     if (-not (Test-Path -LiteralPath $DeviceParametersPath)) {
         New-Item -Path $DeviceParametersPath -Force | Out-Null
     }
 
-    New-ItemProperty -LiteralPath $DeviceParametersPath -Name $script:LumaBridgeDriverConstants.RegistryValueEnableExt -PropertyType DWord -Value $Value -Force | Out-Null
+    New-ItemProperty -LiteralPath $DeviceParametersPath -Name $propName -PropertyType DWord -Value $Value -Force | Out-Null
 }
 
 function Get-LumaBridgeDeviceEnableGpuSharedTransport {
@@ -1480,6 +2047,48 @@ function Get-LumaBridgeInfDriverVersion {
     return $null
 }
 
+function Get-LumaBridgeInstalledDriverBinaryPath {
+    [CmdletBinding()]
+    param(
+        [string]$PublishedInfName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($PublishedInfName) -or [string]::IsNullOrWhiteSpace($env:SystemRoot)) {
+        return $null
+    }
+
+    $constants = $script:LumaBridgeDriverConstants
+    $infLeaf = [System.IO.Path]::GetFileName($PublishedInfName)
+    $windirInf = Join-Path -Path $env:SystemRoot -ChildPath ("INF\{0}" -f $infLeaf)
+    if (-not (Test-Path -LiteralPath $windirInf -PathType Leaf)) {
+        return $null
+    }
+
+    try {
+        $publishedInfHash = (Get-FileHash -LiteralPath $windirInf -Algorithm SHA256 -ErrorAction Stop).Hash
+        $repoRoot = Join-Path -Path $env:SystemRoot -ChildPath 'System32\DriverStore\FileRepository'
+        if (-not (Test-Path -LiteralPath $repoRoot -PathType Container)) {
+            return $null
+        }
+        $candidates = @(Get-ChildItem -LiteralPath $repoRoot -Filter 'lumabridgeidddriver.inf_*' -Directory -ErrorAction SilentlyContinue)
+        foreach ($dir in $candidates) {
+            $infCandidate = Join-Path -Path $dir.FullName -ChildPath $constants.InfFileName
+            $dllCandidate = Join-Path -Path $dir.FullName -ChildPath $constants.DllFileName
+            if ((Test-Path -LiteralPath $infCandidate -PathType Leaf) -and (Test-Path -LiteralPath $dllCandidate -PathType Leaf)) {
+                $candHash = (Get-FileHash -LiteralPath $infCandidate -Algorithm SHA256 -ErrorAction Stop).Hash
+                if ($candHash -ieq $publishedInfHash) {
+                    return $dllCandidate
+                }
+            }
+        }
+    }
+    catch {
+        return $null
+    }
+
+    return $null
+}
+
 function Test-LumaBridgeDeviceDriverBinding {
     [CmdletBinding()]
     param(
@@ -1490,6 +2099,14 @@ function Test-LumaBridgeDeviceDriverBinding {
 
         [string]$ExpectedInfPath,
 
+        [string]$ExpectedDllPath,
+
+        [string]$ExpectedDllSha256,
+
+        [string]$LoadedModulePath,
+
+        [switch]$RequireBinaryHashMatch,
+
         [string]$HardwareId = $script:LumaBridgeDriverConstants.HardwareId
     )
 
@@ -1498,6 +2115,22 @@ function Test-LumaBridgeDeviceDriverBinding {
     $constants = $script:LumaBridgeDriverConstants
     $problemCode = $null
     $problemStatusHex = $null
+    $resolvedExpectedDllSha256 = if (-not [string]::IsNullOrWhiteSpace($ExpectedDllSha256)) { $ExpectedDllSha256.Trim().ToUpperInvariant() } else { $null }
+    $installedDllPath = $null
+    $installedDllSha256 = $null
+    $binaryIdentityStatus = 'NOT_MEASURED'
+    $binaryIdentityDetail = 'Binary hash comparison not requested or source DLL unavailable.'
+
+    if ([string]::IsNullOrWhiteSpace($resolvedExpectedDllSha256) -and
+        -not [string]::IsNullOrWhiteSpace($ExpectedDllPath) -and
+        (Test-Path -LiteralPath $ExpectedDllPath -PathType Leaf)) {
+        try {
+            $resolvedExpectedDllSha256 = (Get-FileHash -LiteralPath $ExpectedDllPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToUpperInvariant()
+        }
+        catch {
+            $resolvedExpectedDllSha256 = $null
+        }
+    }
 
     if ($null -eq $Instance) {
         $reasons.Add('Device instance is null.')
@@ -1547,6 +2180,42 @@ function Test-LumaBridgeDeviceDriverBinding {
                 $reasons.Add(("Bound driver version '{0}' does not match expected INF DriverVer '{1}'." -f $Instance.DriverVersion, $expectedVersion))
             }
         }
+
+        if (-not [string]::IsNullOrWhiteSpace($resolvedExpectedDllSha256)) {
+            if (-not [string]::IsNullOrWhiteSpace($LoadedModulePath) -and (Test-Path -LiteralPath $LoadedModulePath -PathType Leaf)) {
+                $installedDllPath = $LoadedModulePath
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace($Instance.DriverInfPath)) {
+                $installedDllPath = Get-LumaBridgeInstalledDriverBinaryPath -PublishedInfName $Instance.DriverInfPath
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($installedDllPath) -and (Test-Path -LiteralPath $installedDllPath -PathType Leaf)) {
+                try {
+                    $installedDllSha256 = (Get-FileHash -LiteralPath $installedDllPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToUpperInvariant()
+                    if ($installedDllSha256 -ieq $resolvedExpectedDllSha256) {
+                        $binaryIdentityStatus = 'VERIFIED'
+                        $binaryIdentityDetail = ("Installed DLL '{0}' SHA-256 matched expected package DLL." -f $installedDllPath)
+                    }
+                    else {
+                        $binaryIdentityStatus = 'MISMATCH'
+                        $binaryIdentityDetail = ("Installed DLL '{0}' SHA-256 '{1}' does not match expected '{2}'." -f $installedDllPath, $installedDllSha256, $resolvedExpectedDllSha256)
+                        $reasons.Add($binaryIdentityDetail)
+                    }
+                }
+                catch {
+                    $binaryIdentityStatus = 'NOT_MEASURED'
+                    $binaryIdentityDetail = ("Unable to hash installed DLL '{0}': {1}" -f $installedDllPath, $_.Exception.Message)
+                }
+            }
+            else {
+                $binaryIdentityStatus = 'NOT_MEASURED'
+                $binaryIdentityDetail = ("Installed driver DLL path could not be resolved for '{0}'." -f $Instance.DriverInfPath)
+            }
+
+            if ($RequireBinaryHashMatch -and $binaryIdentityStatus -eq 'NOT_MEASURED') {
+                $reasons.Add(("RequireBinaryHashMatch specified but binary identity was NOT_MEASURED: {0}" -f $binaryIdentityDetail))
+            }
+        }
     }
 
     return [pscustomobject]@{
@@ -1558,6 +2227,11 @@ function Test-LumaBridgeDeviceDriverBinding {
         BoundDriverVersion    = if ($null -ne $Instance) { $Instance.DriverVersion } else { $null }
         ProblemCode           = $problemCode
         ProblemStatusHex      = $problemStatusHex
+        BinaryIdentityStatus  = $binaryIdentityStatus
+        BinaryIdentityDetail  = $binaryIdentityDetail
+        ExpectedDllSha256     = $resolvedExpectedDllSha256
+        InstalledDllSha256    = $installedDllSha256
+        InstalledDllPath      = $installedDllPath
     }
 }
 
@@ -2018,6 +2692,79 @@ function Test-LumaBridgePackageArtifacts {
     return $result
 }
 
+function Get-LumaBridgeDeviceWudfDiagnosticInfo {
+    [CmdletBinding()]
+    param(
+        [string]$DeviceParametersPath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($DeviceParametersPath)) {
+        return $null
+    }
+
+    $basePath = $DeviceParametersPath.TrimEnd('\')
+    $wudfPath = ("{0}\WUDF" -f $basePath)
+    $wudfDiagPath = ("{0}\WUDFDiagnosticInfo" -f $basePath)
+
+    $deviceGroupId = $null
+    $hostProcessGuid = $null
+    $hostProcessSharingEnabled = $null
+    $wudfHostPid = $null
+    $wudfLifetimeId = $null
+
+    try {
+        if (Test-Path -LiteralPath $wudfPath -ErrorAction SilentlyContinue) {
+            $wudfProps = Get-ItemProperty -LiteralPath $wudfPath -ErrorAction SilentlyContinue
+            if ($null -ne $wudfProps) {
+                if (($wudfProps.PSObject.Properties.Name -contains 'DeviceGroupId') -and -not [string]::IsNullOrWhiteSpace([string]$wudfProps.DeviceGroupId)) {
+                    $deviceGroupId = ([string]$wudfProps.DeviceGroupId).Trim()
+                }
+                if (($wudfProps.PSObject.Properties.Name -contains 'HostProcessGUID') -and -not [string]::IsNullOrWhiteSpace([string]$wudfProps.HostProcessGUID)) {
+                    $hostProcessGuid = ([string]$wudfProps.HostProcessGUID).Trim()
+                }
+                if ($wudfProps.PSObject.Properties.Name -contains 'HostProcessSharingEnabled') {
+                    $hostProcessSharingEnabled = $wudfProps.HostProcessSharingEnabled
+                }
+            }
+        }
+    }
+    catch {
+    }
+
+    try {
+        if (Test-Path -LiteralPath $wudfDiagPath -ErrorAction SilentlyContinue) {
+            $diagProps = Get-ItemProperty -LiteralPath $wudfDiagPath -ErrorAction SilentlyContinue
+            if ($null -ne $diagProps) {
+                if (($diagProps.PSObject.Properties.Name -contains 'HostPid') -and $null -ne $diagProps.HostPid) {
+                    $parsedPid = 0
+                    if ([int]::TryParse([string]$diagProps.HostPid, [ref]$parsedPid) -and $parsedPid -gt 0) {
+                        $wudfHostPid = $parsedPid
+                    }
+                }
+                if (($diagProps.PSObject.Properties.Name -contains 'LifetimeID') -and -not [string]::IsNullOrWhiteSpace([string]$diagProps.LifetimeID)) {
+                    $wudfLifetimeId = ([string]$diagProps.LifetimeID).Trim()
+                }
+            }
+        }
+    }
+    catch {
+    }
+
+    if ($null -eq $deviceGroupId -and $null -eq $hostProcessGuid -and $null -eq $wudfHostPid -and $null -eq $wudfLifetimeId) {
+        return $null
+    }
+
+    return [pscustomobject]@{
+        WudfPath                  = $wudfPath
+        WudfDiagnosticInfoPath    = $wudfDiagPath
+        DeviceGroupId             = $deviceGroupId
+        HostProcessGUID           = $hostProcessGuid
+        HostProcessSharingEnabled = $hostProcessSharingEnabled
+        HostPid                   = $wudfHostPid
+        LifetimeID                = $wudfLifetimeId
+    }
+}
+
 function Get-LumaBridgeRawWudfProcesses {
     [CmdletBinding()]
     param()
@@ -2034,12 +2781,15 @@ function Get-LumaBridgeRawWudfProcesses {
     $rawList = New-Object System.Collections.Generic.List[object]
 
     foreach ($p in $procs) {
+        $hasExited = $false
+        try { $hasExited = [bool]$p.HasExited } catch { $hasExited = $false }
         $startUtc = $null
         try { $startUtc = $p.StartTime.ToUniversalTime().ToString('o') } catch { $startUtc = $null }
         $cpuSec = $null
         try { $cpuSec = [Math]::Round($p.TotalProcessorTime.TotalSeconds, 3) } catch { $cpuSec = $null }
 
         $loadedModules = @()
+        $loadedModulesReadable = $false
         try {
             $loadedModules = @($p.Modules | ForEach-Object {
                 [pscustomobject]@{
@@ -2047,23 +2797,30 @@ function Get-LumaBridgeRawWudfProcesses {
                     FileName   = $_.FileName
                 }
             })
+            if ($loadedModules.Count -gt 0) {
+                $loadedModulesReadable = $true
+            }
         }
         catch {
             $loadedModules = @()
+            $loadedModulesReadable = $false
         }
 
         $cmdLine = if ($cimByPid.ContainsKey([int]$p.Id)) { $cimByPid[[int]$p.Id] } else { $null }
 
         $rawList.Add([pscustomobject]@{
-            Id                = [int]$p.Id
-            StartTimeUtc      = $startUtc
-            WorkingSetMB      = [Math]::Round($p.WorkingSet64 / 1MB, 2)
-            PrivateMemoryMB   = [Math]::Round($p.PrivateMemorySize64 / 1MB, 2)
-            HandleCount       = [int]$p.HandleCount
-            ThreadCount       = [int]$p.Threads.Count
-            TotalProcessorSec = $cpuSec
-            CommandLine       = $cmdLine
-            LoadedModules     = $loadedModules
+            Id                    = [int]$p.Id
+            ProcessName           = $p.ProcessName
+            HasExited             = $hasExited
+            StartTimeUtc          = $startUtc
+            WorkingSetMB          = [Math]::Round($p.WorkingSet64 / 1MB, 2)
+            PrivateMemoryMB       = [Math]::Round($p.PrivateMemorySize64 / 1MB, 2)
+            HandleCount           = [int]$p.HandleCount
+            ThreadCount           = [int]$p.Threads.Count
+            TotalProcessorSec     = $cpuSec
+            CommandLine           = $cmdLine
+            LoadedModules         = $loadedModules
+            LoadedModulesReadable = $loadedModulesReadable
         })
     }
 
@@ -2077,14 +2834,23 @@ function Get-LumaBridgeWudfHostProcesses {
 
         [object[]]$RecentEvents = @(),
 
-        [string[]]$DebugTraceLines = @()
+        [string[]]$DebugTraceLines = @(),
+
+        [Nullable[DateTime]]$NotBeforeUtc = $null,
+
+        [Nullable[int]]$ExpectedHostPid = $null
     )
 
     $constants = $script:LumaBridgeDriverConstants
     $rawProcesses = @(Get-LumaBridgeRawWudfProcesses)
 
     $hostGuids = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
+    $deviceGroups = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
     $instanceIds = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
+
+    $wudfDiagPidToMeta = @{}
+    $startupDiagPidToInst = @{}
+    $conflictingHintPids = New-Object System.Collections.Generic.HashSet[int]
 
     foreach ($inst in @($PnpInstances)) {
         if ($null -eq $inst -or [string]::IsNullOrWhiteSpace($inst.InstanceId)) {
@@ -2092,23 +2858,55 @@ function Get-LumaBridgeWudfHostProcesses {
         }
         $null = $instanceIds.Add($inst.InstanceId)
 
-        if (-not [string]::IsNullOrWhiteSpace($inst.DeviceParametersPath)) {
-            $hasWudfSubKey = $false
-            $wudfSubKey = $null
-            try {
-                $wudfSubKey = Join-Path -Path $inst.DeviceParametersPath -ChildPath 'WUDF'
-                $hasWudfSubKey = Test-Path -LiteralPath $wudfSubKey -ErrorAction SilentlyContinue
+        $devParamsPath = if ($inst.PSObject.Properties.Name -contains 'DeviceParametersPath') { [string]$inst.DeviceParametersPath } else { '' }
+        $wudfDiag = $null
+        if ($inst.PSObject.Properties.Name -contains 'WudfDiagnosticInfo' -and $null -ne $inst.WudfDiagnosticInfo) {
+            $wudfDiag = $inst.WudfDiagnosticInfo
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($devParamsPath)) {
+            $wudfDiag = Get-LumaBridgeDeviceWudfDiagnosticInfo -DeviceParametersPath $devParamsPath
+        }
+
+        $wudfHostPid = $null
+        $wudfLifetime = $null
+        if ($null -ne $wudfDiag) {
+            if (($wudfDiag.PSObject.Properties.Name -contains 'HostProcessGUID') -and -not [string]::IsNullOrWhiteSpace([string]$wudfDiag.HostProcessGUID)) {
+                $null = $hostGuids.Add(([string]$wudfDiag.HostProcessGUID).Trim())
             }
-            catch {
-                $hasWudfSubKey = $false
+            if (($wudfDiag.PSObject.Properties.Name -contains 'DeviceGroupId') -and -not [string]::IsNullOrWhiteSpace([string]$wudfDiag.DeviceGroupId)) {
+                $null = $deviceGroups.Add(([string]$wudfDiag.DeviceGroupId).Trim())
             }
-            if ($hasWudfSubKey -and -not [string]::IsNullOrWhiteSpace($wudfSubKey)) {
-                $wudfProps = Get-ItemProperty -LiteralPath $wudfSubKey -ErrorAction SilentlyContinue
-                if ($null -ne $wudfProps -and ($wudfProps.PSObject.Properties.Name -contains 'HostProcessGUID')) {
-                    $guidVal = [string]$wudfProps.HostProcessGUID
-                    if (-not [string]::IsNullOrWhiteSpace($guidVal)) {
-                        $null = $hostGuids.Add($guidVal.Trim())
-                    }
+            if (($wudfDiag.PSObject.Properties.Name -contains 'HostPid') -and $null -ne $wudfDiag.HostPid -and [int]$wudfDiag.HostPid -gt 0) {
+                $wudfHostPid = [int]$wudfDiag.HostPid
+            }
+            if (($wudfDiag.PSObject.Properties.Name -contains 'LifetimeID') -and -not [string]::IsNullOrWhiteSpace([string]$wudfDiag.LifetimeID)) {
+                $wudfLifetime = ([string]$wudfDiag.LifetimeID).Trim()
+            }
+        }
+
+        $startupPid = $null
+        if (($inst.PSObject.Properties.Name -contains 'StartupDiagnostics') -and $null -ne $inst.StartupDiagnostics) {
+            $sd = $inst.StartupDiagnostics
+            if (($sd.PSObject.Properties.Name -contains 'HostProcessId') -and $null -ne $sd.HostProcessId -and [int]$sd.HostProcessId -gt 0) {
+                $startupPid = [int]$sd.HostProcessId
+            }
+        }
+
+        if ($null -ne $wudfHostPid -and $null -ne $startupPid -and $wudfHostPid -ne $startupPid) {
+            $null = $conflictingHintPids.Add($wudfHostPid)
+            $null = $conflictingHintPids.Add($startupPid)
+        }
+        else {
+            if ($null -ne $wudfHostPid) {
+                $wudfDiagPidToMeta[$wudfHostPid] = [pscustomobject]@{
+                    InstanceId = $inst.InstanceId
+                    LifetimeID = $wudfLifetime
+                }
+            }
+            if ($null -ne $startupPid) {
+                $startupDiagPidToInst[$startupPid] = [pscustomobject]@{
+                    InstanceId = $inst.InstanceId
+                    LifetimeID = $wudfLifetime
                 }
             }
         }
@@ -2153,60 +2951,192 @@ function Get-LumaBridgeWudfHostProcesses {
 
     $annotated = New-Object System.Collections.Generic.List[object]
     $hasActiveLumaBridgeDevice = ($PnpInstances.Count -gt 0)
+    $primaryInstanceId = if ($PnpInstances.Count -eq 1 -and ($PnpInstances[0].PSObject.Properties.Name -contains 'InstanceId')) {
+        [string]$PnpInstances[0].InstanceId
+    }
+    else {
+        $null
+    }
 
     foreach ($proc in $rawProcesses) {
+        $procPid = [int]$proc.Id
+        $procName = if ($proc.PSObject.Properties.Name -contains 'ProcessName') { [string]$proc.ProcessName } else { 'WUDFHost' }
+        $hasExited = ($proc.PSObject.Properties.Name -contains 'HasExited') -and [bool]$proc.HasExited
+        $modulesArr = @()
+        if (($proc.PSObject.Properties.Name -contains 'LoadedModules') -and $null -ne $proc.LoadedModules) {
+            $modulesArr = @($proc.LoadedModules)
+        }
+        $modulesReadable = if (($proc.PSObject.Properties.Name -contains 'LoadedModulesReadable') -and $null -ne $proc.LoadedModulesReadable) {
+            [bool]$proc.LoadedModulesReadable -or ($modulesArr.Count -gt 0)
+        }
+        else {
+            ($modulesArr.Count -gt 0)
+        }
+
+        $startedAfterAnchor = $null
+        if ($null -ne $NotBeforeUtc -and -not [string]::IsNullOrWhiteSpace([string]$proc.StartTimeUtc)) {
+            $parsedStart = [DateTime]::MinValue
+            if ([DateTime]::TryParse([string]$proc.StartTimeUtc, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal, [ref]$parsedStart)) {
+                $startedAfterAnchor = ($parsedStart.ToUniversalTime() -ge ([DateTime]$NotBeforeUtc).ToUniversalTime().AddSeconds(-2))
+            }
+        }
+
         $isLumaBridge = $false
         $method = if ($hasActiveLumaBridgeDevice) { 'Unverified' } else { 'None' }
+        $identityStatus = if ($hasActiveLumaBridgeDevice) { 'UNVERIFIED' } else { 'NONE' }
+        $identityDetail = if ($hasActiveLumaBridgeDevice) { 'Process could not be definitively correlated with LumaBridge.' } else { 'No active LumaBridge PnP instance present.' }
         $loadedDriverModulePath = $null
+        $correlatedInstId = $primaryInstanceId
+        $wudfLifetimeId = $null
 
-        if ($hasActiveLumaBridgeDevice) {
-            foreach ($mod in @($proc.LoadedModules)) {
+        if ($hasExited) {
+            $method = 'ExitedProcess'
+            $identityStatus = 'STALE_OR_CONFLICT'
+            $identityDetail = ("Candidate PID {0} has already exited." -f $procPid)
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($procName) -and ($procName -ine 'WUDFHost' -and $procName -ine 'WUDFHost.exe')) {
+            $method = 'NonWudfProcessName'
+            $identityStatus = 'STALE_OR_CONFLICT'
+            $identityDetail = ("Process PID {0} image name '{1}' is not WUDFHost." -f $procPid, $procName)
+        }
+        elseif ($hasActiveLumaBridgeDevice) {
+            $hasLumaBridgeDll = $false
+            foreach ($mod in $modulesArr) {
                 if ($null -eq $mod) {
                     continue
                 }
                 if (($mod.ModuleName -ieq $constants.DllFileName) -or
                     ($mod.FileName -like ("*\{0}" -f $constants.DllFileName))) {
-                    $isLumaBridge = $true
-                    $method = 'LoadedModule'
+                    $hasLumaBridgeDll = $true
                     $loadedDriverModulePath = $mod.FileName
                     break
                 }
             }
 
-            if (-not $isLumaBridge -and -not [string]::IsNullOrWhiteSpace($proc.CommandLine)) {
+            $cmdMatchMethod = $null
+            if (-not [string]::IsNullOrWhiteSpace($proc.CommandLine)) {
                 if (($proc.CommandLine -match '(?i)LumaBridge') -or
                     ($proc.CommandLine -match '(?i)LumaBridgeIddGroup')) {
-                    $isLumaBridge = $true
-                    $method = 'CommandLineLumaBridge'
+                    $cmdMatchMethod = 'CommandLineLumaBridge'
                 }
                 else {
                     foreach ($hg in $hostGuids) {
                         if ($proc.CommandLine.IndexOf($hg, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                            $isLumaBridge = $true
-                            $method = 'CommandLineHostGuid'
+                            $cmdMatchMethod = 'CommandLineHostGuid'
                             break
+                        }
+                    }
+                    if ($null -eq $cmdMatchMethod) {
+                        foreach ($dg in $deviceGroups) {
+                            if ($proc.CommandLine.IndexOf($dg, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                                $cmdMatchMethod = 'CommandLineDeviceGroup'
+                                break
+                            }
                         }
                     }
                 }
             }
 
-            if (-not $isLumaBridge -and $eventMatchedPids.Contains([int]$proc.Id)) {
+            if ($hasLumaBridgeDll) {
                 $isLumaBridge = $true
-                $method = 'EventLogCorrelation'
+                $method = 'LoadedModule'
+                $identityStatus = 'VERIFIED'
+                $identityDetail = ("Verified via loaded driver module '{0}'." -f $loadedDriverModulePath)
+                if ($wudfDiagPidToMeta.ContainsKey($procPid)) {
+                    $correlatedInstId = $wudfDiagPidToMeta[$procPid].InstanceId
+                    $wudfLifetimeId = $wudfDiagPidToMeta[$procPid].LifetimeID
+                }
             }
-
-            if (-not $isLumaBridge -and $traceMatchedPids.Contains([int]$proc.Id)) {
+            elseif ($null -ne $cmdMatchMethod) {
                 $isLumaBridge = $true
-                $method = 'DebugTracePid'
+                $method = $cmdMatchMethod
+                $identityStatus = 'VERIFIED'
+                $identityDetail = ("Verified via WUDFHost command line ({0})." -f $cmdMatchMethod)
+                if ($wudfDiagPidToMeta.ContainsKey($procPid)) {
+                    $correlatedInstId = $wudfDiagPidToMeta[$procPid].InstanceId
+                    $wudfLifetimeId = $wudfDiagPidToMeta[$procPid].LifetimeID
+                }
+            }
+            elseif ($null -ne $ExpectedHostPid -and [int]$ExpectedHostPid -eq $procPid) {
+                if ($modulesReadable -and -not $hasLumaBridgeDll) {
+                    $method = 'ReusedOrMismatchedPidModules'
+                    $identityStatus = 'STALE_OR_CONFLICT'
+                    $identityDetail = ("Expected IPC PID {0} has readable modules without {1}." -f $procPid, $constants.DllFileName)
+                }
+                else {
+                    $isLumaBridge = $true
+                    $method = 'ExpectedIpcHostPid'
+                    $identityStatus = 'VERIFIED'
+                    $identityDetail = ("Verified via live IPC ServerProcessId {0} matching running WUDFHost.exe." -f $procPid)
+                }
+            }
+            elseif ($wudfDiagPidToMeta.ContainsKey($procPid) -or $startupDiagPidToInst.ContainsKey($procPid)) {
+                $isFromWudfDiag = $wudfDiagPidToMeta.ContainsKey($procPid)
+                $meta = if ($isFromWudfDiag) { $wudfDiagPidToMeta[$procPid] } else { $startupDiagPidToInst[$procPid] }
+                $correlatedInstId = $meta.InstanceId
+                $wudfLifetimeId = $meta.LifetimeID
+
+                if ($modulesReadable -and -not $hasLumaBridgeDll) {
+                    $method = 'ReusedOrMismatchedPidModules'
+                    $identityStatus = 'STALE_OR_CONFLICT'
+                    $identityDetail = ("Registry HostPid {0} points to a WUDFHost whose loaded modules do not include {1} (likely PID reuse)." -f $procPid, $constants.DllFileName)
+                }
+                elseif ($null -ne $ExpectedHostPid -and [int]$ExpectedHostPid -gt 0 -and [int]$ExpectedHostPid -ne $procPid) {
+                    $method = 'RegistryPidVsIpcMismatch'
+                    $identityStatus = 'STALE_OR_CONFLICT'
+                    $identityDetail = ("Registry HostPid {0} conflicts with IPC ServerProcessId {1}." -f $procPid, [int]$ExpectedHostPid)
+                }
+                elseif ($null -ne $NotBeforeUtc -and $startedAfterAnchor -eq $false) {
+                    $method = 'StalePreRestartPid'
+                    $identityStatus = 'STALE_OR_CONFLICT'
+                    $identityDetail = ("Registry HostPid {0} started at {1}, before restart anchor {2}." -f $procPid, $proc.StartTimeUtc, ([DateTime]$NotBeforeUtc).ToUniversalTime().ToString('o'))
+                }
+                else {
+                    $isLumaBridge = $true
+                    $method = if ($isFromWudfDiag) { 'WudfDiagnosticInfoHostPid' } else { 'StartupDiagnosticsHostPid' }
+                    $identityStatus = 'VERIFIED'
+                    $identityDetail = ("Verified live WUDFHost PID {0} via {1} with freshness checks." -f $procPid, $method)
+                }
+            }
+            elseif ($conflictingHintPids.Contains($procPid)) {
+                $method = 'ConflictingDiagnosticHostPids'
+                $identityStatus = 'STALE_OR_CONFLICT'
+                $identityDetail = ("WUDFDiagnosticInfo HostPid and StartupDiagnostics HostProcessId conflict around PID {0}." -f $procPid)
+            }
+            elseif ($eventMatchedPids.Contains($procPid) -or $traceMatchedPids.Contains($procPid)) {
+                $candMethod = if ($eventMatchedPids.Contains($procPid)) { 'EventLogCorrelation' } else { 'DebugTracePid' }
+                if ($modulesReadable -and -not $hasLumaBridgeDll) {
+                    $method = 'ReusedOrMismatchedPidModules'
+                    $identityStatus = 'STALE_OR_CONFLICT'
+                    $identityDetail = ("{0} PID {1} has readable modules without {2}." -f $candMethod, $procPid, $constants.DllFileName)
+                }
+                elseif ($null -ne $NotBeforeUtc -and $startedAfterAnchor -eq $false) {
+                    $method = 'StalePreRestartPid'
+                    $identityStatus = 'STALE_OR_CONFLICT'
+                    $identityDetail = ("{0} PID {1} predates restart anchor {2}." -f $candMethod, $procPid, ([DateTime]$NotBeforeUtc).ToUniversalTime().ToString('o'))
+                }
+                else {
+                    $isLumaBridge = $true
+                    $method = $candMethod
+                    $identityStatus = 'VERIFIED'
+                    $identityDetail = ("Verified live WUDFHost PID {0} via {1}." -f $procPid, $candMethod)
+                }
             }
         }
 
         $annotated.Add([pscustomobject]@{
-            Id                     = [int]$proc.Id
+            Id                     = $procPid
+            ProcessName            = $procName
+            HasExited              = $hasExited
             IsLumaBridgeHost       = $isLumaBridge
             AssociationMethod      = $method
+            IdentityStatus         = $identityStatus
+            IdentityDetail         = $identityDetail
             LoadedDriverModulePath = $loadedDriverModulePath
             StartTimeUtc           = $proc.StartTimeUtc
+            StartedAfterAnchor     = $startedAfterAnchor
+            CorrelatedInstanceId   = $correlatedInstId
+            WudfLifetimeId         = $wudfLifetimeId
             WorkingSetMB           = $proc.WorkingSetMB
             PrivateMemoryMB        = $proc.PrivateMemoryMB
             HandleCount            = $proc.HandleCount
@@ -2218,31 +3148,148 @@ function Get-LumaBridgeWudfHostProcesses {
     return @($annotated.ToArray())
 }
 
+function Resolve-LumaBridgeVerifiedWudfHostProcess {
+    [CmdletBinding()]
+    param(
+        [object[]]$WudfProcesses = @(),
+
+        [Nullable[int]]$ExpectedPid = $null,
+
+        [switch]$RequireStartedAfterAnchor
+    )
+
+    $allProcs = @($WudfProcesses | Where-Object { $null -ne $_ })
+    $verified = @($allProcs | Where-Object {
+        $isHost = ($_.PSObject.Properties.Name -contains 'IsLumaBridgeHost') -and [bool]$_.IsLumaBridgeHost
+        $hasExited = ($_.PSObject.Properties.Name -contains 'HasExited') -and [bool]$_.HasExited
+        $idStatus = if ($_.PSObject.Properties.Name -contains 'IdentityStatus') { [string]$_.IdentityStatus } else { 'VERIFIED' }
+        $anchorOk = $true
+        if ($RequireStartedAfterAnchor -and ($_.PSObject.Properties.Name -contains 'StartedAfterAnchor') -and $null -ne $_.StartedAfterAnchor) {
+            # LoadedModule proves LumaBridgeIddDriver.dll is loaded even if StartTime wasn't anchored;
+            # PID-based methods already reject pre-anchor starts when NotBeforeUtc is provided.
+            if ($_.AssociationMethod -ne 'LoadedModule') {
+                $anchorOk = [bool]$_.StartedAfterAnchor
+            }
+        }
+        $isHost -and (-not $hasExited) -and ($idStatus -ne 'STALE_OR_CONFLICT') -and $anchorOk
+    })
+
+    if ($verified.Count -eq 0) {
+        $hasConflict = @($allProcs | Where-Object {
+            ($_.PSObject.Properties.Name -contains 'IdentityStatus') -and ([string]$_.IdentityStatus -eq 'STALE_OR_CONFLICT')
+        }).Count -gt 0
+
+        if ($allProcs.Count -eq 0) {
+            return [pscustomobject]@{
+                Status            = 'FAIL'
+                Process           = $null
+                VerifiedProcesses = @()
+                CandidateCount    = 0
+                Reason            = 'No running WUDFHost.exe processes detected.'
+            }
+        }
+        if ($hasConflict) {
+            return [pscustomobject]@{
+                Status            = 'FAIL'
+                Process           = $null
+                VerifiedProcesses = @()
+                CandidateCount    = $allProcs.Count
+                Reason            = 'Detected WUDFHost.exe identity conflict, reused PID, or stale pre-restart PID.'
+            }
+        }
+        return [pscustomobject]@{
+            Status            = 'UNKNOWN'
+            Process           = $null
+            VerifiedProcesses = @()
+            CandidateCount    = $allProcs.Count
+            Reason            = ("Found {0} WUDFHost.exe process(es), none verified as LumaBridge host." -f $allProcs.Count)
+        }
+    }
+
+    if ($null -ne $ExpectedPid -and [int]$ExpectedPid -gt 0) {
+        $expectedMatch = @($verified | Where-Object { [int]$_.Id -eq [int]$ExpectedPid })
+        if ($expectedMatch.Count -eq 0) {
+            $verifiedIds = ($verified | ForEach-Object { $_.Id }) -join ', '
+            return [pscustomobject]@{
+                Status            = 'FAIL'
+                Process           = $null
+                VerifiedProcesses = $verified
+                CandidateCount    = $allProcs.Count
+                Reason            = ("Expected ServerProcessId {0} does not match verified LumaBridge WUDFHost PID(s): {1}" -f [int]$ExpectedPid, $verifiedIds)
+            }
+        }
+        return [pscustomobject]@{
+            Status            = 'VERIFIED'
+            Process           = $expectedMatch[0]
+            VerifiedProcesses = $verified
+            CandidateCount    = $allProcs.Count
+            Reason            = ("Verified WUDFHost PID {0} matched ExpectedPid." -f [int]$ExpectedPid)
+        }
+    }
+
+    $priorityMap = @{
+        'LoadedModule'               = 1
+        'CommandLineLumaBridge'      = 2
+        'CommandLineHostGuid'        = 3
+        'CommandLineDeviceGroup'     = 4
+        'ExpectedIpcHostPid'         = 5
+        'WudfDiagnosticInfoHostPid'  = 6
+        'StartupDiagnosticsHostPid'  = 7
+        'EventLogCorrelation'        = 8
+        'DebugTracePid'              = 9
+    }
+    $sorted = @($verified | Sort-Object {
+        $m = [string]$_.AssociationMethod
+        if ($priorityMap.ContainsKey($m)) { $priorityMap[$m] } else { 99 }
+    })
+
+    return [pscustomobject]@{
+        Status            = 'VERIFIED'
+        Process           = $sorted[0]
+        VerifiedProcesses = $sorted
+        CandidateCount    = $allProcs.Count
+        Reason            = ("Verified WUDFHost PID {0} via {1}." -f $sorted[0].Id, $sorted[0].AssociationMethod)
+    }
+}
+
 function Get-LumaBridgeHostSecurityState {
     [CmdletBinding()]
     param()
 
+    $unavailableChecks = New-Object System.Collections.Generic.List[string]
+    $blockingConditions = New-Object System.Collections.Generic.List[string]
+    $informationalWarnings = New-Object System.Collections.Generic.List[string]
+
     $secureBootState = 'Unknown'
+    $secureBootSource = 'Unavailable'
     if (Get-Command -Name 'Confirm-SecureBootUEFI' -ErrorAction SilentlyContinue) {
         try {
             $sb = Confirm-SecureBootUEFI -ErrorAction Stop
             $secureBootState = if ($sb) { 'Enabled' } else { 'Disabled' }
+            $secureBootSource = 'Confirm-SecureBootUEFI'
         }
         catch [System.UnauthorizedAccessException] {
             $secureBootState = 'RequiresAdministrator'
+            $secureBootSource = 'Confirm-SecureBootUEFI_AccessDenied'
         }
         catch {
             $secureBootState = 'UnsupportedOrLegacyBios'
+            $secureBootSource = 'Confirm-SecureBootUEFI_Unsupported'
         }
     }
     if ($secureBootState -in @('Unknown', 'RequiresAdministrator')) {
         $sbReg = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State' -Name 'UEFISecureBootEnabled' -ErrorAction SilentlyContinue
         if ($null -ne $sbReg -and ($sbReg.PSObject.Properties.Name -contains 'UEFISecureBootEnabled')) {
             $secureBootState = if ([int]$sbReg.UEFISecureBootEnabled -eq 1) { 'Enabled' } else { 'Disabled' }
+            $secureBootSource = 'Registry:SecureBoot\State'
+        }
+        else {
+            $unavailableChecks.Add('SecureBoot')
         }
     }
 
     $testSigningState = 'Unknown'
+    $testSigningSource = 'Unavailable'
     try {
         $prevEap = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
@@ -2266,6 +3313,7 @@ function Get-LumaBridgeHostSecurityState {
             else {
                 $testSigningState = 'Disabled'
             }
+            $testSigningSource = 'bcdedit'
         }
         else {
             $testSigningState = 'RequiresAdministrator'
@@ -2283,12 +3331,376 @@ function Get-LumaBridgeHostSecurityState {
             else {
                 $testSigningState = 'Disabled'
             }
+            $testSigningSource = 'Registry:SystemStartOptions'
+        }
+        else {
+            $unavailableChecks.Add('TestSigning')
+        }
+    }
+
+    $vbsStatus = 'Unavailable'
+    $vbsSource = 'Unavailable'
+    $vbsRawValue = $null
+    $hvciStatus = 'Unavailable'
+    $hvciSource = 'Unavailable'
+    $hvciRegistryEnabled = $null
+    $deviceGuardCimAvailable = $false
+
+    try {
+        if (Get-Command -Name 'Get-CimInstance' -ErrorAction SilentlyContinue) {
+            $dg = Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName 'Win32_DeviceGuard' -ErrorAction Stop | Select-Object -First 1
+            if ($null -ne $dg) {
+                $deviceGuardCimAvailable = $true
+                $vbsRawValue = [int]$dg.VirtualizationBasedSecurityStatus
+                $vbsSource = 'CIM:Win32_DeviceGuard'
+                switch ($vbsRawValue) {
+                    2 { $vbsStatus = 'Running' }
+                    1 { $vbsStatus = 'EnabledNotRunning' }
+                    0 { $vbsStatus = 'Disabled' }
+                    default { $vbsStatus = ("Unknown({0})" -f $vbsRawValue) }
+                }
+
+                $secRunning = @($dg.SecurityServicesRunning)
+                $secConfigured = @($dg.SecurityServicesConfigured)
+                $hvciSource = 'CIM:Win32_DeviceGuard'
+                if ($secRunning -contains 2) {
+                    $hvciStatus = 'Running'
+                }
+                elseif ($secConfigured -contains 2) {
+                    $hvciStatus = 'ConfiguredNotRunning'
+                }
+                else {
+                    $hvciStatus = 'Disabled'
+                }
+            }
+        }
+    }
+    catch {
+        $deviceGuardCimAvailable = $false
+    }
+
+    $dgKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard'
+    $hvciKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity'
+    $hvciRegState = Get-LumaBridgeRegistryValueState -LiteralPath $hvciKey -Name 'Enabled'
+    if ($hvciRegState.ValueExists) {
+        $hvciRegistryEnabled = [int]$hvciRegState.Value
+    }
+    if ($vbsStatus -eq 'Unavailable') {
+        $vbsRegState = Get-LumaBridgeRegistryValueState -LiteralPath $dgKey -Name 'EnableVirtualizationBasedSecurity'
+        if ($vbsRegState.ValueExists) {
+            $vbsRawValue = [int]$vbsRegState.Value
+            $vbsStatus = if ($vbsRawValue -eq 1) { 'EnabledInRegistry' } else { 'Disabled' }
+            $vbsSource = 'Registry:DeviceGuard'
+        }
+        else {
+            $unavailableChecks.Add('VbsStatus')
+        }
+    }
+    if ($hvciStatus -eq 'Unavailable') {
+        if ($hvciRegState.ValueExists) {
+            $hvciStatus = if ([int]$hvciRegState.Value -eq 1) { 'EnabledInRegistry' } else { 'Disabled' }
+            $hvciSource = 'Registry:HypervisorEnforcedCodeIntegrity'
+        }
+        else {
+            $unavailableChecks.Add('HvciStatus')
+        }
+    }
+
+    $osArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+    $osReg = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+    $osBuild = if ($null -ne $osReg -and ($osReg.PSObject.Properties.Name -contains 'CurrentBuildNumber')) { [int]$osReg.CurrentBuildNumber } else { [Environment]::OSVersion.Version.Build }
+    $osUbr = if ($null -ne $osReg -and ($osReg.PSObject.Properties.Name -contains 'UBR') -and $null -ne $osReg.UBR) { [int]$osReg.UBR } else { 0 }
+
+    $serviceStates = [ordered]@{}
+    foreach ($svcName in @('WUDFRd', 'WudfPf', 'PlugPlay', 'EventLog')) {
+        try {
+            $svc = Get-Service -Name $svcName -ErrorAction Stop
+            $serviceStates[$svcName] = [pscustomobject]@{
+                Available = $true
+                Status    = $svc.Status.ToString()
+                StartType = $svc.StartType.ToString()
+                Reason    = $null
+            }
+        }
+        catch {
+            $regSvcPath = ("HKLM:\SYSTEM\CurrentControlSet\Services\{0}" -f $svcName)
+            $regStart = Get-LumaBridgeRegistryValueState -LiteralPath $regSvcPath -Name 'Start'
+            if ($regStart.ValueExists) {
+                $serviceStates[$svcName] = [pscustomobject]@{
+                    Available = $true
+                    Status    = 'RegistryPresent_RuntimeStatusUnavailable'
+                    StartType = ("Start={0}" -f $regStart.Value)
+                    Reason    = $_.Exception.Message
+                }
+            }
+            else {
+                $serviceStates[$svcName] = [pscustomobject]@{
+                    Available = $false
+                    Status    = 'Unavailable'
+                    StartType = 'Unknown'
+                    Reason    = $_.Exception.Message
+                }
+                $unavailableChecks.Add(("Service:{0}" -f $svcName))
+            }
+        }
+    }
+
+    $nvEncodePath = if (-not [string]::IsNullOrWhiteSpace($env:SystemRoot)) {
+        Join-Path -Path $env:SystemRoot -ChildPath 'System32\nvEncodeAPI64.dll'
+    }
+    else {
+        'C:\Windows\System32\nvEncodeAPI64.dll'
+    }
+    $apiAvailability = [pscustomobject]@{
+        GetPnpDevice      = ($null -ne (Get-Command -Name 'Get-PnpDevice' -ErrorAction SilentlyContinue))
+        GetCimInstance    = ($null -ne (Get-Command -Name 'Get-CimInstance' -ErrorAction SilentlyContinue))
+        GetCounter        = ($null -ne (Get-Command -Name 'Get-Counter' -ErrorAction SilentlyContinue))
+        DeviceGuardCim    = $deviceGuardCimAvailable
+        NvEncodeApi64Dll  = (Test-Path -LiteralPath $nvEncodePath -PathType Leaf)
+    }
+
+    if ($testSigningState -eq 'Disabled') {
+        $blockingConditions.Add('TestSigning is Disabled (required for self-signed test packages unless -SkipTestSigningCheck with trusted CA).')
+    }
+    if (-not [Environment]::Is64BitOperatingSystem) {
+        $blockingConditions.Add('64-bit OS is required for LumaBridge x64 UMDF driver.')
+    }
+    if ($osBuild -lt $script:LumaBridgeDriverConstants.MinimumWindows11Build) {
+        $blockingConditions.Add(("OS Build {0} is below minimum Windows 11 build {1}." -f $osBuild, $script:LumaBridgeDriverConstants.MinimumWindows11Build))
+    }
+
+    if ($hvciStatus -in @('Running', 'EnabledInRegistry', 'ConfiguredNotRunning')) {
+        $informationalWarnings.Add(("HVCI/Memory Integrity state is '{0}' ({1}). Note: UMDF/IddCx user-mode drivers must comply with HVCI code integrity & signing requirements; verify TestSigning/trusted cert chain rather than disabling host security without authorization." -f $hvciStatus, $hvciSource))
+    }
+    if ($vbsStatus -in @('Running', 'EnabledInRegistry')) {
+        $informationalWarnings.Add(("VBS state is '{0}' ({1})." -f $vbsStatus, $vbsSource))
+    }
+
+    return [pscustomobject]@{
+        SecureBoot              = $secureBootState
+        SecureBootSource        = $secureBootSource
+        TestSigning             = $testSigningState
+        TestSigningSource       = $testSigningSource
+        VbsStatus               = $vbsStatus
+        VbsSource               = $vbsSource
+        VbsRawValue             = $vbsRawValue
+        HvciStatus              = $hvciStatus
+        HvciSource              = $hvciSource
+        HvciRegistryEnabled     = $hvciRegistryEnabled
+        OsArchitecture          = $osArch
+        OsBuild                 = $osBuild
+        OsUbr                   = $osUbr
+        RequiredServices        = [pscustomobject]$serviceStates
+        ApiAvailability         = $apiAvailability
+        BlockingConditions      = @($blockingConditions.ToArray())
+        InformationalWarnings   = @($informationalWarnings.ToArray())
+        UnavailableChecks       = @($unavailableChecks.ToArray() | Select-Object -Unique)
+    }
+}
+
+function Get-LumaBridgeCertificateStoreSnapshot {
+    [CmdletBinding()]
+    param(
+        [string]$Thumbprint,
+
+        [string]$Subject = $script:LumaBridgeDriverConstants.DefaultCertificateSubject
+    )
+
+    $normThumb = if (-not [string]::IsNullOrWhiteSpace($Thumbprint)) {
+        ($Thumbprint -replace '\s', '').ToUpperInvariant()
+    }
+    else {
+        $null
+    }
+
+    $stores = @('Cert:\CurrentUser\My', 'Cert:\LocalMachine\Root', 'Cert:\LocalMachine\TrustedPublisher')
+    $storeEntries = [ordered]@{}
+    $allMatchingThumbprints = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($store in $stores) {
+        $matchesList = New-Object System.Collections.Generic.List[object]
+        $accessible = $false
+        $storeErr = $null
+        try {
+            if (Test-Path -LiteralPath $store -ErrorAction SilentlyContinue) {
+                $accessible = $true
+                $items = @(Get-ChildItem -Path $store -ErrorAction SilentlyContinue | Where-Object {
+                    ($null -ne $normThumb -and $_.Thumbprint -ieq $normThumb) -or
+                    (-not [string]::IsNullOrWhiteSpace($Subject) -and $_.Subject -eq $Subject)
+                })
+                foreach ($it in $items) {
+                    $null = $allMatchingThumbprints.Add($it.Thumbprint.ToUpperInvariant())
+                    $matchesList.Add([pscustomobject]@{
+                        Thumbprint = $it.Thumbprint.ToUpperInvariant()
+                        Subject    = $it.Subject
+                        NotBefore  = $it.NotBefore.ToUniversalTime().ToString('o')
+                        NotAfter   = $it.NotAfter.ToUniversalTime().ToString('o')
+                    })
+                }
+            }
+        }
+        catch {
+            $storeErr = $_.Exception.Message
+        }
+
+        $storeEntries[$store] = [pscustomobject]@{
+            Accessible = $accessible
+            Error      = $storeErr
+            Count      = $matchesList.Count
+            Certs      = @($matchesList.ToArray())
         }
     }
 
     return [pscustomobject]@{
-        SecureBoot  = $secureBootState
-        TestSigning = $testSigningState
+        CapturedAtUtc        = (Get-Date).ToUniversalTime().ToString('o')
+        QueryThumbprint      = $normThumb
+        QuerySubject         = $Subject
+        MatchingThumbprints  = @($allMatchingThumbprints)
+        Stores               = [pscustomobject]$storeEntries
+    }
+}
+
+function Get-LumaBridgeDisplayTopologySnapshot {
+    [CmdletBinding()]
+    param()
+
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        $screens = @([System.Windows.Forms.Screen]::AllScreens)
+        $mapped = @($screens | ForEach-Object {
+            [pscustomobject]@{
+                DeviceName   = $_.DeviceName
+                Primary      = [bool]$_.Primary
+                Bounds       = ("{0},{1},{2}x{3}" -f $_.Bounds.X, $_.Bounds.Y, $_.Bounds.Width, $_.Bounds.Height)
+                Width        = [int]$_.Bounds.Width
+                Height       = [int]$_.Bounds.Height
+                BitsPerPixel = [int]$_.BitsPerPixel
+            }
+        })
+        return [pscustomobject]@{
+            Available      = $true
+            Status         = 'MEASURED'
+            RestoreSupport = 'ReadOnlySnapshot'
+            ScreenCount    = $mapped.Count
+            Screens        = $mapped
+            Reason         = $null
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            Available      = $false
+            Status         = 'NOT_MEASURED'
+            RestoreSupport = 'ReadOnlySnapshot'
+            ScreenCount    = 0
+            Screens        = @()
+            Reason         = $_.Exception.Message
+        }
+    }
+}
+
+function Get-LumaBridgeInitialSystemSnapshot {
+    [CmdletBinding()]
+    param(
+        [object[]]$PnpInstances = @(),
+
+        [object[]]$DriverStorePackages = @(),
+
+        [string]$CertificateThumbprint,
+
+        [string]$CertificateSubject = $script:LumaBridgeDriverConstants.DefaultCertificateSubject,
+
+        [string]$EtwSessionName = $script:LumaBridgeDriverConstants.EtwSessionName,
+
+        [string]$DxgSessionName = $script:LumaBridgeDriverConstants.EtwDxgSessionName
+    )
+
+    $constants = $script:LumaBridgeDriverConstants
+    $inst = if (@($PnpInstances).Count -eq 1) { $PnpInstances[0] } else { $null }
+    $devParamsPath = if ($null -ne $inst -and ($inst.PSObject.Properties.Name -contains 'DeviceParametersPath')) { [string]$inst.DeviceParametersPath } else { $null }
+
+    $regSnapshot = $null
+    if ($null -ne $inst) {
+        $regSnapshot = [pscustomobject]@{
+            DeviceParametersPath     = $devParamsPath
+            EnableVirtualMonitor     = Get-LumaBridgeRegistryValueState -LiteralPath $devParamsPath -Name $constants.RegistryValueEnableMon
+            EnableFrameExtraction    = Get-LumaBridgeRegistryValueState -LiteralPath $devParamsPath -Name $constants.RegistryValueEnableExt
+            EnableGpuSharedTransport = Get-LumaBridgeRegistryValueState -LiteralPath $devParamsPath -Name $constants.RegistryValueEnableGpuTrans
+            AuthorizedHostUserSid    = Get-LumaBridgeRegistryValueState -LiteralPath $devParamsPath -Name $constants.RegistryValueAuthorizedSid
+        }
+        # Populate Value/ValueExists when instance properties were mocked in-memory without a real registry path.
+        if (-not $regSnapshot.EnableVirtualMonitor.ValueExists -and ($inst.PSObject.Properties.Name -contains 'EnableVirtualMonitor') -and $null -ne $inst.EnableVirtualMonitor) {
+            $regSnapshot.EnableVirtualMonitor = [pscustomobject]@{ KeyExists = $true; ValueExists = $true; Value = $inst.EnableVirtualMonitor }
+        }
+        if (-not $regSnapshot.EnableFrameExtraction.ValueExists -and ($inst.PSObject.Properties.Name -contains 'EnableFrameExtraction') -and $null -ne $inst.EnableFrameExtraction) {
+            $regSnapshot.EnableFrameExtraction = [pscustomobject]@{ KeyExists = $true; ValueExists = $true; Value = $inst.EnableFrameExtraction }
+        }
+        if (-not $regSnapshot.EnableGpuSharedTransport.ValueExists -and ($inst.PSObject.Properties.Name -contains 'EnableGpuSharedTransport') -and $null -ne $inst.EnableGpuSharedTransport) {
+            $regSnapshot.EnableGpuSharedTransport = [pscustomobject]@{ KeyExists = $true; ValueExists = $true; Value = $inst.EnableGpuSharedTransport }
+        }
+        if (-not $regSnapshot.AuthorizedHostUserSid.ValueExists -and ($inst.PSObject.Properties.Name -contains 'AuthorizedHostUserSid') -and -not [string]::IsNullOrWhiteSpace([string]$inst.AuthorizedHostUserSid)) {
+            $regSnapshot.AuthorizedHostUserSid = [pscustomobject]@{ KeyExists = $true; ValueExists = $true; Value = $inst.AuthorizedHostUserSid }
+        }
+    }
+
+    $installedBinaryPath = if ($null -ne $inst -and ($inst.PSObject.Properties.Name -contains 'DriverInfPath') -and -not [string]::IsNullOrWhiteSpace([string]$inst.DriverInfPath)) {
+        Get-LumaBridgeInstalledDriverBinaryPath -PublishedInfName $inst.DriverInfPath
+    }
+    else {
+        $null
+    }
+    $installedBinarySha256 = if (-not [string]::IsNullOrWhiteSpace($installedBinaryPath) -and (Test-Path -LiteralPath $installedBinaryPath -PathType Leaf)) {
+        try { (Get-FileHash -LiteralPath $installedBinaryPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToUpperInvariant() } catch { $null }
+    }
+    else {
+        $null
+    }
+
+    $etwCoreRunning = $false
+    $etwDxgRunning = $false
+    if (Get-Command -Name 'logman.exe' -ErrorAction SilentlyContinue) {
+        try {
+            $null = Invoke-LumaBridgeExternalCommand -FilePath 'logman.exe' -Arguments @('query', $EtwSessionName, '-ets')
+            $etwCoreRunning = $true
+        }
+        catch { $etwCoreRunning = $false }
+        try {
+            $null = Invoke-LumaBridgeExternalCommand -FilePath 'logman.exe' -Arguments @('query', $DxgSessionName, '-ets')
+            $etwDxgRunning = $true
+        }
+        catch { $etwDxgRunning = $false }
+    }
+
+    return [pscustomobject]@{
+        CapturedAtUtc          = (Get-Date).ToUniversalTime().ToString('o')
+        ExistedBeforeRun       = ($null -ne $inst)
+        PnpInstance            = if ($null -ne $inst) {
+            [pscustomobject]@{
+                InstanceId     = $inst.InstanceId
+                Status         = $inst.Status
+                ProblemCode    = $inst.ProblemCode
+                DriverInfPath  = if ($inst.PSObject.Properties.Name -contains 'DriverInfPath') { $inst.DriverInfPath } else { $null }
+                DriverVersion  = if ($inst.PSObject.Properties.Name -contains 'DriverVersion') { $inst.DriverVersion } else { $null }
+                DriverProvider = if ($inst.PSObject.Properties.Name -contains 'DriverProvider') { $inst.DriverProvider } else { $null }
+            }
+        } else { $null }
+        InstalledBinaryPath    = $installedBinaryPath
+        InstalledBinarySha256  = $installedBinarySha256
+        DriverStorePackages    = @($DriverStorePackages | ForEach-Object {
+            [pscustomobject]@{
+                PublishedName = $_.PublishedName
+                OriginalName  = $_.OriginalName
+                DriverVersion = $_.DriverVersion
+            }
+        })
+        RegistryValues         = $regSnapshot
+        EtwState               = [pscustomobject]@{
+            CoreSessionName    = $EtwSessionName
+            CoreSessionRunning = $etwCoreRunning
+            DxgSessionName     = $DxgSessionName
+            DxgSessionRunning  = $etwDxgRunning
+        }
+        CertificateSnapshot    = Get-LumaBridgeCertificateStoreSnapshot -Thumbprint $CertificateThumbprint -Subject $CertificateSubject
+        DisplayTopology        = Get-LumaBridgeDisplayTopologySnapshot
     }
 }
 
@@ -3779,8 +5191,10 @@ function Get-LumaBridgeDriverTraceStageSummary {
         $evProvId = if ($ev.PSObject.Properties.Name -contains 'ProviderId') { [string]$ev.ProviderId } else { '' }
         if (($prov -ine 'LumaBridgeIddDriver') -and ($evProvId -ine $lbGuidLowerStage)) { continue }
 
-        $props = if ($ev.PSObject.Properties.Name -contains 'Properties') { @($ev.Properties) } else { @() }
-        $props = @($props)
+        $props = @()
+        if (($ev.PSObject.Properties.Name -contains 'Properties') -and $null -ne $ev.Properties) {
+            $props = @($ev.Properties)
+        }
         if ($props.Count -eq 8 -and ([string]$props[0] -in @('INFO', 'WARN', 'ERROR'))) {
             ++$etwAdded
             $records.Add([pscustomobject]@{
@@ -3882,6 +5296,9 @@ Export-ModuleMember -Function @(
     'Assert-LumaBridgeIsolatedStagingDirectory',
     'Get-LumaBridgeWdkToolPath',
     'Get-LumaBridgeHostSecurityState',
+    'Get-LumaBridgeCertificateStoreSnapshot',
+    'Get-LumaBridgeDisplayTopologySnapshot',
+    'Get-LumaBridgeInitialSystemSnapshot',
     'Find-LumaBridgeSigningCertificate',
     'New-LumaBridgeSigningCertificate',
     'Export-LumaBridgeCertificateFile',
@@ -3891,7 +5308,13 @@ Export-ModuleMember -Function @(
     'Confirm-LumaBridgeAction',
     'Invoke-LumaBridgeExternalCommand',
     'Invoke-LumaBridgeHostProcess',
+    'Get-LumaBridgeValidationHostTimeoutMs',
+    'Get-LumaBridgeGpuPerfCounterSamples',
+    'Get-LumaBridgeProcessMetricsByPid',
+    'Get-LumaBridgeProcessResourceSnapshot',
+    'Measure-LumaBridgeResourceSeriesSummary',
     'Format-LumaBridgeNtStatusHex',
+    'Get-LumaBridgeRegistryValueState',
     'Get-LumaBridgeDeviceParametersRegistryPath',
     'Get-LumaBridgeDeviceEnableVirtualMonitor',
     'Set-LumaBridgeDeviceEnableVirtualMonitor',
@@ -3902,10 +5325,12 @@ Export-ModuleMember -Function @(
     'Get-LumaBridgeDeviceAuthorizedHostUserSid',
     'Set-LumaBridgeDeviceAuthorizedHostUserSid',
     'Get-LumaBridgeDeviceStartupDiagnostics',
+    'Get-LumaBridgeDeviceWudfDiagnosticInfo',
     'Get-LumaBridgeDevicePropertyData',
     'Get-LumaBridgePnpInstances',
     'Get-LumaBridgeInfDriverVerMetadata',
     'Get-LumaBridgeInfDriverVersion',
+    'Get-LumaBridgeInstalledDriverBinaryPath',
     'Test-LumaBridgeDeviceDriverBinding',
     'Invoke-LumaBridgePnpUtilEnumDriversXml',
     'Get-LumaBridgeDriverStorePackages',
@@ -3916,6 +5341,7 @@ Export-ModuleMember -Function @(
     'Test-LumaBridgePackageArtifacts',
     'Get-LumaBridgeRawWudfProcesses',
     'Get-LumaBridgeWudfHostProcesses',
+    'Resolve-LumaBridgeVerifiedWudfHostProcess',
     'Get-LumaBridgeSetupApiLogExcerpt',
     'Get-LumaBridgeEventChannelStatus',
     'Get-LumaBridgeDiagnosticEvents',

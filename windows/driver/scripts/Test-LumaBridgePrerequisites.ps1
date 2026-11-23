@@ -36,6 +36,13 @@ $isSupportedWindows11 = ($is64BitOs -and $buildNumber -ge $constants.MinimumWind
 $securityState = Get-LumaBridgeHostSecurityState
 $secureBootState = $securityState.SecureBoot
 $testSigningState = $securityState.TestSigning
+$secProp = {
+    param([string]$Name, $Default = $null)
+    if ($null -ne $securityState -and ($securityState.PSObject.Properties.Name -contains $Name)) {
+        return $securityState.$Name
+    }
+    return $Default
+}
 
 $wudfCandidates = @(
     (Join-Path -Path $env:SystemRoot -ChildPath 'System32\Drivers\UMDF\WUDFx02000.dll'),
@@ -89,12 +96,26 @@ $report = [pscustomobject]@{
         CurrentBuildNumber   = $buildNumber
         UBR                  = $ubr
         Is64BitOs            = $is64BitOs
+        Architecture         = (& $secProp 'OsArchitecture' ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()))
         IsSupportedWindows11 = $isSupportedWindows11
     }
     SecurityState             = [pscustomobject]@{
-        SecureBoot  = $secureBootState
-        TestSigning = $testSigningState
+        SecureBoot            = $secureBootState
+        SecureBootSource      = (& $secProp 'SecureBootSource' $null)
+        TestSigning           = $testSigningState
+        TestSigningSource     = (& $secProp 'TestSigningSource' $null)
+        VbsStatus             = (& $secProp 'VbsStatus' 'Unavailable')
+        VbsSource             = (& $secProp 'VbsSource' $null)
+        VbsRawValue           = (& $secProp 'VbsRawValue' $null)
+        HvciStatus            = (& $secProp 'HvciStatus' 'Unavailable')
+        HvciSource            = (& $secProp 'HvciSource' $null)
+        HvciRegistryEnabled   = (& $secProp 'HvciRegistryEnabled' $null)
+        BlockingConditions    = @(& $secProp 'BlockingConditions' @())
+        InformationalWarnings = @(& $secProp 'InformationalWarnings' @())
+        UnavailableChecks     = @(& $secProp 'UnavailableChecks' @())
     }
+    RequiredServices          = (& $secProp 'RequiredServices' $null)
+    ApiAvailability           = (& $secProp 'ApiAvailability' $null)
     RuntimeComponents         = [pscustomobject]@{
         WUDFx02000Path    = $wudfPath
         WUDFx02000Version = $wudfVersion
