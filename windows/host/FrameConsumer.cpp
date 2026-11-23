@@ -4,6 +4,9 @@
 #include <cstring>
 #include <new>
 
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
+
 namespace lumabridge::host {
 
 namespace {
@@ -325,6 +328,39 @@ NearestRankIndex(
     return (idx < sampleCount) ? idx : (sampleCount - 1U);
 }
 
+class ScopedKeyedMutexRelease final
+{
+public:
+    ScopedKeyedMutexRelease(IDXGIKeyedMutex* mutex, UINT64 releaseKey) noexcept
+        : m_mutex(mutex),
+          m_releaseKey(releaseKey)
+    {
+    }
+
+    ~ScopedKeyedMutexRelease()
+    {
+        ReleaseNow();
+    }
+
+    HRESULT ReleaseNow() noexcept
+    {
+        if (m_mutex != nullptr)
+        {
+            IDXGIKeyedMutex* mutex = m_mutex;
+            m_mutex = nullptr;
+            return mutex->ReleaseSync(m_releaseKey);
+        }
+        return S_OK;
+    }
+
+    ScopedKeyedMutexRelease(const ScopedKeyedMutexRelease&) = delete;
+    ScopedKeyedMutexRelease& operator=(const ScopedKeyedMutexRelease&) = delete;
+
+private:
+    IDXGIKeyedMutex* m_mutex{nullptr};
+    UINT64 m_releaseKey{0ULL};
+};
+
 } // namespace
 
 LatencySummaryStats
@@ -488,11 +524,355 @@ FrameConsumer::FrameConsumer(
 FrameConsumer::~FrameConsumer()
 {
     Disconnect();
+    ClearGpuSharedResources();
+    m_diagnosticStagingTexture.Reset();
+    m_hostGpuWorkingTexture.Reset();
+    m_d3dContext.Reset();
+    m_d3dDevice1.Reset();
+    m_d3dDevice.Reset();
     if (m_ioEvent != nullptr)
     {
         CloseHandle(m_ioEvent);
         m_ioEvent = nullptr;
     }
+}
+
+void
+FrameConsumer::ClearGpuSharedResources() noexcept
+{
+    for (auto& entry : m_sharedSlotCache)
+    {
+        entry.Reset();
+    }
+    m_slotSeenInSession.fill(false);
+}
+
+HRESULT
+FrameConsumer::EnsureD3d11DeviceForAdapterLuid(
+    LUID serverAdapterLuid
+    ) noexcept
+{
+    const LUID expectedLuid = m_config.HasForcedAdapterLuid ? m_config.ForcedAdapterLuid : serverAdapterLuid;
+    if (m_config.HasForcedAdapterLuid &&
+        (m_config.ForcedAdapterLuid.LowPart != serverAdapterLuid.LowPart ||
+         m_config.ForcedAdapterLuid.HighPart != serverAdapterLuid.HighPart))
+    {
+        return DXGI_ERROR_INVALID_CALL;
+    }
+
+    if (m_hasBoundD3dDevice &&
+        m_d3dDevice != nullptr &&
+        m_d3dDevice1 != nullptr &&
+        m_d3dContext != nullptr &&
+        m_boundAdapterLuid.LowPart == expectedLuid.LowPart &&
+        m_boundAdapterLuid.HighPart == expectedLuid.HighPart &&
+        SUCCEEDED(m_d3dDevice->GetDeviceRemovedReason()))
+    {
+        return S_OK;
+    }
+
+    ClearGpuSharedResources();
+    m_diagnosticStagingTexture.Reset();
+    m_hostGpuWorkingTexture.Reset();
+    m_d3dContext.Reset();
+    m_d3dDevice1.Reset();
+    m_d3dDevice.Reset();
+    m_hasBoundD3dDevice = false;
+    m_workingWidth = 0U;
+    m_workingHeight = 0U;
+    m_workingFormat = DXGI_FORMAT_UNKNOWN;
+    m_stagingWidth = 0U;
+    m_stagingHeight = 0U;
+    m_stagingFormat = DXGI_FORMAT_UNKNOWN;
+
+    static constexpr D3D_FEATURE_LEVEL kLevels[] = {
+        D3D_FEATURE_LEVEL_11_1,
+        D3D_FEATURE_LEVEL_11_0,
+        D3D_FEATURE_LEVEL_10_1,
+        D3D_FEATURE_LEVEL_10_0};
+
+    Microsoft::WRL::ComPtr<IDXGIFactory4> dxgiFactory;
+    HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&dxgiFactory));
+    if (FAILED(hr) || dxgiFactory == nullptr)
+    {
+        return FAILED(hr) ? hr : E_FAIL;
+    }
+
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> targetAdapter;
+    const bool hasNonZeroLuid = (expectedLuid.LowPart != 0UL || expectedLuid.HighPart != 0L);
+    if (hasNonZeroLuid)
+    {
+        hr = dxgiFactory->EnumAdapterByLuid(expectedLuid, IID_PPV_ARGS(&targetAdapter));
+        if (FAILED(hr) || targetAdapter == nullptr)
+        {
+            if (!m_config.AllowWarpAdapterFallbackForSyntheticLuid)
+            {
+                return FAILED(hr) ? hr : DXGI_ERROR_NOT_FOUND;
+            }
+            targetAdapter.Reset();
+        }
+    }
+
+    D3D_FEATURE_LEVEL selectedLevel = D3D_FEATURE_LEVEL_11_0;
+    Microsoft::WRL::ComPtr<ID3D11Device> device;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> context;
+
+    if (targetAdapter != nullptr)
+    {
+        hr = D3D11CreateDevice(
+            targetAdapter.Get(),
+            D3D_DRIVER_TYPE_UNKNOWN,
+            nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            kLevels,
+            ARRAYSIZE(kLevels),
+            D3D11_SDK_VERSION,
+            &device,
+            &selectedLevel,
+            &context);
+    }
+    else
+    {
+        hr = D3D11CreateDevice(
+            nullptr,
+            D3D_DRIVER_TYPE_HARDWARE,
+            nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            kLevels,
+            ARRAYSIZE(kLevels),
+            D3D11_SDK_VERSION,
+            &device,
+            &selectedLevel,
+            &context);
+        if (FAILED(hr) && m_config.AllowWarpAdapterFallbackForSyntheticLuid)
+        {
+            hr = D3D11CreateDevice(
+                nullptr,
+                D3D_DRIVER_TYPE_WARP,
+                nullptr,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                kLevels,
+                ARRAYSIZE(kLevels),
+                D3D11_SDK_VERSION,
+                &device,
+                &selectedLevel,
+                &context);
+        }
+    }
+
+    if (FAILED(hr) || device == nullptr || context == nullptr)
+    {
+        return FAILED(hr) ? hr : E_FAIL;
+    }
+
+    Microsoft::WRL::ComPtr<ID3D11Device1> device1;
+    hr = device.As(&device1);
+    if (FAILED(hr) || device1 == nullptr)
+    {
+        return FAILED(hr) ? hr : E_NOINTERFACE;
+    }
+
+    m_d3dDevice = device;
+    m_d3dDevice1 = device1;
+    m_d3dContext = context;
+    m_boundAdapterLuid = expectedLuid;
+    m_hasBoundD3dDevice = true;
+    return S_OK;
+}
+
+HRESULT
+FrameConsumer::EnsureHostWorkingTexture(
+    uint32_t width,
+    uint32_t height,
+    DXGI_FORMAT format
+    ) noexcept
+{
+    if (m_d3dDevice == nullptr)
+    {
+        return E_NOT_VALID_STATE;
+    }
+
+    if (m_hostGpuWorkingTexture != nullptr &&
+        m_workingWidth == width &&
+        m_workingHeight == height &&
+        m_workingFormat == format)
+    {
+        return S_OK;
+    }
+
+    m_hostGpuWorkingTexture.Reset();
+    m_workingWidth = 0U;
+    m_workingHeight = 0U;
+    m_workingFormat = DXGI_FORMAT_UNKNOWN;
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 1U;
+    desc.ArraySize = 1U;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1U;
+    desc.SampleDesc.Quality = 0U;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> working;
+    HRESULT hr = m_d3dDevice->CreateTexture2D(&desc, nullptr, &working);
+    if (FAILED(hr) || working == nullptr)
+    {
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        hr = m_d3dDevice->CreateTexture2D(&desc, nullptr, &working);
+        if (FAILED(hr) || working == nullptr)
+        {
+            return FAILED(hr) ? hr : E_OUTOFMEMORY;
+        }
+    }
+
+    m_hostGpuWorkingTexture = working;
+    m_workingWidth = width;
+    m_workingHeight = height;
+    m_workingFormat = format;
+    return S_OK;
+}
+
+HRESULT
+FrameConsumer::VerifyWorkingGpuTextureSyntheticPattern(
+    uint32_t presentationFrameNumber,
+    uint32_t width,
+    uint32_t height,
+    DXGI_FORMAT format,
+    bool& outMatches
+    ) noexcept
+{
+    outMatches = false;
+    if (m_d3dDevice == nullptr || m_d3dContext == nullptr || m_hostGpuWorkingTexture == nullptr)
+    {
+        return E_NOT_VALID_STATE;
+    }
+
+    if (m_diagnosticStagingTexture == nullptr ||
+        m_stagingWidth != width ||
+        m_stagingHeight != height ||
+        m_stagingFormat != format)
+    {
+        m_diagnosticStagingTexture.Reset();
+        m_stagingWidth = 0U;
+        m_stagingHeight = 0U;
+        m_stagingFormat = DXGI_FORMAT_UNKNOWN;
+
+        D3D11_TEXTURE2D_DESC stDesc{};
+        stDesc.Width = width;
+        stDesc.Height = height;
+        stDesc.MipLevels = 1U;
+        stDesc.ArraySize = 1U;
+        stDesc.Format = format;
+        stDesc.SampleDesc.Count = 1U;
+        stDesc.Usage = D3D11_USAGE_STAGING;
+        stDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+        HRESULT hr = m_d3dDevice->CreateTexture2D(&stDesc, nullptr, &m_diagnosticStagingTexture);
+        if (FAILED(hr) || m_diagnosticStagingTexture == nullptr)
+        {
+            return FAILED(hr) ? hr : E_OUTOFMEMORY;
+        }
+        m_stagingWidth = width;
+        m_stagingHeight = height;
+        m_stagingFormat = format;
+    }
+
+    m_d3dContext->CopyResource(m_diagnosticStagingTexture.Get(), m_hostGpuWorkingTexture.Get());
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    HRESULT mapHr = m_d3dContext->Map(m_diagnosticStagingTexture.Get(), 0U, D3D11_MAP_READ, 0U, &mapped);
+    if (FAILED(mapHr))
+    {
+        return mapHr;
+    }
+
+    uint32_t rowPitch = 0U;
+    uint32_t payloadBytes = 0U;
+    if (!ipc::ComputeTightRowPitchBytes(width, rowPitch) ||
+        !ipc::ComputeValidatedFramePayloadBytes(width, height, rowPitch, payloadBytes) ||
+        mapped.pData == nullptr ||
+        mapped.RowPitch < rowPitch)
+    {
+        m_d3dContext->Unmap(m_diagnosticStagingTexture.Get(), 0U);
+        return E_FAIL;
+    }
+
+    std::vector<uint8_t> packed;
+    try
+    {
+        packed.resize(payloadBytes);
+    }
+    catch (const std::bad_alloc&)
+    {
+        m_d3dContext->Unmap(m_diagnosticStagingTexture.Get(), 0U);
+        return E_OUTOFMEMORY;
+    }
+
+    const uint8_t* src = static_cast<const uint8_t*>(mapped.pData);
+    for (uint32_t y = 0U; y < height; ++y)
+    {
+        std::memcpy(
+            packed.data() + static_cast<size_t>(y) * rowPitch,
+            src + static_cast<size_t>(y) * mapped.RowPitch,
+            rowPitch);
+    }
+    m_d3dContext->Unmap(m_diagnosticStagingTexture.Get(), 0U);
+
+    {
+        ExclusiveLock lock(&m_metricsLock);
+        ++m_metrics.CpuStagingReadsPerformed;
+    }
+
+    outMatches = ipc::VerifySyntheticTestPatternBgra8(
+        presentationFrameNumber,
+        width,
+        height,
+        packed.data(),
+        packed.size());
+    return S_OK;
+}
+
+HRESULT
+FrameConsumer::SendGpuFrameAck(
+    uint64_t frameSequence,
+    uint32_t presentationFrameNumber,
+    ipc::FrameIpcStatus status,
+    uint16_t slotIndex,
+    uint16_t slotGeneration,
+    uint32_t gpuSyncWaitUs,
+    uint64_t receiveQpc,
+    HANDLE stopEvent
+    ) noexcept
+{
+    ipc::FrameIpcFrameAck ack{};
+    ack.Envelope = ipc::InitEnvelope(
+        ipc::FrameIpcMessageType::FrameAck,
+        static_cast<uint32_t>(sizeof(ipc::FrameIpcFrameAck)),
+        ipc::kFrameIpcProtocolVersionMinorV1_1);
+    ack.SessionId = m_sessionId;
+    ack.FrameSequence = frameSequence;
+    ack.PresentationFrameNumber = presentationFrameNumber;
+    ack.Status = static_cast<uint32_t>(status);
+    ack.HostReceiveQpcTime = receiveQpc;
+    ack.Reserved1 = ipc::PackGpuFrameAckData(slotIndex, slotGeneration, gpuSyncWaitUs);
+
+    size_t ackBytesWritten = 0U;
+    const DWORD ackErr = WriteExactOverlapped(
+        m_pipeHandle,
+        m_ioEvent,
+        stopEvent,
+        &ack,
+        sizeof(ack),
+        m_config.IoTimeoutMs,
+        ackBytesWritten);
+    if (ackErr != ERROR_SUCCESS)
+    {
+        return HRESULT_FROM_WIN32(ackErr);
+    }
+    return S_OK;
 }
 
 void
@@ -539,6 +919,7 @@ FrameConsumer::UpdateDerivedFpsAndLatenciesLocked(
     m_metrics.EndToEndLatency = m_endToEndLat.Summarize();
     m_metrics.LiveEndToEndLatency = m_liveEndToEndLat.Summarize();
     m_metrics.InterFrameInterval = m_interFrameLat.Summarize();
+    m_metrics.GpuSyncWaitLatency = m_gpuSyncWaitLat.Summarize();
 }
 
 HRESULT
@@ -576,13 +957,18 @@ FrameConsumer::Connect(
             return hr;
         }
 
+        const DWORD sqosFlags =
+            (m_config.TransportPreference == HostTransportPreference::CpuStagingOnly)
+                ? (SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION)
+                : (SECURITY_SQOS_PRESENT | SECURITY_IMPERSONATION);
+
         openedPipe = CreateFileW(
             m_config.PipeName.c_str(),
             GENERIC_READ | GENERIC_WRITE,
             0U,
             nullptr,
             OPEN_EXISTING,
-            FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+            FILE_FLAG_OVERLAPPED | sqosFlags,
             nullptr);
         if (openedPipe != INVALID_HANDLE_VALUE)
         {
@@ -652,13 +1038,29 @@ FrameConsumer::Connect(
         return hr;
     }
 
+    const bool requestGpu = (m_config.TransportPreference != HostTransportPreference::CpuStagingOnly);
+    uint32_t clientCaps = 0U;
+    if (requestGpu)
+    {
+        clientCaps |= static_cast<uint32_t>(ipc::FrameIpcCapabilities::GpuSharedNtHandle);
+    }
+    if (m_config.TransportPreference != HostTransportPreference::GpuSharedOnly || m_config.AllowCpuFallback)
+    {
+        clientCaps |= static_cast<uint32_t>(ipc::FrameIpcCapabilities::CpuStagingRawPixels);
+        if (requestGpu && m_config.AllowCpuFallback)
+        {
+            clientCaps |= static_cast<uint32_t>(ipc::FrameIpcCapabilities::GpuFallbackToCpuStaging);
+        }
+    }
+
     ipc::FrameIpcClientHello clientHello{};
     clientHello.Envelope = ipc::InitEnvelope(
         ipc::FrameIpcMessageType::ClientHello,
-        static_cast<uint32_t>(sizeof(ipc::FrameIpcClientHello)));
+        static_cast<uint32_t>(sizeof(ipc::FrameIpcClientHello)),
+        requestGpu ? ipc::kFrameIpcProtocolVersionMinorV1_1 : ipc::kFrameIpcProtocolVersionMinor);
     clientHello.ClientProcessId = GetCurrentProcessId();
     clientHello.ClientSessionId = static_cast<uint32_t>(clientSessionId);
-    clientHello.ClientCapabilities = 1U;
+    clientHello.ClientCapabilities = clientCaps;
 
     size_t helloWritten = 0U;
     const DWORD writeErr = WriteExactOverlapped(
@@ -738,9 +1140,74 @@ FrameConsumer::Connect(
         return hr;
     }
 
+    const uint32_t negotiatedCaps = ipc::UnpackServerHelloCapabilities(serverHello.Reserved1);
+    const uint32_t negotiatedPoolSize = ipc::UnpackServerHelloSharedPoolSize(serverHello.Reserved1);
+    const bool serverAgreedGpu =
+        (negotiatedCaps & static_cast<uint32_t>(ipc::FrameIpcCapabilities::GpuSharedNtHandle)) != 0U;
+    const LUID serverAdapterLuid{
+        static_cast<DWORD>(serverHello.AdapterLuidLow),
+        static_cast<LONG>(serverHello.AdapterLuidHigh)};
+
+    if (m_config.HasForcedAdapterLuid &&
+        (m_config.ForcedAdapterLuid.LowPart != serverAdapterLuid.LowPart ||
+         m_config.ForcedAdapterLuid.HighPart != serverAdapterLuid.HighPart))
+    {
+        ClosePipeAndResetConnectionState(false);
+        ExclusiveLock lock(&m_metricsLock);
+        ++m_metrics.AdapterMismatchErrors;
+        ++m_metrics.ProtocolErrors;
+        m_metrics.LastProtocolStatus = ipc::FrameIpcStatus::AdapterLuidMismatch;
+        m_metrics.LastErrorHResult = DXGI_ERROR_INVALID_CALL;
+        m_metrics.TransportHealthy = false;
+        return DXGI_ERROR_INVALID_CALL;
+    }
+
+    if (m_config.TransportPreference == HostTransportPreference::GpuSharedOnly && !serverAgreedGpu)
+    {
+        ClosePipeAndResetConnectionState(false);
+        ExclusiveLock lock(&m_metricsLock);
+        ++m_metrics.ProtocolErrors;
+        m_metrics.LastProtocolStatus = ipc::FrameIpcStatus::VersionMismatch;
+        m_metrics.LastErrorHResult = DXGI_ERROR_UNSUPPORTED;
+        m_metrics.TransportHealthy = false;
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+
+    bool activeGpuMode = serverAgreedGpu;
+    bool fallbackActivated = false;
+    if (activeGpuMode)
+    {
+        const HRESULT d3dHr = EnsureD3d11DeviceForAdapterLuid(serverAdapterLuid);
+        if (FAILED(d3dHr))
+        {
+            if (m_config.AllowCpuFallback &&
+                (negotiatedCaps & static_cast<uint32_t>(ipc::FrameIpcCapabilities::CpuStagingRawPixels)) != 0U &&
+                m_config.TransportPreference != HostTransportPreference::GpuSharedOnly)
+            {
+                activeGpuMode = false;
+                fallbackActivated = true;
+            }
+            else
+            {
+                ClosePipeAndResetConnectionState(false);
+                ExclusiveLock lock(&m_metricsLock);
+                ++m_metrics.AdapterMismatchErrors;
+                m_metrics.LastProtocolStatus = ipc::FrameIpcStatus::AdapterLuidMismatch;
+                m_metrics.LastErrorHResult = d3dHr;
+                m_metrics.TransportHealthy = false;
+                return d3dHr;
+            }
+        }
+    }
+    else if (requestGpu && m_config.AllowCpuFallback)
+    {
+        fallbackActivated = true;
+    }
+
     m_sessionId = serverHello.SessionId;
     m_sessionConnectQpc = QueryCurrentQpc();
     m_currentSessionFrames = 0ULL;
+    m_slotSeenInSession.fill(false);
 
     {
         ExclusiveLock lock(&m_metricsLock);
@@ -750,6 +1217,14 @@ FrameConsumer::Connect(
         m_metrics.AdapterLuidLow = serverHello.AdapterLuidLow;
         m_metrics.AdapterLuidHigh = serverHello.AdapterLuidHigh;
         m_metrics.ServerMaxQueueDepth = serverHello.MaxQueueDepth;
+        m_metrics.NegotiatedTransportMode = activeGpuMode
+            ? ipc::FrameIpcTransportMode::GpuSharedNtHandle
+            : ipc::FrameIpcTransportMode::CpuStagingPipe;
+        m_metrics.FallbackToCpuActivated = fallbackActivated;
+        if (negotiatedPoolSize > 0U)
+        {
+            m_metrics.SharedTexturePoolSize = negotiatedPoolSize;
+        }
         if (m_metrics.ConnectCount > 0ULL)
         {
             ++m_metrics.ReconnectCount;
@@ -770,6 +1245,29 @@ FrameConsumer::ReceiveNextFrame(
     HANDLE stopEvent
     ) noexcept
 {
+    bool isGpu = false;
+    ipc::FrameIpcGpuFrameHeader gpuHeader{};
+    return ReceiveNextGpuOrCpuFrame(
+        isGpu,
+        gpuHeader,
+        outHeader,
+        outPixels,
+        timeoutMs,
+        stopEvent);
+}
+
+HRESULT
+FrameConsumer::ReceiveNextGpuOrCpuFrame(
+    bool& outIsGpuFrame,
+    ipc::FrameIpcGpuFrameHeader& outGpuHeader,
+    ipc::FrameIpcFrameHeader& outHeader,
+    std::vector<uint8_t>& outPixels,
+    DWORD timeoutMs,
+    HANDLE stopEvent
+    ) noexcept
+{
+    outIsGpuFrame = false;
+    outGpuHeader = {};
     outHeader = {};
     outPixels.clear();
 
@@ -859,16 +1357,511 @@ FrameConsumer::ReceiveNextFrame(
         return S_FALSE;
     }
 
+    if (env.Magic == ipc::kFrameIpcMagic &&
+        env.VersionMajor == ipc::kFrameIpcProtocolVersionMajor &&
+        env.VersionMinor == ipc::kFrameIpcProtocolVersionMinorV1_1 &&
+        env.MessageType == static_cast<uint16_t>(ipc::FrameIpcMessageType::GpuFrameHeader) &&
+        env.HeaderSizeBytes == sizeof(ipc::FrameIpcGpuFrameHeader))
+    {
+        std::memcpy(&outGpuHeader.Envelope, &env, sizeof(env));
+        size_t gpuHdrBytesRead = 0U;
+        const DWORD hdrErr = ReadExactOverlapped(
+            m_pipeHandle,
+            m_ioEvent,
+            stopEvent,
+            reinterpret_cast<uint8_t*>(&outGpuHeader) + sizeof(env),
+            sizeof(outGpuHeader) - sizeof(env),
+            m_config.IoTimeoutMs,
+            gpuHdrBytesRead);
+        if (hdrErr != ERROR_SUCCESS)
+        {
+            const HRESULT hr = HRESULT_FROM_WIN32(hdrErr);
+            ClosePipeAndResetConnectionState(false);
+            ExclusiveLock lock(&m_metricsLock);
+            if (hdrErr == ERROR_TIMEOUT)
+            {
+                ++m_metrics.FatalIoTimeouts;
+                ++m_metrics.PartialMessageTimeouts;
+            }
+            if (hdrErr != ERROR_OPERATION_ABORTED)
+            {
+                ++m_metrics.FatalIpcErrors;
+                m_metrics.TransportHealthy = false;
+            }
+            m_metrics.LastErrorHResult = hr;
+            return hr;
+        }
+
+        const ipc::FrameIpcStatus gpuHdrStatus = ipc::ValidateGpuFrameHeader(
+            &outGpuHeader,
+            sizeof(outGpuHeader),
+            m_sessionId);
+        if (gpuHdrStatus != ipc::FrameIpcStatus::Ok)
+        {
+            ClosePipeAndResetConnectionState(false);
+            ExclusiveLock lock(&m_metricsLock);
+            ++m_metrics.ProtocolErrors;
+            ++m_metrics.FatalIpcErrors;
+            m_metrics.TransportHealthy = false;
+            m_metrics.LastProtocolStatus = gpuHdrStatus;
+            m_metrics.LastErrorHResult = E_INVALIDARG;
+            return E_INVALIDARG;
+        }
+
+        const uint64_t recvHeaderQpc = QueryCurrentQpc();
+        const LUID hdrLuid{
+            static_cast<DWORD>(outGpuHeader.AdapterLuidLow),
+            static_cast<LONG>(outGpuHeader.AdapterLuidHigh)};
+        if (m_config.HasForcedAdapterLuid &&
+            (hdrLuid.LowPart != m_config.ForcedAdapterLuid.LowPart ||
+             hdrLuid.HighPart != m_config.ForcedAdapterLuid.HighPart))
+        {
+            (void)SendGpuFrameAck(
+                outGpuHeader.FrameSequence,
+                outGpuHeader.PresentationFrameNumber,
+                ipc::FrameIpcStatus::AdapterLuidMismatch,
+                static_cast<uint16_t>(outGpuHeader.SlotIndex),
+                static_cast<uint16_t>(outGpuHeader.SlotGeneration),
+                0U,
+                recvHeaderQpc,
+                stopEvent);
+            ClosePipeAndResetConnectionState(false);
+            ExclusiveLock lock(&m_metricsLock);
+            ++m_metrics.AdapterMismatchErrors;
+            ++m_metrics.ProtocolErrors;
+            m_metrics.LastProtocolStatus = ipc::FrameIpcStatus::AdapterLuidMismatch;
+            m_metrics.LastErrorHResult = DXGI_ERROR_INVALID_CALL;
+            m_metrics.TransportHealthy = false;
+            return DXGI_ERROR_INVALID_CALL;
+        }
+
+        const HRESULT devHr = EnsureD3d11DeviceForAdapterLuid(hdrLuid);
+        if (FAILED(devHr))
+        {
+            (void)SendGpuFrameAck(
+                outGpuHeader.FrameSequence,
+                outGpuHeader.PresentationFrameNumber,
+                ipc::FrameIpcStatus::DeviceRemoved,
+                static_cast<uint16_t>(outGpuHeader.SlotIndex),
+                static_cast<uint16_t>(outGpuHeader.SlotGeneration),
+                0U,
+                recvHeaderQpc,
+                stopEvent);
+            ClosePipeAndResetConnectionState(false);
+            ExclusiveLock lock(&m_metricsLock);
+            ++m_metrics.FatalIpcErrors;
+            m_metrics.LastProtocolStatus = ipc::FrameIpcStatus::DeviceRemoved;
+            m_metrics.LastErrorHResult = devHr;
+            m_metrics.TransportHealthy = false;
+            return devHr;
+        }
+
+        const uint32_t slotIdx = outGpuHeader.SlotIndex;
+        HostSharedSlotCacheEntry& cacheEntry = m_sharedSlotCache[slotIdx];
+        const bool isNewHandleFlag =
+            (outGpuHeader.SyncAndFallbackFlags & static_cast<uint32_t>(ipc::FrameIpcGpuFrameFlags::NewHandleDuplicated)) != 0U;
+
+        if (m_config.SimulateInvalidSharedHandleForTesting)
+        {
+            if (isNewHandleFlag && outGpuHeader.DuplicatedNtHandleValue != 0ULL)
+            {
+                const HANDLE leakedDup = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(outGpuHeader.DuplicatedNtHandleValue));
+                if (leakedDup != nullptr && leakedDup != INVALID_HANDLE_VALUE)
+                {
+                    CloseHandle(leakedDup);
+                }
+            }
+            (void)SendGpuFrameAck(
+                outGpuHeader.FrameSequence,
+                outGpuHeader.PresentationFrameNumber,
+                ipc::FrameIpcStatus::ResourceOpenFailed,
+                static_cast<uint16_t>(slotIdx),
+                static_cast<uint16_t>(outGpuHeader.SlotGeneration),
+                0U,
+                recvHeaderQpc,
+                stopEvent);
+            ClosePipeAndResetConnectionState(false);
+            ExclusiveLock lock(&m_metricsLock);
+            ++m_metrics.GpuSharedOpenFailures;
+            ++m_metrics.FatalIpcErrors;
+            m_metrics.LastProtocolStatus = ipc::FrameIpcStatus::ResourceOpenFailed;
+            m_metrics.LastErrorHResult = E_HANDLE;
+            m_metrics.TransportHealthy = false;
+            return E_HANDLE;
+        }
+
+        if (isNewHandleFlag || cacheEntry.SlotGeneration != outGpuHeader.SlotGeneration || cacheEntry.SharedTexture == nullptr)
+        {
+            const HANDLE incomingHandle =
+                reinterpret_cast<HANDLE>(static_cast<uintptr_t>(outGpuHeader.DuplicatedNtHandleValue));
+            if (incomingHandle == nullptr || incomingHandle == INVALID_HANDLE_VALUE)
+            {
+                (void)SendGpuFrameAck(
+                    outGpuHeader.FrameSequence,
+                    outGpuHeader.PresentationFrameNumber,
+                    ipc::FrameIpcStatus::ResourceOpenFailed,
+                    static_cast<uint16_t>(slotIdx),
+                    static_cast<uint16_t>(outGpuHeader.SlotGeneration),
+                    0U,
+                    recvHeaderQpc,
+                    stopEvent);
+                ClosePipeAndResetConnectionState(false);
+                ExclusiveLock lock(&m_metricsLock);
+                ++m_metrics.GpuSharedOpenFailures;
+                ++m_metrics.FatalIpcErrors;
+                m_metrics.LastProtocolStatus = ipc::FrameIpcStatus::ResourceOpenFailed;
+                m_metrics.LastErrorHResult = E_HANDLE;
+                m_metrics.TransportHealthy = false;
+                return E_HANDLE;
+            }
+
+            cacheEntry.Reset();
+            cacheEntry.DuplicatedNtHandle = incomingHandle;
+
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> openedTex;
+            const HRESULT openHr = m_d3dDevice1->OpenSharedResource1(incomingHandle, IID_PPV_ARGS(&openedTex));
+            if (FAILED(openHr) || openedTex == nullptr)
+            {
+                cacheEntry.Reset();
+                (void)SendGpuFrameAck(
+                    outGpuHeader.FrameSequence,
+                    outGpuHeader.PresentationFrameNumber,
+                    ipc::FrameIpcStatus::ResourceOpenFailed,
+                    static_cast<uint16_t>(slotIdx),
+                    static_cast<uint16_t>(outGpuHeader.SlotGeneration),
+                    0U,
+                    recvHeaderQpc,
+                    stopEvent);
+                ClosePipeAndResetConnectionState(false);
+                ExclusiveLock lock(&m_metricsLock);
+                ++m_metrics.GpuSharedOpenFailures;
+                ++m_metrics.FatalIpcErrors;
+                m_metrics.LastProtocolStatus = ipc::FrameIpcStatus::ResourceOpenFailed;
+                m_metrics.LastErrorHResult = FAILED(openHr) ? openHr : E_FAIL;
+                m_metrics.TransportHealthy = false;
+                return FAILED(openHr) ? openHr : E_FAIL;
+            }
+
+            Microsoft::WRL::ComPtr<IDXGIKeyedMutex> keyedMutex;
+            const HRESULT kmHr = openedTex.As(&keyedMutex);
+            if (FAILED(kmHr) || keyedMutex == nullptr)
+            {
+                cacheEntry.Reset();
+                (void)SendGpuFrameAck(
+                    outGpuHeader.FrameSequence,
+                    outGpuHeader.PresentationFrameNumber,
+                    ipc::FrameIpcStatus::ResourceOpenFailed,
+                    static_cast<uint16_t>(slotIdx),
+                    static_cast<uint16_t>(outGpuHeader.SlotGeneration),
+                    0U,
+                    recvHeaderQpc,
+                    stopEvent);
+                ClosePipeAndResetConnectionState(false);
+                ExclusiveLock lock(&m_metricsLock);
+                ++m_metrics.GpuSharedOpenFailures;
+                ++m_metrics.FatalIpcErrors;
+                m_metrics.LastProtocolStatus = ipc::FrameIpcStatus::ResourceOpenFailed;
+                m_metrics.LastErrorHResult = FAILED(kmHr) ? kmHr : E_NOINTERFACE;
+                m_metrics.TransportHealthy = false;
+                return FAILED(kmHr) ? kmHr : E_NOINTERFACE;
+            }
+
+            cacheEntry.SharedTexture = openedTex;
+            cacheEntry.KeyedMutex = keyedMutex;
+            cacheEntry.SlotGeneration = outGpuHeader.SlotGeneration;
+
+            ExclusiveLock lock(&m_metricsLock);
+            ++m_metrics.GpuFramesOpened;
+        }
+
+        if (!m_slotSeenInSession[slotIdx])
+        {
+            m_slotSeenInSession[slotIdx] = true;
+            uint32_t activeSlots = 0U;
+            for (bool seen : m_slotSeenInSession)
+            {
+                if (seen)
+                {
+                    ++activeSlots;
+                }
+            }
+            ExclusiveLock lock(&m_metricsLock);
+            if (activeSlots > m_metrics.SharedTexturePoolPeakUsage)
+            {
+                m_metrics.SharedTexturePoolPeakUsage = activeSlots;
+            }
+        }
+
+        const uint64_t syncWaitStartQpc = QueryCurrentQpc();
+        const HRESULT acqSyncHr = cacheEntry.KeyedMutex->AcquireSync(
+            outGpuHeader.KeyedMutexAcquireKey,
+            outGpuHeader.KeyedMutexTimeoutMs);
+        const uint64_t syncWaitEndQpc = QueryCurrentQpc();
+        const uint64_t syncWaitUs64 = ipc::ComputeQpcElapsedUs(syncWaitStartQpc, syncWaitEndQpc, m_qpcFreq);
+        const uint32_t syncWaitUs32 = (syncWaitUs64 > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : static_cast<uint32_t>(syncWaitUs64);
+
+        if (acqSyncHr != S_OK)
+        {
+            cacheEntry.Reset();
+            (void)SendGpuFrameAck(
+                outGpuHeader.FrameSequence,
+                outGpuHeader.PresentationFrameNumber,
+                ipc::FrameIpcStatus::GpuSyncTimeout,
+                static_cast<uint16_t>(slotIdx),
+                static_cast<uint16_t>(outGpuHeader.SlotGeneration),
+                syncWaitUs32,
+                syncWaitEndQpc,
+                stopEvent);
+            ClosePipeAndResetConnectionState(false);
+            ExclusiveLock lock(&m_metricsLock);
+            ++m_metrics.GpuSyncTimeouts;
+            ++m_metrics.FatalIpcErrors;
+            m_metrics.LastProtocolStatus = ipc::FrameIpcStatus::GpuSyncTimeout;
+            m_metrics.LastErrorHResult = (acqSyncHr == static_cast<HRESULT>(WAIT_TIMEOUT))
+                ? HRESULT_FROM_WIN32(ERROR_TIMEOUT)
+                : E_FAIL;
+            m_metrics.TransportHealthy = false;
+            return m_metrics.LastErrorHResult;
+        }
+
+        if (m_config.SimulateDisconnectWhileHoldingMutexForTesting)
+        {
+            // Deliberately abort connection while holding KeyedMutex so tests prove driver slot recovery.
+            ClosePipeAndResetConnectionState(false);
+            return HRESULT_FROM_WIN32(ERROR_CONNECTION_ABORTED);
+        }
+
+        bool patternOk = true;
+        HRESULT gpuWorkHr = EnsureHostWorkingTexture(
+            outGpuHeader.Width,
+            outGpuHeader.Height,
+            static_cast<DXGI_FORMAT>(outGpuHeader.PixelFormat));
+        if (SUCCEEDED(gpuWorkHr))
+        {
+            ScopedKeyedMutexRelease mutexReleaseGuard(
+                cacheEntry.KeyedMutex.Get(),
+                outGpuHeader.KeyedMutexReleaseKey);
+            m_d3dContext->CopyResource(m_hostGpuWorkingTexture.Get(), cacheEntry.SharedTexture.Get());
+            const HRESULT relHr = mutexReleaseGuard.ReleaseNow();
+            if (FAILED(relHr))
+            {
+                gpuWorkHr = relHr;
+            }
+        }
+        else
+        {
+            (void)cacheEntry.KeyedMutex->ReleaseSync(outGpuHeader.KeyedMutexReleaseKey);
+        }
+
+        if (FAILED(gpuWorkHr))
+        {
+            cacheEntry.Reset();
+            (void)SendGpuFrameAck(
+                outGpuHeader.FrameSequence,
+                outGpuHeader.PresentationFrameNumber,
+                ipc::FrameIpcStatus::DeviceRemoved,
+                static_cast<uint16_t>(slotIdx),
+                static_cast<uint16_t>(outGpuHeader.SlotGeneration),
+                syncWaitUs32,
+                QueryCurrentQpc(),
+                stopEvent);
+            ClosePipeAndResetConnectionState(false);
+            ExclusiveLock lock(&m_metricsLock);
+            ++m_metrics.FatalIpcErrors;
+            m_metrics.LastErrorHResult = gpuWorkHr;
+            m_metrics.TransportHealthy = false;
+            return gpuWorkHr;
+        }
+
+        if (m_config.VerifySyntheticPattern)
+        {
+            const HRESULT patHr = VerifyWorkingGpuTextureSyntheticPattern(
+                outGpuHeader.PresentationFrameNumber,
+                outGpuHeader.Width,
+                outGpuHeader.Height,
+                static_cast<DXGI_FORMAT>(outGpuHeader.PixelFormat),
+                patternOk);
+            if (FAILED(patHr))
+            {
+                patternOk = false;
+            }
+        }
+
+        if (m_config.SimulatedAckDelayMsForTesting > 0U)
+        {
+            Sleep(m_config.SimulatedAckDelayMsForTesting);
+        }
+
+        const uint64_t recvCompleteQpc = QueryCurrentQpc();
+        if (m_config.SendAck)
+        {
+            const HRESULT ackSendHr = SendGpuFrameAck(
+                outGpuHeader.FrameSequence,
+                outGpuHeader.PresentationFrameNumber,
+                ipc::FrameIpcStatus::Ok,
+                static_cast<uint16_t>(slotIdx),
+                static_cast<uint16_t>(outGpuHeader.SlotGeneration),
+                syncWaitUs32,
+                recvCompleteQpc,
+                stopEvent);
+            if (FAILED(ackSendHr))
+            {
+                ClosePipeAndResetConnectionState(false);
+                ExclusiveLock lock(&m_metricsLock);
+                if (ackSendHr == HRESULT_FROM_WIN32(ERROR_TIMEOUT))
+                {
+                    ++m_metrics.FatalIoTimeouts;
+                }
+                if (ackSendHr != HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED))
+                {
+                    ++m_metrics.FatalIpcErrors;
+                    m_metrics.TransportHealthy = false;
+                }
+                m_metrics.LastErrorHResult = ackSendHr;
+                return ackSendHr;
+            }
+        }
+
+        const uint64_t ackCompleteQpc = QueryCurrentQpc();
+        ipc::FrameIpcFrameHeader synthHdr{};
+        synthHdr.Envelope = outGpuHeader.Envelope;
+        synthHdr.SessionId = outGpuHeader.SessionId;
+        synthHdr.FrameSequence = outGpuHeader.FrameSequence;
+        synthHdr.PresentationFrameNumber = outGpuHeader.PresentationFrameNumber;
+        synthHdr.Width = outGpuHeader.Width;
+        synthHdr.Height = outGpuHeader.Height;
+        synthHdr.RowPitchBytes = outGpuHeader.Width * ipc::kBytesPerPixelBgra8;
+        synthHdr.PixelFormat = outGpuHeader.PixelFormat;
+        synthHdr.Flags = outGpuHeader.Flags;
+        synthHdr.PresentDisplayQpcTime = outGpuHeader.PresentDisplayQpcTime;
+        synthHdr.ExtractCompleteQpcTime = outGpuHeader.ExtractCompleteQpcTime;
+        synthHdr.ServerSendQpcTime = outGpuHeader.ServerSendQpcTime;
+        synthHdr.QpcFrequency = outGpuHeader.QpcFrequency;
+
+        const ValidatedFrameIntervals intervals = ComputeValidatedFrameIntervals(
+            synthHdr,
+            recvCompleteQpc,
+            ackCompleteQpc,
+            m_qpcFreq,
+            m_config.SendAck);
+
+        {
+            ExclusiveLock lock(&m_metricsLock);
+            if (m_metrics.LastFrameSequence != 0ULL &&
+                outGpuHeader.FrameSequence > (m_metrics.LastFrameSequence + 1ULL))
+            {
+                m_metrics.SequenceGapsDetected += (outGpuHeader.FrameSequence - m_metrics.LastFrameSequence - 1ULL);
+            }
+
+            ++m_metrics.FramesReceived;
+            ++m_currentSessionFrames;
+            if (m_currentSessionFrames > m_metrics.MaxFramesPerSession)
+            {
+                m_metrics.MaxFramesPerSession = m_currentSessionFrames;
+            }
+            m_metrics.BytesReceived += sizeof(outGpuHeader);
+
+            if (!patternOk)
+            {
+                ++m_metrics.SyntheticPatternMismatches;
+                m_metrics.TransportHealthy = false;
+            }
+            else
+            {
+                ++m_metrics.FramesValid;
+                if (m_firstValidFrameQpc == 0ULL)
+                {
+                    m_firstValidFrameQpc = recvCompleteQpc;
+                }
+                m_lastValidFrameQpc = recvCompleteQpc;
+
+                if (intervals.PreConnectQueued)
+                {
+                    ++m_metrics.PreConnectFramesReceived;
+                }
+                else
+                {
+                    ++m_metrics.LiveFramesReceived;
+                    if (m_firstLiveFrameQpc == 0ULL)
+                    {
+                        m_firstLiveFrameQpc = recvCompleteQpc;
+                    }
+                    m_lastLiveFrameQpc = recvCompleteQpc;
+                }
+
+                if (m_prevValidRecvQpc > 0ULL)
+                {
+                    if (recvCompleteQpc >= m_prevValidRecvQpc)
+                    {
+                        m_interFrameLat.Record(
+                            ipc::ComputeQpcElapsedUs(m_prevValidRecvQpc, recvCompleteQpc, m_qpcFreq));
+                    }
+                    else
+                    {
+                        ++m_metrics.TimestampMeasurementErrors;
+                    }
+                }
+                m_prevValidRecvQpc = recvCompleteQpc;
+            }
+
+            m_metrics.LastFrameSequence = outGpuHeader.FrameSequence;
+            m_metrics.LastPresentationFrameNumber = outGpuHeader.PresentationFrameNumber;
+            m_metrics.LastFrameWidth = outGpuHeader.Width;
+            m_metrics.LastFrameHeight = outGpuHeader.Height;
+            m_metrics.LastPixelFormat = outGpuHeader.PixelFormat;
+            m_metrics.LastFrameChecksumCrc32 = 0U;
+            m_gpuSyncWaitLat.Record(syncWaitUs64);
+
+            if (!intervals.Valid)
+            {
+                ++m_metrics.TimestampMeasurementErrors;
+            }
+            else
+            {
+                m_copyLat.Record(intervals.CopyUs);
+                if (intervals.HasPresentToExtract)
+                {
+                    m_presentToExtractLat.Record(intervals.PresentToExtractUs);
+                }
+                m_queueWaitLat.Record(intervals.QueueWaitUs);
+                m_ipcTransitLat.Record(intervals.IpcTransitUs);
+                m_hostVerifyAckLat.Record(intervals.HostVerifyAckUs);
+                m_endToEndLat.Record(intervals.EndToEndUs);
+
+                if (!intervals.PreConnectQueued)
+                {
+                    m_liveQueueWaitLat.Record(intervals.QueueWaitUs);
+                    m_liveEndToEndLat.Record(intervals.EndToEndUs);
+                }
+
+                m_metrics.LastEndToEndLatencyUs = intervals.EndToEndUs;
+                m_metrics.TotalEndToEndLatencyUs += intervals.EndToEndUs;
+                m_metrics.AvgEndToEndLatencyUs =
+                    (m_endToEndLat.Count > 0ULL) ? (m_metrics.TotalEndToEndLatencyUs / m_endToEndLat.Count) : 0ULL;
+                if (intervals.EndToEndUs > m_metrics.MaxEndToEndLatencyUs)
+                {
+                    m_metrics.MaxEndToEndLatencyUs = intervals.EndToEndUs;
+                }
+                m_metrics.LastIpcTransitLatencyUs = intervals.IpcTransitUs;
+            }
+
+            UpdateDerivedFpsAndLatenciesLocked(ackCompleteQpc, m_executionStartQpc);
+        }
+
+        outIsGpuFrame = true;
+        return S_OK;
+    }
+
     if (env.Magic != ipc::kFrameIpcMagic ||
         env.VersionMajor != ipc::kFrameIpcProtocolVersionMajor ||
-        env.VersionMinor != ipc::kFrameIpcProtocolVersionMinor ||
+        !ipc::IsSupportedProtocolMinorVersion(env.VersionMinor) ||
         env.MessageType != static_cast<uint16_t>(ipc::FrameIpcMessageType::FrameHeader) ||
         env.HeaderSizeBytes != sizeof(ipc::FrameIpcFrameHeader))
     {
         const ipc::FrameIpcStatus badStatus =
             (env.Magic != ipc::kFrameIpcMagic) ? ipc::FrameIpcStatus::InvalidMagic :
             ((env.VersionMajor != ipc::kFrameIpcProtocolVersionMajor ||
-              env.VersionMinor != ipc::kFrameIpcProtocolVersionMinor)
+              !ipc::IsSupportedProtocolMinorVersion(env.VersionMinor))
                 ? ipc::FrameIpcStatus::VersionMismatch
                 : ipc::FrameIpcStatus::InvalidLength);
         ClosePipeAndResetConnectionState(false);
@@ -1152,7 +2145,12 @@ FrameConsumer::ReceiveNextFrame(
 HRESULT
 FrameConsumer::RunLoop(
     HANDLE stopEvent,
-    const std::function<void(const ipc::FrameIpcFrameHeader&, const std::vector<uint8_t>&)>& onFrame
+    const std::function<void(const ipc::FrameIpcFrameHeader&, const std::vector<uint8_t>&)>& onFrame,
+    const std::function<void(
+        const ipc::FrameIpcGpuFrameHeader&,
+        ID3D11Device*,
+        ID3D11DeviceContext*,
+        ID3D11Texture2D*)>& onGpuFrame
     ) noexcept
 {
     const ULONGLONG startTick = GetTickCount64();
@@ -1224,8 +2222,12 @@ FrameConsumer::RunLoop(
             }
         }
 
+        bool isGpuFrame = false;
+        ipc::FrameIpcGpuFrameHeader gpuHeader{};
         ipc::FrameIpcFrameHeader header{};
-        const HRESULT recvHr = ReceiveNextFrame(
+        const HRESULT recvHr = ReceiveNextGpuOrCpuFrame(
+            isGpuFrame,
+            gpuHeader,
             header,
             pixels,
             stepTimeoutMs,
@@ -1256,9 +2258,12 @@ FrameConsumer::RunLoop(
         if (FAILED(recvHr))
         {
             finalHr = recvHr;
+            const HostConsumerMetricsSnapshot errSnap = GetMetricsSnapshot();
             if (recvHr == HRESULT_FROM_WIN32(ERROR_TIMEOUT))
             {
-                finalReason = HostExitReason::FatalIoTimeout;
+                finalReason = (errSnap.LastProtocolStatus == ipc::FrameIpcStatus::GpuSyncTimeout)
+                    ? HostExitReason::GpuResourceError
+                    : HostExitReason::FatalIoTimeout;
             }
             else if (recvHr == HRESULT_FROM_WIN32(ERROR_CRC))
             {
@@ -1268,7 +2273,16 @@ FrameConsumer::RunLoop(
             {
                 finalReason = HostExitReason::OutOfMemory;
             }
-            else if (recvHr == E_FAIL || recvHr == E_INVALIDARG)
+            else if (errSnap.LastProtocolStatus == ipc::FrameIpcStatus::AdapterLuidMismatch)
+            {
+                finalReason = HostExitReason::AdapterMismatch;
+            }
+            else if (errSnap.LastProtocolStatus == ipc::FrameIpcStatus::ResourceOpenFailed ||
+                     errSnap.LastProtocolStatus == ipc::FrameIpcStatus::DeviceRemoved)
+            {
+                finalReason = HostExitReason::GpuResourceError;
+            }
+            else if (recvHr == E_FAIL || recvHr == E_INVALIDARG || recvHr == E_HANDLE)
             {
                 finalReason = HostExitReason::FatalProtocolError;
             }
@@ -1284,7 +2298,18 @@ FrameConsumer::RunLoop(
             continue;
         }
 
-        if (onFrame)
+        if (isGpuFrame)
+        {
+            if (onGpuFrame)
+            {
+                onGpuFrame(
+                    gpuHeader,
+                    m_d3dDevice.Get(),
+                    m_d3dContext.Get(),
+                    m_hostGpuWorkingTexture.Get());
+            }
+        }
+        else if (onFrame)
         {
             onFrame(header, pixels);
         }
@@ -1387,6 +2412,7 @@ FrameConsumer::ClosePipeAndResetConnectionState(
     }
     m_sessionConnectQpc = 0ULL;
     m_sessionId = 0ULL;
+    ClearGpuSharedResources();
 
     if (hadSession)
     {

@@ -289,7 +289,12 @@ LumaBridgeTraceMetrics(
     unsigned long queueDepth = 0UL,
     unsigned long peakQueueDepth = 0UL,
     HRESULT lastExtractionError = S_OK,
-    HRESULT lastTransportError = S_OK
+    HRESULT lastTransportError = S_OK,
+    unsigned long long gpuFramesShared = 0ULL,
+    unsigned long long gpuFramesDropped = 0ULL,
+    unsigned long long gpuSyncWaitUs = 0ULL,
+    unsigned long sharedPoolSize = 0UL,
+    unsigned long sharedPoolPeakUsage = 0UL
     ) noexcept
 {
     if constexpr (!GetDiagnosticStageCapabilities(kActiveDiagnosticStage).EnableTraceLoggingAndRegistryBreadcrumbs)
@@ -335,6 +340,11 @@ LumaBridgeTraceMetrics(
         UNREFERENCED_PARAMETER(peakQueueDepth);
         UNREFERENCED_PARAMETER(lastExtractionError);
         UNREFERENCED_PARAMETER(lastTransportError);
+        UNREFERENCED_PARAMETER(gpuFramesShared);
+        UNREFERENCED_PARAMETER(gpuFramesDropped);
+        UNREFERENCED_PARAMETER(gpuSyncWaitUs);
+        UNREFERENCED_PARAMETER(sharedPoolSize);
+        UNREFERENCED_PARAMETER(sharedPoolPeakUsage);
     }
     else
     {
@@ -348,7 +358,7 @@ LumaBridgeTraceMetrics(
             buffer,
             sizeof(buffer),
             _TRUNCATE,
-            "[LB-DRIVER] [METRICS] stage=%s adapterState=%s monitorState=%s monCreate=%llu monArrive=%llu monDepart=%llu monDepartFail=%llu scState=%s scActive=%u scAssigned=%llu scDeleted=%llu framesAcq=%llu framesProc=%llu framesDrop=%llu acqFps=%.2f procFps=%.2f lastUs=%llu avgUs=%llu maxUs=%llu dxgiDevRem=%llu transientErr=%llu fatalErr=%llu extractEn=%u framesExtAcc=%llu framesCopy=%llu framesDeliv=%llu backpressDrop=%llu protRej=%llu copyFail=%llu ipcFail=%llu hostConn=%lu lastSeq=%llu copyUs=%llu delivUs=%llu qDepth=%lu peakQ=%lu extErr=0x%08lX ipcErr=0x%08lX wsKB=%llu privKB=%llu handles=%lu\n",
+            "[LB-DRIVER] [METRICS] stage=%s adapterState=%s monitorState=%s monCreate=%llu monArrive=%llu monDepart=%llu monDepartFail=%llu scState=%s scActive=%u scAssigned=%llu scDeleted=%llu framesAcq=%llu framesProc=%llu framesDrop=%llu acqFps=%.2f procFps=%.2f lastUs=%llu avgUs=%llu maxUs=%llu dxgiDevRem=%llu transientErr=%llu fatalErr=%llu extractEn=%u framesExtAcc=%llu framesCopy=%llu framesDeliv=%llu backpressDrop=%llu protRej=%llu copyFail=%llu ipcFail=%llu hostConn=%lu lastSeq=%llu copyUs=%llu delivUs=%llu qDepth=%lu peakQ=%lu extErr=0x%08lX ipcErr=0x%08lX gpuShr=%llu gpuDrop=%llu gpuSyncUs=%llu gpuPool=%lu/%lu wsKB=%llu privKB=%llu handles=%lu\n",
             safeStage,
             safeAdapterState,
             safeMonitorState,
@@ -387,6 +397,11 @@ LumaBridgeTraceMetrics(
             peakQueueDepth,
             static_cast<unsigned long>(lastExtractionError),
             static_cast<unsigned long>(lastTransportError),
+            gpuFramesShared,
+            gpuFramesDropped,
+            gpuSyncWaitUs,
+            sharedPoolPeakUsage,
+            sharedPoolSize,
             static_cast<unsigned long long>(workingSetKb),
             static_cast<unsigned long long>(privateUsageKb),
             static_cast<unsigned long>(handleCount));
@@ -423,6 +438,11 @@ LumaBridgeTraceMetrics(
             TraceLoggingUInt32(peakQueueDepth, "PeakQueueDepth"),
             TraceLoggingHResult(lastExtractionError, "LastExtractionError"),
             TraceLoggingHResult(lastTransportError, "LastTransportError"),
+            TraceLoggingUInt64(gpuFramesShared, "GpuFramesShared"),
+            TraceLoggingUInt64(gpuFramesDropped, "GpuFramesDropped"),
+            TraceLoggingUInt64(gpuSyncWaitUs, "GpuSyncWaitUs"),
+            TraceLoggingUInt32(sharedPoolSize, "SharedTexturePoolSize"),
+            TraceLoggingUInt32(sharedPoolPeakUsage, "SharedTexturePoolPeakUsage"),
             TraceLoggingUInt64(static_cast<unsigned long long>(workingSetKb), "WorkingSetKb"),
             TraceLoggingUInt64(static_cast<unsigned long long>(privateUsageKb), "PrivateUsageKb"),
             TraceLoggingUInt32(handleCount, "HandleCount"));

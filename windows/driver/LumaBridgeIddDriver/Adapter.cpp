@@ -1,6 +1,7 @@
 #include "Adapter.h"
 #include "FrameExtractor.h"
 #include "FrameTransport.h"
+#include "SharedTexturePool.h"
 
 #include <d3d11.h>
 #include <dxgi1_4.h>
@@ -58,7 +59,16 @@ public:
         if (sidChangedWhileRunning)
         {
             m_ipcServer.Stop();
+            {
+                ExclusiveLockGuard deviceGuard(&m_deviceLock);
+                ConfigureSharedPoolLocked();
+            }
             (void)m_ipcServer.Start(updatedConfig);
+        }
+        else
+        {
+            ExclusiveLockGuard deviceGuard(&m_deviceLock);
+            ConfigureSharedPoolLocked();
         }
     }
 
@@ -91,11 +101,36 @@ public:
         }
     }
 
+    void SetGpuSharedTransportEnabled(bool enabled) noexcept
+    {
+        const bool prev = (InterlockedExchange(&m_gpuSharedTransportEnabled, enabled ? 1 : 0) != 0);
+        if (prev != enabled && m_ipcServer.IsRunning())
+        {
+            FrameTransportConfig updatedConfig{};
+            bool shouldRestart = false;
+            {
+                ExclusiveLockGuard deviceGuard(&m_deviceLock);
+                if (m_boundSwapChainHandle != nullptr &&
+                    InterlockedCompareExchange(&m_frameExtractionEnabled, 0, 0) != 0)
+                {
+                    shouldRestart = true;
+                    updatedConfig = BuildTransportConfigLocked(m_activeRenderAdapterLuid);
+                }
+            }
+            if (shouldRestart)
+            {
+                m_ipcServer.Stop();
+                (void)m_ipcServer.Start(updatedConfig);
+            }
+        }
+    }
+
     void ShutdownTransport() noexcept
     {
         m_ipcServer.Stop();
         ExclusiveLockGuard deviceGuard(&m_deviceLock);
         m_extractor.Reset();
+        m_sharedTexturePool.Shutdown();
     }
 
     HRESULT InitializeDeviceAndBindSwapChain(
@@ -173,6 +208,8 @@ public:
             m_d3dDevice = d3dDevice;
             m_d3dContext = d3dContext;
             m_extractor.SetDevice(d3dDevice.Get(), d3dContext.Get());
+            ConfigureSharedPoolLocked();
+            m_sharedTexturePool.SetDevice(d3dDevice.Get(), d3dContext.Get(), renderAdapterLuid);
             if (InterlockedCompareExchange(&m_frameExtractionEnabled, 0, 0) != 0)
             {
                 shouldStartIpc = true;
@@ -240,6 +277,71 @@ public:
                 outMetadata.ExtractionAttempted = true;
                 texture.Reset();
                 outMetadata.ExtractionHResult = E_OUTOFMEMORY;
+                return S_OK;
+            }
+
+            const bool useGpuShared = m_ipcServer.ShouldProduceGpuSharedFrame();
+            if (useGpuShared)
+            {
+                SharedTextureExtractResult gpuResult{};
+                bool extractionPerformed = false;
+                {
+                    ExclusiveLockGuard deviceGuard(&m_deviceLock);
+                    if (InterlockedCompareExchange(&m_frameExtractionEnabled, 0, 0) != 0 &&
+                        m_boundSwapChainHandle == swapChainHandle)
+                    {
+                        extractionPerformed = true;
+                        FrameExtractionInput input{};
+                        input.AdoptSourceTexture = texture.Detach();
+                        input.PresentationFrameNumber = outMetadata.PresentationFrameNumber;
+                        input.DirtyRectCount = outMetadata.DirtyRectCount;
+                        input.MoveRegionCount = outMetadata.MoveRegionCount;
+                        input.HwProtectedSurface = outMetadata.HwProtectedSurface;
+                        input.PresentDisplayQpcTime = outMetadata.PresentDisplayQPCTime;
+                        input.Flags = static_cast<uint32_t>(ipc::FrameIpcFlags::None);
+
+                        gpuResult = m_sharedTexturePool.ExtractToSharedTexture(input, *slot, true);
+                    }
+                    texture.Reset();
+                }
+
+                if (!extractionPerformed)
+                {
+                    m_ipcServer.RecycleBufferSlot(std::move(slot));
+                    return S_OK;
+                }
+
+                outMetadata.ExtractionAttempted = true;
+                outMetadata.ExtractionAccepted = gpuResult.AcceptedForExtraction;
+                outMetadata.PixelsCopied = gpuResult.GpuCopied;
+                outMetadata.ProtectedContentRejected = gpuResult.ProtectedContentRejected;
+                outMetadata.ExtractedWidth = gpuResult.Width;
+                outMetadata.ExtractedHeight = gpuResult.Height;
+                outMetadata.ExtractedFormat = gpuResult.Format;
+                outMetadata.FrameSequence = gpuResult.FrameSequence;
+                outMetadata.CopyLatencyUs = gpuResult.GpuCopyLatencyUs;
+                outMetadata.ExtractionHResult = gpuResult.HResult;
+
+                if (gpuResult.DeviceRemovedOrReset)
+                {
+                    m_ipcServer.RecycleBufferSlot(std::move(slot));
+                    return gpuResult.HResult;
+                }
+
+                if (gpuResult.GpuCopied)
+                {
+                    bool evictedOldest = false;
+                    const HRESULT enqueueHr = m_ipcServer.EnqueueFrame(std::move(slot), evictedOldest);
+                    outMetadata.EvictedOldestByBackpressure = evictedOldest;
+                    if (FAILED(enqueueHr))
+                    {
+                        outMetadata.ExtractionHResult = enqueueHr;
+                    }
+                }
+                else
+                {
+                    m_ipcServer.RecycleBufferSlot(std::move(slot));
+                }
                 return S_OK;
             }
 
@@ -334,6 +436,7 @@ public:
                 m_boundSwapChainHandle = nullptr;
                 m_activeRenderAdapterLuid = LUID{0, 0};
                 m_extractor.Reset();
+                m_sharedTexturePool.ResetResources();
                 m_d3dContext.Reset();
                 m_d3dDevice.Reset();
             }
@@ -362,6 +465,13 @@ public:
         inoutSnapshot.QueueDepth = ipcSnap.QueueDepth;
         inoutSnapshot.PeakQueueDepth = ipcSnap.PeakQueueDepth;
         inoutSnapshot.LastTransportError = ipcSnap.LastTransportError;
+        inoutSnapshot.GpuSharedTransportEnabled = ipcSnap.GpuSharedTransportConfigured;
+        inoutSnapshot.SharedTexturePoolSize = ipcSnap.SharedTexturePoolSize;
+        inoutSnapshot.SharedTexturePoolPeakUsage = ipcSnap.SharedTexturePoolPeakUsage;
+        inoutSnapshot.GpuFramesShared = ipcSnap.GpuFramesShared;
+        inoutSnapshot.GpuFramesDropped = ipcSnap.GpuFramesDropped;
+        inoutSnapshot.GpuSyncTimeouts = ipcSnap.GpuSyncTimeouts;
+        inoutSnapshot.GpuSyncWaitUs = ipcSnap.LastGpuSyncWaitUs;
     }
 
 private:
@@ -399,6 +509,9 @@ private:
         // WUDFHost.exe executes under LOCAL SERVICE; peer LOCAL SERVICE processes must not
         // implicitly consume virtual monitor frames.
         transportConfig.AllowSameUserAccess = false;
+        transportConfig.EnableGpuSharedTransport =
+            (InterlockedCompareExchange(const_cast<volatile LONG*>(&m_gpuSharedTransportEnabled), 0, 0) != 0);
+        transportConfig.SharedTexturePool = const_cast<D3d11SharedTexturePool*>(&m_sharedTexturePool);
         if (m_authorizedHostUserSid[0] != L'\0')
         {
             transportConfig.SetAuthorizedUserSid(m_authorizedHostUserSid);
@@ -407,14 +520,28 @@ private:
         return transportConfig;
     }
 
+    void ConfigureSharedPoolLocked() noexcept
+    {
+        (void)m_sharedTexturePool.Configure(
+            ipc::kDefaultSharedTexturePoolSize,
+            (m_authorizedHostUserSid[0] != L'\0') ? m_authorizedHostUserSid : nullptr,
+            m_authorizedHostUserSid[0] != L'\0',
+            false,
+            true,
+            true,
+            10U);
+    }
+
     SRWLOCK m_deviceLock{SRWLOCK_INIT};
     volatile LONG m_frameExtractionEnabled{0};
+    volatile LONG m_gpuSharedTransportEnabled{1};
     void* m_boundSwapChainHandle{nullptr};
     LUID m_activeRenderAdapterLuid{0, 0};
     wchar_t m_authorizedHostUserSid[128]{};
     ComPtr<ID3D11Device> m_d3dDevice;
     ComPtr<ID3D11DeviceContext> m_d3dContext;
     D3d11FrameExtractor m_extractor{};
+    D3d11SharedTexturePool m_sharedTexturePool{};
     FrameIpcServer m_ipcServer{};
 };
 
@@ -764,7 +891,12 @@ EmitHostMetricsSnapshot(
             sc.QueueDepth,
             sc.PeakQueueDepth,
             sc.LastExtractionError,
-            sc.LastTransportError);
+            sc.LastTransportError,
+            sc.GpuFramesShared,
+            sc.GpuFramesDropped,
+            sc.GpuSyncWaitUs,
+            sc.SharedTexturePoolSize,
+            sc.SharedTexturePoolPeakUsage);
     }
 }
 
@@ -1155,6 +1287,19 @@ LumaBridgeQueryAuthorizedHostUserSid(
     return false;
 }
 
+bool
+LumaBridgeQueryGpuSharedTransportEnabled(
+    WDFDEVICE Device
+    ) noexcept
+{
+    DECLARE_CONST_UNICODE_STRING(gpuFlagName, L"EnableGpuSharedTransport");
+    return LumaBridgeQueryDeviceDwordFlag(
+        Device,
+        &gpuFlagName,
+        true,
+        true);
+}
+
 void
 LumaBridgeApplyFrameExtractionPolicy(
     WDFDEVICE Device,
@@ -1167,6 +1312,7 @@ LumaBridgeApplyFrameExtractionPolicy(
         authorizedSid,
         ARRAYSIZE(authorizedSid));
     Backend.SetAuthorizedHostUserSid(hasSid ? authorizedSid : nullptr);
+    Backend.SetGpuSharedTransportEnabled(LumaBridgeQueryGpuSharedTransportEnabled(Device));
     Backend.SetFrameExtractionEnabled(LumaBridgeQueryFrameExtractionEnabled(Device));
 }
 

@@ -12,6 +12,7 @@ namespace lumabridge::ipc {
 inline constexpr uint32_t kFrameIpcMagic = 0x4649424CU; // 'LBIF'
 inline constexpr uint16_t kFrameIpcProtocolVersionMajor = 1U;
 inline constexpr uint16_t kFrameIpcProtocolVersionMinor = 0U;
+inline constexpr uint16_t kFrameIpcProtocolVersionMinorV1_1 = 1U;
 
 inline constexpr uint32_t kMinFrameDimension = 1U;
 inline constexpr uint32_t kMaxFrameWidth = 4096U;
@@ -22,7 +23,13 @@ inline constexpr size_t kMaxRetainedPoolBufferBytes = 2560ULL * 1440ULL * 4ULL; 
 
 inline constexpr size_t kDefaultMaxFrameQueueDepth = 3U;
 inline constexpr size_t kDefaultFrameBufferPoolSize = 5U;
+inline constexpr size_t kMinSharedTexturePoolSize = 2U;
+inline constexpr size_t kDefaultSharedTexturePoolSize = 4U;
+inline constexpr size_t kMaxSharedTexturePoolSize = 8U;
 inline constexpr uint32_t kDefaultIpcIoTimeoutMs = 500U;
+inline constexpr uint32_t kDefaultGpuKeyedMutexTimeoutMs = 100U;
+inline constexpr uint64_t kSharedTextureProducerMutexKey = 0ULL;
+inline constexpr uint64_t kSharedTextureConsumerMutexKey = 1ULL;
 inline constexpr wchar_t kDefaultFrameIpcPipeName[] = L"\\\\.\\pipe\\LumaBridgeFrameIpc_v1";
 
 enum class FrameIpcMessageType : uint16_t
@@ -33,6 +40,7 @@ enum class FrameIpcMessageType : uint16_t
     FrameHeader = 3,
     FrameAck = 4,
     DisconnectNotice = 5,
+    GpuFrameHeader = 6,
 };
 
 enum class FrameIpcStatus : uint32_t
@@ -47,6 +55,32 @@ enum class FrameIpcStatus : uint32_t
     UnsupportedPixelFormat = 7,
     ChecksumMismatch = 8,
     ServerStopping = 9,
+    AdapterLuidMismatch = 10,
+    ResourceOpenFailed = 11,
+    GpuSyncTimeout = 12,
+    GpuPoolExhausted = 13,
+    DeviceRemoved = 14,
+};
+
+enum class FrameIpcTransportMode : uint32_t
+{
+    CpuStagingPipe = 0U,
+    GpuSharedNtHandle = 1U,
+};
+
+enum class FrameIpcCapabilities : uint32_t
+{
+    None = 0U,
+    CpuStagingRawPixels = 1U << 0,
+    GpuSharedNtHandle = 1U << 1,
+    GpuFallbackToCpuStaging = 1U << 2,
+};
+
+enum class FrameIpcGpuFrameFlags : uint32_t
+{
+    None = 0U,
+    NewHandleDuplicated = 1U << 0,
+    CpuFallbackAvailable = 1U << 1,
 };
 
 enum class FrameIpcFlags : uint32_t
@@ -55,6 +89,67 @@ enum class FrameIpcFlags : uint32_t
     SyntheticTestFrame = 1U << 0,
     PreConnectQueuedFrame = 1U << 1,
 };
+
+inline constexpr uint32_t
+PackServerHelloCapabilities(
+    uint32_t negotiatedCapabilities,
+    uint32_t sharedPoolSize
+    ) noexcept
+{
+    return (negotiatedCapabilities & 0xFFFFU) | ((sharedPoolSize & 0xFFFFU) << 16U);
+}
+
+inline constexpr uint32_t
+UnpackServerHelloCapabilities(
+    uint32_t reserved1
+    ) noexcept
+{
+    return reserved1 & 0xFFFFU;
+}
+
+inline constexpr uint32_t
+UnpackServerHelloSharedPoolSize(
+    uint32_t reserved1
+    ) noexcept
+{
+    return (reserved1 >> 16U) & 0xFFFFU;
+}
+
+inline constexpr uint64_t
+PackGpuFrameAckData(
+    uint16_t slotIndex,
+    uint16_t slotGeneration,
+    uint32_t gpuSyncWaitUs
+    ) noexcept
+{
+    return static_cast<uint64_t>(slotIndex) |
+           (static_cast<uint64_t>(slotGeneration) << 16ULL) |
+           (static_cast<uint64_t>(gpuSyncWaitUs) << 32ULL);
+}
+
+inline constexpr uint16_t
+UnpackGpuAckSlotIndex(
+    uint64_t reserved1
+    ) noexcept
+{
+    return static_cast<uint16_t>(reserved1 & 0xFFFFULL);
+}
+
+inline constexpr uint16_t
+UnpackGpuAckSlotGeneration(
+    uint64_t reserved1
+    ) noexcept
+{
+    return static_cast<uint16_t>((reserved1 >> 16ULL) & 0xFFFFULL);
+}
+
+inline constexpr uint32_t
+UnpackGpuAckSyncWaitUs(
+    uint64_t reserved1
+    ) noexcept
+{
+    return static_cast<uint32_t>((reserved1 >> 32ULL) & 0xFFFFFFFFULL);
+}
 
 inline constexpr uint32_t kFrameIpcFlagBitMask = 0x000000FFU;
 inline constexpr uint32_t kFrameIpcCopyLatencyUsShift = 8U;
@@ -131,9 +226,28 @@ FrameIpcStatusToString(
         return "ChecksumMismatch";
     case FrameIpcStatus::ServerStopping:
         return "ServerStopping";
+    case FrameIpcStatus::AdapterLuidMismatch:
+        return "AdapterLuidMismatch";
+    case FrameIpcStatus::ResourceOpenFailed:
+        return "ResourceOpenFailed";
+    case FrameIpcStatus::GpuSyncTimeout:
+        return "GpuSyncTimeout";
+    case FrameIpcStatus::GpuPoolExhausted:
+        return "GpuPoolExhausted";
+    case FrameIpcStatus::DeviceRemoved:
+        return "DeviceRemoved";
     default:
         return "Unknown";
     }
+}
+
+inline constexpr bool
+IsSupportedProtocolMinorVersion(
+    uint16_t versionMinor
+    ) noexcept
+{
+    return versionMinor == kFrameIpcProtocolVersionMinor ||
+           versionMinor == kFrameIpcProtocolVersionMinorV1_1;
 }
 
 #pragma pack(push, 1)
@@ -209,6 +323,32 @@ struct FrameIpcDisconnectNotice
     uint32_t Reserved1{0};
 };
 
+struct FrameIpcGpuFrameHeader
+{
+    FrameIpcEnvelope Envelope{};
+    uint64_t SessionId{0};
+    uint64_t FrameSequence{0};
+    uint32_t PresentationFrameNumber{0};
+    uint32_t TransportMode{static_cast<uint32_t>(FrameIpcTransportMode::GpuSharedNtHandle)};
+    uint32_t SlotIndex{0};
+    uint32_t SlotGeneration{0};
+    uint64_t DuplicatedNtHandleValue{0};
+    uint32_t Width{0};
+    uint32_t Height{0};
+    uint32_t PixelFormat{0};
+    uint32_t Flags{0};
+    int32_t AdapterLuidLow{0};
+    int32_t AdapterLuidHigh{0};
+    uint64_t KeyedMutexAcquireKey{kSharedTextureConsumerMutexKey};
+    uint64_t KeyedMutexReleaseKey{kSharedTextureProducerMutexKey};
+    uint32_t KeyedMutexTimeoutMs{kDefaultGpuKeyedMutexTimeoutMs};
+    uint32_t SyncAndFallbackFlags{0};
+    uint64_t PresentDisplayQpcTime{0};
+    uint64_t ExtractCompleteQpcTime{0};
+    uint64_t ServerSendQpcTime{0};
+    uint64_t QpcFrequency{0};
+};
+
 #pragma pack(pop)
 
 static_assert(sizeof(FrameIpcEnvelope) == 16U, "FrameIpcEnvelope wire size must be 16 bytes.");
@@ -217,6 +357,7 @@ static_assert(sizeof(FrameIpcServerHello) == 48U, "FrameIpcServerHello wire size
 static_assert(sizeof(FrameIpcFrameHeader) == 104U, "FrameIpcFrameHeader wire size must be 104 bytes.");
 static_assert(sizeof(FrameIpcFrameAck) == 56U, "FrameIpcFrameAck wire size must be 56 bytes.");
 static_assert(sizeof(FrameIpcDisconnectNotice) == 32U, "FrameIpcDisconnectNotice wire size must be 32 bytes.");
+static_assert(sizeof(FrameIpcGpuFrameHeader) == 136U, "FrameIpcGpuFrameHeader wire size must be 136 bytes.");
 
 inline constexpr bool
 IsSupportedExtractionDxgiFormat(
@@ -293,13 +434,14 @@ ComputeValidatedFramePayloadBytes(
 inline FrameIpcEnvelope
 InitEnvelope(
     FrameIpcMessageType type,
-    uint32_t headerSize
+    uint32_t headerSize,
+    uint16_t versionMinor = kFrameIpcProtocolVersionMinor
     ) noexcept
 {
     FrameIpcEnvelope env{};
     env.Magic = kFrameIpcMagic;
     env.VersionMajor = kFrameIpcProtocolVersionMajor;
-    env.VersionMinor = kFrameIpcProtocolVersionMinor;
+    env.VersionMinor = versionMinor;
     env.MessageType = static_cast<uint16_t>(type);
     env.Reserved0 = 0U;
     env.HeaderSizeBytes = headerSize;
@@ -328,7 +470,7 @@ ValidateEnvelope(
     }
 
     if (env.VersionMajor != kFrameIpcProtocolVersionMajor ||
-        env.VersionMinor != kFrameIpcProtocolVersionMinor)
+        !IsSupportedProtocolMinorVersion(env.VersionMinor))
     {
         return FrameIpcStatus::VersionMismatch;
     }
@@ -389,7 +531,7 @@ ValidateServerHello(
     std::memcpy(&hello, data, sizeof(hello));
     if (hello.Status != static_cast<uint32_t>(FrameIpcStatus::Ok))
     {
-        if (hello.Status <= static_cast<uint32_t>(FrameIpcStatus::ServerStopping))
+        if (hello.Status <= static_cast<uint32_t>(FrameIpcStatus::DeviceRemoved))
         {
             return static_cast<FrameIpcStatus>(hello.Status);
         }
@@ -455,6 +597,62 @@ ValidateFrameHeader(
 }
 
 inline FrameIpcStatus
+ValidateGpuFrameHeader(
+    const void* data,
+    size_t byteCount,
+    uint64_t expectedSessionId,
+    uint32_t maxSlotCount = static_cast<uint32_t>(kMaxSharedTexturePoolSize)
+    ) noexcept
+{
+    const FrameIpcStatus envStatus = ValidateEnvelope(
+        data,
+        byteCount,
+        FrameIpcMessageType::GpuFrameHeader,
+        static_cast<uint32_t>(sizeof(FrameIpcGpuFrameHeader)));
+    if (envStatus != FrameIpcStatus::Ok)
+    {
+        return envStatus;
+    }
+
+    FrameIpcGpuFrameHeader header{};
+    std::memcpy(&header, data, sizeof(header));
+
+    if (header.Envelope.VersionMinor < kFrameIpcProtocolVersionMinorV1_1)
+    {
+        return FrameIpcStatus::VersionMismatch;
+    }
+
+    if (header.SessionId == 0ULL ||
+        (expectedSessionId != 0ULL && header.SessionId != expectedSessionId))
+    {
+        return FrameIpcStatus::SessionMismatch;
+    }
+
+    if (header.FrameSequence == 0ULL ||
+        header.TransportMode != static_cast<uint32_t>(FrameIpcTransportMode::GpuSharedNtHandle) ||
+        header.SlotGeneration == 0U ||
+        header.SlotIndex >= maxSlotCount)
+    {
+        return FrameIpcStatus::InvalidLength;
+    }
+
+    if (!IsSupportedExtractionDxgiFormat(header.PixelFormat))
+    {
+        return FrameIpcStatus::UnsupportedPixelFormat;
+    }
+
+    if (header.Width < kMinFrameDimension ||
+        header.Width > kMaxFrameWidth ||
+        header.Height < kMinFrameDimension ||
+        header.Height > kMaxFrameHeight)
+    {
+        return FrameIpcStatus::PayloadOutOfBounds;
+    }
+
+    return FrameIpcStatus::Ok;
+}
+
+inline FrameIpcStatus
 ValidateFrameAck(
     const void* data,
     size_t byteCount,
@@ -487,7 +685,7 @@ ValidateFrameAck(
 
     if (ack.Status != static_cast<uint32_t>(FrameIpcStatus::Ok))
     {
-        if (ack.Status <= static_cast<uint32_t>(FrameIpcStatus::ServerStopping))
+        if (ack.Status <= static_cast<uint32_t>(FrameIpcStatus::DeviceRemoved))
         {
             return static_cast<FrameIpcStatus>(ack.Status);
         }

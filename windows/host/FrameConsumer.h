@@ -1,15 +1,44 @@
 #pragma once
 
 #include <Windows.h>
+#include <d3d11_1.h>
+#include <dxgi1_4.h>
+#include <wrl/client.h>
 
 #include "../driver/LumaBridgeIddDriver/FrameIpcProtocol.h"
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
 
 namespace lumabridge::host {
+
+enum class HostTransportPreference : uint32_t
+{
+    Auto = 0U,
+    GpuSharedOnly = 1U,
+    CpuStagingOnly = 2U,
+};
+
+inline const char*
+HostTransportPreferenceToString(
+    HostTransportPreference pref
+    ) noexcept
+{
+    switch (pref)
+    {
+    case HostTransportPreference::Auto:
+        return "Auto";
+    case HostTransportPreference::GpuSharedOnly:
+        return "GpuSharedOnly";
+    case HostTransportPreference::CpuStagingOnly:
+        return "CpuStagingOnly";
+    default:
+        return "Unknown";
+    }
+}
 
 enum class HostExitReason : uint32_t
 {
@@ -23,6 +52,8 @@ enum class HostExitReason : uint32_t
     FatalProtocolError = 7,
     FatalIntegrityError = 8,
     OutOfMemory = 9,
+    AdapterMismatch = 10,
+    GpuResourceError = 11,
 };
 
 inline const char*
@@ -52,6 +83,10 @@ HostExitReasonToString(
         return "FatalIntegrityError";
     case HostExitReason::OutOfMemory:
         return "OutOfMemory";
+    case HostExitReason::AdapterMismatch:
+        return "AdapterMismatch";
+    case HostExitReason::GpuResourceError:
+        return "GpuResourceError";
     default:
         return "Unknown";
     }
@@ -134,6 +169,14 @@ struct HostConsumerConfig
     bool VerifySyntheticPattern{false};
     bool AutoReconnect{false};
     bool SendAck{true};
+    HostTransportPreference TransportPreference{HostTransportPreference::Auto};
+    bool AllowCpuFallback{true};
+    bool HasForcedAdapterLuid{false};
+    LUID ForcedAdapterLuid{0, 0};
+    bool AllowWarpAdapterFallbackForSyntheticLuid{true};
+    bool SimulateInvalidSharedHandleForTesting{false};
+    DWORD SimulatedAckDelayMsForTesting{0U};
+    bool SimulateDisconnectWhileHoldingMutexForTesting{false};
 };
 
 /// Synchronized runtime statistics observed by lumabridge-host.
@@ -204,6 +247,18 @@ struct HostConsumerMetricsSnapshot
     LatencySummaryStats EndToEndLatency{};
     LatencySummaryStats LiveEndToEndLatency{};
     LatencySummaryStats InterFrameInterval{};
+    LatencySummaryStats GpuSyncWaitLatency{};
+
+    ipc::FrameIpcTransportMode NegotiatedTransportMode{ipc::FrameIpcTransportMode::CpuStagingPipe};
+    bool FallbackToCpuActivated{false};
+    uint32_t SharedTexturePoolSize{0U};
+    uint32_t SharedTexturePoolPeakUsage{0U};
+    uint64_t GpuFramesOpened{0ULL};
+    uint64_t GpuFramesDropped{0ULL};
+    uint64_t GpuSharedOpenFailures{0ULL};
+    uint64_t GpuSyncTimeouts{0ULL};
+    uint64_t AdapterMismatchErrors{0ULL};
+    uint64_t CpuStagingReadsPerformed{0ULL};
 };
 
 /// Overlapped local Named Pipe client that authenticates to LumaBridgeIddDriver,
@@ -231,17 +286,76 @@ public:
         HANDLE stopEvent = nullptr
         ) noexcept;
 
+    HRESULT ReceiveNextGpuOrCpuFrame(
+        bool& outIsGpuFrame,
+        ipc::FrameIpcGpuFrameHeader& outGpuHeader,
+        ipc::FrameIpcFrameHeader& outCpuHeader,
+        std::vector<uint8_t>& outCpuPixels,
+        DWORD timeoutMs,
+        HANDLE stopEvent = nullptr
+        ) noexcept;
+
     HRESULT RunLoop(
         HANDLE stopEvent = nullptr,
-        const std::function<void(const ipc::FrameIpcFrameHeader&, const std::vector<uint8_t>&)>& onFrame = nullptr
+        const std::function<void(const ipc::FrameIpcFrameHeader&, const std::vector<uint8_t>&)>& onFrame = nullptr,
+        const std::function<void(
+            const ipc::FrameIpcGpuFrameHeader&,
+            ID3D11Device*,
+            ID3D11DeviceContext*,
+            ID3D11Texture2D*)>& onGpuFrame = nullptr
         ) noexcept;
 
     void Disconnect() noexcept;
 
     HostConsumerMetricsSnapshot GetMetricsSnapshot() const noexcept;
 
+    ID3D11Device* GetD3d11Device() const noexcept { return m_d3dDevice.Get(); }
+    ID3D11DeviceContext* GetD3d11Context() const noexcept { return m_d3dContext.Get(); }
+    ID3D11Texture2D* GetWorkingGpuTexture() const noexcept { return m_hostGpuWorkingTexture.Get(); }
+
 private:
     static constexpr size_t kMaxStoredLatencySamples = 65536U;
+
+    struct HostSharedSlotCacheEntry
+    {
+        uint32_t SlotGeneration{0U};
+        HANDLE DuplicatedNtHandle{nullptr};
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> SharedTexture{};
+        Microsoft::WRL::ComPtr<IDXGIKeyedMutex> KeyedMutex{};
+
+        void Reset() noexcept
+        {
+            KeyedMutex.Reset();
+            SharedTexture.Reset();
+            if (DuplicatedNtHandle != nullptr && DuplicatedNtHandle != INVALID_HANDLE_VALUE)
+            {
+                CloseHandle(DuplicatedNtHandle);
+            }
+            DuplicatedNtHandle = nullptr;
+            SlotGeneration = 0U;
+        }
+    };
+
+    HRESULT EnsureD3d11DeviceForAdapterLuid(LUID serverAdapterLuid) noexcept;
+    HRESULT EnsureHostWorkingTexture(uint32_t width, uint32_t height, DXGI_FORMAT format) noexcept;
+    HRESULT VerifyWorkingGpuTextureSyntheticPattern(
+        uint32_t presentationFrameNumber,
+        uint32_t width,
+        uint32_t height,
+        DXGI_FORMAT format,
+        bool& outMatches
+        ) noexcept;
+    void ClearGpuSharedResources() noexcept;
+    HRESULT SendGpuFrameAck(
+        uint64_t frameSequence,
+        uint32_t presentationFrameNumber,
+        ipc::FrameIpcStatus status,
+        uint16_t slotIndex,
+        uint16_t slotGeneration,
+        uint32_t gpuSyncWaitUs,
+        uint64_t receiveQpc,
+        HANDLE stopEvent
+        ) noexcept;
 
     struct LatencyAccumulator
     {
@@ -321,6 +435,23 @@ private:
     LatencyAccumulator m_endToEndLat{};
     LatencyAccumulator m_liveEndToEndLat{};
     LatencyAccumulator m_interFrameLat{};
+    LatencyAccumulator m_gpuSyncWaitLat{};
+
+    Microsoft::WRL::ComPtr<ID3D11Device> m_d3dDevice{};
+    Microsoft::WRL::ComPtr<ID3D11Device1> m_d3dDevice1{};
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> m_d3dContext{};
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_hostGpuWorkingTexture{};
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_diagnosticStagingTexture{};
+    LUID m_boundAdapterLuid{0, 0};
+    bool m_hasBoundD3dDevice{false};
+    uint32_t m_workingWidth{0U};
+    uint32_t m_workingHeight{0U};
+    DXGI_FORMAT m_workingFormat{DXGI_FORMAT_UNKNOWN};
+    uint32_t m_stagingWidth{0U};
+    uint32_t m_stagingHeight{0U};
+    DXGI_FORMAT m_stagingFormat{DXGI_FORMAT_UNKNOWN};
+    std::array<HostSharedSlotCacheEntry, ipc::kMaxSharedTexturePoolSize> m_sharedSlotCache{};
+    std::array<bool, ipc::kMaxSharedTexturePoolSize> m_slotSeenInSession{};
 };
 
 } // namespace lumabridge::host

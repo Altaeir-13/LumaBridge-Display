@@ -3,6 +3,7 @@
 #include "SwapChainProcessor.h"
 #include "FrameIpcProtocol.h"
 #include "FrameExtractor.h"
+#include "SharedTexturePool.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -66,6 +67,11 @@ struct FrameTransportConfig
     bool HasExplicitAllowedSessionId{false};
     DWORD AllowedClientSessionId{0U};
     DWORD MinimumIntegrityRid{SECURITY_MANDATORY_MEDIUM_RID};
+    bool EnableGpuSharedTransport{true};
+    bool AllowCpuFallbackWhenGpuNegotiated{true};
+    size_t SharedTexturePoolSize{ipc::kDefaultSharedTexturePoolSize};
+    DWORD GpuKeyedMutexTimeoutMs{ipc::kDefaultGpuKeyedMutexTimeoutMs};
+    D3d11SharedTexturePool* SharedTexturePool{nullptr};
 };
 
 /// Thread-safe snapshot of bounded queue and local IPC delivery metrics.
@@ -101,6 +107,16 @@ struct FrameTransportMetricsSnapshot
     uint64_t AvgDeliveryLatencyUs{0ULL};
     uint64_t MaxDeliveryLatencyUs{0ULL};
     HRESULT LastTransportError{S_OK};
+    bool GpuSharedTransportConfigured{false};
+    uint32_t SharedTexturePoolSize{0U};
+    uint32_t SharedTexturePoolPeakUsage{0U};
+    uint64_t GpuFramesShared{0ULL};
+    uint64_t GpuFramesDropped{0ULL};
+    uint64_t GpuSyncTimeouts{0ULL};
+    uint64_t LastGpuSyncWaitUs{0ULL};
+    uint64_t AvgGpuSyncWaitUs{0ULL};
+    uint64_t MaxGpuSyncWaitUs{0ULL};
+    uint64_t HandleDuplicationFailures{0ULL};
 };
 
 /// Fixed-capacity ring buffer of unique_ptr<ExtractedFrameBuffer> (exception-free for UMDF).
@@ -214,6 +230,9 @@ public:
         bool simulateFailure
         ) noexcept;
 
+    /// Returns whether an authenticated host is connected and requested GPU shared transport.
+    bool ShouldProduceGpuSharedFrame() const noexcept;
+
 private:
     static DWORD WINAPI WorkerThreadProc(LPVOID context) noexcept;
 
@@ -225,6 +244,10 @@ private:
 
     void UpdatePoolMetricsLocked() noexcept;
     void ClearAllBuffersLocked() noexcept;
+    void ReleaseFrameResources(
+        const ExtractedFrameBuffer* frame,
+        bool countGpuAsDrop
+        ) noexcept;
 
     HRESULT CreateSecuredPipeHandle(
         const FrameTransportConfig& config,
@@ -233,7 +256,8 @@ private:
 
     ipc::FrameIpcStatus VerifyConnectedClientIdentity(
         HANDLE pipeHandle,
-        const ipc::FrameIpcClientHello& clientHello
+        const ipc::FrameIpcClientHello& clientHello,
+        ScopedWin32Handle* outClientProcess = nullptr
         ) const noexcept;
 
     mutable SRWLOCK m_lifecycleLock{SRWLOCK_INIT};
@@ -250,6 +274,7 @@ private:
     volatile LONG m_running{0};
     volatile LONG m_stopRequested{0};
     volatile LONG m_simulateSlotAllocationFailure{0};
+    volatile LONG m_activeSessionNegotiatedGpu{0};
     volatile LONG64 m_nextSessionId{0};
 
     ScopedWin32Handle m_pipeHandle{};

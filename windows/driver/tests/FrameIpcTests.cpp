@@ -1,11 +1,15 @@
 #include "../LumaBridgeIddDriver/SwapChainProcessor.h"
 #include "../LumaBridgeIddDriver/FrameIpcProtocol.h"
 #include "../LumaBridgeIddDriver/FrameTransport.h"
+#include "../LumaBridgeIddDriver/SharedTexturePool.h"
 #include "../../host/FrameConsumer.h"
 #include "../../host/VirtualDisplayStimulus.h"
 
 #include <aclapi.h>
 #include <sddl.h>
+#include <d3d11_1.h>
+#include <dxgi1_4.h>
+#include <wrl/client.h>
 
 #include <atomic>
 #include <cstdio>
@@ -1835,6 +1839,337 @@ TestRepeatedSessionsMemoryBoundedness()
     server.Stop();
 }
 
+bool
+CreateIpcTestD3d11Device(
+    Microsoft::WRL::ComPtr<ID3D11Device>& outDev,
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext>& outCtx,
+    LUID& outLuid
+    ) noexcept
+{
+    outLuid = LUID{0, 0};
+    static constexpr D3D_FEATURE_LEVEL kLevels[] = {
+        D3D_FEATURE_LEVEL_11_1,
+        D3D_FEATURE_LEVEL_11_0,
+        D3D_FEATURE_LEVEL_10_1,
+        D3D_FEATURE_LEVEL_10_0};
+    D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
+    HRESULT hr = D3D11CreateDevice(
+        nullptr,
+        D3D_DRIVER_TYPE_HARDWARE,
+        nullptr,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        kLevels,
+        ARRAYSIZE(kLevels),
+        D3D11_SDK_VERSION,
+        &outDev,
+        &level,
+        &outCtx);
+    if (FAILED(hr) || outDev == nullptr)
+    {
+        hr = D3D11CreateDevice(
+            nullptr,
+            D3D_DRIVER_TYPE_WARP,
+            nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            kLevels,
+            ARRAYSIZE(kLevels),
+            D3D11_SDK_VERSION,
+            &outDev,
+            &level,
+            &outCtx);
+    }
+    if (FAILED(hr) || outDev == nullptr || outCtx == nullptr)
+    {
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDev;
+    Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+    if (SUCCEEDED(outDev.As(&dxgiDev)) && dxgiDev != nullptr && SUCCEEDED(dxgiDev->GetAdapter(&adapter)) && adapter != nullptr)
+    {
+        DXGI_ADAPTER_DESC desc{};
+        if (SUCCEEDED(adapter->GetDesc(&desc)))
+        {
+            outLuid = desc.AdapterLuid;
+        }
+    }
+    return true;
+}
+
+bool
+CreateSyntheticIpcGpuTexture(
+    ID3D11Device* device,
+    uint32_t width,
+    uint32_t height,
+    uint32_t frameNumber,
+    Microsoft::WRL::ComPtr<ID3D11Texture2D>& outTex
+    )
+{
+    uint32_t rowPitch = 0U;
+    uint32_t payloadBytes = 0U;
+    if (!ComputeTightRowPitchBytes(width, rowPitch) ||
+        !ComputeValidatedFramePayloadBytes(width, height, rowPitch, payloadBytes))
+    {
+        return false;
+    }
+    std::vector<uint8_t> pixels(payloadBytes, 0U);
+    if (!GenerateSyntheticTestPatternBgra8(frameNumber, width, height, pixels.data(), pixels.size()))
+    {
+        return false;
+    }
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 1U;
+    desc.ArraySize = 1U;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1U;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA init{};
+    init.pSysMem = pixels.data();
+    init.SysMemPitch = rowPitch;
+    return SUCCEEDED(device->CreateTexture2D(&desc, &init, &outTex)) && outTex != nullptr;
+}
+
+void
+TestV1_1GpuTransportCapabilityNegotiationAndFallback()
+{
+    // 1. Client requests Auto GPU, server has no GPU pool -> negotiates fallback to CpuStagingPipe cleanly.
+    {
+        const std::wstring pipeName = MakeUniquePipeName(26U);
+        FrameTransportConfig serverCfg;
+        serverCfg.SetPipeName(pipeName.c_str());
+        serverCfg.EnableGpuSharedTransport = false;
+        serverCfg.SharedTexturePool = nullptr;
+
+        FrameIpcServer server;
+        EXPECT_EQ(server.Start(serverCfg), S_OK);
+
+        HostConsumerConfig autoCfg;
+        autoCfg.PipeName = pipeName;
+        autoCfg.TransportPreference = HostTransportPreference::Auto;
+        autoCfg.AllowCpuFallback = true;
+        autoCfg.VerifySyntheticPattern = true;
+        FrameConsumer consumer(autoCfg);
+        EXPECT_EQ(consumer.Connect(2000U), S_OK);
+        EXPECT_EQ(consumer.GetMetricsSnapshot().NegotiatedTransportMode, FrameIpcTransportMode::CpuStagingPipe);
+        EXPECT_TRUE(consumer.GetMetricsSnapshot().FallbackToCpuActivated);
+
+        bool evicted = false;
+        EXPECT_EQ(server.EnqueueFrame(MakeSyntheticExtractedFrame(1ULL, 10U, 64U, 64U), evicted), S_OK);
+        FrameIpcFrameHeader hdr{};
+        std::vector<uint8_t> pixels;
+        EXPECT_EQ(consumer.ReceiveNextFrame(hdr, pixels, 2000U), S_OK);
+        EXPECT_EQ(hdr.PresentationFrameNumber, 10U);
+        consumer.Disconnect();
+
+        // 2. Client requires GpuSharedOnly against CPU-only server -> rejected cleanly.
+        HostConsumerConfig strictGpuCfg;
+        strictGpuCfg.PipeName = pipeName;
+        strictGpuCfg.TransportPreference = HostTransportPreference::GpuSharedOnly;
+        strictGpuCfg.AllowCpuFallback = false;
+        FrameConsumer strictConsumer(strictGpuCfg);
+        EXPECT_EQ(strictConsumer.Connect(2000U), DXGI_ERROR_UNSUPPORTED);
+        server.Stop();
+    }
+}
+
+void
+TestGpuSharedTextureIpcUnauthorizedClientCannotObtainHandle()
+{
+    static constexpr wchar_t kOtherUserSid[] = L"S-1-5-21-999999999-888888888-777777777-1002";
+
+    Microsoft::WRL::ComPtr<ID3D11Device> dev;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx;
+    LUID adapterLuid{0, 0};
+    EXPECT_TRUE(CreateIpcTestD3d11Device(dev, ctx, adapterLuid));
+
+    D3d11SharedTexturePool pool;
+    EXPECT_EQ(pool.Configure(3U, kOtherUserSid, true, false, false, false), S_OK);
+    pool.SetDevice(dev.Get(), ctx.Get(), adapterLuid);
+
+    const std::wstring pipeName = MakeUniquePipeName(27U);
+    FrameTransportConfig serverCfg;
+    serverCfg.SetPipeName(pipeName.c_str());
+    serverCfg.SetAuthorizedUserSid(kOtherUserSid);
+    serverCfg.RestrictDaclToAuthorizedSid = true;
+    serverCfg.AllowSameUserAccess = false;
+    serverCfg.AllowBuiltinAdmins = false;
+    serverCfg.AdapterLuid = adapterLuid;
+    serverCfg.EnableGpuSharedTransport = true;
+    serverCfg.SharedTexturePoolSize = 3U;
+    serverCfg.SharedTexturePool = &pool;
+
+    FrameIpcServer server;
+    EXPECT_EQ(server.Start(serverCfg), S_OK);
+
+    HostConsumerConfig unauthCfg;
+    unauthCfg.PipeName = pipeName;
+    unauthCfg.TransportPreference = HostTransportPreference::GpuSharedOnly;
+    unauthCfg.AllowCpuFallback = false;
+    FrameConsumer unauthConsumer(unauthCfg);
+    EXPECT_EQ(unauthConsumer.Connect(2000U), E_ACCESSDENIED);
+    EXPECT_EQ(server.GetMetricsSnapshot().GpuFramesShared, 0ULL);
+    EXPECT_EQ(server.GetMetricsSnapshot().ClientConnectionsAccepted, 0ULL);
+
+    server.Stop();
+    pool.Shutdown();
+}
+
+void
+TestGpuSharedTextureDelayedAckAndMidUseClientDisconnectRecovery()
+{
+    Microsoft::WRL::ComPtr<ID3D11Device> dev;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx;
+    LUID adapterLuid{0, 0};
+    EXPECT_TRUE(CreateIpcTestD3d11Device(dev, ctx, adapterLuid));
+
+    D3d11SharedTexturePool pool;
+    EXPECT_EQ(pool.Configure(3U), S_OK);
+    pool.SetDevice(dev.Get(), ctx.Get(), adapterLuid);
+
+    const std::wstring pipeName = MakeUniquePipeName(28U);
+    FrameTransportConfig serverCfg;
+    serverCfg.SetPipeName(pipeName.c_str());
+    serverCfg.AdapterLuid = adapterLuid;
+    serverCfg.EnableGpuSharedTransport = true;
+    serverCfg.SharedTexturePoolSize = 3U;
+    serverCfg.SharedTexturePool = &pool;
+    serverCfg.IoTimeoutMs = 150U;
+
+    FrameIpcServer server;
+    EXPECT_EQ(server.Start(serverCfg), S_OK);
+
+    // 1. Client disconnects while holding KeyedMutex -> server retires slot and recreates cleanly for next client.
+    {
+        HostConsumerConfig abortCfg;
+        abortCfg.PipeName = pipeName;
+        abortCfg.TransportPreference = HostTransportPreference::GpuSharedOnly;
+        abortCfg.AllowCpuFallback = false;
+        abortCfg.SimulateDisconnectWhileHoldingMutexForTesting = true;
+        FrameConsumer abortConsumer(abortCfg);
+        EXPECT_EQ(abortConsumer.Connect(2000U), S_OK);
+
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> src;
+        EXPECT_TRUE(CreateSyntheticIpcGpuTexture(dev.Get(), 64U, 64U, 1U, src));
+        auto slot = server.AcquireBufferSlot();
+        EXPECT_TRUE(slot != nullptr);
+        FrameExtractionInput in{};
+        in.AdoptSourceTexture = src.Detach();
+        in.PresentationFrameNumber = 1U;
+        const auto ext = pool.ExtractToSharedTexture(in, *slot, true);
+        EXPECT_EQ(ext.HResult, S_OK);
+        bool evicted = false;
+        EXPECT_EQ(server.EnqueueFrame(std::move(slot), evicted), S_OK);
+
+        bool isGpu = false;
+        FrameIpcGpuFrameHeader gpuHdr{};
+        FrameIpcFrameHeader cpuHdr{};
+        std::vector<uint8_t> pixels;
+        EXPECT_EQ(abortConsumer.ReceiveNextGpuOrCpuFrame(isGpu, gpuHdr, cpuHdr, pixels, 2000U), HRESULT_FROM_WIN32(ERROR_CONNECTION_ABORTED));
+    }
+
+    Sleep(60U);
+
+    // 2. Subsequent healthy client connects, delays ACK briefly (below timeout), verifies visual pattern, and succeeds.
+    {
+        HostConsumerConfig okCfg;
+        okCfg.PipeName = pipeName;
+        okCfg.TransportPreference = HostTransportPreference::GpuSharedOnly;
+        okCfg.AllowCpuFallback = false;
+        okCfg.VerifySyntheticPattern = true;
+        okCfg.SimulatedAckDelayMsForTesting = 40U;
+        FrameConsumer okConsumer(okCfg);
+        EXPECT_EQ(okConsumer.Connect(2000U), S_OK);
+
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> src2;
+        EXPECT_TRUE(CreateSyntheticIpcGpuTexture(dev.Get(), 128U, 128U, 22U, src2));
+        auto slot2 = server.AcquireBufferSlot();
+        EXPECT_TRUE(slot2 != nullptr);
+        FrameExtractionInput in2{};
+        in2.AdoptSourceTexture = src2.Detach();
+        in2.PresentationFrameNumber = 22U;
+        const auto ext2 = pool.ExtractToSharedTexture(in2, *slot2, true);
+        EXPECT_EQ(ext2.HResult, S_OK);
+        bool evicted = false;
+        EXPECT_EQ(server.EnqueueFrame(std::move(slot2), evicted), S_OK);
+
+        bool isGpu = false;
+        FrameIpcGpuFrameHeader gpuHdr{};
+        FrameIpcFrameHeader cpuHdr{};
+        std::vector<uint8_t> pixels;
+        EXPECT_EQ(okConsumer.ReceiveNextGpuOrCpuFrame(isGpu, gpuHdr, cpuHdr, pixels, 2000U), S_OK);
+        EXPECT_TRUE(isGpu);
+        EXPECT_EQ(okConsumer.GetMetricsSnapshot().FramesValid, 1ULL);
+        EXPECT_EQ(okConsumer.GetMetricsSnapshot().SyntheticPatternMismatches, 0ULL);
+        okConsumer.Disconnect();
+    }
+
+    server.Stop();
+    pool.Shutdown();
+}
+
+void
+TestGpuSharedTextureIncompatibleAdapterAndInvalidHandleAckHandling()
+{
+    Microsoft::WRL::ComPtr<ID3D11Device> dev;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx;
+    LUID adapterLuid{0, 0};
+    EXPECT_TRUE(CreateIpcTestD3d11Device(dev, ctx, adapterLuid));
+
+    D3d11SharedTexturePool pool;
+    EXPECT_EQ(pool.Configure(3U), S_OK);
+    pool.SetDevice(dev.Get(), ctx.Get(), adapterLuid);
+
+    const std::wstring pipeName = MakeUniquePipeName(29U);
+    FrameTransportConfig serverCfg;
+    serverCfg.SetPipeName(pipeName.c_str());
+    serverCfg.AdapterLuid = adapterLuid;
+    serverCfg.EnableGpuSharedTransport = true;
+    serverCfg.SharedTexturePoolSize = 3U;
+    serverCfg.SharedTexturePool = &pool;
+
+    FrameIpcServer server;
+    EXPECT_EQ(server.Start(serverCfg), S_OK);
+
+    // Client simulates invalid handle rejection on frame 1 -> sends ResourceOpenFailed ACK, disconnects cleanly.
+    HostConsumerConfig badHandleCfg;
+    badHandleCfg.PipeName = pipeName;
+    badHandleCfg.TransportPreference = HostTransportPreference::GpuSharedOnly;
+    badHandleCfg.AllowCpuFallback = false;
+    badHandleCfg.SimulateInvalidSharedHandleForTesting = true;
+    FrameConsumer badHandleConsumer(badHandleCfg);
+    EXPECT_EQ(badHandleConsumer.Connect(2000U), S_OK);
+
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> src;
+    EXPECT_TRUE(CreateSyntheticIpcGpuTexture(dev.Get(), 64U, 64U, 5U, src));
+    auto slot = server.AcquireBufferSlot();
+    EXPECT_TRUE(slot != nullptr);
+    FrameExtractionInput in{};
+    in.AdoptSourceTexture = src.Detach();
+    in.PresentationFrameNumber = 5U;
+    EXPECT_EQ(pool.ExtractToSharedTexture(in, *slot, true).HResult, S_OK);
+    bool evicted = false;
+    EXPECT_EQ(server.EnqueueFrame(std::move(slot), evicted), S_OK);
+
+    bool isGpu = false;
+    FrameIpcGpuFrameHeader gpuHdr{};
+    FrameIpcFrameHeader cpuHdr{};
+    std::vector<uint8_t> pixels;
+    EXPECT_EQ(badHandleConsumer.ReceiveNextGpuOrCpuFrame(isGpu, gpuHdr, cpuHdr, pixels, 2000U), E_HANDLE);
+    EXPECT_EQ(badHandleConsumer.GetMetricsSnapshot().GpuSharedOpenFailures, 1ULL);
+    EXPECT_EQ(badHandleConsumer.GetMetricsSnapshot().LastProtocolStatus, FrameIpcStatus::ResourceOpenFailed);
+
+    Sleep(40U);
+    const auto poolSnap = pool.GetMetricsSnapshot();
+    EXPECT_EQ(poolSnap.FreeSlots, 3U);
+    EXPECT_EQ(poolSnap.GpuFramesDropped, 1ULL);
+
+    server.Stop();
+    pool.Shutdown();
+}
+
 template <typename Fn>
 void
 RunTest(
@@ -1877,6 +2212,10 @@ main()
     RunTest("SmokeExitReasonsIdleDesktopAndRecoverableVsPartialTimeouts", TestSmokeExitReasonsIdleDesktopAndRecoverableVsPartialTimeouts);
     RunTest("DeterministicFpsGuardrailsTimestampValidationAndVirtualDisplaySelection", TestDeterministicFpsGuardrailsTimestampValidationAndVirtualDisplaySelection);
     RunTest("RepeatedSessionsMemoryBoundedness", TestRepeatedSessionsMemoryBoundedness);
+    RunTest("V1_1GpuTransportCapabilityNegotiationAndFallback", TestV1_1GpuTransportCapabilityNegotiationAndFallback);
+    RunTest("GpuSharedTextureIpcUnauthorizedClientCannotObtainHandle", TestGpuSharedTextureIpcUnauthorizedClientCannotObtainHandle);
+    RunTest("GpuSharedTextureDelayedAckAndMidUseClientDisconnectRecovery", TestGpuSharedTextureDelayedAckAndMidUseClientDisconnectRecovery);
+    RunTest("GpuSharedTextureIncompatibleAdapterAndInvalidHandleAckHandling", TestGpuSharedTextureIncompatibleAdapterAndInvalidHandleAckHandling);
 
     std::printf("Summary: %d tests run, %d assertion failures.\n", g_TestsRun, g_TestsFailed);
     return (g_TestsFailed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;

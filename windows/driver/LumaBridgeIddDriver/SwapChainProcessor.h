@@ -1,6 +1,6 @@
 #pragma once
 
-#ifndef WIN32_NO_STATUS
+#if !defined(WIN32_NO_STATUS) && !defined(_WINNT_)
 #define WIN32_NO_STATUS
 #define LUMABRIDGE_SWAPCHAIN_DEFINED_WIN32_NO_STATUS
 #endif
@@ -10,7 +10,14 @@
 #undef LUMABRIDGE_SWAPCHAIN_DEFINED_WIN32_NO_STATUS
 #endif
 
+#if !defined(WIN32_NO_STATUS) && defined(_WINNT_)
+#pragma warning(push)
+#pragma warning(disable : 4005)
 #include <ntstatus.h>
+#pragma warning(pop)
+#else
+#include <ntstatus.h>
+#endif
 
 #include <cstdint>
 
@@ -133,6 +140,13 @@ struct SwapChainMetricsSnapshot
     uint32_t LastExtractedFormat{0};
     HRESULT LastExtractionError{S_OK};
     HRESULT LastTransportError{S_OK};
+    bool GpuSharedTransportEnabled{false};
+    uint32_t SharedTexturePoolSize{0};
+    uint32_t SharedTexturePoolPeakUsage{0};
+    uint64_t GpuFramesShared{0};
+    uint64_t GpuFramesDropped{0};
+    uint64_t GpuSyncTimeouts{0};
+    uint64_t GpuSyncWaitUs{0};
 };
 
 /// Abstraction over D3D11/DXGI device setup and IddCx swapchain DDIs for testability.

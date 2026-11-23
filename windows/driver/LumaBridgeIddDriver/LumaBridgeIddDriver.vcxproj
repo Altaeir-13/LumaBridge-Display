@@ -120,6 +120,7 @@
     <ClCompile Include="FrameExtractor.cpp" />
     <ClCompile Include="FrameTransport.cpp" />
     <ClCompile Include="MonitorModes.cpp" />
+    <ClCompile Include="SharedTexturePool.cpp" />
     <ClCompile Include="SwapChainProcessor.cpp" />
     <ClCompile Include="VirtualMonitor.cpp" />
   </ItemGroup>
@@ -132,6 +133,7 @@
     <ClInclude Include="FrameIpcProtocol.h" />
     <ClInclude Include="FrameTransport.h" />
     <ClInclude Include="MonitorModes.h" />
+    <ClInclude Include="SharedTexturePool.h" />
     <ClInclude Include="SwapChainProcessor.h" />
     <ClInclude Include="Trace.h" />
     <ClInclude Include="VirtualMonitor.h" />

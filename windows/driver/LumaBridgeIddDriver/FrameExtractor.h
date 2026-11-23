@@ -112,7 +112,8 @@ private:
     size_t m_capacity{0U};
 };
 
-/// Reusable extracted frame buffer storing tightly packed BGRA8/RGBA8 pixels and frame metadata.
+/// Reusable extracted frame buffer storing either tightly packed BGRA8/RGBA8 pixels (M4.1 fallback)
+/// or a reference to a GPU shared texture pool slot (M4.2).
 struct ExtractedFrameBuffer
 {
     uint64_t FrameSequence{0};
@@ -135,6 +136,10 @@ struct ExtractedFrameBuffer
     uint64_t MapAndCpuCopyLatencyUs{0};
     uint64_t CrcComputeLatencyUs{0};
     uint32_t PayloadCrc32{0};
+    bool IsGpuSharedFrame{false};
+    uint32_t GpuSlotIndex{0U};
+    uint32_t GpuSlotGeneration{0U};
+    LUID GpuAdapterLuid{0, 0};
     bool PooledSlot{false};
     bool InFlightFromPool{false};
     uint64_t PoolEpoch{0ULL};
@@ -162,6 +167,10 @@ struct ExtractedFrameBuffer
         MapAndCpuCopyLatencyUs = 0ULL;
         CrcComputeLatencyUs = 0ULL;
         PayloadCrc32 = 0U;
+        IsGpuSharedFrame = false;
+        GpuSlotIndex = 0U;
+        GpuSlotGeneration = 0U;
+        GpuAdapterLuid = LUID{0, 0};
         Pixels.ClearKeepCapacity(ipc::kMaxRetainedPoolBufferBytes);
     }
 
