@@ -12,12 +12,12 @@ Os seguintes scripts modulares automatizam o ciclo de preparacao, diagnostico e 
 | Script | Responsabilidade | Privilegio Admin |
 |---|---|---|
 | `LumaBridgeDriverCommon.psm1` | Modulo compartilhado (Hardware ID `Root\LumaBridgeIddDriver`, descoberta WDK, lookup PnP exclusivo por `DEVPKEY_Device_HardwareIds`, Driver Store via XML invariante de idioma, verificacao criptografica INF+DLL+CAT + correspondencia de certificados, correlacao `WUDFHost.exe`) | N/A |
-| `Test-LumaBridgePrerequisites.ps1` | Diagnostico somente leitura de Windows 11 x64, Secure Boot e Test Signing (com fallback via registro sem elevacao), UMDF/IddCx e artefatos | Nao |
+| `Test-LumaBridgePrerequisites.ps1` | Diagnostico somente leitura de Windows 11 x64 (`Architecture`), Secure Boot, Test Signing, VBS e HVCI (`Win32_DeviceGuard` + fallback registro), servicos (`WUDFRd`, `WudfPf`, `PlugPlay`, `EventLog`), APIs/NVENC, diferenciacao entre bloqueios e avisos informativos, UMDF/IddCx e artefatos | Nao |
 | `Invoke-LumaBridgePackageSigning.ps1` | Valida isolamento e limpa staging fora do repo antes do `Inf2Cat`, gera/reutiliza certificado de teste, assina `.dll`, regenera/assina `.cat`, verifica integridade INF+DLL+CAT e confirma hashes originais intactos | Somente com `-TrustCertificate` |
 | `Install-LumaBridgeDriver.ps1` | Valida pre-requisitos e assinaturas (inclusive com `-AllowUntrustedChain`, sem aceitar arquivos adulterados), desabilita/reinicia monitor antes de atualizar dispositivo existente, confirma driver vinculado, preserva diagnosticos pre-rollback (`DEVPKEY_Device_ProblemStatus`, SetupAPI, eventos, dumps e breadcrumbs `Diag*`) antes de executar rollback em falhas parciais | Sim (exceto `-DryRun`) |
 | `Set-LumaBridgeVirtualMonitor.ps1` | Localiza dinamicamente a instancia PnP via `DEVPKEY_Device_HardwareIds`, ajusta `EnableVirtualMonitor` (`1`/`0`), reinicia o dispositivo e executa rollback para `0` em falha parcial de ativacao | Sim (exceto `-DryRun`) |
-| `Invoke-LumaBridgeEtwTrace.ps1` | Gerencia sessoes ETW separadas via `-pf` (`LumaBridgeIddCore` sequencial `-f bin -max 256` + verificacao `VerifyProviders`, e opcional `LumaBridgeIddDxg` circular `-f bincirc -max 128` via `-IncludeDxgKrnl`), exporta eventos via XPath streaming e executa decodificacao WPP (`DecodeWpp` com `symchk`/`tracepdb`/`tracefmt`) | Sim para `Start`/`Stop` (exceto `-DryRun`); Nao para `Status`/`VerifyProviders`/`ExportSummary`/`DecodeWpp` |
-| `Invoke-LumaBridgeFunctionalValidation.ps1` | Orquestrador ponta a ponta em 11 etapas (pre-checks, branch/artefatos, staging usando `$signResult.StagingDir`, verificacao criptografica/hashes, ETW `VerifyProviders`, instalacao autorizada, monitor virtual, `EnableFrameExtraction=1` + broker `AuthorizedHostUserSid`, execucao limitada do `lumabridge-host.exe`, coleta de metricas/logs e rollback automatico em `finally`) | Sim (exceto `-DryRun`) |
+| `Invoke-LumaBridgeEtwTrace.ps1` | Gerencia sessoes ETW separadas via `-pf` (`LumaBridgeIddCore` sequencial `-f bin -max <CoreMaxFileSizeMb>` + verificacao `VerifyProviders`, e opcional `LumaBridgeIddDxg` circular `-f bincirc -max 128` via `-IncludeDxgKrnl`), exporta eventos via XPath streaming e executa decodificacao WPP (`DecodeWpp` com `symchk`/`tracepdb`/`tracefmt`) | Sim para `Start`/`Stop` (exceto `-DryRun`); Nao para `Status`/`VerifyProviders`/`ExportSummary`/`DecodeWpp` |
+| `Invoke-LumaBridgeFunctionalValidation.ps1` | Orquestrador ponta a ponta em 11 etapas com `RunId` exclusivo, snapshot inicial completo, verificacao estrita de binding/SHA-256 do driver, identificacao anti-stale de `WUDFHost.exe`, telemetria continua (5 s) com `NOT_MEASURED`, gates rigorosos por subperfil (`1080p60`, `>=98%` quadros, `>=95%` FPS, NVENC ratio/drops, `TimestampMeasurementErrors==0`), timeouts ate `3600s` e rollback nao-mascarado em `finally` | Sim (exceto `-DryRun`) |
 | `Collect-LumaBridgeDiagnostics.ps1` | Coleta estado PnP (incluindo `DEVPKEY_Device_ProblemStatus` e breadcrumbs `Diag*`), Driver Store, excerto SetupAPI contextualizado, canais/eventos, inventario de crash dumps, resumo ETL em streaming (`LumaBridgeIddCore.etl` e `LumaBridgeIddDxg.etl`), `DecodeWpp` opcional, `StageExecutionSummary`, versoes/hashes de pacote e `WUDFHost.exe` associado ao LumaBridge em JSON/Markdown (sem pixels da tela) | Nao |
 | `Prepare-IddSampleReference.ps1` | Baixa somente `video/IndirectDisplay` de `microsoft/Windows-driver-samples` e compila `IddSampleDriver` + `IddSampleApp` em diretorio isolado fora do repositorio (`-DryRun` nao cria diretorios nem executa comandos), sem instalar no host | Nao |
 | `Uninstall-LumaBridgeDriver.ps1` | Desativa monitor, remove instancias PnP, limpa `oemXX.inf` do Driver Store sem `/force` por padrao (opt-in via `-ForceDriverStoreDelete`) e remove certificado somente por `-CertificateThumbprint` + `-ConfirmCertificateRemoval` | Sim (exceto `-DryRun`) |
@@ -139,59 +139,65 @@ Remover os certificados temporarios de teste das stores `CurrentUser\My`, `Local
 | 9 | **Ausencia de monitores fantasmas e leaks** | Desabilitar `EnableVirtualMonitor = 0`, reiniciar e executar `pnputil /remove-device` + `/delete-driver`. | Nenhum monitor fantasma permanece listado em *Gerenciador de Dispositivos -> Monitores* ou Configuracoes de Tela; `WUDFHost.exe` encerra sem handles abertos ou crash dump. |
 | 10 | **Extracao M4.1 opt-in e consumo em `lumabridge-host.exe`** | Com `EnableVirtualMonitor = 1`, definir `REG_DWORD EnableFrameExtraction = 1` na chave `Device Parameters` (ou `Device Parameters\LumaBridgeIddDriver`), reiniciar o dispositivo, executar `lumabridge-host.exe --max-frames 30 --json-summary <temp.json>` e testar desconexao/reconexao. | `lumabridge-host.exe` autentica no Named Pipe `\\.\pipe\LumaBridgeFrameIpc_v1`, recebe frames reais (`FramesDelivered` == `FramesReceived`, `ChecksumMismatches = 0`, `ProtocolErrors = 0`), desconexao nao trava o driver (`FramesDroppedByBackpressure` atua normalmente) e `EnableFrameExtraction = 0` restaura o modo sem copia. |
 
-## 6. Validacao controlada GPU + NVENC H.264 (M4.2 / M4.2.1), Telemetria Temporal e Perfis Prolongados
+## 6. Validacao controlada GPU + NVENC H.264 (M4.2 / M4.2.1 / M0.1), Telemetria Continua e Perfis Prolongados
 
-Utilize preferencialmente o script automatizado `Invoke-LumaBridgeFunctionalValidation.ps1`, que usa `$signResult.StagingDir` e suporta o pipeline residente em GPU + NVENC H.264 (`M4.2`), fallback diagnostico CPU (`M4.1.1`), validação estrita de timestamps causais e perfis prolongados (`M4.2.1`):
+Utilize preferencialmente o script automatizado `Invoke-LumaBridgeFunctionalValidation.ps1`, que usa `$signResult.StagingDir` em diretorio isolado por `RunId`, valida assinatura/binding/hash SHA-256 do driver, identifica dinamicamente o `WUDFHost.exe` associado ao LumaBridge e aplica gates estritos independentes em cada subperfil executado:
 
-- **Perfil A (`-TestProfile Smoke`):** valida integridade ponta a ponta do driver instalado exigindo no minimo `1` frame real valido (`--min-frames 1 --max-frames 60 --duration-ms 5000`), sem exigir 60 frames em desktop estatico nem confundir termino normal por duracao ou timeouts recuperaveis de ociosidade com falha de transporte.
-- **Perfil B (`-TestProfile Performance` ou `Both`):** executa estimulo visual diagnostico controlado com timer de alta resolucao (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`) exclusivamente no display virtual identificado (`--visual-stimulus --require-virtual-stimulus --require-max-frames`) para medir entrega continua real. *Importante:* execucoes curtas (ex.: 120 quadros) **nao** marcam `ProlongedStabilityProven = true`.
-- **Benchmark Prolongado 30 s (`-TestProfile Benchmark30s`, `-BenchmarkDurationSec 30`):** executa 30 s continuos a 60 Hz (`1920x1080`, `--prewarm-width 1920 --prewarm-height 1080`) com coleta de FPS do estimulo, FPS vivo/codificado, cobertura temporal (`>= 95%`), p95/p99, jitter entre quadros, sub-etapas NVENC, ocupacao do pool, memoria/CPU de `lumabridge-host.exe` e `WUDFHost.exe`, e uso de GPU engine (quando disponivel).
-- **Estabilidade Prolongada (`-TestProfile ProlongedStability`, `-StabilityDurationSec 120..3600`, ou `-TestProfile Full`):** combina estabilidade prolongada de 2 a 5 minutos com rollback verificado em `finally`.
-- **Modo GPU Shared + NVENC (`M4.2` / `M4.2.1`):** utilize `-TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc [-VerifyH264Decode]` para exigir texturas compartilhadas (`D3D11_RESOURCE_MISC_SHARED_NTHANDLE | KEYEDMUTEX`, `CpuStagingReadsPerformed = 0`), codificacao NVENC H.264 e validacao estrutural NAL/MFT (`StructuralDecodeValidated=true`, mantendo `FidelityPsnrValidated=false` sem referencia sintetica). Para comprovar fidelidade PSNR em isolamento sem pixels privados, execute `FrameEndToEndIntegrationTests.exe` (`--verify-h264-psnr`) ou informe `-SyntheticFidelityExecutablePath`. Para fallback diagnostico CPU (`M4.1.1`), utilize `-TransportMode Cpu`.
+- **Perfil A (`-TestProfile Smoke`):** valida integridade ponta a ponta do driver instalado exigindo no minimo `1` frame real valido (`--min-frames 1 --max-frames 60 --duration-ms 5000`) com `--require-valid-timestamps` e `--run-id`, sem exigir 60 quadros em desktop estatico nem confundir termino normal por duracao ou timeouts recuperaveis de ociosidade com falha de transporte.
+- **Perfil B (`-TestProfile Performance` ou `Both`):** executa estimulo visual diagnostico controlado (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`) exclusivamente no display virtual identificado (`--visual-stimulus --require-virtual-stimulus --require-max-frames`) para medir entrega continua real. Nos perfis compostos (`Both` e `Full`), **cada subperfil executado e avaliado de forma independente** (uma falha no Smoke, Performance ou Benchmark30s derruba o resultado geral mesmo se o ultimo subperfil passar).
+- **Benchmark 30 s (`-TestProfile Benchmark30s`, `-BenchmarkDurationSec 30`):** exige `1920x1080` (`-ExpectedBenchmarkWidth 1920 -ExpectedBenchmarkHeight 1080`), estimulo `60 FPS`, duracao efetivamente medida `>= 95%` da solicitada, no minimo `98%` dos quadros validos esperados no intervalo efetivamente medido (`-MinBenchmarkFrameRatio 0.98`, ~`1.764` quadros em 30 s), FPS sustentado `>= 95%` (`-MinSustainedFpsRatio 0.95`, `>= 57.0 FPS` avaliado separadamente da contagem), `GpuSharedNtHandle` sem fallback nem readback CPU, `NvencFramesEncoded >= floor(FramesValid * -MinNvencEncodeRatio)` e quedas `<= -MaxDropRatio` (`0.02`, rejeitando `NvencFramesEncoded = 1`), decodificacao estrutural H.264 validada, `TimestampMeasurementErrors == 0`, cobertura temporal `>= 95%`, binding verificado e `WUDFHost.exe` LumaBridge verificado vivo. *Regra estrita:* `Benchmark30s` **nunca** marca `ProlongedStabilityProven = true`.
+- **Estabilidade Prolongada (`-TestProfile ProlongedStability`, `-StabilityDurationSec 180..3600`, ou `-TestProfile Full`):** utiliza exatamente os mesmos criterios rigorosos de `1080p60` (`>= 98%` quadros, ~`10.584` quadros em `180 s`, timeouts seguros ate `3600 s` com margens de prewarm/shutdown, amostragem Algorithm R por reservoir sampling acima de `65.536` amostras e limite ETW ajustavel via `-CoreEtwMaxFileSizeMb`). `ProlongedStabilityProven = true` exige execucao completa com aprovacao de `ProlongedStability` atendendo `>= -MinProlongedStabilitySec` (`180 s` por padrao).
+- **Telemetria Continua (5 s) e Contrato `NOT_MEASURED`:** durante toda a execucao ativa do `lumabridge-host.exe`, o runner coleta amostras periodicas (`-ResourceSampleIntervalSec 5`) de CPU, Working Set, memoria privada, handles, threads, VRAM dedicada e GPU Engine **filtradas estritamente por PID** (`pid_<PID>_*`) separando `lumabridge-host.exe` e o `WUDFHost.exe` do LumaBridge (nunca somando GPU de processos alheios e registrando `NOT_MEASURED` com motivo quando indisponivel — nunca `0`).
+- **Modo GPU Shared + NVENC (`M4.2` / `M4.2.1`):** utilize `-TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc [-VerifyH264Decode]` para exigir texturas compartilhadas (`D3D11_RESOURCE_MISC_SHARED_NTHANDLE | KEYEDMUTEX`, `CpuStagingReadsPerformed = 0`), codificacao NVENC H.264 e validacao estrutural NAL/MFT (`StructuralDecodeValidated=true`, mantendo `FidelityPsnrValidated=false` sem referencia sintetica). Para comprovar fidelidade PSNR em isolamento sem pixels privados, execute `FrameEndToEndIntegrationTests.exe` (`--verify-h264-psnr`) ou informe `-SyntheticFidelityExecutablePath`.
 
 ```powershell
-# Previa Dry Run sem efeitos colaterais (M4.2.1 Benchmark 30s 1080p60 GPU + NVENC + Decode):
+# Previa Dry Run sem efeitos colaterais (M0.1/M4.2.1 Benchmark 30s e Estabilidade Prolongada 180s..3600s):
 .\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 -Configuration Release -TestProfile Benchmark30s -BenchmarkDurationSec 30 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -DryRun
+.\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 -Configuration Release -TestProfile ProlongedStability -StabilityDurationSec 180 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -DryRun
 
-# Execucao real como Administrador — Benchmark 30s 1080p60 (solicita confirmacao explicita e garante rollback):
+# Execucao real como Administrador (somente mediante autorizacao explicita):
 .\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 -Configuration Release -TestProfile Benchmark30s -BenchmarkDurationSec 30 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -CreateTestCertificateIfMissing -TrustCertificate -AllowUntrustedChain
-
-# Execucao real de estabilidade prolongada configuravel (ex.: 180s):
 .\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 -Configuration Release -TestProfile ProlongedStability -StabilityDurationSec 180 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -CreateTestCertificateIfMissing -TrustCertificate -AllowUntrustedChain
 ```
 
-> **Escopo do rollback em `finally`:** o runner reverte deterministicamente a sessao ETW, `EnableFrameExtraction=0`, `EnableGpuSharedTransport` (removendo se inexistente ou restaurando o valor anterior), `AuthorizedHostUserSid` e `EnableVirtualMonitor` ao estado anterior (e remove o dispositivo caso `-FullUninstallOnExit` ou falha na primeira instalacao), registrando em `RollbackIncompleteReasons` qualquer pendencia pos-rollback. Se o dispositivo ja possuia uma versao anterior instalada e `-SkipDriverInstall` nao foi usado, o rollback restaura parametros/registro, mas **nao realiza downgrade automatico do binario de driver anterior** (remocao completa requer `-FullUninstallOnExit`).
+> **Semantica de Rollback e Codigos de Saida (`S-02`, `S-06`):** O runner registra um snapshot inicial completo (`InitialSystemSnapshot` distinguindo valor de registro ausente vs `0` vs `1`, certificados existentes, sessoes ETW, binding/INF e topologia de telas) e separa explicitamente seis resultados: `FunctionalValidationSucceeded`, `RuntimeCleanupSucceeded`, `SystemStateRestored`, `DriverBindingPersisted`, `RollbackClean` e `OverallSucceeded`. Se o rollback falhar parcialmente, `OverallSucceeded = false` e `ValidationSucceeded = false` com lancamento de excecao (exit code != 0), preservando ambos os erros sem mascaramento e gravando o relatorio JSON/Markdown inclusive em falhas de estagios intermediarios. Certificados pre-existentes (ex.: `1EEFC55BD7EEB2A9115432607B97978736B9DFE0`) e pacotes historicos do Driver Store **nunca** sao removidos automaticamente como efeito colateral; quando uma atualizacao autorizada do driver permanece instalada apos o benchmark, o relatorio registra `DriverBindingPersisted = true` e `SystemStateRestored = false`.
 
-Caso execute manualmente os passos individuais em PowerShell **como Administrador**:
+### Procedimento Seguro de Recuperacao Manual (`S-06`)
 
-1. **Habilitacao opt-in (Admin, apos instalacao controlada e `EnableVirtualMonitor = 1`):**
+Se uma execucao interrompida exigir intervencao manual em PowerShell **como Administrador**, preserve obrigatoriamente o estado inicial do host, dispositivos de terceiros e o monitor virtual se ele ja estava ativo (`EnableVirtualMonitor = 1`):
+
+1. **Identificar PID especifico do consumidor e dispositivo LumaBridge sem afetar terceiros:**
    ```powershell
-   $dev = Get-PnpDevice | Where-Object { $_.InstanceId -like 'ROOT\DISPLAY\*' -and $_.FriendlyName -like '*LumaBridge*' } | Select-Object -First 1
-   $devParams = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($dev.InstanceId)\Device Parameters"
-   $userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-   New-ItemProperty -LiteralPath $devParams -Name 'AuthorizedHostUserSid' -PropertyType String -Value $userSid -Force | Out-Null
-   New-ItemProperty -LiteralPath $devParams -Name 'EnableGpuSharedTransport' -PropertyType DWord -Value 1 -Force | Out-Null
-   New-ItemProperty -LiteralPath $devParams -Name 'EnableFrameExtraction' -PropertyType DWord -Value 1 -Force | Out-Null
-   pnputil /restart-device $dev.InstanceId
+   # Nunca executar Stop-Process -Name lumabridge-host indiscriminadamente entre sessoes.
+   Get-CimInstance Win32_Process -Filter "Name = 'lumabridge-host.exe'" |
+     Select-Object ProcessId, ParentProcessId, CommandLine
+   # Encerre apenas o PID orfao especifico via Stop-Process -Id <PID> caso necessario.
+
+   # Localize dinamicamente apenas instancias com DEVPKEY_Device_HardwareIds = Root\LumaBridgeIddDriver:
+   Import-Module .\windows\driver\scripts\LumaBridgeDriverCommon.psm1 -Force
+   $dev = @(Get-LumaBridgePnpInstances) | Select-Object -First 1
    ```
-2. **Captura ETW + execucao do host consumidor GPU + NVENC em processo separado:**
+2. **Restaurar exatamente os valores do `InitialSystemSnapshot` (sem forcar `EnableVirtualMonitor = 0` se antes era `1`):**
    ```powershell
-   .\windows\driver\scripts\Invoke-LumaBridgeEtwTrace.ps1 -Action Start -Force
-   $verify = .\windows\driver\scripts\Invoke-LumaBridgeEtwTrace.ps1 -Action VerifyProviders
-   $verify.AllProvidersVerified # deve retornar True
-   .\windows\driver\x64\Release\lumabridge-host.exe --transport gpu --require-gpu-shared --nvenc --require-nvenc --max-frames 30 --duration-ms 15000 --json-summary "$env:TEMP\lb-host-summary.json"
-   .\windows\driver\scripts\Invoke-LumaBridgeEtwTrace.ps1 -Action Stop -Force
-   .\windows\driver\scripts\Collect-LumaBridgeDiagnostics.ps1 -Configuration Release -EtlPath "$env:LOCALAPPDATA\LumaBridgeDisplay\Diagnostics\Etw\LumaBridgeIddCore.etl"
-   ```
-3. **Rollback imediato para modo sem extracao (ou desinstalacao completa):**
-   ```powershell
+   $devParams = $dev.DeviceParametersPath
+   # Reverter EnableFrameExtraction para 0 (ou remover se ausente no snapshot inicial):
    New-ItemProperty -LiteralPath $devParams -Name 'EnableFrameExtraction' -PropertyType DWord -Value 0 -Force | Out-Null
+   # Remover chaves temporarias caso estivessem ausentes no snapshot inicial (ou restaurar valor anterior):
    Remove-ItemProperty -LiteralPath $devParams -Name 'EnableGpuSharedTransport' -ErrorAction SilentlyContinue
    Remove-ItemProperty -LiteralPath $devParams -Name 'AuthorizedHostUserSid' -ErrorAction SilentlyContinue
+   # Somente defina EnableVirtualMonitor=0 se InitialSystemSnapshot indicava 0/ausente;
+   # se o monitor virtual do usuario ja estava ativo (1), mantenha EnableVirtualMonitor=1!
    pnputil /restart-device $dev.InstanceId
    ```
-   Para rollback total do pacote e certificado, utilize `Uninstall-LumaBridgeDriver.ps1`.
+3. **Encerrar apenas sessoes ETW orfas do LumaBridge e preservar certificados/Driver Store pre-existentes:**
+   ```powershell
+   logman stop LumaBridgeIddCore -ets 2>$null
+   logman stop LumaBridgeIddDxg -ets 2>$null
+   # Nao remover o certificado pre-existente 1EEFC55BD7EEB2A9115432607B97978736B9DFE0
+   # nem os pacotes historicos do Driver Store sem autorizacao explicita.
+   ```
+   Para desinstalacao completa autorizada apenas quando o dispositivo foi criado especificamente pelo teste, utilize `Uninstall-LumaBridgeDriver.ps1`.
 
-4. **Status M4.2 e proximos passos:**
+4. **Status M4.2 / M0.1 e proximos passos:**
    - A arquitetura detalhada, modelo de sincronizacao `IDXGIKeyedMutex`, modelo de seguranca `PROCESS_DUP_HANDLE`, benchmark controlado 3-way (CPU vs GPU Shared vs GPU+NVENC) e caminho para transmissao Linux estao documentados em [windows-gpu-shared-textures-nvenc.md](../architecture/windows-gpu-shared-textures-nvenc.md).
-   - Validacao ao vivo dentro de `WUDFHost.exe` com `EnableFrameExtraction = 1` + `EnableGpuSharedTransport = 1` depende de autorizacao explicita do operador no host Windows 11.
+   - Validacao ao vivo dentro de `WUDFHost.exe` com instalacao controlada da versao compilada e benchmarks `Benchmark30s` / `ProlongedStability` depende de autorizacao administrativa explicita do operador no host Windows 11.

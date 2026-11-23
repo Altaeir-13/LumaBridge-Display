@@ -37,7 +37,13 @@ cl /nologo /std:c++17 /W4 /WX /EHsc /O2 /Zi /MD /DNDEBUG /DUNICODE /D_UNICODE /I
 - `--require-virtual-stimulus`: falha com codigo de saida nao-zero se o estimulo visual nao conseguir identificar o display virtual
 - `--stimulus-fps <fps>`: taxa alvo de atualizacao do estimulo visual (`1..120`, padrao `60`)
 - `--stimulus-display <gdiName>`: override explicito opcional do display GDI (ex.: `\\.\DISPLAY2`)
-- `--json-summary <caminho>`: grava resumo JSON nao visual com metricas de GPU pool, breakdown de sub-etapas NVENC (`FormatPrepare`, `EncodePicture`, `BitstreamLockCopy`, `EncodedQueueWait`), cobertura temporal (`TemporalTelemetry`), `Available` em estatisticas de latencia, `ResourceUsage` (host + `WUDFHost.exe`), decoder H.264 e status do estimulo
+- `--run-id <id>`: associa identificador exclusivo da execucao (`RunId`, `HostProcessId`, `GeneratedAtUtc` e `SummaryComplete`) no JSON de resumo
+- `--require-valid-timestamps`: exige `TimestampMeasurementErrors == 0`, monotonicidade QPC e cobertura temporal `>= 95%` para `ExitCode=0`
+- `--require-width <px>` / `--require-height <px>`: exige resolucao exata dos quadros validos recebidos (e largura/altura da sessao NVENC ativa)
+- `--min-nvenc-encoded-frames <n>`: quantidade minima absoluta de quadros codificados pelo NVENC quando `--require-nvenc`
+- `--min-nvenc-encode-ratio <0..1>`: razao minima `NvencFramesEncoded / FramesValid` exigida quando `--require-nvenc`
+- `--max-nvenc-drop-ratio <0..1>`: teto maximo para `(NvencDroppedFrames + EncodedQueueDrops) / NvencFramesSubmitted` quando `--require-nvenc`
+- `--json-summary <caminho>`: grava resumo JSON nao visual com metricas de GPU pool, breakdown de sub-etapas NVENC (`FormatPrepare`, `EncodePicture`, `BitstreamLockCopy`, `EncodedQueueWait`), cobertura temporal (`TemporalTelemetry`), amostragem por *reservoir sampling* acima de `65.536` amostras (`StoredSampleCount`/`SamplesTruncated`/`ReservoirSampled`), `ResourceUsage` (CPU, RAM, `HandleCount`, VRAM dedicada com `NOT_MEASURED` quando indisponivel), decoder H.264, `GateEvaluation` e status do estimulo
 - `--quiet`: omite log por frame no stdout
 
 ## Limites e privacidade
