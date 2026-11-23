@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <intrin.h>
+#include <limits>
 #include <new>
 
 #pragma comment(lib, "d3d11.lib")
@@ -74,11 +76,14 @@ QueryCurrentQpc() noexcept
 }
 
 uint64_t
-QueryQpcFrequencySafe() noexcept
+QueryQpcFrequencyOrZero() noexcept
 {
     LARGE_INTEGER li{};
-    (void)QueryPerformanceFrequency(&li);
-    return (li.QuadPart > 0) ? static_cast<uint64_t>(li.QuadPart) : 10000000ULL;
+    if (!QueryPerformanceFrequency(&li) || li.QuadPart <= 0)
+    {
+        return 0ULL;
+    }
+    return static_cast<uint64_t>(li.QuadPart);
 }
 
 bool
@@ -363,6 +368,82 @@ private:
 
 } // namespace
 
+uint64_t
+ComputeQpcTicksToUsSafe(
+    uint64_t ticks,
+    uint64_t qpcFreq
+    ) noexcept
+{
+    if (ticks == 0ULL || qpcFreq == 0ULL)
+    {
+        return 0ULL;
+    }
+
+    constexpr uint64_t kMicrosPerSecond = 1000000ULL;
+    constexpr uint64_t kMaxUint64 = (std::numeric_limits<uint64_t>::max)();
+    const uint64_t wholeSeconds = ticks / qpcFreq;
+    const uint64_t remTicks = ticks % qpcFreq;
+
+    if (wholeSeconds > (kMaxUint64 / kMicrosPerSecond))
+    {
+        return kMaxUint64;
+    }
+
+    const uint64_t wholeUs = wholeSeconds * kMicrosPerSecond;
+    uint64_t fracUs = 0ULL;
+    if (remTicks <= (kMaxUint64 / kMicrosPerSecond))
+    {
+        fracUs = (remTicks * kMicrosPerSecond) / qpcFreq;
+    }
+    else
+    {
+#if defined(_MSC_VER) && defined(_M_X64)
+        unsigned __int64 high = 0ULL;
+        const unsigned __int64 low = _umul128(remTicks, kMicrosPerSecond, &high);
+        unsigned __int64 rem = 0ULL;
+        fracUs = _udiv128(high, low, qpcFreq, &rem);
+#else
+        // Binary long-division fallback for remTicks * 1,000,000 / qpcFreq with remTicks < qpcFreq.
+        uint64_t prodHigh = 0ULL;
+        uint64_t prodLow = 0ULL;
+        const uint64_t a = remTicks;
+        const uint64_t b = kMicrosPerSecond;
+        const uint64_t aLo = a & 0xFFFFFFFFULL;
+        const uint64_t aHi = a >> 32U;
+        const uint64_t loProd = aLo * b;
+        const uint64_t midProd = aHi * b + (loProd >> 32U);
+        prodLow = (loProd & 0xFFFFFFFFULL) | ((midProd & 0xFFFFFFFFULL) << 32U);
+        prodHigh = midProd >> 32U;
+
+        uint64_t rem128 = 0ULL;
+        uint64_t quot = 0ULL;
+        for (int i = 127; i >= 0; --i)
+        {
+            const uint64_t curBit = (i >= 64)
+                ? ((prodHigh >> (i - 64)) & 1ULL)
+                : ((prodLow >> i) & 1ULL);
+            const bool remOverflow = (rem128 >> 63U) != 0ULL;
+            rem128 = (rem128 << 1U) | curBit;
+            if (remOverflow || rem128 >= qpcFreq)
+            {
+                rem128 -= qpcFreq;
+                if (i < 64)
+                {
+                    quot |= (1ULL << i);
+                }
+            }
+        }
+        fracUs = quot;
+#endif
+    }
+
+    if (wholeUs > (kMaxUint64 - fracUs))
+    {
+        return kMaxUint64;
+    }
+    return wholeUs + fracUs;
+}
+
 LatencySummaryStats
 ComputeLatencySummary(
     const std::vector<uint64_t>& samples,
@@ -371,6 +452,9 @@ ComputeLatencySummary(
 {
     LatencySummaryStats out{};
     out.Available = false;
+    out.PercentilesAvailable = false;
+    out.PercentilesAreEstimated = false;
+    out.PercentileMethod = LatencyPercentileMethod::NotAvailable;
     out.LastUs = lastUs;
     if (samples.empty())
     {
@@ -396,6 +480,11 @@ ComputeLatencySummary(
 
     const size_t n = sorted.size();
     out.Available = (n > 0U);
+    out.PercentilesAvailable = (n > 0U);
+    out.PercentilesAreEstimated = false;
+    out.PercentileMethod = (n > 0U)
+        ? LatencyPercentileMethod::ExactPopulation
+        : LatencyPercentileMethod::NotAvailable;
     out.SampleCount = static_cast<uint64_t>(n);
     out.StoredSampleCount = static_cast<uint64_t>(n);
     out.SamplesTruncated = false;
@@ -415,10 +504,30 @@ ReservoirLatencyAccumulator::Summarize() const noexcept
     LatencySummaryStats summary = ComputeLatencySummary(Samples, LastUs);
     summary.SampleCount = Count;
     summary.StoredSampleCount = static_cast<uint64_t>(Samples.size());
+    const bool hasPopulation = (Count > 0ULL);
+    const bool hasStoredSamples = !Samples.empty();
+    const bool isEstimated = (Count > static_cast<uint64_t>(Samples.size())) || UsedReservoirSampling;
     summary.SamplesTruncated = (Count > static_cast<uint64_t>(Samples.size()));
     summary.ReservoirSampled = UsedReservoirSampling;
-    summary.Available = (Count > 0ULL);
-    if (Count > 0ULL)
+    summary.Available = hasPopulation;
+    summary.PercentilesAvailable = hasPopulation && hasStoredSamples;
+    summary.PercentilesAreEstimated = summary.PercentilesAvailable && isEstimated;
+    if (!summary.PercentilesAvailable)
+    {
+        summary.PercentileMethod = LatencyPercentileMethod::NotAvailable;
+        summary.P50Us = 0ULL;
+        summary.P95Us = 0ULL;
+        summary.P99Us = 0ULL;
+    }
+    else if (summary.PercentilesAreEstimated)
+    {
+        summary.PercentileMethod = LatencyPercentileMethod::ReservoirSampledEstimate_AlgorithmR;
+    }
+    else
+    {
+        summary.PercentileMethod = LatencyPercentileMethod::ExactPopulation;
+    }
+    if (hasPopulation)
     {
         summary.MinUs = MinUs;
         summary.MaxUs = MaxUs;
@@ -563,7 +672,9 @@ ComputeHostFpsBreakdown(
         out.ConnectedFps = static_cast<double>(framesValid) / connSec;
     }
 
-    const uint64_t activeSpanUs = ipc::ComputeQpcElapsedUs(firstValidFrameQpc, lastValidFrameQpc, qpcFreq);
+    const uint64_t activeSpanUs = (qpcFreq > 0ULL && firstValidFrameQpc > 0ULL && lastValidFrameQpc >= firstValidFrameQpc)
+        ? ComputeQpcTicksToUsSafe(lastValidFrameQpc - firstValidFrameQpc, qpcFreq)
+        : 0ULL;
     if (framesValid >= 5ULL && activeSpanUs >= 50000ULL)
     {
         out.FpsSampleSufficient = true;
@@ -571,7 +682,9 @@ ComputeHostFpsBreakdown(
         out.ObservedActiveFps = static_cast<double>(framesValid - 1ULL) / activeSec;
     }
 
-    const uint64_t liveSpanUs = ipc::ComputeQpcElapsedUs(firstLiveFrameQpc, lastLiveFrameQpc, qpcFreq);
+    const uint64_t liveSpanUs = (qpcFreq > 0ULL && firstLiveFrameQpc > 0ULL && lastLiveFrameQpc >= firstLiveFrameQpc)
+        ? ComputeQpcTicksToUsSafe(lastLiveFrameQpc - firstLiveFrameQpc, qpcFreq)
+        : 0ULL;
     if (liveFramesValid >= 5ULL && liveSpanUs >= 50000ULL)
     {
         const double liveSec = static_cast<double>(liveSpanUs) / 1000000.0;
@@ -585,8 +698,14 @@ FrameConsumer::FrameConsumer(
     const HostConsumerConfig& config
     ) noexcept
     : m_config(config),
-      m_qpcFreq(QueryQpcFrequencySafe())
+      m_qpcClockValid(false),
+      m_qpcFreq(0ULL)
 {
+    m_qpcFreq = m_config.HasForcedQpcFrequencyForTesting
+        ? m_config.ForcedQpcFrequencyForTesting
+        : QueryQpcFrequencyOrZero();
+    m_qpcClockValid = (m_qpcFreq > 0ULL);
+
     if (m_config.PipeName.empty())
     {
         m_config.PipeName = ipc::kDefaultFrameIpcPipeName;
@@ -595,7 +714,10 @@ FrameConsumer::FrameConsumer(
     {
         m_config.IoTimeoutMs = ipc::kDefaultIpcIoTimeoutMs;
     }
+    m_metrics.QpcClockValid = m_qpcClockValid;
     m_metrics.QpcFrequency = m_qpcFreq;
+    m_metrics.DurationCountsConnected = m_config.DurationCountsConnected;
+    m_metrics.RequestedDurationUs = static_cast<uint64_t>(m_config.MaxDurationMs) * 1000ULL;
 }
 
 FrameConsumer::~FrameConsumer()
@@ -1074,9 +1196,14 @@ FrameConsumer::UpdateDerivedFpsAndLatenciesLocked(
     uint64_t executionStartQpc
     ) noexcept
 {
-    if (executionStartQpc > 0ULL && nowQpc >= executionStartQpc)
+    m_metrics.QpcClockValid = m_qpcClockValid;
+    m_metrics.QpcFrequency = m_qpcFreq;
+    m_metrics.DurationCountsConnected = m_config.DurationCountsConnected;
+    m_metrics.RequestedDurationUs = static_cast<uint64_t>(m_config.MaxDurationMs) * 1000ULL;
+
+    if (m_qpcClockValid && executionStartQpc > 0ULL && nowQpc >= executionStartQpc)
     {
-        m_metrics.TotalExecutionDurationUs = ipc::ComputeQpcElapsedUs(executionStartQpc, nowQpc, m_qpcFreq);
+        m_metrics.TotalExecutionDurationUs = ComputeQpcTicksToUsSafe(nowQpc - executionStartQpc, m_qpcFreq);
     }
 
     uint64_t connectedTicks = m_accumulatedConnectedTicks;
@@ -1084,7 +1211,26 @@ FrameConsumer::UpdateDerivedFpsAndLatenciesLocked(
     {
         connectedTicks += (nowQpc - m_sessionConnectQpc);
     }
-    m_metrics.TotalConnectedDurationUs = (connectedTicks * 1000000ULL) / m_qpcFreq;
+    m_metrics.TotalConnectedDurationUs = m_qpcClockValid
+        ? ComputeQpcTicksToUsSafe(connectedTicks, m_qpcFreq)
+        : 0ULL;
+
+    m_metrics.ActiveStreamingDurationUs =
+        (m_qpcClockValid && m_firstValidFrameQpc > 0ULL && m_lastValidFrameQpc >= m_firstValidFrameQpc)
+            ? ComputeQpcTicksToUsSafe(m_lastValidFrameQpc - m_firstValidFrameQpc, m_qpcFreq)
+            : 0ULL;
+    m_metrics.LiveStreamingDurationUs =
+        (m_qpcClockValid && m_firstLiveFrameQpc > 0ULL && m_lastLiveFrameQpc >= m_firstLiveFrameQpc)
+            ? ComputeQpcTicksToUsSafe(m_lastLiveFrameQpc - m_firstLiveFrameQpc, m_qpcFreq)
+            : 0ULL;
+
+    const uint64_t trackedDurationUs = m_config.DurationCountsConnected
+        ? m_metrics.TotalConnectedDurationUs
+        : m_metrics.TotalExecutionDurationUs;
+    m_metrics.DurationTargetReached =
+        m_qpcClockValid &&
+        (m_metrics.RequestedDurationUs > 0ULL) &&
+        (trackedDurationUs >= m_metrics.RequestedDurationUs);
 
     const HostFpsBreakdown fps = ComputeHostFpsBreakdown(
         m_metrics.FramesValid,
@@ -1694,7 +1840,10 @@ FrameConsumer::ReceiveNextGpuOrCpuFrame(
     if (envErr != ERROR_SUCCESS)
     {
         const uint64_t waitDoneQpc = QueryCurrentQpc();
-        const uint64_t waitUs = ipc::ComputeQpcElapsedUs(envWaitStartQpc, waitDoneQpc, m_qpcFreq);
+        const uint64_t waitUs =
+            (m_qpcClockValid && envWaitStartQpc > 0ULL && waitDoneQpc >= envWaitStartQpc)
+                ? ComputeQpcTicksToUsSafe(waitDoneQpc - envWaitStartQpc, m_qpcFreq)
+                : 0ULL;
         const HRESULT hr = HRESULT_FROM_WIN32(envErr);
 
         if (envErr == ERROR_TIMEOUT && envBytesRead == 0U)
@@ -2395,14 +2544,31 @@ FrameConsumer::RunLoop(
         ID3D11Texture2D*)>& onGpuFrame
     ) noexcept
 {
-    const ULONGLONG startTick = GetTickCount64();
+    if (!m_qpcClockValid || m_qpcFreq == 0ULL)
+    {
+        ExclusiveLock lock(&m_metricsLock);
+        m_metrics.QpcClockValid = false;
+        m_metrics.QpcFrequency = 0ULL;
+        m_metrics.DurationCountsConnected = m_config.DurationCountsConnected;
+        m_metrics.RequestedDurationUs = static_cast<uint64_t>(m_config.MaxDurationMs) * 1000ULL;
+        m_metrics.ExitReason = HostExitReason::InvalidQpcClock;
+        m_metrics.HostProcessExitedNormally = false;
+        m_metrics.TransportHealthy = false;
+        m_metrics.LastErrorHResult = E_FAIL;
+        return E_FAIL;
+    }
+
     const uint64_t execStartQpc = QueryCurrentQpc();
     m_executionStartQpc = execStartQpc;
+
+    const uint64_t requestedUs = static_cast<uint64_t>(m_config.MaxDurationMs) * 1000ULL;
+    const uint64_t safetyMaxExecUs = static_cast<uint64_t>(m_config.MaxExecutionDurationMs) * 1000ULL;
 
     std::vector<uint8_t> pixels;
     HRESULT finalHr = S_OK;
     HostExitReason finalReason = HostExitReason::None;
     bool normalExit = false;
+    bool safetyExecutionTimeoutHit = false;
 
     for (;;)
     {
@@ -2413,28 +2579,93 @@ FrameConsumer::RunLoop(
             break;
         }
 
-        DWORD stepTimeoutMs = m_config.IoTimeoutMs;
-        if (m_config.MaxDurationMs > 0U)
+        const uint64_t loopNowQpc = QueryCurrentQpc();
+        const uint64_t execTicks = (loopNowQpc >= execStartQpc) ? (loopNowQpc - execStartQpc) : 0ULL;
+        const uint64_t execUs = ComputeQpcTicksToUsSafe(execTicks, m_qpcFreq);
+        uint64_t connectedTicks = m_accumulatedConnectedTicks;
+        if (m_pipeHandle != INVALID_HANDLE_VALUE && m_sessionConnectQpc > 0ULL && loopNowQpc >= m_sessionConnectQpc)
         {
-            const ULONGLONG elapsedMs = GetTickCount64() - startTick;
-            if (elapsedMs >= static_cast<ULONGLONG>(m_config.MaxDurationMs))
+            connectedTicks += (loopNowQpc - m_sessionConnectQpc);
+        }
+        const uint64_t connectedUs = ComputeQpcTicksToUsSafe(connectedTicks, m_qpcFreq);
+
+        DWORD stepTimeoutMs = m_config.IoTimeoutMs;
+        if (m_config.MaxExecutionDurationMs > 0U)
+        {
+            if (execUs >= safetyMaxExecUs)
             {
-                finalReason = HostExitReason::DurationElapsed;
-                normalExit = true;
+                finalHr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+                finalReason = HostExitReason::SafetyExecutionTimeout;
+                normalExit = false;
+                safetyExecutionTimeoutHit = true;
                 break;
             }
-            const ULONGLONG remainingMs = static_cast<ULONGLONG>(m_config.MaxDurationMs) - elapsedMs;
-            if (remainingMs < static_cast<ULONGLONG>(stepTimeoutMs))
+            const uint64_t remExecUs = safetyMaxExecUs - execUs;
+            const DWORD remExecMs = static_cast<DWORD>((std::min<uint64_t>)((remExecUs + 999ULL) / 1000ULL, 0xFFFFFFFFULL));
+            if (remExecMs < stepTimeoutMs)
             {
-                stepTimeoutMs = static_cast<DWORD>(remainingMs > 0ULL ? remainingMs : 1ULL);
+                stepTimeoutMs = (std::max<DWORD>)(remExecMs, 1U);
+            }
+        }
+
+        if (m_config.MaxDurationMs > 0U)
+        {
+            if (m_config.DurationCountsConnected)
+            {
+                if (connectedUs >= requestedUs)
+                {
+                    finalReason = HostExitReason::DurationElapsed;
+                    normalExit = true;
+                    break;
+                }
+                if (m_pipeHandle != INVALID_HANDLE_VALUE)
+                {
+                    const uint64_t remConnUs = requestedUs - connectedUs;
+                    const DWORD remConnMs = static_cast<DWORD>((std::min<uint64_t>)((remConnUs + 999ULL) / 1000ULL, 0xFFFFFFFFULL));
+                    if (remConnMs < stepTimeoutMs)
+                    {
+                        stepTimeoutMs = (std::max<DWORD>)(remConnMs, 1U);
+                    }
+                }
+            }
+            else
+            {
+                if (execUs >= requestedUs)
+                {
+                    finalReason = HostExitReason::DurationElapsed;
+                    normalExit = true;
+                    break;
+                }
+                const uint64_t remTargetUs = requestedUs - execUs;
+                const DWORD remTargetMs = static_cast<DWORD>((std::min<uint64_t>)((remTargetUs + 999ULL) / 1000ULL, 0xFFFFFFFFULL));
+                if (remTargetMs < stepTimeoutMs)
+                {
+                    stepTimeoutMs = (std::max<DWORD>)(remTargetMs, 1U);
+                }
             }
         }
 
         if (m_pipeHandle == INVALID_HANDLE_VALUE)
         {
-            const DWORD connectTimeout = (m_config.MaxDurationMs > 0U && stepTimeoutMs < m_config.ConnectTimeoutMs)
-                ? stepTimeoutMs
-                : m_config.ConnectTimeoutMs;
+            DWORD connectTimeout = m_config.ConnectTimeoutMs;
+            if (!m_config.DurationCountsConnected && m_config.MaxDurationMs > 0U)
+            {
+                const uint64_t remTargetUs = (execUs < requestedUs) ? (requestedUs - execUs) : 0ULL;
+                const DWORD remTargetMs = static_cast<DWORD>((std::min<uint64_t>)((remTargetUs + 999ULL) / 1000ULL, 0xFFFFFFFFULL));
+                if (remTargetMs < connectTimeout)
+                {
+                    connectTimeout = (std::max<DWORD>)(remTargetMs, 1U);
+                }
+            }
+            if (m_config.MaxExecutionDurationMs > 0U)
+            {
+                const uint64_t remExecUs = (execUs < safetyMaxExecUs) ? (safetyMaxExecUs - execUs) : 0ULL;
+                const DWORD remExecMs = static_cast<DWORD>((std::min<uint64_t>)((remExecUs + 999ULL) / 1000ULL, 0xFFFFFFFFULL));
+                if (remExecMs < connectTimeout)
+                {
+                    connectTimeout = remExecMs;
+                }
+            }
             const HRESULT connectHr = Connect(connectTimeout, stopEvent);
             if (FAILED(connectHr))
             {
@@ -2446,19 +2677,55 @@ FrameConsumer::RunLoop(
                 {
                     break;
                 }
-                if (stopEvent != nullptr)
+                DWORD retrySleepMs = 100U;
+                const uint64_t postFailQpc = QueryCurrentQpc();
+                const uint64_t postFailExecUs = ComputeQpcTicksToUsSafe(
+                    (postFailQpc >= execStartQpc) ? (postFailQpc - execStartQpc) : 0ULL,
+                    m_qpcFreq);
+                if (m_config.MaxExecutionDurationMs > 0U)
                 {
-                    if (WaitForSingleObject(stopEvent, 100U) == WAIT_OBJECT_0)
+                    if (postFailExecUs >= safetyMaxExecUs)
                     {
-                        finalReason = HostExitReason::StopRequested;
-                        normalExit = true;
-                        finalHr = S_OK;
+                        finalHr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+                        finalReason = HostExitReason::SafetyExecutionTimeout;
+                        normalExit = false;
+                        safetyExecutionTimeoutHit = true;
                         break;
                     }
+                    const DWORD remExecMs = static_cast<DWORD>((std::min<uint64_t>)(
+                        ((safetyMaxExecUs - postFailExecUs) + 999ULL) / 1000ULL,
+                        0xFFFFFFFFULL));
+                    retrySleepMs = (std::min)(retrySleepMs, remExecMs);
                 }
-                else
+                if (!m_config.DurationCountsConnected && m_config.MaxDurationMs > 0U)
                 {
-                    Sleep(100U);
+                    if (postFailExecUs >= requestedUs)
+                    {
+                        finalReason = HostExitReason::DurationElapsed;
+                        normalExit = true;
+                        break;
+                    }
+                    const DWORD remTargetMs = static_cast<DWORD>((std::min<uint64_t>)(
+                        ((requestedUs - postFailExecUs) + 999ULL) / 1000ULL,
+                        0xFFFFFFFFULL));
+                    retrySleepMs = (std::min)(retrySleepMs, remTargetMs);
+                }
+                if (retrySleepMs > 0U)
+                {
+                    if (stopEvent != nullptr)
+                    {
+                        if (WaitForSingleObject(stopEvent, retrySleepMs) == WAIT_OBJECT_0)
+                        {
+                            finalReason = HostExitReason::StopRequested;
+                            normalExit = true;
+                            finalHr = S_OK;
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        Sleep(retrySleepMs);
+                    }
                 }
                 continue;
             }
@@ -2596,6 +2863,7 @@ FrameConsumer::RunLoop(
         PopulateLatencySummariesLocked(m_metrics);
         m_metrics.ExitReason = finalReason;
         m_metrics.HostProcessExitedNormally = normalExit;
+        m_metrics.SafetyExecutionTimeoutHit = safetyExecutionTimeoutHit;
         m_metrics.FrameTargetReached =
             (m_config.MaxFrames > 0ULL) && (m_metrics.FramesValid >= m_config.MaxFrames);
         m_metrics.MinFramesReached = (m_metrics.FramesValid >= m_config.MinFrames);
@@ -2603,7 +2871,8 @@ FrameConsumer::RunLoop(
             m_metrics.FatalIpcErrors > 0ULL ||
             m_metrics.ProtocolErrors > 0ULL ||
             m_metrics.ChecksumMismatches > 0ULL ||
-            m_metrics.SyntheticPatternMismatches > 0ULL)
+            m_metrics.SyntheticPatternMismatches > 0ULL ||
+            !m_qpcClockValid)
         {
             m_metrics.TransportHealthy = false;
         }
@@ -2688,16 +2957,37 @@ FrameConsumer::GetMetricsSnapshot() const noexcept
     SharedLock lock(&m_metricsLock);
     HostConsumerMetricsSnapshot snap = m_metrics;
     PopulateLatencySummariesLocked(snap);
-    if (m_executionStartQpc > 0ULL && nowQpc >= m_executionStartQpc)
+    snap.QpcClockValid = m_qpcClockValid;
+    snap.QpcFrequency = m_qpcFreq;
+    snap.DurationCountsConnected = m_config.DurationCountsConnected;
+    snap.RequestedDurationUs = static_cast<uint64_t>(m_config.MaxDurationMs) * 1000ULL;
+    if (m_qpcClockValid && m_executionStartQpc > 0ULL && nowQpc >= m_executionStartQpc)
     {
-        snap.TotalExecutionDurationUs = ipc::ComputeQpcElapsedUs(m_executionStartQpc, nowQpc, m_qpcFreq);
+        snap.TotalExecutionDurationUs = ComputeQpcTicksToUsSafe(nowQpc - m_executionStartQpc, m_qpcFreq);
     }
     uint64_t connTicks = m_accumulatedConnectedTicks;
     if (snap.Connected && m_sessionConnectQpc > 0ULL && nowQpc >= m_sessionConnectQpc)
     {
         connTicks += (nowQpc - m_sessionConnectQpc);
     }
-    snap.TotalConnectedDurationUs = (connTicks * 1000000ULL) / m_qpcFreq;
+    snap.TotalConnectedDurationUs = m_qpcClockValid
+        ? ComputeQpcTicksToUsSafe(connTicks, m_qpcFreq)
+        : 0ULL;
+    snap.ActiveStreamingDurationUs =
+        (m_qpcClockValid && m_firstValidFrameQpc > 0ULL && m_lastValidFrameQpc >= m_firstValidFrameQpc)
+            ? ComputeQpcTicksToUsSafe(m_lastValidFrameQpc - m_firstValidFrameQpc, m_qpcFreq)
+            : 0ULL;
+    snap.LiveStreamingDurationUs =
+        (m_qpcClockValid && m_firstLiveFrameQpc > 0ULL && m_lastLiveFrameQpc >= m_firstLiveFrameQpc)
+            ? ComputeQpcTicksToUsSafe(m_lastLiveFrameQpc - m_firstLiveFrameQpc, m_qpcFreq)
+            : 0ULL;
+    const uint64_t trackedDurationUs = m_config.DurationCountsConnected
+        ? snap.TotalConnectedDurationUs
+        : snap.TotalExecutionDurationUs;
+    snap.DurationTargetReached =
+        m_qpcClockValid &&
+        (snap.RequestedDurationUs > 0ULL) &&
+        (trackedDurationUs >= snap.RequestedDurationUs);
     return snap;
 }
 

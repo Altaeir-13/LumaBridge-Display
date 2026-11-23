@@ -12,9 +12,11 @@
 #include <wrl/client.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -2412,6 +2414,371 @@ TestReservoirLatencySamplingForLongRuns()
     EXPECT_EQ(longSnap.P99Us, 10000ULL);
 }
 
+void
+TestPercentileMethodologyBoundariesAndReservoirEstimate()
+{
+    // 0 samples: PercentilesAvailable=false, PercentileMethod=NotAvailable.
+    {
+        lumabridge::host::ReservoirLatencyAccumulator acc0;
+        const auto s0 = acc0.Summarize();
+        EXPECT_TRUE(!s0.Available);
+        EXPECT_TRUE(!s0.PercentilesAvailable);
+        EXPECT_TRUE(!s0.PercentilesAreEstimated);
+        EXPECT_EQ(s0.PercentileMethod, lumabridge::host::LatencyPercentileMethod::NotAvailable);
+        EXPECT_EQ(s0.SampleCount, 0ULL);
+        EXPECT_EQ(s0.StoredSampleCount, 0ULL);
+        EXPECT_TRUE(!s0.SamplesTruncated);
+        EXPECT_TRUE(!s0.ReservoirSampled);
+        EXPECT_EQ(s0.P50Us, 0ULL);
+        EXPECT_EQ(s0.P95Us, 0ULL);
+        EXPECT_EQ(s0.P99Us, 0ULL);
+
+        const auto emptyVec = lumabridge::host::ComputeLatencySummary({}, 77ULL);
+        EXPECT_TRUE(!emptyVec.Available);
+        EXPECT_TRUE(!emptyVec.PercentilesAvailable);
+        EXPECT_EQ(emptyVec.PercentileMethod, lumabridge::host::LatencyPercentileMethod::NotAvailable);
+        EXPECT_EQ(emptyVec.LastUs, 77ULL);
+    }
+
+    // 1 sample -> ExactPopulation.
+    {
+        lumabridge::host::ReservoirLatencyAccumulator acc1;
+        acc1.Record(1234ULL);
+        const auto s1 = acc1.Summarize();
+        EXPECT_TRUE(s1.Available);
+        EXPECT_TRUE(s1.PercentilesAvailable);
+        EXPECT_TRUE(!s1.PercentilesAreEstimated);
+        EXPECT_EQ(s1.PercentileMethod, lumabridge::host::LatencyPercentileMethod::ExactPopulation);
+        EXPECT_EQ(s1.SampleCount, 1ULL);
+        EXPECT_EQ(s1.StoredSampleCount, 1ULL);
+        EXPECT_TRUE(!s1.SamplesTruncated);
+        EXPECT_TRUE(!s1.ReservoirSampled);
+        EXPECT_EQ(s1.MinUs, 1234ULL);
+        EXPECT_EQ(s1.AvgUs, 1234ULL);
+        EXPECT_EQ(s1.MaxUs, 1234ULL);
+        EXPECT_EQ(s1.P50Us, 1234ULL);
+        EXPECT_EQ(s1.P95Us, 1234ULL);
+        EXPECT_EQ(s1.P99Us, 1234ULL);
+        EXPECT_EQ(s1.LastUs, 1234ULL);
+    }
+
+    // Exact boundary sizes: 1800 (30s@60fps), 10800 (180s@60fps), and 65536 (reservoir cap).
+    for (uint64_t count : {1800ULL, 10800ULL, 65536ULL})
+    {
+        lumabridge::host::ReservoirLatencyAccumulator acc;
+        for (uint64_t i = 1ULL; i <= count; ++i)
+        {
+            acc.Record(i);
+        }
+        const auto s = acc.Summarize();
+        EXPECT_TRUE(s.Available);
+        EXPECT_TRUE(s.PercentilesAvailable);
+        EXPECT_TRUE(!s.PercentilesAreEstimated);
+        EXPECT_EQ(s.PercentileMethod, lumabridge::host::LatencyPercentileMethod::ExactPopulation);
+        EXPECT_EQ(s.SampleCount, count);
+        EXPECT_EQ(s.StoredSampleCount, count);
+        EXPECT_TRUE(!s.SamplesTruncated);
+        EXPECT_TRUE(!s.ReservoirSampled);
+        EXPECT_EQ(s.MinUs, 1ULL);
+        EXPECT_EQ(s.MaxUs, count);
+    }
+
+    // Boundary + 1 (65537) and 216000 (1h@60fps): Algorithm R estimated percentiles while preserving exact Min/Avg/Max.
+    for (uint64_t count : {65537ULL, 216000ULL})
+    {
+        lumabridge::host::ReservoirLatencyAccumulator acc;
+        uint64_t exactSum = 0ULL;
+        for (uint64_t i = 0ULL; i < count; ++i)
+        {
+            const uint64_t v = (i == 0ULL) ? 5ULL : ((i == count - 1ULL) ? 900ULL : 100ULL);
+            exactSum += v;
+            acc.Record(v);
+        }
+        const auto s = acc.Summarize();
+        EXPECT_TRUE(s.Available);
+        EXPECT_TRUE(s.PercentilesAvailable);
+        EXPECT_TRUE(s.PercentilesAreEstimated);
+        EXPECT_EQ(
+            s.PercentileMethod,
+            lumabridge::host::LatencyPercentileMethod::ReservoirSampledEstimate_AlgorithmR);
+        EXPECT_EQ(s.SampleCount, count);
+        EXPECT_EQ(s.StoredSampleCount, lumabridge::host::ReservoirLatencyAccumulator::kDefaultMaxStoredSamples);
+        EXPECT_TRUE(s.SamplesTruncated);
+        EXPECT_TRUE(s.ReservoirSampled);
+        EXPECT_EQ(s.MinUs, 5ULL);
+        EXPECT_EQ(s.MaxUs, 900ULL);
+        EXPECT_EQ(s.AvgUs, exactSum / count);
+        EXPECT_EQ(s.LastUs, 900ULL);
+    }
+}
+
+void
+TestConnectedDurationClockSafetyAndBoundaries()
+{
+    // 1. Overflow-safe QPC ticks -> us conversion + floor rounding + 128-bit remainder path.
+    EXPECT_EQ(lumabridge::host::ComputeQpcTicksToUsSafe(0ULL, 10000000ULL), 0ULL);
+    EXPECT_EQ(lumabridge::host::ComputeQpcTicksToUsSafe(1000ULL, 0ULL), 0ULL);
+    EXPECT_EQ(lumabridge::host::ComputeQpcTicksToUsSafe(3ULL, 2000000ULL), 1ULL);
+    EXPECT_EQ(lumabridge::host::ComputeQpcTicksToUsSafe(1999999ULL, 2000000ULL), 999999ULL);
+    // Would overflow uint64_t if computed as (ticks * 1,000,000ULL) / qpcFreq:
+    EXPECT_EQ(
+        lumabridge::host::ComputeQpcTicksToUsSafe(30000000000000ULL, 1000000000ULL),
+        30000000000ULL);
+    // 128-bit fractional path when qpcFreq > UINT64_MAX / 1,000,000:
+    EXPECT_EQ(
+        lumabridge::host::ComputeQpcTicksToUsSafe(50000000000000ULL, 100000000000000ULL),
+        500000ULL);
+    EXPECT_EQ(
+        lumabridge::host::ComputeQpcTicksToUsSafe((std::numeric_limits<uint64_t>::max)(), 1ULL),
+        (std::numeric_limits<uint64_t>::max)());
+
+    // 2. Invalid QPC frequency (=0) fails closed without synthesizing 10MHz.
+    {
+        HostConsumerConfig cfg;
+        cfg.PipeName = MakeUniquePipeName(901U);
+        cfg.HasForcedQpcFrequencyForTesting = true;
+        cfg.ForcedQpcFrequencyForTesting = 0ULL;
+        cfg.DurationCountsConnected = true;
+        cfg.MaxDurationMs = 100U;
+        FrameConsumer consumer(cfg);
+        EXPECT_TRUE(FAILED(consumer.RunLoop()));
+        const auto snap = consumer.GetMetricsSnapshot();
+        EXPECT_TRUE(!snap.QpcClockValid);
+        EXPECT_EQ(snap.QpcFrequency, 0ULL);
+        EXPECT_EQ(snap.ExitReason, HostExitReason::InvalidQpcClock);
+        EXPECT_TRUE(!snap.HostProcessExitedNormally);
+        EXPECT_TRUE(!snap.TransportHealthy);
+    }
+
+    // 3. Delayed server start: pre-connect delay (~220ms) is excluded from connected duration (250ms target).
+    {
+        const std::wstring pipeName = MakeUniquePipeName(902U);
+        std::atomic<bool> stopProducer{false};
+        std::thread delayedServer([&pipeName, &stopProducer]() {
+            Sleep(220U);
+            FrameTransportConfig serverCfg;
+            serverCfg.SetPipeName(pipeName.c_str());
+            FrameIpcServer server;
+            if (SUCCEEDED(server.Start(serverCfg)))
+            {
+                for (uint64_t seq = 1ULL; !stopProducer.load() && seq <= 60ULL; ++seq)
+                {
+                    bool evicted = false;
+                    (void)server.EnqueueFrame(
+                        MakeSyntheticExtractedFrame(seq, static_cast<uint32_t>(seq), 64U, 64U),
+                        evicted);
+                    Sleep(15U);
+                }
+                server.Stop();
+            }
+        });
+
+        HostConsumerConfig cfg;
+        cfg.PipeName = pipeName;
+        cfg.IoTimeoutMs = 40U;
+        cfg.ConnectTimeoutMs = 2000U;
+        cfg.MaxDurationMs = 250U;
+        cfg.DurationCountsConnected = true;
+        cfg.MaxExecutionDurationMs = 4000U;
+        cfg.VerifySyntheticPattern = true;
+        FrameConsumer consumer(cfg);
+        const HRESULT hr = consumer.RunLoop();
+        stopProducer.store(true);
+        delayedServer.join();
+
+        EXPECT_EQ(hr, S_OK);
+        const auto snap = consumer.GetMetricsSnapshot();
+        EXPECT_TRUE(snap.QpcClockValid);
+        EXPECT_TRUE(snap.DurationCountsConnected);
+        EXPECT_EQ(snap.RequestedDurationUs, 250000ULL);
+        EXPECT_TRUE(snap.TotalConnectedDurationUs >= 250000ULL);
+        EXPECT_TRUE(snap.TotalExecutionDurationUs >= snap.TotalConnectedDurationUs + 150000ULL);
+        EXPECT_TRUE(snap.DurationTargetReached);
+        EXPECT_TRUE(!snap.SafetyExecutionTimeoutHit);
+        EXPECT_EQ(snap.ExitReason, HostExitReason::DurationElapsed);
+        EXPECT_TRUE(snap.FramesValid >= 5ULL);
+        EXPECT_TRUE(snap.ActiveStreamingDurationUs > 0ULL);
+    }
+
+    // 4. Reconnect pause: disconnect gap (~220ms) does not advance connected duration (320ms target).
+    {
+        const std::wstring pipeName = MakeUniquePipeName(903U);
+        std::atomic<bool> stopProducer{false};
+        std::atomic<uint64_t> framesReceivedTotal{0ULL};
+        std::thread reconnectServer([&pipeName, &stopProducer, &framesReceivedTotal]() {
+            FrameTransportConfig serverCfg;
+            serverCfg.SetPipeName(pipeName.c_str());
+            {
+                FrameIpcServer server1;
+                if (SUCCEEDED(server1.Start(serverCfg)))
+                {
+                    for (uint64_t seq = 1ULL; seq <= 100ULL; ++seq)
+                    {
+                        bool evicted = false;
+                        (void)server1.EnqueueFrame(
+                            MakeSyntheticExtractedFrame(seq, static_cast<uint32_t>(seq), 64U, 64U),
+                            evicted);
+                        Sleep(15U);
+                        if (framesReceivedTotal.load() >= 3ULL)
+                        {
+                            break;
+                        }
+                    }
+                    server1.Stop();
+                }
+            }
+            Sleep(220U);
+            {
+                FrameIpcServer server2;
+                if (SUCCEEDED(server2.Start(serverCfg)))
+                {
+                    for (uint64_t seq = 1ULL; !stopProducer.load() && seq <= 120ULL; ++seq)
+                    {
+                        bool evicted = false;
+                        (void)server2.EnqueueFrame(
+                            MakeSyntheticExtractedFrame(seq, static_cast<uint32_t>(seq), 64U, 64U),
+                            evicted);
+                        Sleep(15U);
+                    }
+                    server2.Stop();
+                }
+            }
+        });
+
+        HostConsumerConfig cfg;
+        cfg.PipeName = pipeName;
+        cfg.AutoReconnect = true;
+        cfg.TransportPreference = HostTransportPreference::CpuStagingOnly;
+        cfg.IoTimeoutMs = 40U;
+        cfg.ConnectTimeoutMs = 1500U;
+        cfg.MaxDurationMs = 320U;
+        cfg.DurationCountsConnected = true;
+        cfg.MaxExecutionDurationMs = 5000U;
+        FrameConsumer consumer(cfg);
+        const HRESULT hr = consumer.RunLoop(
+            nullptr,
+            [&framesReceivedTotal](const FrameIpcFrameHeader&, const std::vector<uint8_t>&) {
+                framesReceivedTotal.fetch_add(1ULL);
+            });
+        stopProducer.store(true);
+        reconnectServer.join();
+
+        EXPECT_EQ(hr, S_OK);
+        const auto snap = consumer.GetMetricsSnapshot();
+        EXPECT_TRUE(snap.ReconnectCount >= 1ULL);
+        EXPECT_TRUE(snap.DurationTargetReached);
+        EXPECT_TRUE(snap.TotalConnectedDurationUs >= 320000ULL);
+        EXPECT_TRUE(snap.TotalExecutionDurationUs >= snap.TotalConnectedDurationUs + 150000ULL);
+        EXPECT_EQ(snap.ExitReason, HostExitReason::DurationElapsed);
+    }
+
+    // 5. Idle connected pipe tracks ActiveStreamingDurationUs == 0 and FramesValid == 0.
+    {
+        const std::wstring pipeName = MakeUniquePipeName(904U);
+        FrameTransportConfig serverCfg;
+        serverCfg.SetPipeName(pipeName.c_str());
+        FrameIpcServer server;
+        EXPECT_EQ(server.Start(serverCfg), S_OK);
+
+        HostConsumerConfig cfg;
+        cfg.PipeName = pipeName;
+        cfg.TransportPreference = HostTransportPreference::CpuStagingOnly;
+        cfg.IoTimeoutMs = 40U;
+        cfg.MaxDurationMs = 150U;
+        cfg.DurationCountsConnected = true;
+        FrameConsumer consumer(cfg);
+        EXPECT_EQ(consumer.RunLoop(), S_OK);
+        const auto snap = consumer.GetMetricsSnapshot();
+        EXPECT_EQ(snap.ExitReason, HostExitReason::DurationElapsed);
+        EXPECT_TRUE(snap.TotalConnectedDurationUs >= 150000ULL);
+        EXPECT_EQ(snap.FramesValid, 0ULL);
+        EXPECT_EQ(snap.ActiveStreamingDurationUs, 0ULL);
+        server.Stop();
+    }
+
+    // 6. Early peer disconnect with !AutoReconnect leaves DurationTargetReached == false.
+    {
+        const std::wstring pipeName = MakeUniquePipeName(905U);
+        FrameTransportConfig serverCfg;
+        serverCfg.SetPipeName(pipeName.c_str());
+        FrameIpcServer server;
+        EXPECT_EQ(server.Start(serverCfg), S_OK);
+        std::atomic<uint64_t> framesSeen{0ULL};
+        std::thread stopper([&server, &framesSeen]() {
+            for (uint64_t seq = 1ULL; seq <= 80ULL; ++seq)
+            {
+                bool evicted = false;
+                (void)server.EnqueueFrame(
+                    MakeSyntheticExtractedFrame(seq, static_cast<uint32_t>(seq), 64U, 64U),
+                    evicted);
+                Sleep(15U);
+                if (framesSeen.load() >= 2ULL)
+                {
+                    break;
+                }
+            }
+            Sleep(25U);
+            server.Stop();
+        });
+
+        HostConsumerConfig cfg;
+        cfg.PipeName = pipeName;
+        cfg.AutoReconnect = false;
+        cfg.TransportPreference = HostTransportPreference::CpuStagingOnly;
+        cfg.IoTimeoutMs = 40U;
+        cfg.MaxDurationMs = 2000U;
+        cfg.DurationCountsConnected = true;
+        FrameConsumer consumer(cfg);
+        (void)consumer.RunLoop(
+            nullptr,
+            [&framesSeen](const FrameIpcFrameHeader&, const std::vector<uint8_t>&) {
+                framesSeen.fetch_add(1ULL);
+            });
+        stopper.join();
+        const auto snap = consumer.GetMetricsSnapshot();
+        EXPECT_EQ(snap.ExitReason, HostExitReason::PeerDisconnected);
+        EXPECT_TRUE(!snap.DurationTargetReached);
+        EXPECT_TRUE(snap.TotalConnectedDurationUs < 2000000ULL);
+    }
+
+    // 7. Connect timeout without server: ConnectFailed, TotalConnectedDurationUs=0, DurationTargetReached=false.
+    {
+        HostConsumerConfig cfg;
+        cfg.PipeName = MakeUniquePipeName(906U);
+        cfg.AutoReconnect = false;
+        cfg.ConnectTimeoutMs = 120U;
+        cfg.MaxDurationMs = 1000U;
+        cfg.DurationCountsConnected = true;
+        FrameConsumer consumer(cfg);
+        EXPECT_TRUE(FAILED(consumer.RunLoop()));
+        const auto snap = consumer.GetMetricsSnapshot();
+        EXPECT_EQ(snap.ExitReason, HostExitReason::ConnectFailed);
+        EXPECT_EQ(snap.TotalConnectedDurationUs, 0ULL);
+        EXPECT_TRUE(!snap.DurationTargetReached);
+    }
+
+    // 8. Safety execution ceiling aborts stalled AutoReconnect cleanly with SafetyExecutionTimeout.
+    {
+        HostConsumerConfig cfg;
+        cfg.PipeName = MakeUniquePipeName(907U);
+        cfg.AutoReconnect = true;
+        cfg.ConnectTimeoutMs = 120U;
+        cfg.IoTimeoutMs = 40U;
+        cfg.MaxDurationMs = 3000U;
+        cfg.DurationCountsConnected = true;
+        cfg.MaxExecutionDurationMs = 280U;
+        FrameConsumer consumer(cfg);
+        const HRESULT hr = consumer.RunLoop();
+        EXPECT_EQ(hr, HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+        const auto snap = consumer.GetMetricsSnapshot();
+        EXPECT_EQ(snap.ExitReason, HostExitReason::SafetyExecutionTimeout);
+        EXPECT_TRUE(snap.SafetyExecutionTimeoutHit);
+        EXPECT_TRUE(!snap.HostProcessExitedNormally);
+        EXPECT_TRUE(!snap.DurationTargetReached);
+        EXPECT_TRUE(snap.TotalExecutionDurationUs >= 280000ULL);
+    }
+}
+
 template <typename Fn>
 void
 RunTest(
@@ -2460,6 +2827,8 @@ main()
     RunTest("GpuSharedTextureIncompatibleAdapterAndInvalidHandleAckHandling", TestGpuSharedTextureIncompatibleAdapterAndInvalidHandleAckHandling);
     RunTest("M421TimestampValidationAndRegressionScenarios", TestM421TimestampValidationAndRegressionScenarios);
     RunTest("ReservoirLatencySamplingForLongRuns", TestReservoirLatencySamplingForLongRuns);
+    RunTest("PercentileMethodologyBoundariesAndReservoirEstimate", TestPercentileMethodologyBoundariesAndReservoirEstimate);
+    RunTest("ConnectedDurationClockSafetyAndBoundaries", TestConnectedDurationClockSafetyAndBoundaries);
 
     std::printf("Summary: %d tests run, %d assertion failures.\n", g_TestsRun, g_TestsFailed);
     return (g_TestsFailed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;

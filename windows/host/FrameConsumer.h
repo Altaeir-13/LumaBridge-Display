@@ -54,6 +54,8 @@ enum class HostExitReason : uint32_t
     OutOfMemory = 9,
     AdapterMismatch = 10,
     GpuResourceError = 11,
+    SafetyExecutionTimeout = 12,
+    InvalidQpcClock = 13,
 };
 
 inline const char*
@@ -87,16 +89,55 @@ HostExitReasonToString(
         return "AdapterMismatch";
     case HostExitReason::GpuResourceError:
         return "GpuResourceError";
+    case HostExitReason::SafetyExecutionTimeout:
+        return "SafetyExecutionTimeout";
+    case HostExitReason::InvalidQpcClock:
+        return "InvalidQpcClock";
     default:
         return "Unknown";
     }
 }
 
+enum class LatencyPercentileMethod : uint8_t
+{
+    NotAvailable = 0,
+    ExactPopulation = 1,
+    ReservoirSampledEstimate_AlgorithmR = 2
+};
+
+inline const char*
+LatencyPercentileMethodToString(
+    LatencyPercentileMethod method
+    ) noexcept
+{
+    switch (method)
+    {
+    case LatencyPercentileMethod::ExactPopulation:
+        return "ExactPopulation";
+    case LatencyPercentileMethod::ReservoirSampledEstimate_AlgorithmR:
+        return "ReservoirSampledEstimate_AlgorithmR";
+    case LatencyPercentileMethod::NotAvailable:
+    default:
+        return "NotAvailable";
+    }
+}
+
+/// Converts QPC ticks into microseconds using floor rounding without uint64_t intermediate overflow.
+uint64_t
+ComputeQpcTicksToUsSafe(
+    uint64_t ticks,
+    uint64_t qpcFreq
+    ) noexcept;
+
 struct LatencySummaryStats
 {
     bool Available{false};
+    bool PercentilesAvailable{false};
+    bool PercentilesAreEstimated{false};
+    LatencyPercentileMethod PercentileMethod{LatencyPercentileMethod::NotAvailable};
     uint64_t SampleCount{0ULL};
     uint64_t StoredSampleCount{0ULL};
+    /// True whenever SampleCount > StoredSampleCount (percentiles come from the bounded reservoir sample, while Min/Avg/Max remain exact over all SampleCount).
     bool SamplesTruncated{false};
     bool ReservoirSampled{false};
     uint64_t MinUs{0ULL};
@@ -249,6 +290,8 @@ struct HostConsumerConfig
     uint64_t MaxFrames{0ULL};
     uint64_t MinFrames{0ULL};
     uint32_t MaxDurationMs{0U};
+    bool DurationCountsConnected{false};
+    uint32_t MaxExecutionDurationMs{0U};
     bool RequireFrameTarget{false};
     bool VerifySyntheticPattern{false};
     bool AutoReconnect{false};
@@ -261,6 +304,8 @@ struct HostConsumerConfig
     bool SimulateInvalidSharedHandleForTesting{false};
     DWORD SimulatedAckDelayMsForTesting{0U};
     bool SimulateDisconnectWhileHoldingMutexForTesting{false};
+    bool HasForcedQpcFrequencyForTesting{false};
+    uint64_t ForcedQpcFrequencyForTesting{0ULL};
 };
 
 /// Synchronized runtime statistics observed by lumabridge-host.
@@ -311,9 +356,14 @@ struct HostConsumerMetricsSnapshot
     uint32_t LastFrameHeight{0U};
     uint32_t LastPixelFormat{0U};
     uint32_t LastFrameChecksumCrc32{0U};
+    bool QpcClockValid{true};
     uint64_t QpcFrequency{10000000ULL};
+    bool DurationCountsConnected{false};
+    uint64_t RequestedDurationUs{0ULL};
     uint64_t TotalExecutionDurationUs{0ULL};
     uint64_t TotalConnectedDurationUs{0ULL};
+    uint64_t ActiveStreamingDurationUs{0ULL};
+    uint64_t LiveStreamingDurationUs{0ULL};
     uint64_t TotalIdleWaitDurationUs{0ULL};
     uint64_t LastEndToEndLatencyUs{0ULL};
     uint64_t TotalEndToEndLatencyUs{0ULL};
@@ -331,6 +381,8 @@ struct HostConsumerMetricsSnapshot
     bool TransportHealthy{true};
     bool FrameTargetReached{false};
     bool MinFramesReached{false};
+    bool DurationTargetReached{false};
+    bool SafetyExecutionTimeoutHit{false};
     HRESULT LastErrorHResult{S_OK};
     HRESULT LastRecoverableTimeoutHResult{S_OK};
     ipc::FrameIpcStatus LastProtocolStatus{ipc::FrameIpcStatus::Ok};
@@ -494,6 +546,7 @@ private:
     HANDLE m_pipeHandle{INVALID_HANDLE_VALUE};
     HANDLE m_ioEvent{nullptr};
     uint64_t m_sessionId{0ULL};
+    bool m_qpcClockValid{true};
     uint64_t m_qpcFreq{10000000ULL};
     uint64_t m_executionStartQpc{0ULL};
     uint64_t m_sessionConnectQpc{0ULL};

@@ -177,6 +177,8 @@ PrintUsage()
         "  --min-frames <n>                 Minimum valid frames required for success exit code\n"
         "  --require-max-frames             Require full --max-frames target for success exit code\n"
         "  --duration-ms <ms>               Stop after MS milliseconds (default: 0 = unlimited)\n"
+        "  --duration-counts-connected      Measure --duration-ms only across connected pipe time (pauses pre-connect/reconnect)\n"
+        "  --max-execution-ms <ms>          Hard wall-clock safety execution timeout in ms (default: 0 = unlimited)\n"
         "  --connect-timeout-ms <ms>        Pipe connect timeout in ms (default: 3000)\n"
         "  --io-timeout-ms <ms>             Pipe I/O timeout in ms (default: 500)\n"
         "  --verify-synthetic-pattern       Verify BGRA8 synthetic test pattern pixels\n"
@@ -510,8 +512,12 @@ WriteLatencyStatsJsonWithIndent(
     bool trailingComma
     )
 {
+    const char* methodStr = lumabridge::host::LatencyPercentileMethodToString(stats.PercentileMethod);
     out << indent << "\"" << name << "\": {\n"
         << indent << "  \"Available\": " << (stats.Available ? "true" : "false") << ",\n"
+        << indent << "  \"PercentilesAvailable\": " << (stats.PercentilesAvailable ? "true" : "false") << ",\n"
+        << indent << "  \"PercentilesAreEstimated\": " << (stats.PercentilesAreEstimated ? "true" : "false") << ",\n"
+        << indent << "  \"PercentileMethod\": \"" << EscapeJsonString(methodStr) << "\",\n"
         << indent << "  \"SampleCount\": " << stats.SampleCount << ",\n"
         << indent << "  \"StoredSampleCount\": " << stats.StoredSampleCount << ",\n"
         << indent << "  \"SamplesTruncated\": " << (stats.SamplesTruncated ? "true" : "false") << ",\n"
@@ -519,9 +525,36 @@ WriteLatencyStatsJsonWithIndent(
         << indent << "  \"MinUs\": " << stats.MinUs << ",\n"
         << indent << "  \"AvgUs\": " << stats.AvgUs << ",\n"
         << indent << "  \"MaxUs\": " << stats.MaxUs << ",\n"
-        << indent << "  \"P50Us\": " << stats.P50Us << ",\n"
-        << indent << "  \"P95Us\": " << stats.P95Us << ",\n"
-        << indent << "  \"P99Us\": " << stats.P99Us << ",\n"
+        << indent << "  \"P50Us\": ";
+    if (stats.PercentilesAvailable)
+    {
+        out << stats.P50Us;
+    }
+    else
+    {
+        out << "null";
+    }
+    out << ",\n"
+        << indent << "  \"P95Us\": ";
+    if (stats.PercentilesAvailable)
+    {
+        out << stats.P95Us;
+    }
+    else
+    {
+        out << "null";
+    }
+    out << ",\n"
+        << indent << "  \"P99Us\": ";
+    if (stats.PercentilesAvailable)
+    {
+        out << stats.P99Us;
+    }
+    else
+    {
+        out << "null";
+    }
+    out << ",\n"
         << indent << "  \"LastUs\": " << stats.LastUs << "\n"
         << indent << "}" << (trailingComma ? "," : "") << "\n";
 }
@@ -548,6 +581,7 @@ struct HostGateEvaluation
     bool IntegrityOk{false};
     bool MinFramesOk{false};
     bool MaxTargetOk{false};
+    bool DurationOk{false};
     bool StimulusOk{false};
     bool GpuTransportOk{false};
     bool NvencOk{false};
@@ -656,6 +690,19 @@ EvaluateHostGates(
     }
     eval.ResolutionOk = resolutionOk;
 
+    bool durationOk = metrics.QpcClockValid && (metrics.QpcFrequency > 0ULL) && !metrics.SafetyExecutionTimeoutHit;
+    if (durationOk && config.MaxDurationMs > 0U && config.DurationCountsConnected)
+    {
+        const bool hasActiveFrames =
+            (metrics.FramesValid > 0ULL) &&
+            (metrics.FramesValid < 2ULL || metrics.ActiveStreamingDurationUs > 0ULL);
+        durationOk =
+            metrics.DurationTargetReached &&
+            (metrics.TotalConnectedDurationUs >= metrics.RequestedDurationUs) &&
+            hasActiveFrames;
+    }
+    eval.DurationOk = durationOk;
+
     eval.OverallExitOk =
         SUCCEEDED(runHr) &&
         metrics.HostProcessExitedNormally &&
@@ -663,6 +710,7 @@ EvaluateHostGates(
         eval.IntegrityOk &&
         eval.MinFramesOk &&
         eval.MaxTargetOk &&
+        eval.DurationOk &&
         eval.StimulusOk &&
         eval.GpuTransportOk &&
         eval.NvencOk &&
@@ -761,6 +809,8 @@ WriteJsonSummary(
         << "  \"CpuStagingReadsPerformed\": " << metrics.CpuStagingReadsPerformed << ",\n"
         << "  \"FrameTargetReached\": " << (metrics.FrameTargetReached ? "true" : "false") << ",\n"
         << "  \"MinFramesReached\": " << (metrics.MinFramesReached ? "true" : "false") << ",\n"
+        << "  \"DurationTargetReached\": " << (metrics.DurationTargetReached ? "true" : "false") << ",\n"
+        << "  \"SafetyExecutionTimeoutHit\": " << (metrics.SafetyExecutionTimeoutHit ? "true" : "false") << ",\n"
         << "  \"SessionId\": " << metrics.SessionId << ",\n"
         << "  \"ServerProcessId\": " << metrics.ServerProcessId << ",\n"
         << "  \"AdapterLuidLow\": " << metrics.AdapterLuidLow << ",\n"
@@ -823,9 +873,15 @@ WriteJsonSummary(
         << "  \"LastFrameHeight\": " << metrics.LastFrameHeight << ",\n"
         << "  \"LastPixelFormat\": " << metrics.LastPixelFormat << ",\n"
         << "  \"LastFrameChecksumCrc32\": \"" << crcBuf << "\",\n"
+        << "  \"QpcClockValid\": " << (metrics.QpcClockValid ? "true" : "false") << ",\n"
         << "  \"QpcFrequency\": " << metrics.QpcFrequency << ",\n"
+        << "  \"DurationCountsConnected\": " << (metrics.DurationCountsConnected ? "true" : "false") << ",\n"
+        << "  \"RequestedDurationUs\": " << metrics.RequestedDurationUs << ",\n"
+        << "  \"MaxExecutionDurationMs\": " << config.MaxExecutionDurationMs << ",\n"
         << "  \"TotalExecutionDurationUs\": " << metrics.TotalExecutionDurationUs << ",\n"
         << "  \"TotalConnectedDurationUs\": " << metrics.TotalConnectedDurationUs << ",\n"
+        << "  \"ActiveStreamingDurationUs\": " << metrics.ActiveStreamingDurationUs << ",\n"
+        << "  \"LiveStreamingDurationUs\": " << metrics.LiveStreamingDurationUs << ",\n"
         << "  \"TotalIdleWaitDurationUs\": " << metrics.TotalIdleWaitDurationUs << ",\n"
         << "  \"LastEndToEndLatencyUs\": " << metrics.LastEndToEndLatencyUs << ",\n"
         << "  \"AvgEndToEndLatencyUs\": " << metrics.AvgEndToEndLatencyUs << ",\n"
@@ -966,6 +1022,7 @@ WriteJsonSummary(
         << "    \"IntegrityOk\": " << (gateEval.IntegrityOk ? "true" : "false") << ",\n"
         << "    \"MinFramesOk\": " << (gateEval.MinFramesOk ? "true" : "false") << ",\n"
         << "    \"MaxTargetOk\": " << (gateEval.MaxTargetOk ? "true" : "false") << ",\n"
+        << "    \"DurationOk\": " << (gateEval.DurationOk ? "true" : "false") << ",\n"
         << "    \"StimulusOk\": " << (gateEval.StimulusOk ? "true" : "false") << ",\n"
         << "    \"GpuTransportOk\": " << (gateEval.GpuTransportOk ? "true" : "false") << ",\n"
         << "    \"NvencOk\": " << (gateEval.NvencOk ? "true" : "false") << ",\n"
@@ -1057,6 +1114,20 @@ wmain(
                 return EXIT_FAILURE;
             }
             config.MaxDurationMs = static_cast<uint32_t>(val);
+        }
+        else if (arg == L"--duration-counts-connected")
+        {
+            config.DurationCountsConnected = true;
+        }
+        else if (arg == L"--max-execution-ms" && (i + 1) < argc)
+        {
+            uint64_t val = 0ULL;
+            if (!ParseUnsigned64(argv[++i], val) || val > 0xFFFFFFFFULL)
+            {
+                std::fprintf(stderr, "Invalid --max-execution-ms value.\n");
+                return EXIT_FAILURE;
+            }
+            config.MaxExecutionDurationMs = static_cast<uint32_t>(val);
         }
         else if (arg == L"--connect-timeout-ms" && (i + 1) < argc)
         {
@@ -1689,15 +1760,17 @@ wmain(
         runHr);
 
     std::printf(
-        "[LB-HOST] Summary: hr=0x%08lX exit=%s normal=%u healthy=%u session=%llu serverPid=%u connects=%llu reconnects=%llu "
+        "[LB-HOST] Summary: hr=0x%08lX exit=%s normal=%u healthy=%u qpcOk=%u durOk=%u session=%llu serverPid=%u connects=%llu reconnects=%llu "
         "frames=%llu valid=%llu live=%llu preConn=%llu bytes=%llu gaps=%llu crcErr=%llu patternErr=%llu protoErr=%llu "
         "recTimeout=%llu fatalTimeout=%llu partialTimeout=%llu tsErr=%llu covCore=%.1f%% covLive=%.1f%% covPres=%.1f%% "
-        "execMs=%llu connMs=%llu idleMs=%llu execFps=%.2f activeFps=%.2f liveFps=%.2f sampleOk=%u "
+        "execMs=%llu connMs=%llu activeMs=%llu idleMs=%llu execFps=%.2f activeFps=%.2f liveFps=%.2f sampleOk=%u "
         "avgE2EUs=%llu liveAvgE2EUs=%llu liveP95Us=%llu liveP99Us=%llu ipcAvgUs=%llu jitterAvgUs=%llu\n",
         static_cast<unsigned long>(runHr),
         lumabridge::host::HostExitReasonToString(metrics.ExitReason),
         metrics.HostProcessExitedNormally ? 1U : 0U,
         metrics.TransportHealthy ? 1U : 0U,
+        metrics.QpcClockValid ? 1U : 0U,
+        gateEval.DurationOk ? 1U : 0U,
         static_cast<unsigned long long>(metrics.SessionId),
         metrics.ServerProcessId,
         static_cast<unsigned long long>(metrics.ConnectCount),
@@ -1720,6 +1793,7 @@ wmain(
         metrics.PresentTimestampCoveragePercent,
         static_cast<unsigned long long>(metrics.TotalExecutionDurationUs / 1000ULL),
         static_cast<unsigned long long>(metrics.TotalConnectedDurationUs / 1000ULL),
+        static_cast<unsigned long long>(metrics.ActiveStreamingDurationUs / 1000ULL),
         static_cast<unsigned long long>(metrics.TotalIdleWaitDurationUs / 1000ULL),
         metrics.AverageExecutionFps,
         metrics.ObservedActiveFps,
