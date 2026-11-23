@@ -78,6 +78,228 @@ struct LocalFreeGuard final
     }
 };
 
+class ScopedRevertToSelf final
+{
+public:
+    explicit ScopedRevertToSelf(bool active) noexcept
+        : m_active(active)
+    {
+    }
+
+    ~ScopedRevertToSelf()
+    {
+        RevertNow();
+    }
+
+    void RevertNow() noexcept
+    {
+        if (m_active)
+        {
+            (void)RevertToSelf();
+            m_active = false;
+        }
+    }
+
+    ScopedRevertToSelf(const ScopedRevertToSelf&) = delete;
+    ScopedRevertToSelf& operator=(const ScopedRevertToSelf&) = delete;
+
+private:
+    bool m_active{false};
+};
+
+bool
+QueryTokenUserSidBytes(
+    HANDLE token,
+    uint8_t* outBuf,
+    size_t outBufSize,
+    PSID& outSid
+    ) noexcept
+{
+    outSid = nullptr;
+    if (token == nullptr || outBuf == nullptr || outBufSize < sizeof(TOKEN_USER))
+    {
+        return false;
+    }
+
+    DWORD requiredSize = static_cast<DWORD>(outBufSize);
+    if (GetTokenInformation(
+            token,
+            TokenUser,
+            outBuf,
+            requiredSize,
+            &requiredSize) == FALSE)
+    {
+        return false;
+    }
+
+    const TOKEN_USER* tokenUser = reinterpret_cast<const TOKEN_USER*>(outBuf);
+    if (tokenUser->User.Sid == nullptr || IsValidSid(tokenUser->User.Sid) == FALSE)
+    {
+        return false;
+    }
+
+    outSid = tokenUser->User.Sid;
+    return true;
+}
+
+bool
+IsSidEqualToWellKnown(
+    PSID sid,
+    WELL_KNOWN_SID_TYPE sidType
+    ) noexcept
+{
+    if (sid == nullptr || IsValidSid(sid) == FALSE)
+    {
+        return false;
+    }
+
+    uint8_t wellKnownBuf[SECURITY_MAX_SID_SIZE]{};
+    DWORD sidSize = sizeof(wellKnownBuf);
+    if (CreateWellKnownSid(sidType, nullptr, wellKnownBuf, &sidSize) == FALSE)
+    {
+        return false;
+    }
+
+    return EqualSid(sid, wellKnownBuf) != FALSE;
+}
+
+bool
+IsGuestUserSid(
+    PSID sid
+    ) noexcept
+{
+    if (sid == nullptr || IsValidSid(sid) == FALSE)
+    {
+        return false;
+    }
+
+    const PUCHAR subAuthCountPtr = GetSidSubAuthorityCount(sid);
+    if (subAuthCountPtr == nullptr || *subAuthCountPtr < 2U)
+    {
+        return false;
+    }
+
+    const DWORD rid = *GetSidSubAuthority(sid, static_cast<DWORD>(*subAuthCountPtr - 1U));
+    return rid == DOMAIN_USER_RID_GUEST;
+}
+
+bool
+IsImpersonationTokenMemberOfWellKnown(
+    HANDLE impersonationToken,
+    WELL_KNOWN_SID_TYPE sidType,
+    bool& outIsMember
+    ) noexcept
+{
+    outIsMember = false;
+    if (impersonationToken == nullptr)
+    {
+        return false;
+    }
+
+    uint8_t wellKnownBuf[SECURITY_MAX_SID_SIZE]{};
+    DWORD sidSize = sizeof(wellKnownBuf);
+    if (CreateWellKnownSid(sidType, nullptr, wellKnownBuf, &sidSize) == FALSE)
+    {
+        return false;
+    }
+
+    BOOL isMember = FALSE;
+    if (CheckTokenMembership(impersonationToken, wellKnownBuf, &isMember) == FALSE)
+    {
+        return false;
+    }
+
+    outIsMember = (isMember != FALSE);
+    return true;
+}
+
+bool
+CanonicalizeSidString(
+    const wchar_t* inputSidString,
+    wchar_t* outCanonicalSidBuf,
+    size_t outCanonicalSidBufChars
+    ) noexcept
+{
+    if (outCanonicalSidBuf == nullptr || outCanonicalSidBufChars == 0U)
+    {
+        return false;
+    }
+    outCanonicalSidBuf[0] = L'\0';
+    if (inputSidString == nullptr || inputSidString[0] == L'\0')
+    {
+        return false;
+    }
+
+    PSID rawSid = nullptr;
+    if (ConvertStringSidToSidW(inputSidString, &rawSid) == FALSE || rawSid == nullptr)
+    {
+        return false;
+    }
+    LocalFreeGuard sidMemGuard{rawSid};
+
+    if (IsValidSid(rawSid) == FALSE)
+    {
+        return false;
+    }
+
+    LPWSTR canonicalStr = nullptr;
+    if (ConvertSidToStringSidW(rawSid, &canonicalStr) == FALSE || canonicalStr == nullptr)
+    {
+        return false;
+    }
+    LocalFreeGuard strGuard{canonicalStr};
+
+    const errno_t copyErr = wcsncpy_s(
+        outCanonicalSidBuf,
+        outCanonicalSidBufChars,
+        canonicalStr,
+        _TRUNCATE);
+    return (copyErr == 0) && (outCanonicalSidBuf[0] != L'\0');
+}
+
+bool
+QueryCurrentProcessUserSidInfo(
+    wchar_t* outSidBuf,
+    size_t outSidBufChars,
+    bool& outIsServiceAccount
+    ) noexcept
+{
+    outIsServiceAccount = false;
+    if (outSidBuf == nullptr || outSidBufChars == 0U)
+    {
+        return false;
+    }
+    outSidBuf[0] = L'\0';
+
+    HANDLE token = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) == FALSE || token == nullptr)
+    {
+        return false;
+    }
+    ScopedWin32Handle tokenGuard(token);
+
+    uint8_t stackTokenBuf[256]{};
+    PSID userSid = nullptr;
+    if (!QueryTokenUserSidBytes(tokenGuard.Get(), stackTokenBuf, sizeof(stackTokenBuf), userSid))
+    {
+        return false;
+    }
+
+    outIsServiceAccount =
+        IsSidEqualToWellKnown(userSid, WinLocalServiceSid) ||
+        IsSidEqualToWellKnown(userSid, WinLocalSystemSid);
+
+    LPWSTR sidStr = nullptr;
+    if (ConvertSidToStringSidW(userSid, &sidStr) == FALSE || sidStr == nullptr)
+    {
+        return false;
+    }
+    LocalFreeGuard sidGuard{sidStr};
+
+    const errno_t copyErr = wcsncpy_s(outSidBuf, outSidBufChars, sidStr, _TRUNCATE);
+    return (copyErr == 0) && (outSidBuf[0] != L'\0');
+}
+
 uint64_t
 QueryCurrentQpc() noexcept
 {
@@ -322,49 +544,6 @@ WriteExactOverlapped(
     return ERROR_SUCCESS;
 }
 
-bool
-QueryCurrentProcessUserSidString(
-    wchar_t* outSidBuf,
-    size_t outSidBufChars
-    ) noexcept
-{
-    if (outSidBuf == nullptr || outSidBufChars == 0U)
-    {
-        return false;
-    }
-    outSidBuf[0] = L'\0';
-
-    HANDLE token = nullptr;
-    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) == FALSE)
-    {
-        return false;
-    }
-    ScopedWin32Handle tokenGuard(token);
-
-    uint8_t stackTokenBuf[256]{};
-    DWORD requiredSize = sizeof(stackTokenBuf);
-    if (GetTokenInformation(
-            tokenGuard.Get(),
-            TokenUser,
-            stackTokenBuf,
-            requiredSize,
-            &requiredSize) == FALSE)
-    {
-        return false;
-    }
-
-    const TOKEN_USER* tokenUser = reinterpret_cast<const TOKEN_USER*>(stackTokenBuf);
-    LPWSTR sidStr = nullptr;
-    if (ConvertSidToStringSidW(tokenUser->User.Sid, &sidStr) == FALSE || sidStr == nullptr)
-    {
-        return false;
-    }
-    LocalFreeGuard sidGuard{sidStr};
-
-    const errno_t copyErr = wcsncpy_s(outSidBuf, outSidBufChars, sidStr, _TRUNCATE);
-    return (copyErr == 0) && (outSidBuf[0] != L'\0');
-}
-
 } // namespace
 
 FrameIpcServer::~FrameIpcServer()
@@ -374,49 +553,103 @@ FrameIpcServer::~FrameIpcServer()
 
 HRESULT
 FrameIpcServer::CreateSecuredPipeHandle(
-    const wchar_t* pipeName,
-    bool allowSameUserAccess,
+    const FrameTransportConfig& config,
     ScopedWin32Handle& outPipeHandle
     ) noexcept
 {
     outPipeHandle.Reset();
 
-    if (pipeName == nullptr || pipeName[0] == L'\0')
+    if (config.PipeName[0] == L'\0')
     {
         return E_INVALIDARG;
     }
 
-    // Deny Network (NU) and Anonymous (AN) logons; grant full control to SYSTEM, Administrators,
-    // and LOCAL SERVICE (WUDFHost.exe); grant read/write to Interactive Users (lumabridge-host.exe);
-    // and set Medium Mandatory Label (ME) so non-elevated interactive host processes can write
-    // frames/ACKs to a pipe hosted by LOCAL SERVICE while blocking Low/AppContainer integrity levels.
+    wchar_t canonicalAuthorizedSid[128]{};
+    bool hasAuthorizedUserSid = false;
+    if (config.AuthorizedUserSid[0] != L'\0')
+    {
+        if (!CanonicalizeSidString(
+                config.AuthorizedUserSid,
+                canonicalAuthorizedSid,
+                ARRAYSIZE(canonicalAuthorizedSid)))
+        {
+            return E_INVALIDARG;
+        }
+        hasAuthorizedUserSid = true;
+    }
+
+    wchar_t serverSidBuf[128]{};
+    bool isServerServiceAccount = false;
+    const bool hasServerUserSid = QueryCurrentProcessUserSidInfo(
+        serverSidBuf,
+        ARRAYSIZE(serverSidBuf),
+        isServerServiceAccount);
+    if (!hasServerUserSid)
+    {
+        return LastWin32HResult();
+    }
+
+    // Explicitly deny Network (NU) and Anonymous (AN) logons and grant full control
+    // to SYSTEM (SY), Built-in Administrators (BA), and LOCAL SERVICE (LS / WUDFHost.exe).
+    // Broad Interactive Users (IU) is omitted whenever a specific AuthorizedUserSid is
+    // provided, when RestrictDaclToAuthorizedSid is enabled, or when running under a
+    // user account (which grants only its own user SID).
     static constexpr wchar_t kBaseDacl[] =
-        L"D:P(D;;GA;;;NU)(D;;GA;;;AN)(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)(A;;GRGW;;;IU)";
+        L"D:P(D;;GA;;;NU)(D;;GA;;;AN)(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)";
     static constexpr wchar_t kMediumLabelSacl[] = L"S:(ML;;NW;;;ME)";
 
-    wchar_t userSidBuf[128]{};
-    const bool hasUserSid = allowSameUserAccess &&
-        QueryCurrentProcessUserSidString(userSidBuf, ARRAYSIZE(userSidBuf));
+    wchar_t sddlBuf[768]{};
+    if (wcsncpy_s(sddlBuf, ARRAYSIZE(sddlBuf), kBaseDacl, _TRUNCATE) != 0)
+    {
+        return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    }
 
-    wchar_t sddlBuf[512]{};
-    const int formatted = hasUserSid
-        ? _snwprintf_s(
-              sddlBuf,
-              ARRAYSIZE(sddlBuf),
-              _TRUNCATE,
-              L"%ls(A;;GA;;;%ls)%ls",
-              kBaseDacl,
-              userSidBuf,
-              kMediumLabelSacl)
-        : _snwprintf_s(
-              sddlBuf,
-              ARRAYSIZE(sddlBuf),
-              _TRUNCATE,
-              L"%ls%ls",
-              kBaseDacl,
-              kMediumLabelSacl);
+    auto appendAce = [&sddlBuf](const wchar_t* fragment) noexcept -> bool {
+        return (wcscat_s(sddlBuf, ARRAYSIZE(sddlBuf), fragment) == 0);
+    };
 
-    if (formatted <= 0)
+    if (hasAuthorizedUserSid)
+    {
+        wchar_t authAce[192]{};
+        if (_snwprintf_s(authAce, ARRAYSIZE(authAce), _TRUNCATE, L"(A;;GRGW;;;%ls)", canonicalAuthorizedSid) <= 0 ||
+            !appendAce(authAce))
+        {
+            return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+        }
+    }
+
+    const bool restrictServerSidByAuthPolicy = config.RestrictDaclToAuthorizedSid && hasAuthorizedUserSid;
+    const bool serverMatchesAuthorized =
+        hasAuthorizedUserSid && (_wcsicmp(serverSidBuf, canonicalAuthorizedSid) == 0);
+    if (config.AllowSameUserAccess &&
+        !isServerServiceAccount &&
+        !restrictServerSidByAuthPolicy &&
+        !serverMatchesAuthorized)
+    {
+        wchar_t serverAce[192]{};
+        if (_snwprintf_s(serverAce, ARRAYSIZE(serverAce), _TRUNCATE, L"(A;;GA;;;%ls)", serverSidBuf) <= 0 ||
+            !appendAce(serverAce))
+        {
+            return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+        }
+    }
+
+    // Only allow Interactive Users (IU) in the DACL when WUDFHost.exe runs as a service
+    // account (LOCAL SERVICE / SYSTEM) without a brokered AuthorizedUserSid, while the
+    // server still strictly enforces TokenSessionId, integrity, and membership checks
+    // during VerifyConnectedClientIdentity() before transmitting any frame.
+    if (isServerServiceAccount &&
+        !hasAuthorizedUserSid &&
+        !config.RestrictDaclToAuthorizedSid &&
+        config.AllowActiveConsoleInteractiveUser)
+    {
+        if (!appendAce(L"(A;;GRGW;;;IU)"))
+        {
+            return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+        }
+    }
+
+    if (!appendAce(kMediumLabelSacl))
     {
         return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
     }
@@ -440,7 +673,7 @@ FrameIpcServer::CreateSecuredPipeHandle(
 
     constexpr DWORD kPipeBufferBytes = 1024U * 1024U;
     const HANDLE pipe = CreateNamedPipeW(
-        pipeName,
+        config.PipeName,
         PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
         1U,
@@ -456,6 +689,239 @@ FrameIpcServer::CreateSecuredPipeHandle(
 
     outPipeHandle.Reset(pipe);
     return S_OK;
+}
+
+ipc::FrameIpcStatus
+FrameIpcServer::VerifyConnectedClientIdentity(
+    HANDLE pipeHandle,
+    const ipc::FrameIpcClientHello& clientHello
+    ) const noexcept
+{
+    if (pipeHandle == nullptr || pipeHandle == INVALID_HANDLE_VALUE)
+    {
+        return ipc::FrameIpcStatus::UnauthorizedClient;
+    }
+
+    // 1. Verify kernel-reported client PID matches ClientHello without relying on secrets.
+    ULONG osClientPid = 0U;
+    if (GetNamedPipeClientProcessId(pipeHandle, &osClientPid) == FALSE ||
+        osClientPid == 0U ||
+        clientHello.ClientProcessId != static_cast<uint32_t>(osClientPid))
+    {
+        return ipc::FrameIpcStatus::UnauthorizedClient;
+    }
+
+    // 2. Obtain the effective security token used by the client when opening the Named Pipe.
+    ScopedWin32Handle clientToken;
+    if (ImpersonateNamedPipeClient(pipeHandle) == FALSE)
+    {
+        return ipc::FrameIpcStatus::UnauthorizedClient;
+    }
+    {
+        ScopedRevertToSelf revertGuard(true);
+        HANDLE threadToken = nullptr;
+        if (OpenThreadToken(GetCurrentThread(), TOKEN_QUERY | TOKEN_DUPLICATE, TRUE, &threadToken) != FALSE &&
+            threadToken != nullptr)
+        {
+            clientToken.Reset(threadToken);
+        }
+        revertGuard.RevertNow();
+    }
+
+    if (!clientToken.IsValid())
+    {
+        return ipc::FrameIpcStatus::UnauthorizedClient;
+    }
+
+    TOKEN_TYPE tokenType = TokenPrimary;
+    DWORD typeSize = 0U;
+    if (GetTokenInformation(clientToken.Get(), TokenType, &tokenType, sizeof(tokenType), &typeSize) == FALSE ||
+        typeSize != sizeof(tokenType) ||
+        tokenType != TokenImpersonation)
+    {
+        return ipc::FrameIpcStatus::UnauthorizedClient;
+    }
+
+    SECURITY_IMPERSONATION_LEVEL impLevel = SecurityAnonymous;
+    DWORD impSize = 0U;
+    if (GetTokenInformation(clientToken.Get(), TokenImpersonationLevel, &impLevel, sizeof(impLevel), &impSize) == FALSE ||
+        impSize != sizeof(impLevel) ||
+        impLevel < SecurityIdentification)
+    {
+        return ipc::FrameIpcStatus::UnauthorizedClient;
+    }
+
+    // 3. Reject AppContainer / sandboxed tokens as well as Network, Anonymous, and Guest logons.
+    DWORD isAppContainer = 1U;
+    DWORD appContSize = 0U;
+    if (GetTokenInformation(
+            clientToken.Get(),
+            TokenIsAppContainer,
+            &isAppContainer,
+            sizeof(isAppContainer),
+            &appContSize) == FALSE ||
+        appContSize != sizeof(isAppContainer) ||
+        isAppContainer != 0U)
+    {
+        return ipc::FrameIpcStatus::UnauthorizedClient;
+    }
+
+    bool isNetwork = true;
+    bool isAnonymous = true;
+    bool isBuiltinGuest = true;
+    if (!IsImpersonationTokenMemberOfWellKnown(clientToken.Get(), WinNetworkSid, isNetwork) ||
+        !IsImpersonationTokenMemberOfWellKnown(clientToken.Get(), WinAnonymousSid, isAnonymous) ||
+        !IsImpersonationTokenMemberOfWellKnown(clientToken.Get(), WinBuiltinGuestsSid, isBuiltinGuest) ||
+        isNetwork || isAnonymous || isBuiltinGuest)
+    {
+        return ipc::FrameIpcStatus::UnauthorizedClient;
+    }
+
+    // 4. Enforce Mandatory Integrity Level (>= MinimumIntegrityRid, default Medium 0x2000).
+    uint8_t ilBuf[SECURITY_MAX_SID_SIZE + sizeof(TOKEN_MANDATORY_LABEL)]{};
+    DWORD ilSize = 0U;
+    if (GetTokenInformation(clientToken.Get(), TokenIntegrityLevel, ilBuf, sizeof(ilBuf), &ilSize) == FALSE ||
+        ilSize < sizeof(TOKEN_MANDATORY_LABEL))
+    {
+        return ipc::FrameIpcStatus::UnauthorizedClient;
+    }
+
+    const TOKEN_MANDATORY_LABEL* tml = reinterpret_cast<const TOKEN_MANDATORY_LABEL*>(ilBuf);
+    if (tml->Label.Sid == nullptr || IsValidSid(tml->Label.Sid) == FALSE)
+    {
+        return ipc::FrameIpcStatus::UnauthorizedClient;
+    }
+    const PUCHAR subAuthCountPtr = GetSidSubAuthorityCount(tml->Label.Sid);
+    if (subAuthCountPtr == nullptr || *subAuthCountPtr == 0U)
+    {
+        return ipc::FrameIpcStatus::UnauthorizedClient;
+    }
+    const DWORD integrityRid = *GetSidSubAuthority(tml->Label.Sid, static_cast<DWORD>(*subAuthCountPtr - 1U));
+    if (integrityRid < m_config.MinimumIntegrityRid)
+    {
+        return ipc::FrameIpcStatus::UnauthorizedClient;
+    }
+
+    // 5. Verify kernel logon/Terminal Services Session ID matches ClientHello and policy.
+    DWORD clientTokenSessionId = 0U;
+    DWORD sessionSize = 0U;
+    if (GetTokenInformation(
+            clientToken.Get(),
+            TokenSessionId,
+            &clientTokenSessionId,
+            sizeof(clientTokenSessionId),
+            &sessionSize) == FALSE ||
+        sessionSize != sizeof(clientTokenSessionId) ||
+        clientHello.ClientSessionId != static_cast<uint32_t>(clientTokenSessionId))
+    {
+        return ipc::FrameIpcStatus::UnauthorizedClient;
+    }
+
+    const DWORD activeConsoleSessionId = WTSGetActiveConsoleSessionId();
+    if (m_config.RequireMatchingClientSession)
+    {
+        if (m_config.HasExplicitAllowedSessionId)
+        {
+            if (clientTokenSessionId != m_config.AllowedClientSessionId)
+            {
+                return ipc::FrameIpcStatus::UnauthorizedClient;
+            }
+        }
+        else
+        {
+            DWORD serverSessionId = 0U;
+            if (ProcessIdToSessionId(GetCurrentProcessId(), &serverSessionId) == FALSE)
+            {
+                return ipc::FrameIpcStatus::UnauthorizedClient;
+            }
+
+            const bool matchesServerSession = (clientTokenSessionId == serverSessionId);
+            const bool matchesActiveConsole =
+                (activeConsoleSessionId != 0xFFFFFFFFU && clientTokenSessionId == activeConsoleSessionId);
+            if (!matchesServerSession && !matchesActiveConsole)
+            {
+                return ipc::FrameIpcStatus::UnauthorizedClient;
+            }
+        }
+    }
+
+    // 6. Verify client user SID / privileged role / active console interactive logon.
+    uint8_t clientUserBuf[256]{};
+    PSID clientUserSid = nullptr;
+    if (!QueryTokenUserSidBytes(clientToken.Get(), clientUserBuf, sizeof(clientUserBuf), clientUserSid) ||
+        IsGuestUserSid(clientUserSid))
+    {
+        return ipc::FrameIpcStatus::UnauthorizedClient;
+    }
+
+    HANDLE serverProcTokenRaw = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &serverProcTokenRaw) == FALSE ||
+        serverProcTokenRaw == nullptr)
+    {
+        return ipc::FrameIpcStatus::UnauthorizedClient;
+    }
+    ScopedWin32Handle serverProcToken(serverProcTokenRaw);
+
+    uint8_t serverUserBuf[256]{};
+    PSID serverUserSid = nullptr;
+    if (!QueryTokenUserSidBytes(serverProcToken.Get(), serverUserBuf, sizeof(serverUserBuf), serverUserSid))
+    {
+        return ipc::FrameIpcStatus::UnauthorizedClient;
+    }
+
+    const bool isServerServiceAccount =
+        IsSidEqualToWellKnown(serverUserSid, WinLocalServiceSid) ||
+        IsSidEqualToWellKnown(serverUserSid, WinLocalSystemSid);
+
+    bool isBuiltinAdmin = false;
+    (void)IsImpersonationTokenMemberOfWellKnown(clientToken.Get(), WinBuiltinAdministratorsSid, isBuiltinAdmin);
+    const bool isLocalSystem = IsSidEqualToWellKnown(clientUserSid, WinLocalSystemSid);
+    const bool isPrivilegedAdminOrSystem = isBuiltinAdmin || isLocalSystem;
+
+    bool isAuthorized = false;
+    if (m_config.AuthorizedUserSid[0] != L'\0')
+    {
+        PSID expectedSid = nullptr;
+        if (ConvertStringSidToSidW(m_config.AuthorizedUserSid, &expectedSid) == FALSE || expectedSid == nullptr)
+        {
+            return ipc::FrameIpcStatus::UnauthorizedClient;
+        }
+        LocalFreeGuard expectedSidGuard{expectedSid};
+
+        if (IsValidSid(expectedSid) != FALSE && EqualSid(clientUserSid, expectedSid) != FALSE)
+        {
+            isAuthorized = true;
+        }
+        else if (m_config.AllowBuiltinAdmins && isPrivilegedAdminOrSystem)
+        {
+            isAuthorized = true;
+        }
+    }
+    else
+    {
+        if (m_config.AllowSameUserAccess && EqualSid(clientUserSid, serverUserSid) != FALSE)
+        {
+            isAuthorized = true;
+        }
+        else if (m_config.AllowBuiltinAdmins && isPrivilegedAdminOrSystem)
+        {
+            isAuthorized = true;
+        }
+        else if (isServerServiceAccount && m_config.AllowActiveConsoleInteractiveUser)
+        {
+            bool isInteractive = false;
+            if (IsImpersonationTokenMemberOfWellKnown(clientToken.Get(), WinInteractiveSid, isInteractive) &&
+                isInteractive &&
+                clientTokenSessionId != 0U &&
+                activeConsoleSessionId != 0xFFFFFFFFU &&
+                clientTokenSessionId == activeConsoleSessionId)
+            {
+                isAuthorized = true;
+            }
+        }
+    }
+
+    return isAuthorized ? ipc::FrameIpcStatus::Ok : ipc::FrameIpcStatus::UnauthorizedClient;
 }
 
 HRESULT
@@ -487,10 +953,7 @@ FrameIpcServer::Start(
     }
 
     ScopedWin32Handle pipeHandle;
-    const HRESULT pipeHr = CreateSecuredPipeHandle(
-        config.PipeName,
-        config.AllowSameUserAccess,
-        pipeHandle);
+    const HRESULT pipeHr = CreateSecuredPipeHandle(config, pipeHandle);
     if (FAILED(pipeHr))
     {
         ExclusiveLock metricsGuard(&m_metricsLock);
@@ -541,6 +1004,14 @@ FrameIpcServer::Start(
     if (m_config.IoTimeoutMs == 0U)
     {
         m_config.IoTimeoutMs = ipc::kDefaultIpcIoTimeoutMs;
+    }
+    else if (m_config.IoTimeoutMs < kMinIpcIoTimeoutMs)
+    {
+        m_config.IoTimeoutMs = kMinIpcIoTimeoutMs;
+    }
+    else if (m_config.IoTimeoutMs > kMaxIpcIoTimeoutMs)
+    {
+        m_config.IoTimeoutMs = kMaxIpcIoTimeoutMs;
     }
 
     m_pipeHandle = std::move(pipeHandle);
@@ -760,10 +1231,11 @@ FrameIpcServer::FlushQueue() noexcept
         auto item = m_queue.PopFront();
         if (item != nullptr && m_freePool.Size() < m_effectiveMaxPoolSize)
         {
-            item->ResetMetadataKeepCapacity();
+            item->ResetMetadataAndFreePixels();
             (void)m_freePool.PushBack(std::move(item));
         }
     }
+    m_freePool.FreeAllPixelStorage();
     m_queueMetrics.QueueDepth = 0U;
 }
 
@@ -893,18 +1365,11 @@ FrameIpcServer::WorkerLoop() noexcept
 
         ipc::FrameIpcStatus validationStatus = ipc::ValidateClientHello(
             &clientHello,
-            sizeof(clientHello),
-            m_config.ExpectedClientAuthToken);
+            sizeof(clientHello));
 
         if (validationStatus == ipc::FrameIpcStatus::Ok)
         {
-            ULONG osClientPid = 0U;
-            if (GetNamedPipeClientProcessId(pipeHandle, &osClientPid) == FALSE ||
-                osClientPid == 0U ||
-                clientHello.ClientProcessId != static_cast<uint32_t>(osClientPid))
-            {
-                validationStatus = ipc::FrameIpcStatus::UnauthorizedClient;
-            }
+            validationStatus = VerifyConnectedClientIdentity(pipeHandle, clientHello);
         }
 
         ipc::FrameIpcServerHello serverHello{};

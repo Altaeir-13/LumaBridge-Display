@@ -30,6 +30,38 @@ public:
         ShutdownTransport();
     }
 
+    void SetAuthorizedHostUserSid(const wchar_t* sidString) noexcept
+    {
+        bool sidChangedWhileRunning = false;
+        FrameTransportConfig updatedConfig{};
+        {
+            ExclusiveLockGuard deviceGuard(&m_deviceLock);
+            wchar_t normalized[128]{};
+            if (sidString != nullptr && sidString[0] != L'\0')
+            {
+                (void)wcsncpy_s(normalized, ARRAYSIZE(normalized), sidString, _TRUNCATE);
+            }
+
+            if (wcscmp(m_authorizedHostUserSid, normalized) != 0)
+            {
+                (void)wcsncpy_s(m_authorizedHostUserSid, ARRAYSIZE(m_authorizedHostUserSid), normalized, _TRUNCATE);
+                if (m_boundSwapChainHandle != nullptr &&
+                    InterlockedCompareExchange(&m_frameExtractionEnabled, 0, 0) != 0 &&
+                    m_ipcServer.IsRunning())
+                {
+                    sidChangedWhileRunning = true;
+                    updatedConfig = BuildTransportConfigLocked(m_activeRenderAdapterLuid);
+                }
+            }
+        }
+
+        if (sidChangedWhileRunning)
+        {
+            m_ipcServer.Stop();
+            (void)m_ipcServer.Start(updatedConfig);
+        }
+    }
+
     void SetFrameExtractionEnabled(bool enabled) noexcept
     {
         const bool wasEnabled = (InterlockedExchange(&m_frameExtractionEnabled, enabled ? 1 : 0) != 0);
@@ -43,17 +75,18 @@ public:
         }
 
         bool hasBoundSwapChain = false;
-        LUID activeLuid{0, 0};
+        FrameTransportConfig transportConfig{};
         {
             ExclusiveLockGuard deviceGuard(&m_deviceLock);
             hasBoundSwapChain = (m_boundSwapChainHandle != nullptr);
-            activeLuid = m_activeRenderAdapterLuid;
+            if (hasBoundSwapChain)
+            {
+                transportConfig = BuildTransportConfigLocked(m_activeRenderAdapterLuid);
+            }
         }
 
         if (hasBoundSwapChain && !m_ipcServer.IsRunning())
         {
-            FrameTransportConfig transportConfig{};
-            transportConfig.AdapterLuid = activeLuid;
             (void)m_ipcServer.Start(transportConfig);
         }
     }
@@ -131,6 +164,8 @@ public:
             return hr;
         }
 
+        bool shouldStartIpc = false;
+        FrameTransportConfig transportConfig{};
         {
             ExclusiveLockGuard deviceGuard(&m_deviceLock);
             m_boundSwapChainHandle = swapChainHandle;
@@ -138,13 +173,15 @@ public:
             m_d3dDevice = d3dDevice;
             m_d3dContext = d3dContext;
             m_extractor.SetDevice(d3dDevice.Get(), d3dContext.Get());
+            if (InterlockedCompareExchange(&m_frameExtractionEnabled, 0, 0) != 0)
+            {
+                shouldStartIpc = true;
+                transportConfig = BuildTransportConfigLocked(renderAdapterLuid);
+            }
         }
 
-        if (InterlockedCompareExchange(&m_frameExtractionEnabled, 0, 0) != 0 &&
-            !m_ipcServer.IsRunning())
+        if (shouldStartIpc && !m_ipcServer.IsRunning())
         {
-            FrameTransportConfig transportConfig{};
-            transportConfig.AdapterLuid = renderAdapterLuid;
             (void)m_ipcServer.Start(transportConfig);
         }
         return S_OK;
@@ -185,6 +222,7 @@ public:
                 texture->GetDesc(&desc);
                 hasValidSurface = (desc.Width > 0 && desc.Height > 0);
             }
+            surface.Reset();
         }
 
         outMetadata.PresentationFrameNumber = bufferOut.MetaData.PresentationFrameNumber;
@@ -196,30 +234,44 @@ public:
 
         if (InterlockedCompareExchange(&m_frameExtractionEnabled, 0, 0) != 0 && hasValidSurface)
         {
-            outMetadata.ExtractionAttempted = true;
             std::unique_ptr<ExtractedFrameBuffer> slot = m_ipcServer.AcquireBufferSlot();
             if (slot == nullptr)
             {
+                outMetadata.ExtractionAttempted = true;
                 texture.Reset();
-                surface.Reset();
                 outMetadata.ExtractionHResult = E_OUTOFMEMORY;
                 return S_OK;
             }
 
-            FrameExtractionInput input{};
-            input.SourceTexture = texture.Get();
-            input.PresentationFrameNumber = outMetadata.PresentationFrameNumber;
-            input.DirtyRectCount = outMetadata.DirtyRectCount;
-            input.MoveRegionCount = outMetadata.MoveRegionCount;
-            input.HwProtectedSurface = outMetadata.HwProtectedSurface;
-            input.PresentDisplayQpcTime = outMetadata.PresentDisplayQPCTime;
-            input.Flags = static_cast<uint32_t>(ipc::FrameIpcFlags::None);
+            FrameExtractionResult extractResult{};
+            bool extractionPerformed = false;
+            {
+                ExclusiveLockGuard deviceGuard(&m_deviceLock);
+                if (InterlockedCompareExchange(&m_frameExtractionEnabled, 0, 0) != 0 &&
+                    m_boundSwapChainHandle == swapChainHandle)
+                {
+                    extractionPerformed = true;
+                    FrameExtractionInput input{};
+                    input.AdoptSourceTexture = texture.Detach();
+                    input.PresentationFrameNumber = outMetadata.PresentationFrameNumber;
+                    input.DirtyRectCount = outMetadata.DirtyRectCount;
+                    input.MoveRegionCount = outMetadata.MoveRegionCount;
+                    input.HwProtectedSurface = outMetadata.HwProtectedSurface;
+                    input.PresentDisplayQpcTime = outMetadata.PresentDisplayQPCTime;
+                    input.Flags = static_cast<uint32_t>(ipc::FrameIpcFlags::None);
 
-            // Release all COM references to the acquired IddCx surface immediately after GPU copy/extraction.
-            const FrameExtractionResult extractResult = m_extractor.ExtractFrame(input, *slot);
-            texture.Reset();
-            surface.Reset();
+                    extractResult = m_extractor.ExtractFrame(input, *slot);
+                }
+                texture.Reset();
+            }
 
+            if (!extractionPerformed)
+            {
+                m_ipcServer.RecycleBufferSlot(std::move(slot));
+                return S_OK;
+            }
+
+            outMetadata.ExtractionAttempted = true;
             outMetadata.ExtractionAccepted = extractResult.AcceptedForExtraction;
             outMetadata.PixelsCopied = extractResult.PixelsCopied;
             outMetadata.ProtectedContentRejected = extractResult.ProtectedContentRejected;
@@ -254,7 +306,6 @@ public:
         else
         {
             texture.Reset();
-            surface.Reset();
         }
         return S_OK;
     }
@@ -341,10 +392,26 @@ private:
         SRWLOCK* m_lock;
     };
 
+    FrameTransportConfig BuildTransportConfigLocked(LUID adapterLuid) const noexcept
+    {
+        FrameTransportConfig transportConfig{};
+        transportConfig.AdapterLuid = adapterLuid;
+        // WUDFHost.exe executes under LOCAL SERVICE; peer LOCAL SERVICE processes must not
+        // implicitly consume virtual monitor frames.
+        transportConfig.AllowSameUserAccess = false;
+        if (m_authorizedHostUserSid[0] != L'\0')
+        {
+            transportConfig.SetAuthorizedUserSid(m_authorizedHostUserSid);
+            transportConfig.RestrictDaclToAuthorizedSid = true;
+        }
+        return transportConfig;
+    }
+
     SRWLOCK m_deviceLock{SRWLOCK_INIT};
     volatile LONG m_frameExtractionEnabled{0};
     void* m_boundSwapChainHandle{nullptr};
     LUID m_activeRenderAdapterLuid{0, 0};
+    wchar_t m_authorizedHostUserSid[128]{};
     ComPtr<ID3D11Device> m_d3dDevice;
     ComPtr<ID3D11DeviceContext> m_d3dContext;
     D3d11FrameExtractor m_extractor{};
@@ -1024,6 +1091,85 @@ LumaBridgeQueryFrameExtractionEnabled(
         true);
 }
 
+bool
+LumaBridgeQueryAuthorizedHostUserSid(
+    WDFDEVICE Device,
+    wchar_t* outSidBuf,
+    size_t outSidBufChars
+    ) noexcept
+{
+    if (outSidBuf == nullptr || outSidBufChars == 0U)
+    {
+        return false;
+    }
+    outSidBuf[0] = L'\0';
+    if (Device == nullptr || outSidBufChars < 2U)
+    {
+        return false;
+    }
+
+    DECLARE_CONST_UNICODE_STRING(sidValueName, L"AuthorizedHostUserSid");
+    const ULONG flagsToTry[2] = {
+        PLUGPLAY_REGKEY_DEVICE,
+        PLUGPLAY_REGKEY_DEVICE | WDF_REGKEY_DEVICE_SUBKEY};
+
+    for (size_t i = 0U; i < 2U; ++i)
+    {
+        WDFKEY hardwareKey = nullptr;
+        const NTSTATUS openStatus = WdfDeviceOpenRegistryKey(
+            Device,
+            flagsToTry[i],
+            KEY_READ,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            &hardwareKey);
+        if (!NT_SUCCESS(openStatus) || hardwareKey == nullptr)
+        {
+            continue;
+        }
+
+        UNICODE_STRING queryValue{};
+        queryValue.Buffer = outSidBuf;
+        queryValue.Length = 0U;
+        queryValue.MaximumLength = static_cast<USHORT>((outSidBufChars - 1U) * sizeof(wchar_t));
+        USHORT valueLength = 0U;
+        const NTSTATUS queryStatus = WdfRegistryQueryUnicodeString(
+            hardwareKey,
+            &sidValueName,
+            &valueLength,
+            &queryValue);
+        WdfRegistryClose(hardwareKey);
+
+        if (NT_SUCCESS(queryStatus) && queryValue.Length > 0U)
+        {
+            const size_t charCount = static_cast<size_t>(queryValue.Length / sizeof(wchar_t));
+            const size_t clampedChars = (charCount < outSidBufChars) ? charCount : (outSidBufChars - 1U);
+            outSidBuf[clampedChars] = L'\0';
+            if (outSidBuf[0] != L'\0')
+            {
+                return true;
+            }
+        }
+        outSidBuf[0] = L'\0';
+    }
+
+    return false;
+}
+
+void
+LumaBridgeApplyFrameExtractionPolicy(
+    WDFDEVICE Device,
+    lumabridge::driver::D3d11IddCxSwapChainBackend& Backend
+    ) noexcept
+{
+    wchar_t authorizedSid[128]{};
+    const bool hasSid = LumaBridgeQueryAuthorizedHostUserSid(
+        Device,
+        authorizedSid,
+        ARRAYSIZE(authorizedSid));
+    Backend.SetAuthorizedHostUserSid(hasSid ? authorizedSid : nullptr);
+    Backend.SetFrameExtractionEnabled(LumaBridgeQueryFrameExtractionEnabled(Device));
+}
+
 void
 AssignUnicodeDiagnosticValue(
     WDFKEY HardwareKey,
@@ -1521,7 +1667,7 @@ LumaBridgeStartAdapter(
             }
             if (host.Get() != nullptr)
             {
-                host.Get()->Backend.SetFrameExtractionEnabled(LumaBridgeQueryFrameExtractionEnabled(Device));
+                LumaBridgeApplyFrameExtractionPolicy(Device, host.Get()->Backend);
                 (void)host.Get()->MonitorManager.OnResume();
                 (void)host.Get()->Processor.OnResume();
                 if (adapterHandle != nullptr)
@@ -1548,7 +1694,7 @@ LumaBridgeStartAdapter(
             const ScopedSwapChainHostRef host = AcquireSwapChainHostForDevice(Device);
             if (host.Get() != nullptr)
             {
-                host.Get()->Backend.SetFrameExtractionEnabled(LumaBridgeQueryFrameExtractionEnabled(Device));
+                LumaBridgeApplyFrameExtractionPolicy(Device, host.Get()->Backend);
                 (void)host.Get()->MonitorManager.OnResume();
                 (void)host.Get()->Processor.OnResume();
             }
@@ -1565,7 +1711,7 @@ LumaBridgeStartAdapter(
             const ScopedSwapChainHostRef host = AcquireSwapChainHostForDevice(Device);
             if (host.Get() != nullptr)
             {
-                host.Get()->Backend.SetFrameExtractionEnabled(LumaBridgeQueryFrameExtractionEnabled(Device));
+                LumaBridgeApplyFrameExtractionPolicy(Device, host.Get()->Backend);
                 (void)host.Get()->MonitorManager.OnResume();
                 (void)host.Get()->Processor.OnResume();
             }
@@ -2278,8 +2424,7 @@ LumaBridgeEvtAdapterInitFinished(
                 const ScopedSwapChainHostRef host = AcquireSwapChainHostForDevice(wdfDevice);
                 if (host.Get() != nullptr)
                 {
-                    const bool extractionEnabled = LumaBridgeQueryFrameExtractionEnabled(wdfDevice);
-                    host.Get()->Backend.SetFrameExtractionEnabled(extractionEnabled);
+                    LumaBridgeApplyFrameExtractionPolicy(wdfDevice, host.Get()->Backend);
                     const bool activationEnabled = LumaBridgeQueryVirtualMonitorActivationEnabled(wdfDevice);
                     host.Get()->MonitorManager.SetActivationEnabled(activationEnabled);
                     const NTSTATUS monitorStatus = host.Get()->MonitorManager.EnsureMonitorArrived(AdapterObject);
@@ -2622,8 +2767,7 @@ LumaBridgeEvtMonitorAssignSwapChain(
 
         if (wdfDevice != nullptr)
         {
-            host.Get()->Backend.SetFrameExtractionEnabled(
-                LumaBridgeQueryFrameExtractionEnabled(wdfDevice));
+            LumaBridgeApplyFrameExtractionPolicy(wdfDevice, host.Get()->Backend);
         }
 
         const NTSTATUS status = host.Get()->Processor.AssignSwapChain(

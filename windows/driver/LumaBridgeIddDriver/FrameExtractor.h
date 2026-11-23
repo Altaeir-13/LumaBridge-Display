@@ -52,11 +52,26 @@ public:
             return true;
         }
 
-        if (newSize > m_capacity)
+        if (newSize > ipc::kMaxFramePayloadBytes)
+        {
+            return false;
+        }
+
+        const bool shouldShrinkOversized =
+            (m_capacity > ipc::kMaxRetainedPoolBufferBytes) &&
+            (newSize <= ipc::kMaxRetainedPoolBufferBytes);
+
+        if (newSize > m_capacity || shouldShrinkOversized)
         {
             std::unique_ptr<uint8_t[]> next(new (std::nothrow) uint8_t[newSize]);
             if (next == nullptr)
             {
+                if (shouldShrinkOversized)
+                {
+                    // Existing allocation already covers newSize under memory pressure.
+                    m_size = newSize;
+                    return true;
+                }
                 return false;
             }
             m_data = std::move(next);
@@ -67,9 +82,15 @@ public:
         return true;
     }
 
-    void ClearKeepCapacity() noexcept
+    void ClearKeepCapacity(
+        size_t maxRetainedCapacity = ipc::kMaxRetainedPoolBufferBytes
+        ) noexcept
     {
         m_size = 0U;
+        if (m_capacity > maxRetainedCapacity)
+        {
+            FreeStorage();
+        }
     }
 
     void FreeStorage() noexcept
@@ -126,7 +147,13 @@ struct ExtractedFrameBuffer
         QpcFrequency = 0ULL;
         CopyLatencyUs = 0ULL;
         PayloadCrc32 = 0U;
-        Pixels.ClearKeepCapacity();
+        Pixels.ClearKeepCapacity(ipc::kMaxRetainedPoolBufferBytes);
+    }
+
+    void ResetMetadataAndFreePixels() noexcept
+    {
+        ResetMetadataKeepCapacity();
+        Pixels.FreeStorage();
     }
 };
 
@@ -135,6 +162,8 @@ struct FrameExtractionInput
 {
     IDXGIResource* SurfaceResource{nullptr};
     ID3D11Texture2D* SourceTexture{nullptr};
+    /// Optional caller-owned reference adopted via ComPtr::Detach() and released right after CopyResource.
+    ID3D11Texture2D* AdoptSourceTexture{nullptr};
     uint32_t PresentationFrameNumber{0};
     uint32_t DirtyRectCount{0};
     uint32_t MoveRegionCount{0};

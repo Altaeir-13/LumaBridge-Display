@@ -342,7 +342,7 @@ FrameConsumer::Connect(
             0U,
             nullptr,
             OPEN_EXISTING,
-            FILE_FLAG_OVERLAPPED,
+            FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
             nullptr);
         if (openedPipe != INVALID_HANDLE_VALUE)
         {
@@ -354,6 +354,10 @@ FrameConsumer::Connect(
         {
             const HRESULT hr = HRESULT_FROM_WIN32(lastOpenErr);
             ExclusiveLock lock(&m_metricsLock);
+            if (lastOpenErr == ERROR_ACCESS_DENIED)
+            {
+                m_metrics.LastProtocolStatus = ipc::FrameIpcStatus::UnauthorizedClient;
+            }
             m_metrics.LastErrorHResult = hr;
             return hr;
         }
@@ -396,12 +400,22 @@ FrameConsumer::Connect(
 
     m_pipeHandle = openedPipe;
 
+    DWORD clientSessionId = 0U;
+    if (ProcessIdToSessionId(GetCurrentProcessId(), &clientSessionId) == FALSE)
+    {
+        const HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
+        ClosePipeAndResetConnectionState(false);
+        ExclusiveLock lock(&m_metricsLock);
+        m_metrics.LastErrorHResult = hr;
+        return hr;
+    }
+
     ipc::FrameIpcClientHello clientHello{};
     clientHello.Envelope = ipc::InitEnvelope(
         ipc::FrameIpcMessageType::ClientHello,
         static_cast<uint32_t>(sizeof(ipc::FrameIpcClientHello)));
     clientHello.ClientProcessId = GetCurrentProcessId();
-    clientHello.ClientAuthToken = m_config.AuthToken;
+    clientHello.ClientSessionId = static_cast<uint32_t>(clientSessionId);
     clientHello.ClientCapabilities = 1U;
 
     const DWORD writeErr = WriteExactOverlapped(

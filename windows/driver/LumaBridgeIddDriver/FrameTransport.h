@@ -13,6 +13,8 @@ namespace lumabridge::driver {
 
 inline constexpr size_t kMaxSupportedQueueDepth = 16U;
 inline constexpr size_t kMaxSupportedPoolSize = 20U;
+inline constexpr DWORD kMinIpcIoTimeoutMs = 50U;
+inline constexpr DWORD kMaxIpcIoTimeoutMs = 5000U;
 
 /// Configuration for the bounded local Named Pipe IPC transport server.
 struct FrameTransportConfig
@@ -32,14 +34,37 @@ struct FrameTransportConfig
         (void)wcsncpy_s(PipeName, ARRAYSIZE(PipeName), pipeName, _TRUNCATE);
     }
 
+    void SetAuthorizedUserSid(const wchar_t* sidString) noexcept
+    {
+        if (sidString == nullptr)
+        {
+            AuthorizedUserSid[0] = L'\0';
+            return;
+        }
+        (void)wcsncpy_s(AuthorizedUserSid, ARRAYSIZE(AuthorizedUserSid), sidString, _TRUNCATE);
+    }
+
+    void SetAllowedClientSessionId(DWORD sessionId) noexcept
+    {
+        HasExplicitAllowedSessionId = true;
+        AllowedClientSessionId = sessionId;
+    }
+
     wchar_t PipeName[260]{};
+    wchar_t AuthorizedUserSid[128]{};
     size_t MaxQueueDepth{ipc::kDefaultMaxFrameQueueDepth};
     size_t BufferPoolSize{ipc::kDefaultFrameBufferPoolSize};
-    uint32_t ExpectedClientAuthToken{ipc::kDefaultClientAuthToken};
     DWORD IoTimeoutMs{ipc::kDefaultIpcIoTimeoutMs};
     LUID AdapterLuid{0, 0};
     bool RequireClientAck{true};
+    bool RestrictDaclToAuthorizedSid{false};
     bool AllowSameUserAccess{true};
+    bool AllowBuiltinAdmins{true};
+    bool AllowActiveConsoleInteractiveUser{true};
+    bool RequireMatchingClientSession{true};
+    bool HasExplicitAllowedSessionId{false};
+    DWORD AllowedClientSessionId{0U};
+    DWORD MinimumIntegrityRid{SECURITY_MANDATORY_MEDIUM_RID};
 };
 
 /// Thread-safe snapshot of bounded queue and local IPC delivery metrics.
@@ -95,6 +120,18 @@ public:
         m_head = (m_head + 1U) % Capacity;
         --m_count;
         return item;
+    }
+
+    void FreeAllPixelStorage() noexcept
+    {
+        for (size_t i = 0U; i < m_count; ++i)
+        {
+            const size_t idx = (m_head + i) % Capacity;
+            if (m_items[idx] != nullptr)
+            {
+                m_items[idx]->ResetMetadataAndFreePixels();
+            }
+        }
     }
 
     void Clear() noexcept
@@ -171,10 +208,14 @@ private:
     void ClearAllBuffersLocked() noexcept;
 
     HRESULT CreateSecuredPipeHandle(
-        const wchar_t* pipeName,
-        bool allowSameUserAccess,
+        const FrameTransportConfig& config,
         ScopedWin32Handle& outPipeHandle
         ) noexcept;
+
+    ipc::FrameIpcStatus VerifyConnectedClientIdentity(
+        HANDLE pipeHandle,
+        const ipc::FrameIpcClientHello& clientHello
+        ) const noexcept;
 
     mutable SRWLOCK m_lifecycleLock{SRWLOCK_INIT};
     mutable SRWLOCK m_queueLock{SRWLOCK_INIT};

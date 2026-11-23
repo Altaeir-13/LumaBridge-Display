@@ -185,7 +185,19 @@ D3d11FrameExtractor::ExtractFrame(
     }
 
     ComPtr<ID3D11Texture2D> sourceTexture;
-    if (input.SourceTexture != nullptr)
+    if (input.AdoptSourceTexture != nullptr)
+    {
+        sourceTexture.Attach(input.AdoptSourceTexture);
+    }
+    auto releaseAcquiredSurfaceRefs = [&]() noexcept {
+        sourceTexture.Reset();
+    };
+
+    if (sourceTexture != nullptr)
+    {
+        // Adopted ownership from input.AdoptSourceTexture; released before Map or error exit.
+    }
+    else if (input.SourceTexture != nullptr)
     {
         sourceTexture = input.SourceTexture;
     }
@@ -194,12 +206,14 @@ D3d11FrameExtractor::ExtractFrame(
         const HRESULT qiHr = input.SurfaceResource->QueryInterface(IID_PPV_ARGS(&sourceTexture));
         if (FAILED(qiHr) || sourceTexture == nullptr)
         {
+            releaseAcquiredSurfaceRefs();
             result.HResult = FAILED(qiHr) ? qiHr : E_NOINTERFACE;
             return result;
         }
     }
     else
     {
+        releaseAcquiredSurfaceRefs();
         result.HResult = E_INVALIDARG;
         return result;
     }
@@ -208,7 +222,7 @@ D3d11FrameExtractor::ExtractFrame(
     sourceTexture->GetDesc(&desc);
     if (desc.Width == 0U || desc.Height == 0U)
     {
-        sourceTexture.Reset();
+        releaseAcquiredSurfaceRefs();
         result.HResult = E_INVALIDARG;
         return result;
     }
@@ -221,7 +235,7 @@ D3d11FrameExtractor::ExtractFrame(
     // Reject hardware-protected content immediately without copying or mapping pixels.
     if (input.HwProtectedSurface || (desc.MiscFlags & D3D11_RESOURCE_MISC_HW_PROTECTED) != 0U)
     {
-        sourceTexture.Reset();
+        releaseAcquiredSurfaceRefs();
         outFrame.ResetMetadataKeepCapacity();
         result.ProtectedContentRejected = true;
         result.HResult = DXGI_ERROR_ACCESS_DENIED;
@@ -234,14 +248,14 @@ D3d11FrameExtractor::ExtractFrame(
         desc.ArraySize != 1U ||
         desc.SampleDesc.Count != 1U)
     {
-        sourceTexture.Reset();
+        releaseAcquiredSurfaceRefs();
         result.HResult = E_INVALIDARG;
         return result;
     }
 
     if (!ipc::IsSupportedExtractionDxgiFormat(static_cast<uint32_t>(desc.Format)))
     {
-        sourceTexture.Reset();
+        releaseAcquiredSurfaceRefs();
         result.HResult = DXGI_ERROR_UNSUPPORTED;
         return result;
     }
@@ -251,12 +265,22 @@ D3d11FrameExtractor::ExtractFrame(
     if (!ipc::ComputeTightRowPitchBytes(desc.Width, tightRowPitch) ||
         !ipc::ComputeValidatedFramePayloadBytes(desc.Width, desc.Height, tightRowPitch, payloadBytes))
     {
-        sourceTexture.Reset();
+        releaseAcquiredSurfaceRefs();
         result.HResult = HRESULT_FROM_WIN32(ERROR_ARITHMETIC_OVERFLOW);
         return result;
     }
 
     result.AcceptedForExtraction = true;
+
+    // Pre-allocate destination RAM buffer before GPU staging allocation/copy/map
+    // so allocation failures abort cleanly without holding or locking GPU surfaces.
+    if (!outFrame.Pixels.Resize(static_cast<size_t>(payloadBytes)))
+    {
+        releaseAcquiredSurfaceRefs();
+        outFrame.ResetMetadataKeepCapacity();
+        result.HResult = E_OUTOFMEMORY;
+        return result;
+    }
 
     const bool needNewStaging =
         (m_stagingTexture == nullptr) ||
@@ -304,7 +328,8 @@ D3d11FrameExtractor::ExtractFrame(
                     createHr = removedReason;
                 }
             }
-            sourceTexture.Reset();
+            releaseAcquiredSurfaceRefs();
+            outFrame.ResetMetadataKeepCapacity();
             result.HResult = createHr;
             return result;
         }
@@ -316,26 +341,31 @@ D3d11FrameExtractor::ExtractFrame(
         result.StagingRecreated = true;
     }
 
-    const HRESULT copyHr = m_hooks->CopyTextureResource(
+    HRESULT copyHr = m_hooks->CopyTextureResource(
         m_d3dContext.Get(),
         m_stagingTexture.Get(),
         sourceTexture.Get());
 
-    // Release our COM reference to the acquired IddCx surface immediately after GPU copy submission
-    // so it never survives past extraction or across CPU mapping.
-    sourceTexture.Reset();
+    // Release ALL COM references to the acquired IddCx surface immediately after GPU copy submission
+    // so the OS surface never survives into Map(D3D11_MAP_READ) or beyond extraction.
+    releaseAcquiredSurfaceRefs();
 
-    if (FAILED(copyHr))
+    const HRESULT postCopyRemovedReason = m_d3dDevice->GetDeviceRemovedReason();
+    if (FAILED(copyHr) || IsDeviceRemovedOrResetHResult(postCopyRemovedReason))
     {
-        const HRESULT removedReason = m_d3dDevice->GetDeviceRemovedReason();
-        if (IsDeviceRemovedOrResetHResult(copyHr) || IsDeviceRemovedOrResetHResult(removedReason))
+        if (IsDeviceRemovedOrResetHResult(copyHr) || IsDeviceRemovedOrResetHResult(postCopyRemovedReason))
         {
             result.DeviceRemovedOrReset = true;
+            if (IsDeviceRemovedOrResetHResult(postCopyRemovedReason) && !IsDeviceRemovedOrResetHResult(copyHr))
+            {
+                copyHr = postCopyRemovedReason;
+            }
             m_stagingTexture.Reset();
             m_stagingWidth = 0U;
             m_stagingHeight = 0U;
             m_stagingFormat = DXGI_FORMAT_UNKNOWN;
         }
+        outFrame.ResetMetadataKeepCapacity();
         result.HResult = copyHr;
         return result;
     }
@@ -357,6 +387,7 @@ D3d11FrameExtractor::ExtractFrame(
             m_stagingHeight = 0U;
             m_stagingFormat = DXGI_FORMAT_UNKNOWN;
         }
+        outFrame.ResetMetadataKeepCapacity();
         result.HResult = mapHr;
         return result;
     }
@@ -366,14 +397,8 @@ D3d11FrameExtractor::ExtractFrame(
 
         if (mapped.pData == nullptr || mapped.RowPitch < tightRowPitch)
         {
-            result.HResult = E_FAIL;
-            return result;
-        }
-
-        if (!outFrame.Pixels.Resize(static_cast<size_t>(payloadBytes)))
-        {
             outFrame.ResetMetadataKeepCapacity();
-            result.HResult = E_OUTOFMEMORY;
+            result.HResult = E_FAIL;
             return result;
         }
 

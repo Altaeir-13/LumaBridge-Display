@@ -113,7 +113,6 @@ PrintUsage()
         "  --duration-ms <ms>            Stop after MS milliseconds (default: 0 = unlimited)\n"
         "  --connect-timeout-ms <ms>     Pipe connect timeout in ms (default: 3000)\n"
         "  --io-timeout-ms <ms>          Pipe I/O timeout in ms (default: 500)\n"
-        "  --auth-token <value>          32-bit auth token in dec/hex (default: 0x4148424C)\n"
         "  --verify-synthetic-pattern    Verify BGRA8 synthetic test pattern pixels\n"
         "  --reconnect                   Automatically reconnect on disconnect/idle loss\n"
         "  --json-summary <path>         Write non-visual telemetry summary JSON to file\n"
@@ -246,16 +245,6 @@ wmain(
                 return EXIT_FAILURE;
             }
             config.IoTimeoutMs = static_cast<DWORD>(val);
-        }
-        else if (arg == L"--auth-token" && (i + 1) < argc)
-        {
-            uint64_t val = 0ULL;
-            if (!ParseUnsigned64(argv[++i], val) || val > 0xFFFFFFFFULL)
-            {
-                std::fprintf(stderr, "Invalid --auth-token value.\n");
-                return EXIT_FAILURE;
-            }
-            config.AuthToken = static_cast<uint32_t>(val);
         }
         else if (arg == L"--verify-synthetic-pattern")
         {

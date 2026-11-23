@@ -15,7 +15,6 @@ namespace lumabridge::host {
 struct HostConsumerConfig
 {
     std::wstring PipeName{ipc::kDefaultFrameIpcPipeName};
-    uint32_t AuthToken{ipc::kDefaultClientAuthToken};
     DWORD ConnectTimeoutMs{3000U};
     DWORD IoTimeoutMs{ipc::kDefaultIpcIoTimeoutMs};
     uint64_t MaxFrames{0ULL};

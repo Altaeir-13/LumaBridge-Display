@@ -12,13 +12,13 @@ namespace lumabridge::ipc {
 inline constexpr uint32_t kFrameIpcMagic = 0x4649424CU; // 'LBIF'
 inline constexpr uint16_t kFrameIpcProtocolVersionMajor = 1U;
 inline constexpr uint16_t kFrameIpcProtocolVersionMinor = 0U;
-inline constexpr uint32_t kDefaultClientAuthToken = 0x4148424CU; // 'LBHA'
 
 inline constexpr uint32_t kMinFrameDimension = 1U;
 inline constexpr uint32_t kMaxFrameWidth = 4096U;
 inline constexpr uint32_t kMaxFrameHeight = 4096U;
 inline constexpr uint32_t kBytesPerPixelBgra8 = 4U;
 inline constexpr uint64_t kMaxFramePayloadBytes = 4096ULL * 4096ULL * 4ULL; // 64 MiB
+inline constexpr size_t kMaxRetainedPoolBufferBytes = 2560ULL * 1440ULL * 4ULL; // ~14.06 MiB (1440p BGRA8)
 
 inline constexpr size_t kDefaultMaxFrameQueueDepth = 3U;
 inline constexpr size_t kDefaultFrameBufferPoolSize = 5U;
@@ -103,7 +103,7 @@ struct FrameIpcClientHello
 {
     FrameIpcEnvelope Envelope{};
     uint32_t ClientProcessId{0};
-    uint32_t ClientAuthToken{0};
+    uint32_t ClientSessionId{0};
     uint32_t ClientCapabilities{0};
     uint32_t Reserved1{0};
 };
@@ -297,8 +297,7 @@ ValidateEnvelope(
 inline FrameIpcStatus
 ValidateClientHello(
     const void* data,
-    size_t byteCount,
-    uint32_t expectedAuthToken
+    size_t byteCount
     ) noexcept
 {
     const FrameIpcStatus envStatus = ValidateEnvelope(
@@ -313,7 +312,7 @@ ValidateClientHello(
 
     FrameIpcClientHello hello{};
     std::memcpy(&hello, data, sizeof(hello));
-    if (hello.ClientProcessId == 0U || hello.ClientAuthToken != expectedAuthToken)
+    if (hello.ClientProcessId == 0U)
     {
         return FrameIpcStatus::UnauthorizedClient;
     }
