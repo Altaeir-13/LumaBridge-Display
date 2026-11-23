@@ -2194,7 +2194,7 @@ Invoke-UnitTest -Name 'FunctionalValidationScriptDryRunAndFinallyRollbackOnFailu
             HardwareIds           = @('Root\LumaBridgeIddDriver')
             DriverInfPath         = 'oem99.inf'
             DriverProvider        = 'LumaBridge'
-            DriverVersion         = '22.0.0.1'
+            DriverVersion         = (Get-LumaBridgeInfDriverVersion -InfPath (Join-Path (Get-LumaBridgePackageDirectory -Configuration Release) 'LumaBridgeIddDriver.inf'))
             DriverService         = 'WUDFRd'
             UpperFilters          = @('IndirectKmd')
             LowerFilters          = @()
@@ -2267,14 +2267,14 @@ Invoke-UnitTest -Name 'FunctionalValidationScriptDryRunAndFinallyRollbackOnFailu
         'Find-LumaBridgeSigningCertificate'           = { [CmdletBinding()] param([string]$CertificateThumbprint, [string]$CertificateSubject) return $global:LbTestState['ValMock'].CertInfo.Certificate }
         'Export-LumaBridgeCertificateFile'            = { [CmdletBinding()] param($Certificate, [string]$FilePath) [System.IO.File]::WriteAllBytes($FilePath, $Certificate.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)) }
         'Get-LumaBridgePnpInstances'                  = $mockGetInstances
-        'Set-LumaBridgeDeviceEnableVirtualMonitor'    = { [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value) $global:LbTestState['ValMock'].EnableMon = $Value }
+        'Set-LumaBridgeDeviceEnableVirtualMonitor'    = { [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value = 0, [switch]$Clear) if ($Clear) { $global:LbTestState['ValMock'].EnableMon = $null } else { $global:LbTestState['ValMock'].EnableMon = $Value } }
         'Get-LumaBridgeDeviceEnableVirtualMonitor'    = { [CmdletBinding()] param([string]$DeviceParametersPath) return $global:LbTestState['ValMock'].EnableMon }
-        'Set-LumaBridgeDeviceEnableFrameExtraction'   = { [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value) $global:LbTestState['ValMock'].EnableExt = $Value }
+        'Set-LumaBridgeDeviceEnableFrameExtraction'   = { [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value = 0, [switch]$Clear) if ($Clear) { $global:LbTestState['ValMock'].EnableExt = $null } else { $global:LbTestState['ValMock'].EnableExt = $Value } }
         'Get-LumaBridgeDeviceEnableFrameExtraction'   = { [CmdletBinding()] param([string]$DeviceParametersPath) return $global:LbTestState['ValMock'].EnableExt }
         'Set-LumaBridgeDeviceAuthorizedHostUserSid'   = { [CmdletBinding()] param([string]$DeviceParametersPath, [string]$SidString, [switch]$Clear) if ($Clear -or [string]::IsNullOrWhiteSpace($SidString)) { $global:LbTestState['ValMock'].AuthSid = $null } else { $global:LbTestState['ValMock'].AuthSid = $SidString } }
         'Get-LumaBridgeDeviceAuthorizedHostUserSid'   = { [CmdletBinding()] param([string]$DeviceParametersPath) return $global:LbTestState['ValMock'].AuthSid }
         'Invoke-LumaBridgeExternalCommand'            = $mockExternalCmd
-        'Get-LumaBridgeWudfHostProcesses'             = { [CmdletBinding()] param([object[]]$PnpInstances, [object[]]$RecentEvents, [string[]]$DebugTraceLines) return @([pscustomobject]@{ Id = 8768; IsLumaBridgeHost = $true; AssociationMethod = 'LoadedModule'; WorkingSetMB = 30.0; PrivateMemoryMB = 15.0; HandleCount = 400 }) }
+        'Get-LumaBridgeWudfHostProcesses'             = { [CmdletBinding()] param([object[]]$PnpInstances, [object[]]$RecentEvents, [string[]]$DebugTraceLines, [Nullable[DateTime]]$NotBeforeUtc = $null, [Nullable[int]]$ExpectedHostPid = $null) return @([pscustomobject]@{ Id = 8768; IsLumaBridgeHost = $true; AssociationMethod = 'LoadedModule'; WorkingSetMB = 30.0; PrivateMemoryMB = 15.0; HandleCount = 400; StartedAfterAnchor = $true }) }
         'Get-LumaBridgeCrashDumpInventory'            = { [CmdletBinding()] param([int]$LookbackMinutes) return [pscustomobject]@{ LookbackMinutes = $LookbackMinutes; Locations = @(); Files = @(); TotalFoundCount = 0 } }
         'Get-LumaBridgeEventChannelStatus'            = { [CmdletBinding()] param([string[]]$ChannelNames) return @() }
         'Get-LumaBridgeDiagnosticEvents'              = { [CmdletBinding()] param([int]$LookbackMinutes, [string[]]$InstanceIds, [string[]]$PublishedInfNames, [object[]]$ChannelStatus) return @() }
@@ -2282,8 +2282,8 @@ Invoke-UnitTest -Name 'FunctionalValidationScriptDryRunAndFinallyRollbackOnFailu
         'Get-LumaBridgeDriverStorePackages'           = { [CmdletBinding()] param([string]$InfFilter) return @() }
         'Get-LumaBridgeEtlEventSummary'               = { [CmdletBinding()] param([string]$EtlPath, $StartTimeUtc, $EndTimeUtc, $ProcessId, [int]$MaxMatchedEvents = 500, [switch]$ExcludeHighVolumeGraphics) return [pscustomobject]@{ EtlPath = $EtlPath; Exists = $true; EventCount = 1; MatchedEventCount = 1; MatchedLimitReached = $false; FilteredOutHighVolume = $true; XPathUsed = '*'; TraceStats = $null; CircularWrapWarning = $null; LumaBridgeEvents = @(); Providers = @(); Events = @(); Error = '' } }
         'Invoke-LumaBridgeHostProcess'                = {
-            [CmdletBinding()] param([string]$ExecutablePath, [string[]]$Arguments = @(), [int]$HardTimeoutMs = 30000, [switch]$DryRun)
-            return [pscustomobject]@{ ExitCode = 1; TimedOut = $false; Output = @('Simulated host connect timeout'); StdErr = @(); DryRun = $false }
+            [CmdletBinding()] param([string]$ExecutablePath, [string[]]$Arguments = @(), [int]$HardTimeoutMs = 30000, [int]$ResourceSampleIntervalSec = 0, [Nullable[int]]$WudfProcessId = $null, [switch]$DryRun)
+            return [pscustomobject]@{ ExitCode = 1; TimedOut = $false; ProcessId = 4401; Output = @('Simulated host connect timeout'); StdErr = @(); DryRun = $false }
         }
     }
 
@@ -2411,7 +2411,7 @@ Invoke-UnitTest -Name 'HostProcessOutputCaptureGlobalTimeoutAndTwoProfileRunner'
                 HardwareIds           = @('Root\LumaBridgeIddDriver')
                 DriverInfPath         = 'oem99.inf'
                 DriverProvider        = 'LumaBridge'
-                DriverVersion         = '22.0.0.1'
+                DriverVersion         = (Get-LumaBridgeInfDriverVersion -InfPath (Join-Path (Get-LumaBridgePackageDirectory -Configuration Release) 'LumaBridgeIddDriver.inf'))
                 DriverService         = 'WUDFRd'
                 UpperFilters          = @('IndirectKmd')
                 LowerFilters          = @()
@@ -2423,13 +2423,13 @@ Invoke-UnitTest -Name 'HostProcessOutputCaptureGlobalTimeoutAndTwoProfileRunner'
                 StartupDiagnostics    = [pscustomobject]@{ LastStage = 'AdapterInitFinished'; LastSuccessfulStage = 'AdapterInitFinished'; LastStatusHex = '0x00000000'; LastErrorStatusHex = '0x00000000' }
             })
         }
-        'Set-LumaBridgeDeviceEnableVirtualMonitor'  = { [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value) $global:LbTestState['ProfMock'].EnableMon = $Value }
+        'Set-LumaBridgeDeviceEnableVirtualMonitor'  = { [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value = 0, [switch]$Clear) if ($Clear) { $global:LbTestState['ProfMock'].EnableMon = $null } else { $global:LbTestState['ProfMock'].EnableMon = $Value } }
         'Get-LumaBridgeDeviceEnableVirtualMonitor'  = { [CmdletBinding()] param([string]$DeviceParametersPath) return $global:LbTestState['ProfMock'].EnableMon }
-        'Set-LumaBridgeDeviceEnableFrameExtraction' = { [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value) $global:LbTestState['ProfMock'].EnableExt = $Value }
+        'Set-LumaBridgeDeviceEnableFrameExtraction' = { [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value = 0, [switch]$Clear) if ($Clear) { $global:LbTestState['ProfMock'].EnableExt = $null } else { $global:LbTestState['ProfMock'].EnableExt = $Value } }
         'Get-LumaBridgeDeviceEnableFrameExtraction' = { [CmdletBinding()] param([string]$DeviceParametersPath) return $global:LbTestState['ProfMock'].EnableExt }
         'Set-LumaBridgeDeviceAuthorizedHostUserSid' = { [CmdletBinding()] param([string]$DeviceParametersPath, [string]$SidString, [switch]$Clear) if ($Clear -or [string]::IsNullOrWhiteSpace($SidString)) { $global:LbTestState['ProfMock'].AuthSid = $null } else { $global:LbTestState['ProfMock'].AuthSid = $SidString } }
         'Get-LumaBridgeDeviceAuthorizedHostUserSid' = { [CmdletBinding()] param([string]$DeviceParametersPath) return $global:LbTestState['ProfMock'].AuthSid }
-        'Get-LumaBridgeWudfHostProcesses'           = { [CmdletBinding()] param($PnpInstances, $RecentEvents, $DebugTraceLines) return @([pscustomobject]@{ Id = 8768; IsLumaBridgeHost = $true; AssociationMethod = 'LoadedModule'; WorkingSetMB = 30.0; PrivateMemoryMB = 15.0; HandleCount = 400 }) }
+        'Get-LumaBridgeWudfHostProcesses'           = { [CmdletBinding()] param($PnpInstances, $RecentEvents, $DebugTraceLines, [Nullable[DateTime]]$NotBeforeUtc = $null, [Nullable[int]]$ExpectedHostPid = $null) return @([pscustomobject]@{ Id = 8768; IsLumaBridgeHost = $true; AssociationMethod = 'LoadedModule'; WorkingSetMB = 30.0; PrivateMemoryMB = 15.0; HandleCount = 400; StartedAfterAnchor = $true }) }
         'Get-LumaBridgeCrashDumpInventory'          = { [CmdletBinding()] param([int]$LookbackMinutes) return [pscustomobject]@{ LookbackMinutes = $LookbackMinutes; Locations = @(); Files = @(); TotalFoundCount = 0 } }
         'Get-LumaBridgeEventChannelStatus'            = { [CmdletBinding()] param($ChannelNames) return @() }
         'Get-LumaBridgeDiagnosticEvents'            = { [CmdletBinding()] param($LookbackMinutes, $InstanceIds, $PublishedInfNames, $ChannelStatus) return @() }
@@ -2457,17 +2457,20 @@ Invoke-UnitTest -Name 'HostProcessOutputCaptureGlobalTimeoutAndTwoProfileRunner'
             return [pscustomobject]@{ ExitCode = 0; Output = @('OK'); DryRun = $false }
         }
         'Invoke-LumaBridgeHostProcess'              = {
-            [CmdletBinding()] param([string]$ExecutablePath, [string[]]$Arguments = @(), [int]$HardTimeoutMs = 30000, [switch]$DryRun)
+            [CmdletBinding()] param([string]$ExecutablePath, [string[]]$Arguments = @(), [int]$HardTimeoutMs = 30000, [int]$ResourceSampleIntervalSec = 0, [Nullable[int]]$WudfProcessId = $null, [switch]$DryRun)
             $jsonIdx = [Array]::IndexOf($Arguments, '--json-summary')
             $jsonPath = $Arguments[$jsonIdx + 1]
+            $runIdIdx = [Array]::IndexOf($Arguments, '--run-id')
+            $runIdVal = if ($runIdIdx -ge 0 -and ($runIdIdx + 1) -lt $Arguments.Count) { [string]$Arguments[$runIdIdx + 1] } else { '' }
             $isPerf = ($Arguments -contains '--require-max-frames')
             $st = $global:LbTestState['ProfMock']
             if (-not $isPerf) {
                 $payload = [pscustomobject]@{
+                    RunId = $runIdVal; SummaryComplete = $true;
                     ExitReason = 'DurationElapsed'; HostProcessExitedNormally = $true; TransportHealthy = $true;
                     ConnectCount = 1; FramesReceived = 3; FramesValid = 3; LiveFramesReceived = 0; PreConnectFramesReceived = 3;
                     FrameTargetReached = $false; MinFramesReached = $true; ChecksumMismatches = 0; ProtocolErrors = 0; FatalIoTimeouts = 0; FatalIpcErrors = 0;
-                    LastFrameSequence = 33; LastProtocolStatus = 'Ok'; AvgEndToEndLatencyUs = 1200; ReceiveFps = 0.6;
+                    LastFrameSequence = 33; LastFrameWidth = 1920; LastFrameHeight = 1080; LastProtocolStatus = 'Ok'; AvgEndToEndLatencyUs = 1200; ReceiveFps = 0.6;
                     TimestampMeasurementErrors = 0; OutOfOrderSequenceCount = 0; NonMonotonicTimestampCount = 0; MissingCoreTimestampCount = 0;
                     FutureTimestampErrorCount = 0; IncompatibleTimestampUnitsCount = 0; QpcFrequencyMismatchCount = 0;
                     ValidCoreTimestampSamples = 3; ValidLiveTimestampSamples = 0; ValidPresentTimestampSamples = 0;
@@ -2476,16 +2479,17 @@ Invoke-UnitTest -Name 'HostProcessOutputCaptureGlobalTimeoutAndTwoProfileRunner'
                     LiveEndToEndLatency = [pscustomobject]@{ Available = $false; SampleCount = 0; AvgUs = 0; P95Us = 0; P99Us = 0 }
                 }
                 $payload | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
-                return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Output = @('[LB-HOST] Summary: frames=3'); StdErr = @(); DryRun = $false }
+                return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] Summary: frames=3'); StdErr = @(); DryRun = $false }
             }
             else {
                 $failPerf = $st.PerfFails
                 $fc = $(if ($failPerf) { 12 } else { 60 })
                 $payload = [pscustomobject]@{
+                    RunId = $runIdVal; SummaryComplete = $true;
                     ExitReason = 'DurationElapsed'; HostProcessExitedNormally = $true; TransportHealthy = $true;
                     ConnectCount = 1; FramesReceived = $fc; FramesValid = $fc; LiveFramesReceived = $fc; PreConnectFramesReceived = 0;
                     FrameTargetReached = (-not $failPerf); ChecksumMismatches = 0; ProtocolErrors = 0; FatalIoTimeouts = 0; FatalIpcErrors = 0;
-                    LastFrameSequence = 93; LastProtocolStatus = 'Ok'; AvgEndToEndLatencyUs = 2400; ReceiveFps = 58.5;
+                    LastFrameSequence = 93; LastFrameWidth = 1920; LastFrameHeight = 1080; LastProtocolStatus = 'Ok'; AvgEndToEndLatencyUs = 2400; ReceiveFps = 58.5;
                     TimestampMeasurementErrors = 0; OutOfOrderSequenceCount = 0; NonMonotonicTimestampCount = 0; MissingCoreTimestampCount = 0;
                     FutureTimestampErrorCount = 0; IncompatibleTimestampUnitsCount = 0; QpcFrequencyMismatchCount = 0;
                     ValidCoreTimestampSamples = $fc; ValidLiveTimestampSamples = $fc; ValidPresentTimestampSamples = $fc;
@@ -2495,7 +2499,7 @@ Invoke-UnitTest -Name 'HostProcessOutputCaptureGlobalTimeoutAndTwoProfileRunner'
                     VisualStimulus = [pscustomobject]@{ VirtualDisplayIdentified = $true; Started = $true }
                 }
                 $payload | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
-                return [pscustomobject]@{ ExitCode = $(if ($failPerf) { 1 } else { 0 }); TimedOut = $false; Output = @('[LB-HOST] Summary: perf'); StdErr = @(); DryRun = $false }
+                return [pscustomobject]@{ ExitCode = $(if ($failPerf) { 1 } else { 0 }); TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] Summary: perf'); StdErr = @(); DryRun = $false }
             }
         }
     }
@@ -2572,16 +2576,16 @@ Invoke-UnitTest -Name 'M42GpuTransportNvencGatesAndRollback' -TestBody {
                 InstanceId = 'ROOT\DISPLAY\0000'; FriendlyName = 'LumaBridge Indirect Display Adapter'; Status = 'OK';
                 ProblemCode = 0; ProblemStatus = 0; ProblemStatusHex = '0x00000000'; Present = $true;
                 HardwareIds = @('Root\LumaBridgeIddDriver'); DriverInfPath = 'oem99.inf'; DriverProvider = 'LumaBridge';
-                DriverVersion = '22.0.0.1'; DriverService = 'WUDFRd'; UpperFilters = @('IndirectKmd'); LowerFilters = @();
+                DriverVersion = (Get-LumaBridgeInfDriverVersion -InfPath (Join-Path (Get-LumaBridgePackageDirectory -Configuration Release) 'LumaBridgeIddDriver.inf')); DriverService = 'WUDFRd'; UpperFilters = @('IndirectKmd'); LowerFilters = @();
                 ConfigurationId = 'oem99.inf:Root\LumaBridgeIddDriver'; DeviceParametersPath = 'MOCK:\ROOT\DISPLAY\0000\Device Parameters';
                 EnableVirtualMonitor = $st.EnableMon; EnableFrameExtraction = $st.EnableExt;
                 EnableGpuSharedTransport = $st.EnableGpuTrans; AuthorizedHostUserSid = $st.AuthSid;
                 StartupDiagnostics = [pscustomobject]@{ LastStage = 'AdapterInitFinished'; LastSuccessfulStage = 'AdapterInitFinished'; LastStatusHex = '0x00000000'; LastErrorStatusHex = '0x00000000' }
             })
         }
-        'Set-LumaBridgeDeviceEnableVirtualMonitor'     = { [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value) $global:LbTestState['M42Mock'].EnableMon = $Value }
+        'Set-LumaBridgeDeviceEnableVirtualMonitor'     = { [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value = 0, [switch]$Clear) if ($Clear) { $global:LbTestState['M42Mock'].EnableMon = $null } else { $global:LbTestState['M42Mock'].EnableMon = $Value } }
         'Get-LumaBridgeDeviceEnableVirtualMonitor'     = { [CmdletBinding()] param([string]$DeviceParametersPath) return $global:LbTestState['M42Mock'].EnableMon }
-        'Set-LumaBridgeDeviceEnableFrameExtraction'    = { [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value) $global:LbTestState['M42Mock'].EnableExt = $Value }
+        'Set-LumaBridgeDeviceEnableFrameExtraction'    = { [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value = 0, [switch]$Clear) if ($Clear) { $global:LbTestState['M42Mock'].EnableExt = $null } else { $global:LbTestState['M42Mock'].EnableExt = $Value } }
         'Get-LumaBridgeDeviceEnableFrameExtraction'    = { [CmdletBinding()] param([string]$DeviceParametersPath) return $global:LbTestState['M42Mock'].EnableExt }
         'Set-LumaBridgeDeviceEnableGpuSharedTransport' = {
             [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value = 1, [switch]$Clear)
@@ -2591,7 +2595,7 @@ Invoke-UnitTest -Name 'M42GpuTransportNvencGatesAndRollback' -TestBody {
         'Get-LumaBridgeDeviceEnableGpuSharedTransport' = { [CmdletBinding()] param([string]$DeviceParametersPath) return $global:LbTestState['M42Mock'].EnableGpuTrans }
         'Set-LumaBridgeDeviceAuthorizedHostUserSid'    = { [CmdletBinding()] param([string]$DeviceParametersPath, [string]$SidString, [switch]$Clear) if ($Clear -or [string]::IsNullOrWhiteSpace($SidString)) { $global:LbTestState['M42Mock'].AuthSid = $null } else { $global:LbTestState['M42Mock'].AuthSid = $SidString } }
         'Get-LumaBridgeDeviceAuthorizedHostUserSid'    = { [CmdletBinding()] param([string]$DeviceParametersPath) return $global:LbTestState['M42Mock'].AuthSid }
-        'Get-LumaBridgeWudfHostProcesses'              = { [CmdletBinding()] param($PnpInstances, $RecentEvents, $DebugTraceLines) return @([pscustomobject]@{ Id = 8768; IsLumaBridgeHost = $true; AssociationMethod = 'LoadedModule'; WorkingSetMB = 30.0; PrivateMemoryMB = 15.0; HandleCount = 400 }) }
+        'Get-LumaBridgeWudfHostProcesses'              = { [CmdletBinding()] param($PnpInstances, $RecentEvents, $DebugTraceLines, [Nullable[DateTime]]$NotBeforeUtc = $null, [Nullable[int]]$ExpectedHostPid = $null) return @([pscustomobject]@{ Id = 8768; IsLumaBridgeHost = $true; AssociationMethod = 'LoadedModule'; WorkingSetMB = 30.0; PrivateMemoryMB = 15.0; HandleCount = 400; StartedAfterAnchor = $true }) }
         'Get-LumaBridgeCrashDumpInventory'             = { [CmdletBinding()] param([int]$LookbackMinutes) return [pscustomobject]@{ LookbackMinutes = $LookbackMinutes; Locations = @(); Files = @(); TotalFoundCount = 0 } }
         'Get-LumaBridgeEventChannelStatus'             = { [CmdletBinding()] param($ChannelNames) return @() }
         'Get-LumaBridgeDiagnosticEvents'               = { [CmdletBinding()] param($LookbackMinutes, $InstanceIds, $PublishedInfNames, $ChannelStatus) return @() }
@@ -2620,38 +2624,41 @@ Invoke-UnitTest -Name 'M42GpuTransportNvencGatesAndRollback' -TestBody {
             return [pscustomobject]@{ ExitCode = 0; Output = @('OK'); DryRun = $false }
         }
         'Invoke-LumaBridgeHostProcess'                 = {
-            [CmdletBinding()] param([string]$ExecutablePath, [string[]]$Arguments = @(), [int]$HardTimeoutMs = 30000, [switch]$DryRun)
+            [CmdletBinding()] param([string]$ExecutablePath, [string[]]$Arguments = @(), [int]$HardTimeoutMs = 30000, [int]$ResourceSampleIntervalSec = 0, [Nullable[int]]$WudfProcessId = $null, [switch]$DryRun)
             if ($DryRun) {
                 $stDry = $global:LbTestState['M42Mock']
                 $stDry.LastDryRunArgs = @($Arguments)
-                return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Output = @('[DRY-RUN] host'); StdErr = @(); DryRun = $true }
+                return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; ProcessId = 0; Output = @('[DRY-RUN] host'); StdErr = @(); DryRun = $true }
             }
             $jsonIdx = [Array]::IndexOf($Arguments, '--json-summary')
             $jsonPath = $Arguments[$jsonIdx + 1]
+            $runIdIdx = [Array]::IndexOf($Arguments, '--run-id')
+            $runIdVal = if ($runIdIdx -ge 0 -and ($runIdIdx + 1) -lt $Arguments.Count) { [string]$Arguments[$runIdIdx + 1] } else { '' }
             $st = $global:LbTestState['M42Mock']
             $isGpu = ($Arguments -contains '--require-gpu-shared')
             $cpuReads = if ($st.SimulateCpuReadViolation) { 5 } else { 0 }
             $payload = [pscustomobject]@{
+                RunId = $runIdVal; SummaryComplete = $true;
                 ExitReason = 'FrameTargetReached'; HostProcessExitedNormally = $true; TransportHealthy = $true;
                 NegotiatedTransportMode = $(if ($isGpu) { 'GpuSharedNtHandle' } else { 'CpuStagingPipe' });
                 FallbackToCpuActivated = $false; GpuFramesOpened = $(if ($isGpu) { 3 } else { 0 });
                 GpuSharedOpenFailures = 0; GpuSyncTimeouts = 0; AdapterMismatchErrors = 0; CpuStagingReadsPerformed = $cpuReads;
                 ConnectCount = 1; FramesReceived = 60; FramesValid = 60; LiveFramesReceived = 60; PreConnectFramesReceived = 0;
-                FrameTargetReached = $true; MinFramesReached = $true; TotalConnectedDurationUs = 1000000;
+                FrameTargetReached = $true; MinFramesReached = $true; TotalConnectedDurationUs = 1000000; SustainedLiveFps = 60.0;
                 ChecksumMismatches = 0; ProtocolErrors = 0; FatalIoTimeouts = 0; FatalIpcErrors = 0;
-                LastFrameSequence = 60; LastProtocolStatus = 'Ok'; AvgEndToEndLatencyUs = 450; ReceiveFps = 60.0;
+                LastFrameSequence = 60; LastFrameWidth = 1920; LastFrameHeight = 1080; LastProtocolStatus = 'Ok'; AvgEndToEndLatencyUs = 450; ReceiveFps = 60.0;
                 TimestampMeasurementErrors = 0; OutOfOrderSequenceCount = 0; NonMonotonicTimestampCount = 0; MissingCoreTimestampCount = 0;
                 FutureTimestampErrorCount = 0; IncompatibleTimestampUnitsCount = 0; QpcFrequencyMismatchCount = 0;
                 ValidCoreTimestampSamples = 60; ValidLiveTimestampSamples = 60; ValidPresentTimestampSamples = 60;
                 CoreTimestampCoveragePercent = 100.0; LiveTimestampCoveragePercent = 100.0; PresentTimestampCoveragePercent = 100.0;
                 EndToEndLatency = [pscustomobject]@{ Available = $true; SampleCount = 60; AvgUs = 450; P95Us = 800; P99Us = 950 };
                 LiveEndToEndLatency = [pscustomobject]@{ Available = $true; SampleCount = 60; AvgUs = 450; P95Us = 800; P99Us = 950 };
-                Nvenc = [pscustomobject]@{ NvencFramesEncoded = 60; TotalBitstreamBytes = 2500000; InvalidTimestampCount = 0; ExtractToBitstreamCoveragePercent = 100.0 };
-                H264DecodeValidation = [pscustomobject]@{ Passed = $true; StructuralDecodeValidated = $true; FidelityPsnrValidated = $false };
+                Nvenc = [pscustomobject]@{ NvencFramesSubmitted = 60; NvencFramesEncoded = 60; NvencDroppedFrames = 0; EncodedQueueDrops = 0; TotalBitstreamBytes = 2500000; InvalidTimestampCount = 0; ExtractToBitstreamCoveragePercent = 100.0; EncoderOutputFps = 60.0; Width = 1920; Height = 1080; Initialized = $true };
+                H264DecodeValidation = [pscustomobject]@{ Passed = $true; StructuralDecodeValidated = $true; FidelityPsnrValidated = $false; PacketsInspected = 60; FramesDecoded = 60; NalParseFailures = 0; DecodeFailures = 0 };
                 VisualStimulus = [pscustomobject]@{ VirtualDisplayIdentified = $true; Started = $true }
             }
             $payload | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
-            return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Output = @('[LB-HOST] Summary'); StdErr = @(); DryRun = $false }
+            return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] Summary'); StdErr = @(); DryRun = $false }
         }
     }
 
@@ -2728,16 +2735,16 @@ Invoke-UnitTest -Name 'M421TimestampErrorsMaskingRejectedAndProlongedProfilesDry
                 InstanceId = 'ROOT\DISPLAY\0000'; FriendlyName = 'LumaBridge Indirect Display Adapter'; Status = 'OK';
                 ProblemCode = 0; ProblemStatus = 0; ProblemStatusHex = '0x00000000'; Present = $true;
                 HardwareIds = @('Root\LumaBridgeIddDriver'); DriverInfPath = 'oem99.inf'; DriverProvider = 'LumaBridge';
-                DriverVersion = '22.0.0.1'; DriverService = 'WUDFRd'; UpperFilters = @('IndirectKmd'); LowerFilters = @();
+                DriverVersion = (Get-LumaBridgeInfDriverVersion -InfPath (Join-Path (Get-LumaBridgePackageDirectory -Configuration Release) 'LumaBridgeIddDriver.inf')); DriverService = 'WUDFRd'; UpperFilters = @('IndirectKmd'); LowerFilters = @();
                 ConfigurationId = 'oem99.inf:Root\LumaBridgeIddDriver'; DeviceParametersPath = 'MOCK:\ROOT\DISPLAY\0000\Device Parameters';
                 EnableVirtualMonitor = $st.EnableMon; EnableFrameExtraction = $st.EnableExt;
                 EnableGpuSharedTransport = $st.EnableGpuTrans; AuthorizedHostUserSid = $st.AuthSid;
                 StartupDiagnostics = [pscustomobject]@{ LastStage = 'AdapterInitFinished'; LastSuccessfulStage = 'AdapterInitFinished'; LastStatusHex = '0x00000000'; LastErrorStatusHex = '0x00000000' }
             })
         }
-        'Set-LumaBridgeDeviceEnableVirtualMonitor'     = { [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value) $global:LbTestState['M421Mock'].EnableMon = $Value }
+        'Set-LumaBridgeDeviceEnableVirtualMonitor'     = { [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value = 0, [switch]$Clear) if ($Clear) { $global:LbTestState['M421Mock'].EnableMon = $null } else { $global:LbTestState['M421Mock'].EnableMon = $Value } }
         'Get-LumaBridgeDeviceEnableVirtualMonitor'     = { [CmdletBinding()] param([string]$DeviceParametersPath) return $global:LbTestState['M421Mock'].EnableMon }
-        'Set-LumaBridgeDeviceEnableFrameExtraction'    = { [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value) $global:LbTestState['M421Mock'].EnableExt = $Value }
+        'Set-LumaBridgeDeviceEnableFrameExtraction'    = { [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value = 0, [switch]$Clear) if ($Clear) { $global:LbTestState['M421Mock'].EnableExt = $null } else { $global:LbTestState['M421Mock'].EnableExt = $Value } }
         'Get-LumaBridgeDeviceEnableFrameExtraction'    = { [CmdletBinding()] param([string]$DeviceParametersPath) return $global:LbTestState['M421Mock'].EnableExt }
         'Set-LumaBridgeDeviceEnableGpuSharedTransport' = {
             [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value = 1, [switch]$Clear)
@@ -2746,7 +2753,7 @@ Invoke-UnitTest -Name 'M421TimestampErrorsMaskingRejectedAndProlongedProfilesDry
         'Get-LumaBridgeDeviceEnableGpuSharedTransport' = { [CmdletBinding()] param([string]$DeviceParametersPath) return $global:LbTestState['M421Mock'].EnableGpuTrans }
         'Set-LumaBridgeDeviceAuthorizedHostUserSid'    = { [CmdletBinding()] param([string]$DeviceParametersPath, [string]$SidString, [switch]$Clear) if ($Clear -or [string]::IsNullOrWhiteSpace($SidString)) { $global:LbTestState['M421Mock'].AuthSid = $null } else { $global:LbTestState['M421Mock'].AuthSid = $SidString } }
         'Get-LumaBridgeDeviceAuthorizedHostUserSid'    = { [CmdletBinding()] param([string]$DeviceParametersPath) return $global:LbTestState['M421Mock'].AuthSid }
-        'Get-LumaBridgeWudfHostProcesses'              = { [CmdletBinding()] param($PnpInstances, $RecentEvents, $DebugTraceLines) return @([pscustomobject]@{ Id = 8768; IsLumaBridgeHost = $true; AssociationMethod = 'LoadedModule'; WorkingSetMB = 30.0; PrivateMemoryMB = 15.0; HandleCount = 400 }) }
+        'Get-LumaBridgeWudfHostProcesses'              = { [CmdletBinding()] param($PnpInstances, $RecentEvents, $DebugTraceLines, [Nullable[DateTime]]$NotBeforeUtc = $null, [Nullable[int]]$ExpectedHostPid = $null) return @([pscustomobject]@{ Id = 8768; IsLumaBridgeHost = $true; AssociationMethod = 'LoadedModule'; WorkingSetMB = 30.0; PrivateMemoryMB = 15.0; HandleCount = 400; StartedAfterAnchor = $true }) }
         'Get-LumaBridgeCrashDumpInventory'             = { [CmdletBinding()] param([int]$LookbackMinutes) return [pscustomobject]@{ LookbackMinutes = $LookbackMinutes; Locations = @(); Files = @(); TotalFoundCount = 0 } }
         'Get-LumaBridgeEventChannelStatus'             = { [CmdletBinding()] param($ChannelNames) return @() }
         'Get-LumaBridgeDiagnosticEvents'               = { [CmdletBinding()] param($LookbackMinutes, $InstanceIds, $PublishedInfNames, $ChannelStatus) return @() }
@@ -2775,78 +2782,83 @@ Invoke-UnitTest -Name 'M421TimestampErrorsMaskingRejectedAndProlongedProfilesDry
             return [pscustomobject]@{ ExitCode = 0; Output = @('OK'); DryRun = $false }
         }
         'Invoke-LumaBridgeHostProcess'                 = {
-            [CmdletBinding()] param([string]$ExecutablePath, [string[]]$Arguments = @(), [int]$HardTimeoutMs = 30000, [switch]$DryRun)
+            [CmdletBinding()] param([string]$ExecutablePath, [string[]]$Arguments = @(), [int]$HardTimeoutMs = 30000, [int]$ResourceSampleIntervalSec = 0, [Nullable[int]]$WudfProcessId = $null, [switch]$DryRun)
             $st = $global:LbTestState['M421Mock']
             if ($DryRun) {
                 $st.DryArgsLog[$st.Mode] = @($Arguments)
-                return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Output = @('[DRY-RUN]'); StdErr = @(); DryRun = $true }
+                return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; ProcessId = 0; Output = @('[DRY-RUN]'); StdErr = @(); DryRun = $true }
             }
             $jsonIdx = [Array]::IndexOf($Arguments, '--json-summary')
             $jsonPath = $Arguments[$jsonIdx + 1]
+            $runIdIdx = [Array]::IndexOf($Arguments, '--run-id')
+            $runIdVal = if ($runIdIdx -ge 0 -and ($runIdIdx + 1) -lt $Arguments.Count) { [string]$Arguments[$runIdIdx + 1] } else { '' }
             if ($st.Mode -eq 'MaskingBug') {
                 # Simulates M4.2 regression: 120 frames ok in seq/CRC, but 120 TimestampMeasurementErrors and 0 LiveEndToEnd samples
                 $payload = [pscustomobject]@{
+                    RunId = $runIdVal; SummaryComplete = $true;
                     ExitReason = 'FrameTargetReached'; HostProcessExitedNormally = $true; TransportHealthy = $true;
                     NegotiatedTransportMode = 'GpuSharedNtHandle'; FallbackToCpuActivated = $false; GpuFramesOpened = 3;
                     GpuSharedOpenFailures = 0; GpuSyncTimeouts = 0; AdapterMismatchErrors = 0; CpuStagingReadsPerformed = 0;
                     ConnectCount = 1; FramesReceived = 120; FramesValid = 120; LiveFramesReceived = 120; PreConnectFramesReceived = 0;
-                    FrameTargetReached = $true; MinFramesReached = $true; TotalConnectedDurationUs = 2000000;
+                    FrameTargetReached = $true; MinFramesReached = $true; TotalConnectedDurationUs = 2000000; SustainedLiveFps = 59.6;
                     ChecksumMismatches = 0; ProtocolErrors = 0; FatalIoTimeouts = 0; FatalIpcErrors = 0;
-                    LastFrameSequence = 120; LastProtocolStatus = 'Ok'; AvgEndToEndLatencyUs = 0; ReceiveFps = 59.6;
+                    LastFrameSequence = 120; LastFrameWidth = 1920; LastFrameHeight = 1080; LastProtocolStatus = 'Ok'; AvgEndToEndLatencyUs = 0; ReceiveFps = 59.6;
                     TimestampMeasurementErrors = 120; OutOfOrderSequenceCount = 0; NonMonotonicTimestampCount = 0;
                     MissingCoreTimestampCount = 0; FutureTimestampErrorCount = 120; IncompatibleTimestampUnitsCount = 0; QpcFrequencyMismatchCount = 0;
                     ValidCoreTimestampSamples = 0; ValidLiveTimestampSamples = 0; ValidPresentTimestampSamples = 6;
                     CoreTimestampCoveragePercent = 0.0; LiveTimestampCoveragePercent = 0.0; PresentTimestampCoveragePercent = 5.0;
                     EndToEndLatency = [pscustomobject]@{ Available = $false; SampleCount = 0; AvgUs = 0 };
                     LiveEndToEndLatency = [pscustomobject]@{ Available = $false; SampleCount = 0; AvgUs = 0 };
-                    Nvenc = [pscustomobject]@{ NvencFramesEncoded = 120; TotalBitstreamBytes = 4000000; InvalidTimestampCount = 0; ExtractToBitstreamCoveragePercent = 100.0 };
-                    H264DecodeValidation = [pscustomobject]@{ Passed = $true; StructuralDecodeValidated = $true; FidelityPsnrValidated = $false };
+                    Nvenc = [pscustomobject]@{ NvencFramesSubmitted = 120; NvencFramesEncoded = 120; NvencDroppedFrames = 0; EncodedQueueDrops = 0; TotalBitstreamBytes = 4000000; InvalidTimestampCount = 0; ExtractToBitstreamCoveragePercent = 100.0; EncoderOutputFps = 59.6; Width = 1920; Height = 1080; Initialized = $true };
+                    H264DecodeValidation = [pscustomobject]@{ Passed = $true; StructuralDecodeValidated = $true; FidelityPsnrValidated = $false; PacketsInspected = 120; FramesDecoded = 120; NalParseFailures = 0; DecodeFailures = 0 };
                     VisualStimulus = [pscustomobject]@{ VirtualDisplayIdentified = $true; Started = $true }
                 }
             }
             elseif ($st.Mode -eq 'Short120Ok') {
                 $payload = [pscustomobject]@{
+                    RunId = $runIdVal; SummaryComplete = $true;
                     ExitReason = 'FrameTargetReached'; HostProcessExitedNormally = $true; TransportHealthy = $true;
                     NegotiatedTransportMode = 'GpuSharedNtHandle'; FallbackToCpuActivated = $false; GpuFramesOpened = 3;
                     GpuSharedOpenFailures = 0; GpuSyncTimeouts = 0; AdapterMismatchErrors = 0; CpuStagingReadsPerformed = 0;
                     ConnectCount = 1; FramesReceived = 120; FramesValid = 120; LiveFramesReceived = 120; PreConnectFramesReceived = 0;
-                    FrameTargetReached = $true; MinFramesReached = $true; TotalConnectedDurationUs = 2000000;
+                    FrameTargetReached = $true; MinFramesReached = $true; TotalConnectedDurationUs = 2000000; SustainedLiveFps = 60.0;
                     ChecksumMismatches = 0; ProtocolErrors = 0; FatalIoTimeouts = 0; FatalIpcErrors = 0;
-                    LastFrameSequence = 120; LastProtocolStatus = 'Ok'; AvgEndToEndLatencyUs = 900; ReceiveFps = 60.0;
+                    LastFrameSequence = 120; LastFrameWidth = 1920; LastFrameHeight = 1080; LastProtocolStatus = 'Ok'; AvgEndToEndLatencyUs = 900; ReceiveFps = 60.0;
                     TimestampMeasurementErrors = 0; OutOfOrderSequenceCount = 0; NonMonotonicTimestampCount = 0;
                     MissingCoreTimestampCount = 0; FutureTimestampErrorCount = 0; IncompatibleTimestampUnitsCount = 0; QpcFrequencyMismatchCount = 0;
                     ValidCoreTimestampSamples = 120; ValidLiveTimestampSamples = 120; ValidPresentTimestampSamples = 120;
                     CoreTimestampCoveragePercent = 100.0; LiveTimestampCoveragePercent = 100.0; PresentTimestampCoveragePercent = 100.0;
                     EndToEndLatency = [pscustomobject]@{ Available = $true; SampleCount = 120; AvgUs = 900 };
                     LiveEndToEndLatency = [pscustomobject]@{ Available = $true; SampleCount = 120; AvgUs = 900 };
-                    Nvenc = [pscustomobject]@{ NvencFramesEncoded = 120; TotalBitstreamBytes = 4000000; InvalidTimestampCount = 0; ExtractToBitstreamCoveragePercent = 100.0 };
-                    H264DecodeValidation = [pscustomobject]@{ Passed = $true; StructuralDecodeValidated = $true; FidelityPsnrValidated = $false };
+                    Nvenc = [pscustomobject]@{ NvencFramesSubmitted = 120; NvencFramesEncoded = 120; NvencDroppedFrames = 0; EncodedQueueDrops = 0; TotalBitstreamBytes = 4000000; InvalidTimestampCount = 0; ExtractToBitstreamCoveragePercent = 100.0; EncoderOutputFps = 60.0; Width = 1920; Height = 1080; Initialized = $true };
+                    H264DecodeValidation = [pscustomobject]@{ Passed = $true; StructuralDecodeValidated = $true; FidelityPsnrValidated = $false; PacketsInspected = 120; FramesDecoded = 120; NalParseFailures = 0; DecodeFailures = 0 };
                     VisualStimulus = [pscustomobject]@{ VirtualDisplayIdentified = $true; Started = $true }
                 }
             }
             else {
                 # Valid 30s 1800-frame benchmark run
                 $payload = [pscustomobject]@{
+                    RunId = $runIdVal; SummaryComplete = $true;
                     ExitReason = 'DurationElapsed'; HostProcessExitedNormally = $true; TransportHealthy = $true;
                     NegotiatedTransportMode = 'GpuSharedNtHandle'; FallbackToCpuActivated = $false; GpuFramesOpened = 3;
                     GpuSharedOpenFailures = 0; GpuSyncTimeouts = 0; AdapterMismatchErrors = 0; CpuStagingReadsPerformed = 0;
                     ConnectCount = 1; FramesReceived = 1800; FramesValid = 1800; LiveFramesReceived = 1800; PreConnectFramesReceived = 0;
                     FrameTargetReached = $false; MinFramesReached = $true; TotalConnectedDurationUs = 30000000; SustainedLiveFps = 60.0;
                     ChecksumMismatches = 0; ProtocolErrors = 0; FatalIoTimeouts = 0; FatalIpcErrors = 0;
-                    LastFrameSequence = 1800; LastProtocolStatus = 'Ok'; AvgEndToEndLatencyUs = 950; ReceiveFps = 60.0;
+                    LastFrameSequence = 1800; LastFrameWidth = 1920; LastFrameHeight = 1080; LastProtocolStatus = 'Ok'; AvgEndToEndLatencyUs = 950; ReceiveFps = 60.0;
                     TimestampMeasurementErrors = 0; OutOfOrderSequenceCount = 0; NonMonotonicTimestampCount = 0;
                     MissingCoreTimestampCount = 0; FutureTimestampErrorCount = 0; IncompatibleTimestampUnitsCount = 0; QpcFrequencyMismatchCount = 0;
                     ValidCoreTimestampSamples = 1800; ValidLiveTimestampSamples = 1800; ValidPresentTimestampSamples = 1800;
                     CoreTimestampCoveragePercent = 100.0; LiveTimestampCoveragePercent = 100.0; PresentTimestampCoveragePercent = 100.0;
                     EndToEndLatency = [pscustomobject]@{ Available = $true; SampleCount = 1800; AvgUs = 950; P95Us = 1500; P99Us = 1900 };
                     LiveEndToEndLatency = [pscustomobject]@{ Available = $true; SampleCount = 1800; AvgUs = 950; P95Us = 1500; P99Us = 1900 };
-                    Nvenc = [pscustomobject]@{ NvencFramesEncoded = 1800; TotalBitstreamBytes = 60000000; InvalidTimestampCount = 0; ExtractToBitstreamCoveragePercent = 100.0 };
-                    H264DecodeValidation = [pscustomobject]@{ Passed = $true; StructuralDecodeValidated = $true; FidelityPsnrValidated = $false };
+                    Nvenc = [pscustomobject]@{ NvencFramesSubmitted = 1800; NvencFramesEncoded = 1800; NvencDroppedFrames = 0; EncodedQueueDrops = 0; TotalBitstreamBytes = 60000000; InvalidTimestampCount = 0; ExtractToBitstreamCoveragePercent = 100.0; EncoderOutputFps = 60.0; Width = 1920; Height = 1080; Initialized = $true };
+                    H264DecodeValidation = [pscustomobject]@{ Passed = $true; StructuralDecodeValidated = $true; FidelityPsnrValidated = $false; PacketsInspected = 1800; FramesDecoded = 1800; NalParseFailures = 0; DecodeFailures = 0 };
                     VisualStimulus = [pscustomobject]@{ VirtualDisplayIdentified = $true; Started = $true }
                 }
             }
             $payload | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
-            return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Output = @('[LB-HOST] Summary'); StdErr = @(); DryRun = $false }
+            return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] Summary'); StdErr = @(); DryRun = $false }
         }
     }
 
@@ -2886,15 +2898,1058 @@ Invoke-UnitTest -Name 'M421TimestampErrorsMaskingRejectedAndProlongedProfilesDry
         Assert-Equal $dryStab.DryRun $true 'ProlongedStability DryRun succeeded'
         Assert-True ($global:LbTestState['M421Mock'].DryArgsLog['DryStab'] -contains '120000') 'ProlongedStability DryRun passes 120000 ms duration'
 
-        # 4. Valid 30s 1800-frame benchmark run proves ProlongedStabilityProven=true
+        # 4. Valid 30s 1800-frame benchmark run passes Benchmark30s WITHOUT falsely proving >=180s ProlongedStabilityProven
         $global:LbTestState['M421Mock'].Mode = 'Bench30s'
         $benchRes = & $valScript -Configuration Release -TestProfile Benchmark30s -BenchmarkDurationSec 30 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $stgDir -OutputDir $out30sPass -HostExecutablePath $fakeHostExe -CertificateThumbprint $certInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
         Assert-Equal $benchRes.ValidationSucceeded $true 'Benchmark30s profile passes with 1800 frames / 30s'
         Assert-Equal $benchRes.AcceptanceCriteria.Benchmark30sExecuted $true 'Benchmark30sExecuted=true'
         Assert-Equal $benchRes.AcceptanceCriteria.Benchmark30sPassed $true 'Benchmark30sPassed=true'
-        Assert-Equal $benchRes.AcceptanceCriteria.ProlongedStabilityProven $true 'ProlongedStabilityProven=true after 30s / 1800 frames'
+        Assert-Equal $benchRes.AcceptanceCriteria.ProlongedStabilityProven $false 'ProlongedStabilityProven remains false after Benchmark30s (30s cannot prove >=180s prolonged stability)'
         Assert-Equal $benchRes.RollbackClean $true 'RollbackClean=true after Benchmark30s'
     }
+}
+
+function New-M01MockHostPayload {
+    param(
+        [string]$RunId = '',
+        [uint64]$Frames = 60,
+        [uint32]$Width = 1920,
+        [uint32]$Height = 1080,
+        [int]$DurationSec = 1,
+        [double]$SustainedFps = 60.0,
+        [int]$TargetFps = 60,
+        [uint64]$NvencSubmitted = 60,
+        [uint64]$NvencEncoded = 60,
+        [uint64]$NvencDropped = 0,
+        [uint64]$EncodedQueueDrops = 0,
+        [double]$EncoderOutputFps = 60.0,
+        [uint64]$H264Decoded = 60,
+        [int]$ServerProcessId = 8768,
+        [bool]$SummaryComplete = $true,
+        [bool]$FrameTargetReached = $true,
+        [bool]$StimulusStarted = $true
+    )
+
+    $durUs = [uint64]([Math]::Max(1, $DurationSec) * 1000000)
+    $sampleCount = [uint64]([Math]::Max(1, $Frames))
+    return [pscustomobject]@{
+        RunId                        = $RunId
+        HostProcessId                = 4401
+        ServerProcessId              = $ServerProcessId
+        SummaryComplete              = $SummaryComplete
+        ExitReason                   = $(if ($DurationSec -ge 30) { 'DurationElapsed' } else { 'FrameTargetReached' })
+        HostProcessExitedNormally    = $true
+        TransportHealthy             = $true
+        NegotiatedTransportMode      = 'GpuSharedNtHandle'
+        FallbackToCpuActivated       = $false
+        GpuFramesOpened              = 3
+        GpuFramesDropped             = 0
+        GpuSharedOpenFailures        = 0
+        GpuSyncTimeouts              = 0
+        AdapterMismatchErrors        = 0
+        CpuStagingReadsPerformed     = 0
+        ConnectCount                 = 1
+        FramesReceived               = $Frames
+        FramesValid                  = $Frames
+        LiveFramesReceived           = $Frames
+        PreConnectFramesReceived     = 0
+        FrameTargetReached           = $FrameTargetReached
+        MinFramesReached             = ($Frames -ge 1)
+        TotalConnectedDurationUs     = $durUs
+        SustainedLiveFps             = $SustainedFps
+        ObservedActiveFps            = $SustainedFps
+        ReceiveFps                   = $SustainedFps
+        ChecksumMismatches           = 0
+        ProtocolErrors               = 0
+        FatalIoTimeouts              = 0
+        FatalIpcErrors               = 0
+        LastFrameSequence            = $Frames
+        LastFrameWidth               = $Width
+        LastFrameHeight              = $Height
+        LastProtocolStatus           = 'Ok'
+        AvgEndToEndLatencyUs         = 850
+        TimestampMeasurementErrors   = 0
+        OutOfOrderSequenceCount      = 0
+        NonMonotonicTimestampCount   = 0
+        MissingCoreTimestampCount    = 0
+        FutureTimestampErrorCount    = 0
+        IncompatibleTimestampUnitsCount = 0
+        QpcFrequencyMismatchCount    = 0
+        ValidCoreTimestampSamples    = $Frames
+        ValidLiveTimestampSamples    = $Frames
+        ValidPresentTimestampSamples = $Frames
+        CoreTimestampCoveragePercent = 100.0
+        LiveTimestampCoveragePercent = 100.0
+        PresentTimestampCoveragePercent = 100.0
+        EndToEndLatency              = [pscustomobject]@{ Available = ($Frames -gt 0); SampleCount = $sampleCount; StoredSampleCount = $sampleCount; SamplesTruncated = $false; ReservoirSampled = $false; AvgUs = 850; P95Us = 1200; P99Us = 1400 }
+        LiveEndToEndLatency          = [pscustomobject]@{ Available = ($Frames -gt 0); SampleCount = $sampleCount; StoredSampleCount = $sampleCount; SamplesTruncated = $false; ReservoirSampled = $false; AvgUs = 850; P95Us = 1200; P99Us = 1400 }
+        Nvenc                        = [pscustomobject]@{
+            Initialized                       = $true
+            Width                             = $Width
+            Height                            = $Height
+            NvencFramesSubmitted              = $NvencSubmitted
+            NvencFramesEncoded                = $NvencEncoded
+            NvencDroppedFrames                = $NvencDropped
+            EncodedQueueDrops                 = $EncodedQueueDrops
+            TotalBitstreamBytes               = ([uint64]([Math]::Max(1, $NvencEncoded)) * 30000)
+            InvalidTimestampCount             = 0
+            ExtractToBitstreamCoveragePercent = 100.0
+            EncoderOutputFps                  = $EncoderOutputFps
+        }
+        H264DecodeValidation         = [pscustomobject]@{
+            Passed                    = $true
+            StructuralDecodeValidated = $true
+            FidelityPsnrValidated     = $false
+            PacketsInspected          = $NvencEncoded
+            FramesDecoded             = $H264Decoded
+            NalParseFailures          = 0
+            DecodeFailures            = 0
+        }
+        VisualStimulus               = [pscustomobject]@{
+            VirtualDisplayIdentified = $StimulusStarted
+            Started                  = $StimulusStarted
+            TargetFps                = $TargetFps
+        }
+    }
+}
+
+function New-M01ValidationMockHarness {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CaseDir,
+        [Parameter(Mandatory = $true)]
+        [string]$StateKey,
+        [string]$InitialDriverInfPath = 'oem99.inf',
+        [string]$InitialDriverVersion = '',
+        [int]$InitialEnableMon = 0,
+        [int]$InitialEnableExt = 0,
+        [object]$InitialEnableGpuTrans = $null,
+        [string]$InitialAuthSid = $null,
+        [string]$PreExistingCertThumbprint = ''
+    )
+
+    $certInfo = New-EphemeralTestCertificate -OutDirectory (Join-Path $CaseDir 'certs') -NamePrefix $StateKey
+    $releaseInfPath = Join-Path (Get-LumaBridgePackageDirectory -Configuration Release) 'LumaBridgeIddDriver.inf'
+    $releaseDriverVer = Get-LumaBridgeInfDriverVersion -InfPath $releaseInfPath
+    if ([string]::IsNullOrWhiteSpace($InitialDriverVersion)) {
+        $InitialDriverVersion = $releaseDriverVer
+    }
+
+    $c = Get-LumaBridgeDriverConstants
+    $mockLogmanLines = @(
+        'Name:                 LumaBridgeIddCore',
+        ('Provider:             {0}' -f $c.LumaBridgeTraceProviderGuid),
+        ('Provider:             {0}' -f $c.IddCxManifestProviderGuid),
+        ('Provider:             {0}' -f $c.IddCxWppProviderGuid),
+        ('Provider:             {0}' -f $c.UmdfOperationalProviderGuid),
+        ('Provider:             {0}' -f $c.WdfCoreWppProviderGuid),
+        ('Provider:             {0}' -f $c.WerKernelProviderGuid)
+    )
+
+    $fakeHostExe = Join-Path $CaseDir 'lumabridge-host.exe'
+    if (-not (Test-Path -LiteralPath $fakeHostExe -PathType Leaf)) {
+        [System.IO.File]::WriteAllBytes($fakeHostExe, [byte[]]@(0x4D, 0x5A, 0x90, 0x00))
+    }
+
+    $global:LbTestState[$StateKey] = [ordered]@{
+        StateKey                  = $StateKey
+        CertInfo                  = $certInfo
+        Signtool                  = Get-LumaBridgeWdkToolPath -ToolName 'signtool.exe'
+        LogmanLines               = $mockLogmanLines
+        ReleaseDriverVersion      = $releaseDriverVer
+        FakeHostExe               = $fakeHostExe
+        StagingDir                = Join-Path $CaseDir ("stg_{0}" -f $StateKey)
+        InstanceId                = 'ROOT\DISPLAY\0000'
+        Status                    = 'OK'
+        ProblemCode               = 0
+        DriverInfPath             = $InitialDriverInfPath
+        DriverVersion             = $InitialDriverVersion
+        EnableMon                 = $InitialEnableMon
+        EnableExt                 = $InitialEnableExt
+        EnableGpuTrans            = $InitialEnableGpuTrans
+        AuthSid                   = $InitialAuthSid
+        PreExistingCertThumbprint = $PreExistingCertThumbprint
+        DropCertInPostRollback    = $false
+        LockEnableExtOnRollback   = $false
+        Stage9Reached             = $false
+        InjectStage7Fail          = $false
+        EtwRunning                = $false
+        EtwStopCalls              = 0
+        CertutilAddCalls          = 0
+        WudfProcsFactory          = $null
+        HostHandler               = $null
+        InRollback                = $false
+    }
+
+    $stateKeyCapture = $StateKey
+    $makeCertSnap = {
+        param([string]$Thumb, [bool]$IncludePreExisting)
+        $entries = [ordered]@{}
+        foreach ($sn in @('Cert:\CurrentUser\My', 'Cert:\LocalMachine\Root', 'Cert:\LocalMachine\TrustedPublisher')) {
+            if ($IncludePreExisting -and -not [string]::IsNullOrWhiteSpace($Thumb)) {
+                $entries[$sn] = [pscustomobject]@{
+                    Accessible = $true
+                    Error      = $null
+                    Count      = 1
+                    Certs      = @([pscustomobject]@{ Thumbprint = $Thumb.ToUpperInvariant(); Subject = 'CN=LumaBridge Test Driver Signing' })
+                }
+            }
+            else {
+                $entries[$sn] = [pscustomobject]@{ Accessible = $true; Error = $null; Count = 0; Certs = @() }
+            }
+        }
+        return [pscustomobject]@{
+            CapturedAtUtc       = (Get-Date).ToUniversalTime().ToString('o')
+            QueryThumbprint     = $Thumb
+            MatchingThumbprints = $(if ($IncludePreExisting -and -not [string]::IsNullOrWhiteSpace($Thumb)) { @($Thumb.ToUpperInvariant()) } else { @() })
+            Stores              = [pscustomobject]$entries
+        }
+    }.GetNewClosure()
+
+    $mocks = @{
+        'Assert-LumaBridgeAdministrator' = { [CmdletBinding()] param([string]$OperationName, [switch]$DryRun) return $true }.GetNewClosure()
+        'Get-LumaBridgeHostSecurityState' = {
+            [CmdletBinding()] param()
+            return [pscustomobject]@{
+                SecureBoot = 'Disabled'; TestSigning = 'Enabled'; VbsStatus = 'Running'; HvciStatus = 'Running';
+                OsArchitecture = 'X64'; OsBuild = 26200; OsUbr = 8037;
+                BlockingConditions = @(); InformationalWarnings = @(); UnavailableChecks = @()
+            }
+        }.GetNewClosure()
+        'Find-LumaBridgeSigningCertificate' = {
+            [CmdletBinding()] param([string]$CertificateThumbprint, [string]$CertificateSubject)
+            return $global:LbTestState[$stateKeyCapture].CertInfo.Certificate
+        }.GetNewClosure()
+        'Export-LumaBridgeCertificateFile' = {
+            [CmdletBinding()] param($Certificate, [string]$FilePath)
+            [System.IO.File]::WriteAllBytes($FilePath, $Certificate.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
+        }.GetNewClosure()
+        'Get-LumaBridgeCertificateStoreSnapshot' = {
+            [CmdletBinding()] param([string]$Thumbprint, [string]$Subject)
+            $st = $global:LbTestState[$stateKeyCapture]
+            $hasPre = (-not [string]::IsNullOrWhiteSpace($st.PreExistingCertThumbprint)) -and (-not ($st.InRollback -and $st.DropCertInPostRollback))
+            return (& $makeCertSnap $st.PreExistingCertThumbprint $hasPre)
+        }.GetNewClosure()
+        'Get-LumaBridgePnpInstances' = {
+            [CmdletBinding()] param([string]$HardwareId)
+            $st = $global:LbTestState[$stateKeyCapture]
+            return @([pscustomobject]@{
+                InstanceId               = $st.InstanceId
+                FriendlyName             = 'LumaBridge Indirect Display Adapter'
+                Status                   = $st.Status
+                ProblemCode              = $st.ProblemCode
+                ProblemStatus            = $(if ($st.ProblemCode -eq 0) { 0 } else { -1073741666 })
+                ProblemStatusHex         = $(if ($st.ProblemCode -eq 0) { '0x00000000' } else { '0xC000009E' })
+                Present                  = $true
+                HardwareIds              = @('Root\LumaBridgeIddDriver')
+                DriverInfPath            = $st.DriverInfPath
+                DriverProvider           = 'LumaBridge'
+                DriverVersion            = $st.DriverVersion
+                DriverService            = 'WUDFRd'
+                UpperFilters             = @('IndirectKmd')
+                LowerFilters             = @()
+                ConfigurationId          = ("{0}:Root\LumaBridgeIddDriver" -f $st.DriverInfPath)
+                DeviceParametersPath     = 'MOCK:\ROOT\DISPLAY\0000\Device Parameters'
+                EnableVirtualMonitor     = $st.EnableMon
+                EnableFrameExtraction    = $st.EnableExt
+                EnableGpuSharedTransport = $st.EnableGpuTrans
+                AuthorizedHostUserSid    = $st.AuthSid
+                StartupDiagnostics       = [pscustomobject]@{ LastStage = 'AdapterInitFinished'; LastSuccessfulStage = 'AdapterInitFinished'; LastStatusHex = '0x00000000'; LastErrorStatusHex = '0x00000000' }
+            })
+        }.GetNewClosure()
+        'Set-LumaBridgeDeviceEnableVirtualMonitor' = {
+            [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value = 0, [switch]$Clear)
+            $st = $global:LbTestState[$stateKeyCapture]
+            if ($Clear) { $st.EnableMon = $null } else { $st.EnableMon = $Value }
+            if ($st.InjectStage7Fail -and $Value -eq 1) {
+                throw 'Simulated Stage 7 virtual monitor failure'
+            }
+        }.GetNewClosure()
+        'Get-LumaBridgeDeviceEnableVirtualMonitor' = {
+            [CmdletBinding()] param([string]$DeviceParametersPath)
+            return $global:LbTestState[$stateKeyCapture].EnableMon
+        }.GetNewClosure()
+        'Set-LumaBridgeDeviceEnableFrameExtraction' = {
+            [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value = 0, [switch]$Clear)
+            $st = $global:LbTestState[$stateKeyCapture]
+            if ($st.LockEnableExtOnRollback -and $st.Stage9Reached) {
+                $st.EnableExt = 1
+                return
+            }
+            if ($Clear) { $st.EnableExt = $null } else { $st.EnableExt = $Value }
+        }.GetNewClosure()
+        'Get-LumaBridgeDeviceEnableFrameExtraction' = {
+            [CmdletBinding()] param([string]$DeviceParametersPath)
+            return $global:LbTestState[$stateKeyCapture].EnableExt
+        }.GetNewClosure()
+        'Set-LumaBridgeDeviceEnableGpuSharedTransport' = {
+            [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value = 1, [switch]$Clear)
+            $st = $global:LbTestState[$stateKeyCapture]
+            if ($Clear) { $st.EnableGpuTrans = $null } else { $st.EnableGpuTrans = $Value }
+        }.GetNewClosure()
+        'Get-LumaBridgeDeviceEnableGpuSharedTransport' = {
+            [CmdletBinding()] param([string]$DeviceParametersPath)
+            return $global:LbTestState[$stateKeyCapture].EnableGpuTrans
+        }.GetNewClosure()
+        'Set-LumaBridgeDeviceAuthorizedHostUserSid' = {
+            [CmdletBinding()] param([string]$DeviceParametersPath, [string]$SidString, [switch]$Clear)
+            $st = $global:LbTestState[$stateKeyCapture]
+            if ($Clear -or [string]::IsNullOrWhiteSpace($SidString)) { $st.AuthSid = $null } else { $st.AuthSid = $SidString }
+        }.GetNewClosure()
+        'Get-LumaBridgeDeviceAuthorizedHostUserSid' = {
+            [CmdletBinding()] param([string]$DeviceParametersPath)
+            return $global:LbTestState[$stateKeyCapture].AuthSid
+        }.GetNewClosure()
+        'Get-LumaBridgeWudfHostProcesses' = {
+            [CmdletBinding()] param([object[]]$PnpInstances, [object[]]$RecentEvents, [string[]]$DebugTraceLines, [Nullable[DateTime]]$NotBeforeUtc = $null, [Nullable[int]]$ExpectedHostPid = $null)
+            $st = $global:LbTestState[$stateKeyCapture]
+            if ($null -ne $st.WudfProcsFactory) {
+                return (& $st.WudfProcsFactory $PnpInstances $NotBeforeUtc $ExpectedHostPid)
+            }
+            return @([pscustomobject]@{ Id = 8768; IsLumaBridgeHost = $true; AssociationMethod = 'LoadedModule'; IdentityStatus = 'VERIFIED'; HasExited = $false; WorkingSetMB = 30.0; PrivateMemoryMB = 15.0; HandleCount = 400; StartedAfterAnchor = $true })
+        }.GetNewClosure()
+        'Get-LumaBridgeCrashDumpInventory' = { [CmdletBinding()] param([int]$LookbackMinutes) return [pscustomobject]@{ LookbackMinutes = $LookbackMinutes; Locations = @(); Files = @(); TotalFoundCount = 0 } }.GetNewClosure()
+        'Get-LumaBridgeEventChannelStatus' = { [CmdletBinding()] param([string[]]$ChannelNames) return @() }.GetNewClosure()
+        'Get-LumaBridgeDiagnosticEvents' = { [CmdletBinding()] param([int]$LookbackMinutes, [string[]]$InstanceIds, [string[]]$PublishedInfNames, [object[]]$ChannelStatus) return @() }.GetNewClosure()
+        'Get-LumaBridgeSetupApiLogExcerpt' = { [CmdletBinding()] param([string]$SetupApiLogPath, [string[]]$InstanceIds, [string[]]$PublishedInfNames, [int]$MaxMatchedSections) return [pscustomobject]@{ LogPath = $SetupApiLogPath; Exists = $false; AccessDenied = $false; Error = ''; MatchedSectionCount = 0; WdfSchemaWarnings = @(); DeviceStartProblemLines = @(); Sections = @(); RawExcerptText = '' } }.GetNewClosure()
+        'Get-LumaBridgeDriverStorePackages' = { [CmdletBinding()] param([string]$InfFilter) return @() }.GetNewClosure()
+        'Get-LumaBridgeEtlEventSummary' = { [CmdletBinding()] param($EtlPath, $StartTimeUtc, $EndTimeUtc, $ProcessId, [int]$MaxMatchedEvents = 500, [switch]$ExcludeHighVolumeGraphics) return [pscustomobject]@{ EtlPath = $EtlPath; Exists = $true; EventCount = 1; MatchedEventCount = 1; MatchedLimitReached = $false; FilteredOutHighVolume = $true; XPathUsed = '*'; TraceStats = $null; CircularWrapWarning = $null; LumaBridgeEvents = @(); Providers = @(); Events = @(); Error = '' } }.GetNewClosure()
+        'Invoke-LumaBridgeExternalCommand' = {
+            [CmdletBinding()] param([string]$FilePath, [string[]]$Arguments = @(), [switch]$DryRun)
+            $st = $global:LbTestState[$stateKeyCapture]
+            if ($FilePath -like '*git*') { return [pscustomobject]@{ ExitCode = 0; Output = @('feature/windows-gpu-shared-textures-nvenc'); DryRun = $false } }
+            if ($DryRun) { return [pscustomobject]@{ ExitCode = 0; Output = @('[DRY-RUN]'); DryRun = $true } }
+            if ($FilePath -like '*certutil*' -and ($Arguments -contains '-addstore')) {
+                $st.CertutilAddCalls++
+                return [pscustomobject]@{ ExitCode = 0; Output = @('Cert added'); DryRun = $false }
+            }
+            if ($FilePath -ieq $st.Signtool -and $Arguments.Count -ge 1 -and $Arguments[0] -eq 'sign') {
+                $out = & $FilePath sign /fd SHA256 /f $st.CertInfo.PfxPath /p $st.CertInfo.Password $Arguments[-1] 2>&1
+                if ($LASTEXITCODE -ne 0) { throw 'mock signtool sign error' }
+                return [pscustomobject]@{ ExitCode = 0; Output = @($out); DryRun = $false }
+            }
+            if ($FilePath -like '*Inf2Cat*' -or ($FilePath -ieq $st.Signtool -and $Arguments.Count -ge 1 -and $Arguments[0] -eq 'verify')) {
+                $out = & $FilePath @Arguments 2>&1
+                if ($LASTEXITCODE -ne 0) { throw 'mock verify error' }
+                return [pscustomobject]@{ ExitCode = 0; Output = @($out); DryRun = $false }
+            }
+            if ($FilePath -like '*logman*') {
+                if ($Arguments.Count -ge 1 -and $Arguments[0] -eq 'create' -and ($Arguments -contains 'LumaBridgeIddCore')) {
+                    $st.EtwRunning = $true
+                    return [pscustomobject]@{ ExitCode = 0; Output = @('The command completed successfully.'); DryRun = $false }
+                }
+                if ($Arguments.Count -ge 1 -and $Arguments[0] -eq 'stop' -and ($Arguments -contains 'LumaBridgeIddCore')) {
+                    $st.EtwRunning = $false
+                    $st.InRollback = $true
+                    $st.EtwStopCalls++
+                    return [pscustomobject]@{ ExitCode = 0; Output = @('The command completed successfully.'); DryRun = $false }
+                }
+                if ($Arguments[0] -eq 'query' -and ($Arguments -contains 'LumaBridgeIddDxg')) { throw 'not found' }
+                if ($Arguments[0] -eq 'query' -and -not $st.EtwRunning) { throw 'Session not running' }
+                if ($Arguments[0] -eq 'query') { return [pscustomobject]@{ ExitCode = 0; Output = $st.LogmanLines; DryRun = $false } }
+            }
+            return [pscustomobject]@{ ExitCode = 0; Output = @('OK'); DryRun = $false }
+        }.GetNewClosure()
+        'Invoke-LumaBridgeHostProcess' = {
+            [CmdletBinding()] param([string]$ExecutablePath, [string[]]$Arguments = @(), [int]$HardTimeoutMs = 30000, [int]$ResourceSampleIntervalSec = 0, [Nullable[int]]$WudfProcessId = $null, [switch]$DryRun)
+            $st = $global:LbTestState[$stateKeyCapture]
+            $st.Stage9Reached = $true
+            $st.InRollback = $true
+            if ($DryRun) {
+                return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; ProcessId = 0; Output = @('[DRY-RUN]'); StdErr = @(); DryRun = $true }
+            }
+            $jsonIdx = [Array]::IndexOf($Arguments, '--json-summary')
+            $jsonPath = $Arguments[$jsonIdx + 1]
+            $runIdIdx = [Array]::IndexOf($Arguments, '--run-id')
+            $runIdVal = if ($runIdIdx -ge 0 -and ($runIdIdx + 1) -lt $Arguments.Count) { [string]$Arguments[$runIdIdx + 1] } else { '' }
+            $durIdx = [Array]::IndexOf($Arguments, '--duration-ms')
+            $durMs = if ($durIdx -ge 0 -and ($durIdx + 1) -lt $Arguments.Count) { [int]$Arguments[$durIdx + 1] } else { 5000 }
+            $maxFIdx = [Array]::IndexOf($Arguments, '--max-frames')
+            $maxF = if ($maxFIdx -ge 0 -and ($maxFIdx + 1) -lt $Arguments.Count) { [int]$Arguments[$maxFIdx + 1] } else { 0 }
+
+            if ($null -ne $st.HostHandler) {
+                return (& $st.HostHandler $Arguments $jsonPath $runIdVal $durMs $maxF $WudfProcessId)
+            }
+            $sec = [Math]::Max(1, [int][Math]::Round($durMs / 1000.0))
+            $fc = if ($maxF -gt 0) { [uint64]$maxF } else { [uint64]($sec * 60) }
+            $payload = New-M01MockHostPayload -RunId $runIdVal -Frames $fc -DurationSec $sec -NvencSubmitted $fc -NvencEncoded $fc -H264Decoded $fc
+            $payload | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+            return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] Summary'); StdErr = @(); DryRun = $false }
+        }.GetNewClosure()
+    }
+
+    return [pscustomobject]@{
+        State = $global:LbTestState[$StateKey]
+        Mocks = $mocks
+    }
+}
+
+# 34. M0.1 S-01 (#1): Multi-candidate WUDFHost correlation, anti-stale pre-restart PID rejection & conflict detection
+Invoke-UnitTest -Name 'M01_S01_WudfHostMultiCandidateAndAntiStaleCorrelation' -TestBody {
+    param($caseDir)
+    $anchorUtc = [DateTime]::UtcNow.AddSeconds(-5)
+    $pnp = @([pscustomobject]@{
+        InstanceId           = 'ROOT\DISPLAY\0000'
+        DeviceParametersPath = ''
+        WudfDiagnosticInfo   = [pscustomobject]@{ HostPid = 4102; HostProcessGUID = '{aaaaaaaa-1111-2222-3333-444444444444}'; DeviceGroupId = 'LumaBridgeGroupA'; LifetimeID = '{11111111-1111-1111-1111-111111111111}' }
+        StartupDiagnostics   = [pscustomobject]@{ HostProcessId = 4102 }
+    })
+
+    # Case A: 3 candidates: unrelated PID 4101, stale pre-restart PID 4102, verified LoadedModule PID 4105
+    $global:LbTestState['S01RawA'] = @(
+        [pscustomobject]@{ Id = 4101; ProcessName = 'WUDFHost'; HasExited = $false; StartTimeUtc = [DateTime]::UtcNow.ToString('o'); CommandLine = 'WUDFHost.exe -HostGuid:{other}'; LoadedModules = @([pscustomobject]@{ ModuleName = 'HidCfu.dll'; FileName = 'C:\Windows\System32\Drivers\UMDF\HidCfu.dll' }); LoadedModulesReadable = $true; WorkingSetMB = 10.0; PrivateMemoryMB = 3.0; HandleCount = 200; ThreadCount = 4; TotalProcessorSec = 0.1 },
+        [pscustomobject]@{ Id = 4102; ProcessName = 'WUDFHost'; HasExited = $false; StartTimeUtc = $anchorUtc.AddMinutes(-10).ToString('o'); CommandLine = ''; LoadedModules = @(); LoadedModulesReadable = $false; WorkingSetMB = 12.0; PrivateMemoryMB = 4.0; HandleCount = 220; ThreadCount = 5; TotalProcessorSec = 0.2 },
+        [pscustomobject]@{ Id = 4105; ProcessName = 'WUDFHost'; HasExited = $false; StartTimeUtc = [DateTime]::UtcNow.ToString('o'); CommandLine = 'WUDFHost.exe'; LoadedModules = @([pscustomobject]@{ ModuleName = 'LumaBridgeIddDriver.dll'; FileName = 'C:\Windows\System32\DriverStore\FileRepository\lb\LumaBridgeIddDriver.dll' }); LoadedModulesReadable = $true; WorkingSetMB = 32.0; PrivateMemoryMB = 16.0; HandleCount = 420; ThreadCount = 10; TotalProcessorSec = 1.5 }
+    )
+    Invoke-WithModuleMocks -ModuleMocks @{ 'Get-LumaBridgeRawWudfProcesses' = { return $global:LbTestState['S01RawA'] } } -Body {
+        $procs = @(Get-LumaBridgeWudfHostProcesses -PnpInstances $pnp -NotBeforeUtc $anchorUtc)
+        $stale = @($procs | Where-Object { $_.Id -eq 4102 })[0]
+        Assert-Equal $stale.IsLumaBridgeHost $false 'Pre-restart stale PID 4102 rejected'
+        Assert-Equal $stale.AssociationMethod 'StalePreRestartPid' 'Pre-restart stale PID tagged StalePreRestartPid'
+        Assert-Equal $stale.IdentityStatus 'STALE_OR_CONFLICT' 'Pre-restart stale PID tagged STALE_OR_CONFLICT'
+        $res = Resolve-LumaBridgeVerifiedWudfHostProcess -WudfProcesses $procs -RequireStartedAfterAnchor
+        Assert-Equal $res.Status 'VERIFIED' 'LoadedModule candidate 4105 resolved as VERIFIED'
+        Assert-Equal $res.Process.Id 4105 'Verified candidate 4105 selected over unrelated 4101 and stale 4102'
+    }
+
+    # Case B: Conflicting WUDFDiagnosticInfo HostPid (4103) vs StartupDiagnostics HostProcessId (4104) without loaded DLL -> FAIL
+    $pnpConflict = @([pscustomobject]@{
+        InstanceId           = 'ROOT\DISPLAY\0000'
+        DeviceParametersPath = ''
+        WudfDiagnosticInfo   = [pscustomobject]@{ HostPid = 4103 }
+        StartupDiagnostics   = [pscustomobject]@{ HostProcessId = 4104 }
+    })
+    $global:LbTestState['S01RawB'] = @(
+        [pscustomobject]@{ Id = 4103; ProcessName = 'WUDFHost'; HasExited = $false; StartTimeUtc = [DateTime]::UtcNow.ToString('o'); CommandLine = ''; LoadedModules = @(); LoadedModulesReadable = $false; WorkingSetMB = 12.0; PrivateMemoryMB = 4.0; HandleCount = 220; ThreadCount = 5; TotalProcessorSec = 0.2 },
+        [pscustomobject]@{ Id = 4104; ProcessName = 'WUDFHost'; HasExited = $false; StartTimeUtc = [DateTime]::UtcNow.ToString('o'); CommandLine = ''; LoadedModules = @(); LoadedModulesReadable = $false; WorkingSetMB = 12.0; PrivateMemoryMB = 4.0; HandleCount = 220; ThreadCount = 5; TotalProcessorSec = 0.2 }
+    )
+    Invoke-WithModuleMocks -ModuleMocks @{ 'Get-LumaBridgeRawWudfProcesses' = { return $global:LbTestState['S01RawB'] } } -Body {
+        $procsB = @(Get-LumaBridgeWudfHostProcesses -PnpInstances $pnpConflict -NotBeforeUtc $anchorUtc)
+        $resB = Resolve-LumaBridgeVerifiedWudfHostProcess -WudfProcesses $procsB -RequireStartedAfterAnchor
+        Assert-Equal $resB.Status 'FAIL' 'Conflicting HostPid metadata without DLL verification produces FAIL (never VERIFIED)'
+    }
+
+    # Case C: End-to-end runner picks verified PID 4105 from multiple WUDFHost processes and matches ServerProcessId=4105
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+    $h = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'S01Runner'
+    $h.State.WudfProcsFactory = {
+        param($p, $nb, $exp)
+        return @(
+            [pscustomobject]@{ Id = 4101; IsLumaBridgeHost = $false; AssociationMethod = 'Unverified'; IdentityStatus = 'UNVERIFIED'; HasExited = $false; WorkingSetMB = 10.0; PrivateMemoryMB = 3.0; HandleCount = 200; StartedAfterAnchor = $true },
+            [pscustomobject]@{ Id = 4105; IsLumaBridgeHost = $true; AssociationMethod = 'LoadedModule'; IdentityStatus = 'VERIFIED'; HasExited = $false; WorkingSetMB = 32.0; PrivateMemoryMB = 16.0; HandleCount = 420; StartedAfterAnchor = $true }
+        )
+    }
+    $h.State.HostHandler = {
+        param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+        Assert-Equal $wudfPid 4105 'Runner passes verified WUDFHost PID 4105 (not unrelated 4101) to Invoke-LumaBridgeHostProcess'
+        $payload = New-M01MockHostPayload -RunId $runIdVal -Frames 10 -ServerProcessId 4105 -NvencSubmitted 10 -NvencEncoded 10 -H264Decoded 10
+        $payload | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+        return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] ok'); StdErr = @(); DryRun = $false }
+    }
+    $outDir = Join-Path $caseDir 'out_s01_ok'
+    Invoke-WithModuleMocks -GlobalMocks $h.Mocks -ModuleMocks $h.Mocks -Body {
+        $res = & $valScript -Configuration Release -TestProfile Smoke -StagingDir $h.State.StagingDir -OutputDir $outDir -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        Assert-Equal $res.OverallSucceeded $true 'Runner succeeds when verified WUDFHost 4105 matches ServerProcessId'
+        Assert-Equal $res.AcceptanceCriteria.WudfIdentityStatus 'VERIFIED' 'AcceptanceCriteria records WudfIdentityStatus=VERIFIED'
+    }
+}
+
+# 35. M0.1 S-01 (#2): Missing WUDFHost, unrelated-only WUDFHost, reused PID without DLL & mid-run WUDF exit rejected
+Invoke-UnitTest -Name 'M01_S01_WudfHostMissingReusedPidAndMidRunExitRejected' -TestBody {
+    param($caseDir)
+    $anchorUtc = [DateTime]::UtcNow.AddSeconds(-5)
+    $pnp = @([pscustomobject]@{
+        InstanceId           = 'ROOT\DISPLAY\0000'
+        DeviceParametersPath = ''
+        WudfDiagnosticInfo   = [pscustomobject]@{ HostPid = 4106 }
+        StartupDiagnostics   = [pscustomobject]@{ HostProcessId = 4106 }
+    })
+
+    # 0 processes -> FAIL
+    $resEmpty = Resolve-LumaBridgeVerifiedWudfHostProcess -WudfProcesses @()
+    Assert-Equal $resEmpty.Status 'FAIL' 'Zero WUDFHost processes returns FAIL'
+
+    # Unrelated only -> UNKNOWN
+    $global:LbTestState['S01OnlyUnrel'] = @(
+        [pscustomobject]@{ Id = 4101; ProcessName = 'WUDFHost'; HasExited = $false; StartTimeUtc = [DateTime]::UtcNow.ToString('o'); CommandLine = ''; LoadedModules = @([pscustomobject]@{ ModuleName = 'Other.dll'; FileName = 'C:\Other.dll' }); LoadedModulesReadable = $true; WorkingSetMB = 10.0; PrivateMemoryMB = 3.0; HandleCount = 150; ThreadCount = 3; TotalProcessorSec = 0.1 }
+    )
+    Invoke-WithModuleMocks -ModuleMocks @{ 'Get-LumaBridgeRawWudfProcesses' = { return $global:LbTestState['S01OnlyUnrel'] } } -Body {
+        $procsUnrel = @(Get-LumaBridgeWudfHostProcesses -PnpInstances @([pscustomobject]@{ InstanceId = 'ROOT\DISPLAY\0000'; DeviceParametersPath = '' }))
+        $resUnrel = Resolve-LumaBridgeVerifiedWudfHostProcess -WudfProcesses $procsUnrel
+        Assert-Equal $resUnrel.Status 'UNKNOWN' 'Only unrelated WUDFHost returns UNKNOWN (never PASS/VERIFIED)'
+    }
+
+    # Reused PID 4106 with readable modules lacking LumaBridgeIddDriver.dll -> STALE_OR_CONFLICT / FAIL
+    $global:LbTestState['S01Reused'] = @(
+        [pscustomobject]@{ Id = 4106; ProcessName = 'WUDFHost'; HasExited = $false; StartTimeUtc = [DateTime]::UtcNow.ToString('o'); CommandLine = ''; LoadedModules = @([pscustomobject]@{ ModuleName = 'UnrelatedUmdf.dll'; FileName = 'C:\UnrelatedUmdf.dll' }); LoadedModulesReadable = $true; WorkingSetMB = 10.0; PrivateMemoryMB = 3.0; HandleCount = 150; ThreadCount = 3; TotalProcessorSec = 0.1 }
+    )
+    Invoke-WithModuleMocks -ModuleMocks @{ 'Get-LumaBridgeRawWudfProcesses' = { return $global:LbTestState['S01Reused'] } } -Body {
+        $procsReused = @(Get-LumaBridgeWudfHostProcesses -PnpInstances $pnp -NotBeforeUtc $anchorUtc)
+        Assert-Equal $procsReused[0].IdentityStatus 'STALE_OR_CONFLICT' 'Reused PID without LumaBridge DLL marked STALE_OR_CONFLICT'
+        Assert-Equal $procsReused[0].AssociationMethod 'ReusedOrMismatchedPidModules' 'AssociationMethod indicates module mismatch'
+        $resReused = Resolve-LumaBridgeVerifiedWudfHostProcess -WudfProcesses $procsReused
+        Assert-Equal $resReused.Status 'FAIL' 'Reused PID triggers FAIL status'
+    }
+
+    # Mid-run WUDFHost exit during active host execution -> runner fails with WudfProcessHealthy=false
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+    $h = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'S01MidExit'
+    $h.State.HostHandler = {
+        param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+        $payload = New-M01MockHostPayload -RunId $runIdVal -Frames 60 -ServerProcessId 8768
+        $payload | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+        return [pscustomobject]@{
+            ExitCode = 0; TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] ok'); StdErr = @(); DryRun = $false;
+            ResourceTelemetry = [pscustomobject]@{ WudfProcessExitedDuringRun = $true; Samples = @() }
+        }
+    }
+    $outDir = Join-Path $caseDir 'out_mid_exit'
+    Invoke-WithModuleMocks -GlobalMocks $h.Mocks -ModuleMocks $h.Mocks -Body {
+        Assert-Throws {
+            & $valScript -Configuration Release -TestProfile Smoke -StagingDir $h.State.StagingDir -OutputDir $outDir -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        } -ExpectedPattern 'WudfProcessHealthy.*RollbackClean=True' -Message 'Mid-run WUDFHost exit must reject validation while preserving clean rollback'
+    }
+    $rep = Get-Content -LiteralPath (Join-Path $outDir 'functional-validation-report.json') -Raw | ConvertFrom-Json
+    Assert-Equal $rep.AcceptanceCriteria.WudfIdentityStatus 'FAIL' 'Report records WudfIdentityStatus=FAIL after mid-run WUDF exit'
+    Assert-Equal $rep.AcceptanceCriteria.WudfProcessHealthy $false 'Report records WudfProcessHealthy=false'
+    Assert-Equal $rep.FunctionalValidationSucceeded $false 'FunctionalValidationSucceeded=false after mid-run WUDF exit'
+    Assert-Equal $rep.RollbackClean $true 'RollbackClean=true'
+}
+
+# 36. M0.1 S-02 (#3): Partial rollback failure always forces OverallSucceeded=false & throws non-zero even when Stage 9 passed
+Invoke-UnitTest -Name 'M01_S02_PartialRollbackAlwaysFailsOverallWithNonZeroThrow' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+    $h = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'S02PartialRb'
+    $h.State.LockEnableExtOnRollback = $true
+    $outDir = Join-Path $caseDir 'out_partial_rb'
+
+    Invoke-WithModuleMocks -GlobalMocks $h.Mocks -ModuleMocks $h.Mocks -Body {
+        Assert-Throws {
+            & $valScript -Configuration Release -TestProfile Smoke -StagingDir $h.State.StagingDir -OutputDir $outDir -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        } -ExpectedPattern 'OverallSucceeded=False.*FunctionalValidationSucceeded=True.*RollbackClean=False.*RuntimeCleanupSucceeded=False' -Message 'Partial rollback leaving EnableFrameExtraction=1 forces throw with OverallSucceeded=False'
+    }
+
+    $rep = Get-Content -LiteralPath (Join-Path $outDir 'functional-validation-report.json') -Raw | ConvertFrom-Json
+    Assert-Equal $rep.FunctionalValidationSucceeded $true 'Stage 9 FunctionalValidationSucceeded faithfully stays true'
+    Assert-Equal $rep.RuntimeCleanupSucceeded $false 'RuntimeCleanupSucceeded=false when EnableFrameExtraction stays 1'
+    Assert-Equal $rep.RollbackClean $false 'RollbackClean=false on partial rollback'
+    Assert-Equal $rep.OverallSucceeded $false 'OverallSucceeded=false on partial rollback'
+    Assert-Equal $rep.ValidationSucceeded $false 'ValidationSucceeded=false on partial rollback'
+    Assert-Equal $h.State.EtwRunning $false 'ETW was stopped even though EnableFrameExtraction rollback failed'
+}
+
+# 37. M0.1 S-03 (#4): Benchmark rejects wrong resolution (1280x720 != 1920x1080)
+Invoke-UnitTest -Name 'M01_S03_BenchmarkRejectsWrongResolution' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+    $h = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'S03WrongRes'
+    $h.State.HostHandler = {
+        param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+        $payload = New-M01MockHostPayload -RunId $runIdVal -Frames 1800 -Width 1280 -Height 720 -DurationSec 30 -NvencSubmitted 1800 -NvencEncoded 1800 -H264Decoded 1800
+        $payload | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+        return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] ok'); StdErr = @(); DryRun = $false }
+    }
+    $outDir = Join-Path $caseDir 'out_wrong_res'
+    Invoke-WithModuleMocks -GlobalMocks $h.Mocks -ModuleMocks $h.Mocks -Body {
+        Assert-Throws {
+            & $valScript -Configuration Release -TestProfile Benchmark30s -BenchmarkDurationSec 30 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $h.State.StagingDir -OutputDir $outDir -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        } -ExpectedPattern 'Benchmark30sPassed.*RollbackClean=True' -Message 'Benchmark30s must reject 1280x720 when 1920x1080 is required'
+    }
+    $rep = Get-Content -LiteralPath (Join-Path $outDir 'functional-validation-report.json') -Raw | ConvertFrom-Json
+    Assert-Equal $rep.AcceptanceCriteria.Benchmark30sPassed $false 'Benchmark30sPassed=false on 1280x720'
+    Assert-Equal $rep.SubprofileEvaluations.Benchmark30s.ResolutionOk $false 'ResolutionOk=false recorded on 1280x720'
+    Assert-Equal $rep.OverallSucceeded $false 'OverallSucceeded=false'
+    Assert-Equal $rep.RollbackClean $true 'RollbackClean=true'
+}
+
+# 38. M0.1 S-03 (#5): Benchmark rejects low frames (<98%) and low sustained FPS (<95%)
+Invoke-UnitTest -Name 'M01_S03_BenchmarkRejectsLowFramesOrLowSustainedFps' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+
+    # Case A: 1500/1800 frames (< 98% = 1764) even with FPS=60
+    $hA = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'S03LowFrames'
+    $hA.State.HostHandler = {
+        param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+        $payload = New-M01MockHostPayload -RunId $runIdVal -Frames 1500 -DurationSec 30 -SustainedFps 60.0 -NvencSubmitted 1500 -NvencEncoded 1500 -H264Decoded 1500
+        $payload | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+        return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] ok'); StdErr = @(); DryRun = $false }
+    }
+    $outLowF = Join-Path $caseDir 'out_low_frames'
+    Invoke-WithModuleMocks -GlobalMocks $hA.Mocks -ModuleMocks $hA.Mocks -Body {
+        Assert-Throws {
+            & $valScript -Configuration Release -TestProfile Benchmark30s -BenchmarkDurationSec 30 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $hA.State.StagingDir -OutputDir $outLowF -HostExecutablePath $hA.State.FakeHostExe -CertificateThumbprint $hA.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        } -ExpectedPattern 'Benchmark30sPassed' -Message '1500/1800 frames must fail Benchmark30s'
+    }
+
+    # Case B: 1800 frames but SustainedLiveFps=45.0 (< 57.0) -> fail
+    $hB = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'S03LowFps'
+    $hB.State.HostHandler = {
+        param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+        $payload = New-M01MockHostPayload -RunId $runIdVal -Frames 1800 -DurationSec 30 -SustainedFps 45.0 -NvencSubmitted 1800 -NvencEncoded 1800 -EncoderOutputFps 45.0 -H264Decoded 1800
+        $payload | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+        return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] ok'); StdErr = @(); DryRun = $false }
+    }
+    $outLowFps = Join-Path $caseDir 'out_low_fps'
+    Invoke-WithModuleMocks -GlobalMocks $hB.Mocks -ModuleMocks $hB.Mocks -Body {
+        Assert-Throws {
+            & $valScript -Configuration Release -TestProfile Benchmark30s -BenchmarkDurationSec 30 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $hB.State.StagingDir -OutputDir $outLowFps -HostExecutablePath $hB.State.FakeHostExe -CertificateThumbprint $hB.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        } -ExpectedPattern 'Benchmark30sPassed' -Message 'SustainedLiveFps=45.0 (<57.0) must fail Benchmark30s'
+    }
+}
+
+# 39. M0.1 S-03 (#6): NVENC with only 1 encoded frame out of 120 valid frames rejected
+Invoke-UnitTest -Name 'M01_S03_NvencSingleFrameEncodedRejected' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+    $h = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'S03SingleNvenc'
+    $h.State.HostHandler = {
+        param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+        $payload = New-M01MockHostPayload -RunId $runIdVal -Frames 120 -DurationSec 2 -NvencSubmitted 120 -NvencEncoded 1 -H264Decoded 1
+        $payload | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+        return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] ok'); StdErr = @(); DryRun = $false }
+    }
+    $outDir = Join-Path $caseDir 'out_single_nvenc'
+    Invoke-WithModuleMocks -GlobalMocks $h.Mocks -ModuleMocks $h.Mocks -Body {
+        Assert-Throws {
+            & $valScript -Configuration Release -TestProfile Performance -PerformanceTargetFrames 120 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $h.State.StagingDir -OutputDir $outDir -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        } -ExpectedPattern 'NvencPassed.*RollbackClean=True' -Message 'Single NVENC encoded frame (1/120) must be rejected when RequireNvenc is set'
+    }
+    $rep = Get-Content -LiteralPath (Join-Path $outDir 'functional-validation-report.json') -Raw | ConvertFrom-Json
+    Assert-Equal $rep.AcceptanceCriteria.NvencPassed $false 'NvencPassed=false for 1/120 encoded'
+}
+
+# 40. M0.1 S-03 (#7): Excessive NVENC/queue drops above MaxDropRatio rejected
+Invoke-UnitTest -Name 'M01_S03_ExcessiveFrameDropsRejected' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+    $h = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'S03Drops'
+    $h.State.HostHandler = {
+        param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+        $payload = New-M01MockHostPayload -RunId $runIdVal -Frames 120 -DurationSec 2 -NvencSubmitted 200 -NvencEncoded 120 -NvencDropped 50 -EncodedQueueDrops 30 -H264Decoded 120
+        $payload | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+        return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] ok'); StdErr = @(); DryRun = $false }
+    }
+    $outDir = Join-Path $caseDir 'out_drops'
+    Invoke-WithModuleMocks -GlobalMocks $h.Mocks -ModuleMocks $h.Mocks -Body {
+        Assert-Throws {
+            & $valScript -Configuration Release -TestProfile Performance -PerformanceTargetFrames 120 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -MaxDropRatio 0.02 -StagingDir $h.State.StagingDir -OutputDir $outDir -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        } -ExpectedPattern 'NvencPassed.*RollbackClean=True' -Message '40% NVENC/queue drop rate (>2%) must reject NvencPassed'
+    }
+    $rep = Get-Content -LiteralPath (Join-Path $outDir 'functional-validation-report.json') -Raw | ConvertFrom-Json
+    Assert-Equal $rep.AcceptanceCriteria.NvencPassed $false 'NvencPassed=false on excessive drops'
+}
+
+# 41. M0.1 S-03 (#8): 30s benchmark never proves >=180s ProlongedStability; 180s does
+Invoke-UnitTest -Name 'M01_S03_Benchmark30sNeverProves180sProlongedStability' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+    $h = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'S03StabProof'
+
+    Invoke-WithModuleMocks -GlobalMocks $h.Mocks -ModuleMocks $h.Mocks -Body {
+        $res30 = & $valScript -Configuration Release -TestProfile Benchmark30s -BenchmarkDurationSec 30 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $h.State.StagingDir -OutputDir (Join-Path $caseDir 'out_30s') -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        Assert-Equal $res30.OverallSucceeded $true '30s benchmark passes'
+        Assert-Equal $res30.AcceptanceCriteria.Benchmark30sPassed $true 'Benchmark30sPassed=true'
+        Assert-Equal $res30.AcceptanceCriteria.ProlongedStabilityProven $false '30s benchmark NEVER claims ProlongedStabilityProven=true'
+
+        $res60 = & $valScript -Configuration Release -TestProfile ProlongedStability -StabilityDurationSec 60 -MinProlongedStabilitySec 180 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $h.State.StagingDir -OutputDir (Join-Path $caseDir 'out_60s') -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        Assert-Equal $res60.OverallSucceeded $true '60s subprofile passes its 60s gate'
+        Assert-Equal $res60.AcceptanceCriteria.ProlongedStabilityPassed $true 'ProlongedStabilityPassed=true for 60s run'
+        Assert-Equal $res60.AcceptanceCriteria.ProlongedStabilityProven $false '60s run keeps ProlongedStabilityProven=false when MinProlongedStabilitySec=180'
+
+        $res180 = & $valScript -Configuration Release -TestProfile ProlongedStability -StabilityDurationSec 180 -MinProlongedStabilitySec 180 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $h.State.StagingDir -OutputDir (Join-Path $caseDir 'out_180s') -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        Assert-Equal $res180.OverallSucceeded $true '180s prolonged run passes'
+        Assert-Equal $res180.AcceptanceCriteria.ProlongedStabilityProven $true '180s prolonged run sets ProlongedStabilityProven=true'
+    }
+}
+
+# 42. M0.1 S-04 (#9): Timeout calculation across 30, 180, 600, 1800, 3600s + overflow guard + ETW >256MB support
+Invoke-UnitTest -Name 'M01_S04_TimeoutCalculation30To3600SecAndOverflowValidation' -TestBody {
+    param($caseDir)
+    $expected = @(
+        @{ Sec = 30;   Hard = 80000 },
+        @{ Sec = 180;  Hard = 230000 },
+        @{ Sec = 600;  Hard = 650000 },
+        @{ Sec = 1800; Hard = 1850000 },
+        @{ Sec = 3600; Hard = 3650000 }
+    )
+    foreach ($item in $expected) {
+        $calc = Get-LumaBridgeValidationHostTimeoutMs -RequestedDurationMs ([int64]$item.Sec * 1000) -ConnectTimeoutMs 5000 -PrewarmMarginMs 15000 -ShutdownMarginMs 30000 -MinimumHardTimeoutMs 30000
+        Assert-Equal $calc.HardTimeoutMs $item.Hard ("HardTimeoutMs matches expected margin math for {0}s" -f $item.Sec)
+    }
+
+    Assert-Throws {
+        $null = Get-LumaBridgeValidationHostTimeoutMs -RequestedDurationMs 4000000
+    } -ExpectedPattern 'out of valid range \[500\.\.3600000\]' -Message 'Durations > 3600000ms must fail explicitly instead of silently overflowing or truncating'
+
+    & (Join-Path $scriptsDir 'Invoke-LumaBridgeEtwTrace.ps1') -Action Start -OutputDir (Join-Path $caseDir 'etw_1024') -CoreMaxFileSizeMb 1024 -DryRun | Out-Null
+}
+
+# 43. M0.1 S-05 (#10): Continuous resource telemetry PID isolation and NOT_MEASURED contract (never substituting 0)
+Invoke-UnitTest -Name 'M01_S05_ContinuousTelemetrySamplingAndNotMeasuredContract' -TestBody {
+    param($caseDir)
+    $snapMocks = @{
+        'Get-LumaBridgeProcessMetricsByPid' = {
+            param([int]$ProcessId)
+            if ($ProcessId -eq 4200) {
+                return [pscustomobject]@{ Available = $true; CpuTimeSec = 1.25; WorkingSetMB = 84.5; PrivateMemoryMB = 62.0; HandleCount = 510; ThreadCount = 14; Reason = $null }
+            }
+            return [pscustomobject]@{ Available = $false; CpuTimeSec = $null; WorkingSetMB = $null; PrivateMemoryMB = $null; HandleCount = $null; ThreadCount = $null; Reason = ("Process PID {0} not running" -f $ProcessId) }
+        }
+        'Get-LumaBridgeGpuPerfCounterSamples' = {
+            param([string]$CounterPath)
+            if ($CounterPath -like '*Dedicated Usage*') {
+                return [pscustomobject]@{
+                    Available = $true; Reason = $null;
+                    Samples   = @(
+                        [pscustomobject]@{ InstanceName = 'pid_4200_luid_0x00000000_0x0001_phys_0'; Path = '\GPU Process Memory(pid_4200)\Dedicated Usage'; CookedValue = (128MB) },
+                        [pscustomobject]@{ InstanceName = 'pid_42001_luid_0x00000000_0x0001_phys_0'; Path = '\GPU Process Memory(pid_42001)\Dedicated Usage'; CookedValue = (512MB) }
+                    )
+                }
+            }
+            return [pscustomobject]@{
+                Available = $true; Reason = $null;
+                Samples   = @(
+                    [pscustomobject]@{ InstanceName = 'pid_4200_luid_0x00000000_0x0001_phys_0_eng_0_engtype_3D'; Path = '\GPU Engine(pid_4200_..._engtype_3D)\Utilization Percentage'; CookedValue = 14.5 },
+                    [pscustomobject]@{ InstanceName = 'pid_42001_luid_0x00000000_0x0001_phys_0_eng_2_engtype_VideoEncode'; Path = '\GPU Engine(pid_42001_..._engtype_VideoEncode)\Utilization Percentage'; CookedValue = 88.0 }
+                )
+            }
+        }
+    }
+
+    Invoke-WithModuleMocks -ModuleMocks $snapMocks -Body {
+        $s1 = Get-LumaBridgeProcessResourceSnapshot -HostPid 4200 -WudfPid 4209 -Phase 'Start'
+        $s2 = Get-LumaBridgeProcessResourceSnapshot -HostPid 4200 -WudfPid 4209 -Phase 'End'
+
+        Assert-Equal $s1.Host.Status 'MEASURED' 'Host process metrics measured cleanly'
+        Assert-Equal $s1.Host.DedicatedVramMB 128.0 'Host VRAM matches pid_4200 only (excludes pid_42001 512MB)'
+        Assert-Equal $s1.Host.GpuEngineTotalPercent 14.5 'Host GPU Engine matches pid_4200 only (excludes pid_42001 88.0%)'
+
+        Assert-Equal $s1.WudfHost.Status 'NOT_MEASURED' 'Unavailable WUDFHost reports NOT_MEASURED (never 0)'
+        Assert-Equal $s1.WudfHost.WorkingSetMB $null 'Unavailable WorkingSetMB is $null (never 0)'
+        Assert-Equal $s1.WudfHost.DedicatedVramStatus 'NOT_MEASURED' 'Unavailable VRAM reports NOT_MEASURED'
+        Assert-Equal $s1.WudfHost.DedicatedVramMB $null 'Unavailable VRAM is $null (never 0)'
+        Assert-True (-not [string]::IsNullOrWhiteSpace($s1.WudfHost.Reason)) 'Unmeasured telemetry includes explicit Reason'
+
+        $hostSum = Measure-LumaBridgeResourceSeriesSummary -Samples @($s1, $s2) -Role Host
+        $wudfSum = Measure-LumaBridgeResourceSeriesSummary -Samples @($s1, $s2) -Role WudfHost
+        Assert-Equal $hostSum.Status 'MEASURED' 'Host series status MEASURED'
+        Assert-Equal $hostSum.DedicatedVramMB.Peak 128.0 'Host VRAM Peak=128MB'
+        Assert-Equal $wudfSum.Status 'NOT_MEASURED' 'WudfHost series status NOT_MEASURED'
+        Assert-Equal $wudfSum.WorkingSetMB.Peak $null 'WudfHost WorkingSetMB.Peak is $null'
+    }
+}
+
+# 44. M0.1 S-06 (#11): Initial snapshot restores pre-existing EnableVirtualMonitor=1 and preserves pre-existing certs
+Invoke-UnitTest -Name 'M01_S06_InitialSnapshotPreservesPreExistingCertsAndRegistrySemantics' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+
+    # Case A: Pre-existing EnableVirtualMonitor=1, absent EnableGpuSharedTransport/AuthSid, pre-existing cert -> exact restore
+    $h = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'S06Preserve' -InitialEnableMon 1 -InitialEnableExt 0 -InitialEnableGpuTrans $null -InitialAuthSid $null
+    $h.State.PreExistingCertThumbprint = $h.State.CertInfo.Thumbprint
+
+    Invoke-WithModuleMocks -GlobalMocks $h.Mocks -ModuleMocks $h.Mocks -Body {
+        $res = & $valScript -Configuration Release -TestProfile Smoke -TransportMode Gpu -StagingDir $h.State.StagingDir -OutputDir (Join-Path $caseDir 'out_preserve') -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -SkipDriverInstall -Force
+        Assert-Equal $res.OverallSucceeded $true 'Run succeeds with pre-existing EnableVirtualMonitor=1 and trusted cert'
+        Assert-Equal $res.SystemStateRestored $true 'SystemStateRestored=true when exact initial snapshot restored'
+        Assert-Equal $res.RollbackClean $true 'RollbackClean=true'
+        Assert-Equal $h.State.EnableMon 1 'Pre-existing EnableVirtualMonitor=1 preserved on rollback (NOT cleared to 0)'
+        Assert-Equal $h.State.EnableExt 0 'Pre-existing EnableFrameExtraction=0 restored'
+        Assert-Equal $h.State.EnableGpuTrans $null 'Previously absent EnableGpuSharedTransport restored to $null'
+        Assert-Equal $h.State.AuthSid $null 'Previously absent AuthorizedHostUserSid cleared back to $null'
+    }
+    $rep = Get-Content -LiteralPath (Join-Path (Join-Path $caseDir 'out_preserve') 'functional-validation-report.json') -Raw | ConvertFrom-Json
+    Assert-Equal $rep.CertificateWasPreExisting $true 'Report records CertificateWasPreExisting=true'
+    Assert-Equal $rep.PreExistingCertsPreserved $true 'Report records PreExistingCertsPreserved=true'
+
+    # Case B: Invoke-LumaBridgePackageSigning -TrustCertificate skips certutil -addstore when cert is already trusted in Root & TrustedPublisher
+    $h.State.CertutilAddCalls = 0
+    $signSkipMocks = @{}
+    foreach ($k in $h.Mocks.Keys) { $signSkipMocks[$k] = $h.Mocks[$k] }
+    $signSkipMocks['Test-LumaBridgePackageArtifacts'] = {
+        [CmdletBinding()]
+        param([string]$PackageDirectory, [string]$ExpectedSignerThumbprint, [switch]$RequireValidSignature, [switch]$AllowUntrustedChain)
+        return [pscustomobject]@{
+            SignerCertificatesMatch  = $true
+            IsCryptographicallyValid = $true
+            IsValidWithUntrustedRoot = $true
+        }
+    }
+    Invoke-WithModuleMocks -GlobalMocks $signSkipMocks -ModuleMocks $signSkipMocks -Body {
+        $signOut = & (Join-Path $scriptsDir 'Invoke-LumaBridgePackageSigning.ps1') -Configuration Release -StagingDir (Join-Path $caseDir 'stg_sign_skip') -CertificateThumbprint $h.State.CertInfo.Thumbprint -TrustCertificate -Force
+        Assert-Equal $h.State.CertutilAddCalls 0 'PackageSigning -TrustCertificate avoids redundant certutil -addstore when already trusted'
+        Assert-Equal $signOut.CertificateAlreadyTrustedRoot $true 'CertificateAlreadyTrustedRoot=true'
+        Assert-Equal $signOut.CertificateAlreadyTrustedPub $true 'CertificateAlreadyTrustedPub=true'
+        Assert-Equal $signOut.CertificateTrustedInRun $false 'CertificateTrustedInRun=false'
+    }
+
+    # Case C: Missing pre-existing cert post-rollback forces RollbackClean=false & throw
+    $hC = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'S06DropCert' -InitialEnableMon 1
+    $hC.State.PreExistingCertThumbprint = $hC.State.CertInfo.Thumbprint
+    $hC.State.DropCertInPostRollback = $true
+    $outDrop = Join-Path $caseDir 'out_drop_cert'
+    Invoke-WithModuleMocks -GlobalMocks $hC.Mocks -ModuleMocks $hC.Mocks -Body {
+        Assert-Throws {
+            & $valScript -Configuration Release -TestProfile Smoke -StagingDir $hC.State.StagingDir -OutputDir $outDrop -HostExecutablePath $hC.State.FakeHostExe -CertificateThumbprint $hC.State.CertInfo.Thumbprint -SkipDriverInstall -Force
+        } -ExpectedPattern 'RollbackClean=False' -Message 'Disappearance of pre-existing cert post-rollback must fail RollbackClean'
+    }
+    $repDrop = Get-Content -LiteralPath (Join-Path $outDrop 'functional-validation-report.json') -Raw | ConvertFrom-Json
+    Assert-Equal $repDrop.PreExistingCertsPreserved $false 'Report records PreExistingCertsPreserved=false'
+}
+
+# 45. M0.1 S-07 (#12): Stale timestamps, mismatched RunId, incomplete summary & truncated JSON rejected
+Invoke-UnitTest -Name 'M01_S07_StaleWrongRunIdAndIncompleteJsonRejected' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+
+    $modes = @(
+        @{ Key = 'RunIdMismatch'; ExpectedStatus = 'RUN_ID_MISMATCH' },
+        @{ Key = 'Incomplete';    ExpectedStatus = 'INCOMPLETE_SUMMARY' },
+        @{ Key = 'Truncated';     ExpectedStatus = 'INVALID_JSON' },
+        @{ Key = 'StaleTime';     ExpectedStatus = 'STALE_TIMESTAMP' }
+    )
+
+    foreach ($m in $modes) {
+        $sk = "S07_" + $m.Key
+        $h = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey $sk
+        $modeName = $m.Key
+        $h.State.HostHandler = {
+            param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+            switch ($modeName) {
+                'RunIdMismatch' {
+                    $p = New-M01MockHostPayload -RunId '20200101T000000Z-foreign0000' -Frames 60
+                    $p | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+                }
+                'Incomplete' {
+                    $p = New-M01MockHostPayload -RunId $runIdVal -Frames 60 -SummaryComplete $false
+                    $p | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+                }
+                'Truncated' {
+                    '{"RunId":"' + $runIdVal + '","FramesReceived":' | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+                }
+                'StaleTime' {
+                    $p = New-M01MockHostPayload -RunId $runIdVal -Frames 60
+                    $p | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+                    [System.IO.File]::SetLastWriteTimeUtc($jsonPath, [DateTime]::UtcNow.AddMinutes(-15))
+                }
+            }
+            return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] ok'); StdErr = @(); DryRun = $false }
+        }.GetNewClosure()
+
+        $outDir = Join-Path $caseDir ("out_{0}" -f $m.Key)
+        Invoke-WithModuleMocks -GlobalMocks $h.Mocks -ModuleMocks $h.Mocks -Body {
+            Assert-Throws {
+                & $valScript -Configuration Release -TestProfile Smoke -StagingDir $h.State.StagingDir -OutputDir $outDir -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+            } -ExpectedPattern 'RollbackClean=True' -Message ("Runner rejects {0} JSON summary" -f $m.Key)
+        }
+        $rep = Get-Content -LiteralPath (Join-Path $outDir 'functional-validation-report.json') -Raw | ConvertFrom-Json
+        Assert-Equal $rep.SmokeSummaryValidation.Status $m.ExpectedStatus ("Report records SummaryValidation.Status={0}" -f $m.ExpectedStatus)
+        Assert-Equal $rep.FunctionalValidationSucceeded $false ("FunctionalValidationSucceeded=false for {0}" -f $m.Key)
+    }
+}
+
+# 46. M0.1 S-07 (#13): Wrong driver version, missing binding & DLL SHA-256 mismatch rejected
+Invoke-UnitTest -Name 'M01_S07_WrongDriverVersionMissingBindingAndBinaryHashMismatchRejected' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+
+    # Case A: -SkipDriverInstall when bound driver is old 1.50.4.765 -> Stage 6 fails & preserves EnableVirtualMonitor=1
+    $h = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'S07OldDriver' -InitialDriverVersion '1.50.4.765' -InitialEnableMon 1
+    $outOld = Join-Path $caseDir 'out_old_drv'
+    Invoke-WithModuleMocks -GlobalMocks $h.Mocks -ModuleMocks $h.Mocks -Body {
+        Assert-Throws {
+            & $valScript -Configuration Release -TestProfile Smoke -StagingDir $h.State.StagingDir -OutputDir $outOld -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        } -ExpectedPattern 'Installed driver binding/identity check failed.*RollbackClean=True' -Message 'Old driver version under -SkipDriverInstall fails Stage 6'
+    }
+    Assert-Equal $h.State.EnableMon 1 'EnableVirtualMonitor=1 preserved after Stage 6 failure'
+
+    # Case B: Direct Test-LumaBridgeDeviceDriverBinding binary identity tests
+    $relDir = Get-LumaBridgePackageDirectory -Configuration Release
+    $relInf = Join-Path $relDir 'LumaBridgeIddDriver.inf'
+    $relDll = Join-Path $relDir 'LumaBridgeIddDriver.dll'
+    $relVer = Get-LumaBridgeInfDriverVersion -InfPath $relInf
+    $tamperedDll = Join-Path $caseDir 'Tampered.dll'
+    [System.IO.File]::WriteAllBytes($tamperedDll, [byte[]]@(1, 2, 3, 4, 5))
+
+    $instOk = [pscustomobject]@{ InstanceId = 'ROOT\DISPLAY\0000'; Present = $true; Status = 'OK'; ProblemCode = 0; HardwareIds = @('Root\LumaBridgeIddDriver'); DriverInfPath = 'oem99.inf'; DriverProvider = 'LumaBridge'; DriverVersion = $relVer }
+    $bindOk = Test-LumaBridgeDeviceDriverBinding -Instance $instOk -ExpectedInfPath $relInf -ExpectedDllPath $relDll -LoadedModulePath $relDll -RequireBinaryHashMatch
+    Assert-Equal $bindOk.IsBound $true 'Matching DLL SHA-256 binds cleanly'
+    Assert-Equal $bindOk.BinaryIdentityStatus 'VERIFIED' 'BinaryIdentityStatus=VERIFIED'
+
+    $bindMismatch = Test-LumaBridgeDeviceDriverBinding -Instance $instOk -ExpectedInfPath $relInf -ExpectedDllPath $relDll -LoadedModulePath $tamperedDll -RequireBinaryHashMatch
+    Assert-Equal $bindMismatch.IsBound $false 'Mismatched DLL SHA-256 fails binding'
+    Assert-Equal $bindMismatch.BinaryIdentityStatus 'MISMATCH' 'BinaryIdentityStatus=MISMATCH'
+
+    $instNoInf = [pscustomobject]@{ InstanceId = 'ROOT\DISPLAY\0000'; Present = $true; Status = 'OK'; ProblemCode = 0; HardwareIds = @('Root\LumaBridgeIddDriver'); DriverInfPath = ''; DriverProvider = 'LumaBridge'; DriverVersion = $relVer }
+    $bindNoInf = Test-LumaBridgeDeviceDriverBinding -Instance $instNoInf -ExpectedInfPath $relInf
+    Assert-Equal $bindNoInf.IsBound $false 'Empty DriverInfPath fails binding'
+
+    $bindUnmeasured = Test-LumaBridgeDeviceDriverBinding -Instance $instOk -ExpectedInfPath $relInf -ExpectedDllPath $relDll -LoadedModulePath (Join-Path $caseDir 'Missing.dll') -RequireBinaryHashMatch
+    Assert-Equal $bindUnmeasured.IsBound $false 'RequireBinaryHashMatch fails when binary identity is NOT_MEASURED'
+    Assert-Equal $bindUnmeasured.BinaryIdentityStatus 'NOT_MEASURED' 'BinaryIdentityStatus=NOT_MEASURED'
+}
+
+# 47. M0.1 S-07 (#14): Composite profiles Both and Full evaluate each subprofile independently
+Invoke-UnitTest -Name 'M01_S07_CompositeProfilesBothAndFullEvaluateEachSubprofileIndependently' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+
+    # Case A: Both where Smoke returns >=1 frames so Performance still runs and PASSES (60 frames),
+    # while Smoke FAILS (ChecksumMismatches=1 / ExitCode=1) -> Overall MUST FAIL
+    $hBoth = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'S07BothFailSmoke'
+    $hBoth.State.HostHandler = {
+        param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+        $isPerf = ($Arguments -contains '--require-max-frames')
+        $fc = if ($isPerf) { 60 } else { 3 }
+        $payload = New-M01MockHostPayload -RunId $runIdVal -Frames $fc -FrameTargetReached $isPerf -NvencSubmitted $fc -NvencEncoded $fc -H264Decoded $fc
+        if (-not $isPerf) {
+            $payload.ChecksumMismatches = 1
+        }
+        $payload | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+        return [pscustomobject]@{ ExitCode = $(if ($isPerf) { 0 } else { 1 }); TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] ok'); StdErr = @(); DryRun = $false }
+    }
+    $outBoth = Join-Path $caseDir 'out_both_indep'
+    Invoke-WithModuleMocks -GlobalMocks $hBoth.Mocks -ModuleMocks $hBoth.Mocks -Body {
+        Assert-Throws {
+            & $valScript -Configuration Release -TestProfile Both -StagingDir $hBoth.State.StagingDir -OutputDir $outBoth -HostExecutablePath $hBoth.State.FakeHostExe -CertificateThumbprint $hBoth.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        } -ExpectedPattern 'AllSubprofilesPassed.*RollbackClean=True' -Message 'Both fails overall when Smoke fails even if Performance passes'
+    }
+    $repBoth = Get-Content -LiteralPath (Join-Path $outBoth 'functional-validation-report.json') -Raw | ConvertFrom-Json
+    Assert-Equal $repBoth.AcceptanceCriteria.FunctionalSmokePassed $false 'FunctionalSmokePassed=false'
+    Assert-Equal $repBoth.AcceptanceCriteria.PerformanceTargetReached $true 'PerformanceTargetReached=true'
+    Assert-Equal $repBoth.AcceptanceCriteria.AllSubprofilesPassed $false 'AllSubprofilesPassed=false'
+
+    # Case B: Full where Smoke, Performance, ProlongedStability PASS, ONLY Benchmark30s fails (1280x720) -> Overall MUST FAIL
+    $hFull = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'S07FullFailBench'
+    $hFull.State.HostHandler = {
+        param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+        $is30s = ($durMs -eq 30000)
+        $sec = [Math]::Max(1, [int][Math]::Round($durMs / 1000.0))
+        $fc = if ($Arguments -contains '--require-max-frames') { [uint64]$maxF } else { [uint64]($sec * 60) }
+        $w = if ($is30s) { [uint32]1280 } else { [uint32]1920 }
+        $ht = if ($is30s) { [uint32]720 } else { [uint32]1080 }
+        $payload = New-M01MockHostPayload -RunId $runIdVal -Frames $fc -Width $w -Height $ht -DurationSec $sec -NvencSubmitted $fc -NvencEncoded $fc -H264Decoded $fc
+        $payload | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+        return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] ok'); StdErr = @(); DryRun = $false }
+    }
+    $outFull = Join-Path $caseDir 'out_full_indep'
+    Invoke-WithModuleMocks -GlobalMocks $hFull.Mocks -ModuleMocks $hFull.Mocks -Body {
+        Assert-Throws {
+            & $valScript -Configuration Release -TestProfile Full -BenchmarkDurationSec 30 -StabilityDurationSec 180 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $hFull.State.StagingDir -OutputDir $outFull -HostExecutablePath $hFull.State.FakeHostExe -CertificateThumbprint $hFull.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        } -ExpectedPattern 'Benchmark30sPassed.*RollbackClean=True' -Message 'Full fails overall when Benchmark30s fails even if ProlongedStability passes'
+    }
+    $repFull = Get-Content -LiteralPath (Join-Path $outFull 'functional-validation-report.json') -Raw | ConvertFrom-Json
+    Assert-Equal $repFull.AcceptanceCriteria.FunctionalSmokePassed $true 'Full Smoke passed'
+    Assert-Equal $repFull.AcceptanceCriteria.PerformanceTestExecuted $false 'Full profile does not run standalone Performance subprofile'
+    Assert-Equal $repFull.AcceptanceCriteria.Benchmark30sExecuted $true 'Full Benchmark30s executed'
+    Assert-Equal $repFull.AcceptanceCriteria.Benchmark30sPassed $false 'Full Benchmark30s failed'
+    Assert-Equal $repFull.AcceptanceCriteria.ProlongedStabilityExecuted $true 'Full ProlongedStability executed'
+    Assert-Equal $repFull.AcceptanceCriteria.ProlongedStabilityPassed $true 'Full ProlongedStability passed'
+    Assert-Equal $repFull.AcceptanceCriteria.ProlongedStabilityProven $true 'Full ProlongedStabilityProven=true (180s)'
+    Assert-Equal $repFull.AcceptanceCriteria.AllSubprofilesPassed $false 'AllSubprofilesPassed=false'
+}
+
+# 48. M0.1 S-06/S-07 (#15): Intermediate Stage 6, Stage 7, and Stage 9 failures recover cleanly & capture Stage 10 diagnostics
+Invoke-UnitTest -Name 'M01_S06_S07_IntermediateStage6_7_8_9FailuresWithRecoveryAndDiagnostics' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+
+    # Case A: Stage 6 unhealthy PnP instance stops ETW, preserves EnableVirtualMonitor=1 & honestly reports persistent ProblemCode on rollback;
+    # and healthy PnP instance with missing binding fails Stage 6 with RollbackClean=True
+    $h6 = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'S07Stage6' -InitialEnableMon 1
+    $h6.State.Status = 'Error'
+    $h6.State.ProblemCode = 31
+    Invoke-WithModuleMocks -GlobalMocks $h6.Mocks -ModuleMocks $h6.Mocks -Body {
+        Assert-Throws {
+            & $valScript -Configuration Release -TestProfile Smoke -StagingDir $h6.State.StagingDir -OutputDir (Join-Path $caseDir 'out_st6') -HostExecutablePath $h6.State.FakeHostExe -CertificateThumbprint $h6.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        } -ExpectedPattern 'unhealthy after Stage 6.*Post-rollback device unhealthy' -Message 'Stage 6 unhealthy device halts validation and surfaces persistent ProblemCode post-rollback'
+    }
+    Assert-Equal $h6.State.EtwRunning $false 'ETW stopped after Stage 6 failure'
+    Assert-Equal $h6.State.EnableMon 1 'EnableVirtualMonitor=1 preserved after Stage 6 failure'
+
+    $h6Bind = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'S07Stage6Bind' -InitialDriverInfPath '' -InitialEnableMon 1
+    Invoke-WithModuleMocks -GlobalMocks $h6Bind.Mocks -ModuleMocks $h6Bind.Mocks -Body {
+        Assert-Throws {
+            & $valScript -Configuration Release -TestProfile Smoke -StagingDir $h6Bind.State.StagingDir -OutputDir (Join-Path $caseDir 'out_st6_bind') -HostExecutablePath $h6Bind.State.FakeHostExe -CertificateThumbprint $h6Bind.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        } -ExpectedPattern 'Installed driver binding/identity check failed.*RollbackClean=True' -Message 'Stage 6 missing INF binding triggers clean rollback'
+    }
+    Assert-Equal $h6Bind.State.EtwRunning $false 'ETW stopped after Stage 6 missing binding failure'
+    Assert-Equal $h6Bind.State.EnableMon 1 'EnableVirtualMonitor=1 preserved after Stage 6 missing binding failure'
+
+    # Case B: Stage 7 monitor activation failure
+    $h7 = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'S07Stage7' -InitialEnableMon 0
+    $h7.State.InjectStage7Fail = $true
+    Invoke-WithModuleMocks -GlobalMocks $h7.Mocks -ModuleMocks $h7.Mocks -Body {
+        Assert-Throws {
+            & $valScript -Configuration Release -TestProfile Smoke -StagingDir $h7.State.StagingDir -OutputDir (Join-Path $caseDir 'out_st7') -HostExecutablePath $h7.State.FakeHostExe -CertificateThumbprint $h7.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        } -ExpectedPattern 'Simulated Stage 7 virtual monitor failure.*RollbackClean=True' -Message 'Stage 7 failure triggers clean rollback'
+    }
+    Assert-Equal $h7.State.EtwRunning $false 'ETW stopped after Stage 7 failure'
+    Assert-Equal $h7.State.EnableMon 0 'EnableVirtualMonitor restored to 0 after Stage 7 failure'
+
+    # Case C: Stage 9 host crash still executes Stage 10 diagnostics capture
+    $h9 = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'S07Stage9' -InitialEnableMon 1
+    $h9.State.HostHandler = {
+        param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+        return [pscustomobject]@{ ExitCode = 1; TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] simulated crash'); StdErr = @('fatal'); DryRun = $false }
+    }
+    $out9 = Join-Path $caseDir 'out_st9'
+    Invoke-WithModuleMocks -GlobalMocks $h9.Mocks -ModuleMocks $h9.Mocks -Body {
+        Assert-Throws {
+            & $valScript -Configuration Release -TestProfile Smoke -StagingDir $h9.State.StagingDir -OutputDir $out9 -HostExecutablePath $h9.State.FakeHostExe -CertificateThumbprint $h9.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        } -ExpectedPattern 'RollbackClean=True' -Message 'Stage 9 failure rolls back cleanly'
+    }
+    $rep9 = Get-Content -LiteralPath (Join-Path $out9 'functional-validation-report.json') -Raw | ConvertFrom-Json
+    Assert-True ($null -ne $rep9.DiagnosticsResult) 'Stage 10 DiagnosticsResult captured even when Stage 9 host failed'
+    Assert-True (Test-Path -LiteralPath $rep9.DiagnosticsResult.JsonReportPath -PathType Leaf) 'Stage 10 diagnostics JSON written on Stage 9 failure'
+    Assert-Equal $rep9.RollbackClean $true 'RollbackClean=true after Stage 9 failure'
+}
+
+# 49. M0.1 S-08: Read-only VBS/HVCI, OS build/arch, required services & API availability diagnostics
+Invoke-UnitTest -Name 'M01_S08_HostSecurityVbsHvciAndServicesReadOnlyDiagnostics' -TestBody {
+    param($caseDir)
+
+    # Case A: Mocked Running VBS + HVCI -> populates InformationalWarnings without inventing blocking error
+    Invoke-WithModuleMocks -ModuleMocks @{
+        'Confirm-SecureBootUEFI' = { return $false }
+        'Get-CimInstance' = {
+            param($Namespace, $ClassName)
+            return [pscustomobject]@{ VirtualizationBasedSecurityStatus = 2; SecurityServicesRunning = @(1, 2); SecurityServicesConfigured = @(1, 2) }
+        }
+        'Get-Service' = {
+            param([string]$Name)
+            return [pscustomobject]@{ Status = 'Running'; StartType = 'Manual' }
+        }
+    } -Body {
+        $sec = Get-LumaBridgeHostSecurityState
+        Assert-Equal $sec.VbsStatus 'Running' 'VbsStatus=Running reported'
+        Assert-Equal $sec.HvciStatus 'Running' 'HvciStatus=Running reported'
+        Assert-True (@($sec.InformationalWarnings).Count -ge 2) 'HVCI and VBS produce informational warnings'
+        Assert-Equal $sec.RequiredServices.WUDFRd.Status 'Running' 'RequiredServices.WUDFRd reported'
+    }
+
+    # Case B: Inaccessible DeviceGuard + missing registry/service -> records UnavailableChecks (never invents Disabled)
+    Invoke-WithModuleMocks -ModuleMocks @{
+        'Confirm-SecureBootUEFI' = { throw ([System.UnauthorizedAccessException]::new('Access denied')) }
+        'Get-CimInstance' = { throw 'WMI blocked' }
+        'Get-LumaBridgeRegistryValueState' = { param([string]$LiteralPath, [string]$Name) return [pscustomobject]@{ KeyExists = $false; ValueExists = $false; Value = $null } }
+        'Get-Service' = { param([string]$Name) throw 'Service inaccessible' }
+    } -Body {
+        $secUnavail = Get-LumaBridgeHostSecurityState
+        Assert-Equal $secUnavail.HvciStatus 'Unavailable' 'HvciStatus marked Unavailable when CIM & registry are inaccessible'
+        Assert-True (@($secUnavail.UnavailableChecks) -contains 'HvciStatus') 'UnavailableChecks includes HvciStatus'
+        Assert-True (@($secUnavail.UnavailableChecks) -contains 'Service:WUDFRd') 'UnavailableChecks includes Service:WUDFRd'
+    }
+
+    # Case C: Live read-only prerequisites script returns VBS/HVCI/Build/Architecture/Services/ApiAvailability schema
+    $prereqOut = & (Join-Path $scriptsDir 'Test-LumaBridgePrerequisites.ps1') -Configuration Release
+    Assert-True ($null -ne $prereqOut.SecurityState.VbsStatus) 'Live SecurityState exposes VbsStatus'
+    Assert-True ($null -ne $prereqOut.SecurityState.HvciStatus) 'Live SecurityState exposes HvciStatus'
+    Assert-True ($null -ne $prereqOut.RequiredServices.WUDFRd) 'Live Prerequisites exposes RequiredServices.WUDFRd'
+    Assert-True ($null -ne $prereqOut.ApiAvailability) 'Live Prerequisites exposes ApiAvailability'
+    Assert-True (-not [string]::IsNullOrWhiteSpace($prereqOut.HostOs.Architecture)) 'Live HostOs exposes Architecture'
 }
 
 try {
