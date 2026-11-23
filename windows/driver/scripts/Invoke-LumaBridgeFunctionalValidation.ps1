@@ -184,6 +184,9 @@ function Test-LumaBridgeTemporalTelemetry {
             ValidCoreTimestampSamples       = [uint64]0
             ValidLiveTimestampSamples       = [uint64]0
             ValidPresentTimestampSamples    = [uint64]0
+            HasEstimatedPercentiles         = $false
+            LatencyMetricsMethodology       = @()
+            EstimatedLatencyMetrics         = @()
             TruncatedLatencyMetrics         = @()
         }
     }
@@ -218,19 +221,97 @@ function Test-LumaBridgeTemporalTelemetry {
     $nvInvalidTs = if ($null -ne $nvenc) { [uint64](Get-LumaBridgeValidationOptionalProp $nvenc 'InvalidTimestampCount' 0) } else { [uint64]0 }
     $nvBsCov = if ($null -ne $nvenc) { [double](Get-LumaBridgeValidationOptionalProp $nvenc 'ExtractToBitstreamCoveragePercent' 0.0) } else { 0.0 }
 
+    $methodologyList = New-Object System.Collections.Generic.List[object]
+    $estimatedList = New-Object System.Collections.Generic.List[object]
     $truncatedList = New-Object System.Collections.Generic.List[object]
-    foreach ($metricName in @('EndToEndLatency', 'LiveEndToEndLatency', 'IpcTransitLatency', 'InterFrameInterval', 'InterFrameJitter')) {
+
+    $inspectLatencyMetric = {
+        param(
+            [string]$Scope,
+            [string]$MetricName,
+            $MetricObj
+        )
+        if ($null -eq $MetricObj) {
+            return
+        }
+        $propNames = @($MetricObj.PSObject.Properties.Name)
+        $sampleCount = [uint64](Get-LumaBridgeValidationOptionalProp $MetricObj 'SampleCount' 0)
+        $available = [bool](Get-LumaBridgeValidationOptionalProp $MetricObj 'Available' ($sampleCount -ge 1))
+        $storedCount = [uint64](Get-LumaBridgeValidationOptionalProp $MetricObj 'StoredSampleCount' $sampleCount)
+        $isTrunc = [bool](Get-LumaBridgeValidationOptionalProp $MetricObj 'SamplesTruncated' ($sampleCount -gt $storedCount))
+        $reservoir = [bool](Get-LumaBridgeValidationOptionalProp $MetricObj 'ReservoirSampled' $false)
+        $hasP95Prop = ($propNames -contains 'P95Us')
+        $p95Raw = if ($hasP95Prop) { $MetricObj.P95Us } else { $null }
+        $defaultPctAvail = $available -and ($sampleCount -ge 1) -and ((-not $hasP95Prop) -or ($null -ne $p95Raw))
+        $pctAvailable = [bool](Get-LumaBridgeValidationOptionalProp $MetricObj 'PercentilesAvailable' $defaultPctAvail)
+        $pctEstimated = [bool](Get-LumaBridgeValidationOptionalProp $MetricObj 'PercentilesAreEstimated' ($pctAvailable -and ($isTrunc -or $reservoir)))
+        $defaultMethod = if (-not $pctAvailable) {
+            'NotAvailable'
+        }
+        elseif ($pctEstimated) {
+            'ReservoirSampledEstimate_AlgorithmR'
+        }
+        else {
+            'ExactPopulation'
+        }
+        $pctMethod = [string](Get-LumaBridgeValidationOptionalProp $MetricObj 'PercentileMethod' $defaultMethod)
+
+        $entry = [pscustomobject]@{
+            Scope                   = $Scope
+            MetricName              = $MetricName
+            Available               = $available
+            PercentilesAvailable    = $pctAvailable
+            PercentilesAreEstimated = $pctEstimated
+            PercentileMethod        = $pctMethod
+            SampleCount             = $sampleCount
+            StoredSampleCount       = $storedCount
+            SamplesTruncated        = $isTrunc
+            ReservoirSampled        = $reservoir
+        }
+        $methodologyList.Add($entry)
+        if ($pctEstimated) {
+            $estimatedList.Add($entry)
+        }
+        if ($isTrunc -or $reservoir -or $pctEstimated) {
+            $truncatedList.Add($entry)
+        }
+    }
+
+    $hostLatencyNames = @(
+        'CopyLatency',
+        'PresentToExtractLatency',
+        'QueueWaitLatency',
+        'LiveQueueWaitLatency',
+        'IpcTransitLatency',
+        'HostVerifyAckLatency',
+        'EndToEndLatency',
+        'LiveEndToEndLatency',
+        'InterFrameInterval',
+        'InterFrameJitter',
+        'GpuSyncWaitLatency',
+        'HostGpuCopyLatency'
+    )
+    foreach ($metricName in $hostLatencyNames) {
         $mObj = Get-LumaBridgeValidationOptionalProp $Summary $metricName $null
-        if ($null -ne $mObj) {
-            $isTrunc = [bool](Get-LumaBridgeValidationOptionalProp $mObj 'SamplesTruncated' $false)
-            if ($isTrunc) {
-                $truncatedList.Add([pscustomobject]@{
-                    MetricName        = $metricName
-                    SampleCount       = [uint64](Get-LumaBridgeValidationOptionalProp $mObj 'SampleCount' 0)
-                    StoredSampleCount = [uint64](Get-LumaBridgeValidationOptionalProp $mObj 'StoredSampleCount' 0)
-                    ReservoirSampled  = [bool](Get-LumaBridgeValidationOptionalProp $mObj 'ReservoirSampled' $false)
-                })
-            }
+        & $inspectLatencyMetric 'Host' $metricName $mObj
+    }
+
+    if ($null -ne $nvenc) {
+        $nvencLatencyNames = @(
+            'EncodeLatencyUs',
+            'HostReceiveToSubmitLatencyUs',
+            'FormatPrepareLatencyUs',
+            'EncodePictureLatencyUs',
+            'BitstreamLockCopyLatencyUs',
+            'EncodedQueueWaitLatencyUs',
+            'EncodeInterFrameJitterUs',
+            'EncodedFrameSizeBytes',
+            'PresentToBitstreamLatencyUs',
+            'ExtractToBitstreamLatencyUs'
+        )
+        foreach ($nvMetricName in $nvencLatencyNames) {
+            $nvMetricObj = Get-LumaBridgeValidationOptionalProp $nvenc $nvMetricName $null
+            & $inspectLatencyMetric 'Nvenc' ("Nvenc.{0}" -f $nvMetricName) $nvMetricObj
         }
     }
 
@@ -263,6 +344,9 @@ function Test-LumaBridgeTemporalTelemetry {
         ValidCoreTimestampSamples       = $validCoreSamples
         ValidLiveTimestampSamples       = $validLiveSamples
         ValidPresentTimestampSamples    = $validPresSamples
+        HasEstimatedPercentiles         = ($estimatedList.Count -gt 0)
+        LatencyMetricsMethodology       = @($methodologyList.ToArray())
+        EstimatedLatencyMetrics         = @($estimatedList.ToArray())
         TruncatedLatencyMetrics         = @($truncatedList.ToArray())
     }
 }
@@ -486,12 +570,48 @@ function Test-LumaBridgeSubprofileGates {
         $reasons.Add(("GpuShared gate failed (Mode={0}, Fallback={1}, Opened={2}, GpuDrop={3}, OpenFail={4}, SyncTo={5}, LuidErr={6}, CpuReads={7})." -f $gpuMode, $gpuFallback, $gpuOpened, $gpuDropped, $gpuOpenFail, $gpuSyncTo, $gpuLuidErr, $cpuReads))
     }
 
-    $durationUs = if ($summaryValid) {
-        $connUs = [uint64](Get-LumaBridgeValidationOptionalProp $summary 'TotalConnectedDurationUs' 0)
-        if ($connUs -gt 0) { $connUs } else { [uint64](Get-LumaBridgeValidationOptionalProp $summary 'TotalExecutionDurationUs' 0) }
+    $qpcClockValid = if ($summaryValid -and ($summary.PSObject.Properties.Name -contains 'QpcClockValid')) {
+        [bool]$summary.QpcClockValid
     }
-    else { [uint64]0 }
+    else {
+        $true
+    }
+    $qpcFrequency = if ($summaryValid -and ($summary.PSObject.Properties.Name -contains 'QpcFrequency')) {
+        [uint64]$summary.QpcFrequency
+    }
+    else {
+        [uint64]10000000
+    }
+    $qpcClockOk = $qpcClockValid -and ($qpcFrequency -gt 0)
+    if ($summaryValid -and -not $qpcClockOk) {
+        $reasons.Add(("Invalid QPC clock telemetry (QpcClockValid={0}, QpcFrequency={1})." -f $qpcClockValid, $qpcFrequency))
+    }
+
+    $safetyTimeoutHit = if ($summaryValid) {
+        [bool](Get-LumaBridgeValidationOptionalProp $summary 'SafetyExecutionTimeoutHit' $false)
+    }
+    else {
+        $false
+    }
+    if ($summaryValid -and $safetyTimeoutHit) {
+        $reasons.Add('Host exited due to safety execution wall-clock timeout before completing target.')
+    }
+
+    $hasConnDurProp = ($summaryValid -and ($summary.PSObject.Properties.Name -contains 'TotalConnectedDurationUs'))
+    $connUs = if ($hasConnDurProp) { [uint64]$summary.TotalConnectedDurationUs } else { [uint64]0 }
+    $execUs = if ($summaryValid) { [uint64](Get-LumaBridgeValidationOptionalProp $summary 'TotalExecutionDurationUs' 0) } else { [uint64]0 }
+    $durationUs = if ($SubprofileName -in @('Benchmark30s', 'ProlongedStability')) {
+        $connUs
+    }
+    elseif ($connUs -gt 0) {
+        $connUs
+    }
+    else {
+        $execUs
+    }
     $measuredSec = [double]$durationUs / 1000000.0
+    $hasActiveStreamingProp = ($summaryValid -and ($summary.PSObject.Properties.Name -contains 'ActiveStreamingDurationUs'))
+    $activeStreamingUs = if ($hasActiveStreamingProp) { [uint64]$summary.ActiveStreamingDurationUs } else { [uint64]0 }
 
     $nvencObj = if ($summaryValid) { Get-LumaBridgeValidationOptionalProp $summary 'Nvenc' $null } else { $null }
     $nvSubmitted = if ($null -ne $nvencObj) { [uint64](Get-LumaBridgeValidationOptionalProp $nvencObj 'NvencFramesSubmitted' 0) } else { [uint64]0 }
@@ -563,6 +683,8 @@ function Test-LumaBridgeSubprofileGates {
     $measuredFps = if ($sustainedLiveFps -gt 0.0) { $sustainedLiveFps } elseif ($observedActiveFps -gt 0.0) { $observedActiveFps } else { $receiveFps }
 
     $profileSpecificOk = $true
+    $durationOk = $true
+    $activeStreamingOk = $true
     $expectedMinFrames = [uint64]1
     switch ($SubprofileName) {
         'Smoke' {
@@ -580,22 +702,31 @@ function Test-LumaBridgeSubprofileGates {
             }
         }
         default {
-            # Benchmark30s and ProlongedStability strict continuous gates
-            $minDurationUs = [uint64]([double]$ExpectedDurationSec * 950000.0)
-            $durationOk = ($ExpectedDurationSec -gt 0) -and ($durationUs -ge $minDurationUs)
-            $frameBasisSec = [Math]::Max($measuredSec, [double]$ExpectedDurationSec * 0.95)
+            # Benchmark30s and ProlongedStability strict continuous gates (100% nominal connected duration, zero 95% discount)
+            $minDurationUs = [uint64]$ExpectedDurationSec * [uint64]1000000
+            $durationOk = ($ExpectedDurationSec -gt 0) -and ($durationUs -ge $minDurationUs) -and (-not $safetyTimeoutHit)
+            $frameBasisSec = [Math]::Max($measuredSec, [double]$ExpectedDurationSec)
             $expectedMinFrames = [uint64][Math]::Max(1, [int64][Math]::Floor($frameBasisSec * [double]$StimulusFps * $MinFrameRatio))
             $framesCountOk = ($framesValid -ge $expectedMinFrames)
             $minRequiredFps = [double]$StimulusFps * $MinSustainedFpsRatio
-            $sustainedFpsOk = ($measuredFps -ge $minRequiredFps)
+            $connectedFps = if ($measuredSec -gt 0.0) { [double]$framesValid / $measuredSec } else { 0.0 }
+            $sustainedFpsOk = ($measuredFps -ge $minRequiredFps) -and ($connectedFps -ge $minRequiredFps)
+            $minActiveSpanUs = [uint64][Math]::Max(1, [int64][Math]::Floor([double]$minDurationUs * $MinSustainedFpsRatio))
+            $activeStreamingOk = if ($hasActiveStreamingProp) {
+                ($framesValid -ge 2) -and ($activeStreamingUs -ge $minActiveSpanUs)
+            }
+            else {
+                ($framesValid -ge 2)
+            }
             $stimFpsOk = ($StimulusFps -eq $ExpectedStimulusFps) -and ($stimTargetFpsProp -eq $ExpectedStimulusFps)
-            $profileSpecificOk = ($stimStarted -and $stimFpsOk -and $durationOk -and $framesCountOk -and $sustainedFpsOk -and $resolutionOk)
+            $profileSpecificOk = ($qpcClockOk -and $stimStarted -and $stimFpsOk -and $durationOk -and $framesCountOk -and $sustainedFpsOk -and $activeStreamingOk -and $resolutionOk)
 
             if ($summaryValid -and -not $stimStarted) { $reasons.Add('Visual stimulus failed to identify/start on virtual display.') }
             if ($summaryValid -and -not $stimFpsOk) { $reasons.Add(("Stimulus FPS config/target ({0} / {1}) != expected {2}." -f $StimulusFps, $stimTargetFpsProp, $ExpectedStimulusFps)) }
-            if ($summaryValid -and -not $durationOk) { $reasons.Add(("Measured benchmark duration {0:F2}s < required 95% of {1}s." -f $measuredSec, $ExpectedDurationSec)) }
+            if ($summaryValid -and -not $durationOk) { $reasons.Add(("Measured connected duration {0:F3}s < required {1}s." -f $measuredSec, $ExpectedDurationSec)) }
             if ($summaryValid -and -not $framesCountOk) { $reasons.Add(("Valid frames {0} < minimum {1} ({2:P1} at {3} FPS)." -f $framesValid, $expectedMinFrames, $MinFrameRatio, $StimulusFps)) }
-            if ($summaryValid -and -not $sustainedFpsOk) { $reasons.Add(("Sustained FPS {0:F2} < minimum {1:F2} FPS." -f $measuredFps, $minRequiredFps)) }
+            if ($summaryValid -and -not $sustainedFpsOk) { $reasons.Add(("Sustained/connected FPS ({0:F2} / {1:F2}) < minimum {2:F2} FPS." -f $measuredFps, $connectedFps, $minRequiredFps)) }
+            if ($summaryValid -and -not $activeStreamingOk) { $reasons.Add(("Active streaming span {0:F3}s < minimum {1:F3}s." -f ([double]$activeStreamingUs / 1000000.0), ([double]$minActiveSpanUs / 1000000.0))) }
         }
     }
 
@@ -603,6 +734,8 @@ function Test-LumaBridgeSubprofileGates {
         $summaryValid -and
         $procExitedOk -and
         $ipcOk -and
+        $qpcClockOk -and
+        (-not $safetyTimeoutHit) -and
         $temporalEval.SequenceAndTimestampsConsistent -and
         ((-not $RequireGpuShared) -or $gpuSharedPassed) -and
         ((-not $RequireNvenc) -or $nvencPassed) -and
@@ -612,18 +745,22 @@ function Test-LumaBridgeSubprofileGates {
     )
 
     return [pscustomobject]@{
-        SubprofileName       = $SubprofileName
-        SummaryValid         = $summaryValid
-        SummaryStatus        = if ($null -ne $ValidationResult) { $ValidationResult.Status } else { 'MISSING' }
-        ProcessExitedOk      = $procExitedOk
-        IpcOk                = $ipcOk
-        TemporalEval         = $temporalEval
-        GpuSharedPassed      = $gpuSharedPassed
-        NvencPassed          = $nvencPassed
-        H264DecodePassed     = $h264Passed
-        ResolutionOk         = $resolutionOk
-        ProfileSpecificOk    = $profileSpecificOk
-        Passed               = $passed
+        SubprofileName            = $SubprofileName
+        SummaryValid              = $summaryValid
+        SummaryStatus             = if ($null -ne $ValidationResult) { $ValidationResult.Status } else { 'MISSING' }
+        ProcessExitedOk           = $procExitedOk
+        IpcOk                     = $ipcOk
+        QpcClockOk                = $qpcClockOk
+        DurationOk                = $durationOk
+        ActiveStreamingOk         = $activeStreamingOk
+        SafetyExecutionTimeoutHit = $safetyTimeoutHit
+        TemporalEval              = $temporalEval
+        GpuSharedPassed           = $gpuSharedPassed
+        NvencPassed               = $nvencPassed
+        H264DecodePassed          = $h264Passed
+        ResolutionOk              = $resolutionOk
+        ProfileSpecificOk         = $profileSpecificOk
+        Passed                    = $passed
         ExpectedDurationSec  = $ExpectedDurationSec
         MeasuredDurationSec  = [Math]::Round($measuredSec, 3)
         ExpectedMinFrames    = $expectedMinFrames
@@ -934,12 +1071,15 @@ function Build-ProlongedHostArgs {
     )
 
     $durationMs = [int64]$DurationSec * 1000
+    $safetyExecMs = $durationMs + [int64]$ConnectTimeoutMs + 15000
     $minTargetFrames = [int][Math]::Max(1, [int64][Math]::Floor([double]$DurationSec * [double]$StimulusFps * $MinBenchmarkFrameRatio))
     $list = New-Object System.Collections.Generic.List[string]
     foreach ($item in @(
         '--pipe', '\\.\pipe\LumaBridgeFrameIpc_v1',
         '--min-frames', "$minTargetFrames",
         '--duration-ms', "$durationMs",
+        '--duration-counts-connected',
+        '--max-execution-ms', "$safetyExecMs",
         '--connect-timeout-ms', "$ConnectTimeoutMs",
         '--io-timeout-ms', "$IoTimeoutMs",
         '--reconnect',
@@ -1162,6 +1302,8 @@ $acceptanceCriteria = $null
 $validationError = $null
 $driverBindingVerified = $false
 $latencySamplingAudit = @()
+$latencyMethodologyAudit = @()
+$hasEstimatedPercentiles = $false
 $rollbackActions = New-Object System.Collections.Generic.List[string]
 $rollbackIncompleteReasons = New-Object System.Collections.Generic.List[string]
 $unrestoredStateDetails = New-Object System.Collections.Generic.List[string]
@@ -1592,6 +1734,7 @@ try {
     $nvencPassed = ($evalSubList.Count -ge 1)
     $h264DecodePassed = ($evalSubList.Count -ge 1)
     $truncatedMetricsList = New-Object System.Collections.Generic.List[object]
+    $methodologyAuditList = New-Object System.Collections.Generic.List[object]
 
     foreach ($se in $evalSubList) {
         $allSubprofilesPassed = $allSubprofilesPassed -and [bool]$se.Passed
@@ -1605,17 +1748,39 @@ try {
         $gpuSharedPassed = $gpuSharedPassed -and [bool]$se.GpuSharedPassed
         $nvencPassed = $nvencPassed -and [bool]$se.NvencPassed
         $h264DecodePassed = $h264DecodePassed -and [bool]$se.H264DecodePassed
+        $hasEstimatedPercentiles = $hasEstimatedPercentiles -or [bool]$te.HasEstimatedPercentiles
+        foreach ($mm in @($te.LatencyMetricsMethodology)) {
+            $methodologyAuditList.Add([pscustomobject]@{
+                Subprofile              = $se.SubprofileName
+                Scope                   = $mm.Scope
+                MetricName              = $mm.MetricName
+                Available               = $mm.Available
+                PercentilesAvailable    = $mm.PercentilesAvailable
+                PercentilesAreEstimated = $mm.PercentilesAreEstimated
+                PercentileMethod        = $mm.PercentileMethod
+                SampleCount             = $mm.SampleCount
+                StoredSampleCount       = $mm.StoredSampleCount
+                SamplesTruncated        = $mm.SamplesTruncated
+                ReservoirSampled        = $mm.ReservoirSampled
+            })
+        }
         foreach ($tm in @($te.TruncatedLatencyMetrics)) {
             $truncatedMetricsList.Add([pscustomobject]@{
-                Subprofile        = $se.SubprofileName
-                MetricName        = $tm.MetricName
-                SampleCount       = $tm.SampleCount
-                StoredSampleCount = $tm.StoredSampleCount
-                ReservoirSampled  = $tm.ReservoirSampled
+                Subprofile              = $se.SubprofileName
+                Scope                   = $tm.Scope
+                MetricName              = $tm.MetricName
+                PercentilesAvailable    = $tm.PercentilesAvailable
+                PercentilesAreEstimated = $tm.PercentilesAreEstimated
+                PercentileMethod        = $tm.PercentileMethod
+                SampleCount             = $tm.SampleCount
+                StoredSampleCount       = $tm.StoredSampleCount
+                SamplesTruncated        = $tm.SamplesTruncated
+                ReservoirSampled        = $tm.ReservoirSampled
             })
         }
     }
     $latencySamplingAudit = @($truncatedMetricsList.ToArray())
+    $latencyMethodologyAudit = @($methodologyAuditList.ToArray())
     $sequenceAndTimestampsOk = ($seqMonotonicityOk -and $timestampsMonotonicOk -and $timestampsValidOk -and $measurableLatenciesOk -and $temporalCoverageSufficient)
 
     $smokeEvalObj = if ($subprofileEvaluations.Contains('Smoke')) { $subprofileEvaluations['Smoke'] } else { $null }
@@ -1635,7 +1800,7 @@ try {
         $stabilityExecuted -and
         $stabilityPassed -and
         ($StabilityDurationSec -ge $MinProlongedStabilitySec) -and
-        ($null -ne $stabEvalObj -and $stabEvalObj.MeasuredDurationSec -ge ([double]$MinProlongedStabilitySec * 0.95)) -and
+        ($null -ne $stabEvalObj -and $stabEvalObj.MeasuredDurationSec -ge [double]$MinProlongedStabilitySec) -and
         $driverBindingVerified -and
         $wudfProcessHealthy
     )
@@ -1750,6 +1915,7 @@ try {
         LiveTimestampCoveragePercent    = $primaryTemporal.LiveTimestampCoveragePercent
         PresentTimestampCoveragePercent = $primaryTemporal.PresentTimestampCoveragePercent
         NvencExtractToBsCoveragePercent = $primaryTemporal.NvencExtractToBsCoveragePercent
+        HasEstimatedPercentiles         = $hasEstimatedPercentiles
         NoUnauthorizedIpcClients        = $noUnauthorizedIpcClients
         NoNewCrashDumps                 = $noNewCrashDumps
         WudfIdentityStatus              = $wudfIdentityStatus
@@ -1776,7 +1942,8 @@ try {
             'GpuSharedPassed', 'NvencPassed', 'H264DecodePassed',
             'StructuralDecodeValidated', 'FidelityPsnrValidated',
             'TimestampMeasurementErrors', 'CoreTimestampCoveragePercent',
-            'LiveTimestampCoveragePercent', 'PresentTimestampCoveragePercent', 'NvencExtractToBsCoveragePercent'
+            'LiveTimestampCoveragePercent', 'PresentTimestampCoveragePercent', 'NvencExtractToBsCoveragePercent',
+            'HasEstimatedPercentiles'
         )
         $failedFlags = @($acceptanceCriteria.PSObject.Properties | Where-Object { $_.Name -notin $skipEvalNames -and -not [bool]$_.Value } | ForEach-Object { $_.Name })
         if ($runPerfProfile -and -not $perfTargetReached) { $failedFlags += 'PerformanceTargetReached' }
@@ -2109,6 +2276,8 @@ finally {
         BenchmarkGateCriteria         = $benchmarkGateCriteria
         EtwFileSizePolicy             = [pscustomobject]@{ CoreMaxFileSizeMb = $effectiveCoreEtwMaxMb; Note = $(if ($maxSubprofileSec -ge 600) { 'Expanded ETW limit for prolonged run; monitor for log wrap' } else { 'Standard sequential ETW size' }) }
         LatencySamplingAudit          = $latencySamplingAudit
+        LatencyMethodologyAudit       = $latencyMethodologyAudit
+        HasEstimatedPercentiles       = $hasEstimatedPercentiles
         SignedStagingDir              = $signedStagingDir
         CertificateThumbprint         = $signedThumbprint
         CertificateWasPreExisting     = $certWasPreExistingInSnapshot
@@ -2185,8 +2354,25 @@ finally {
                 $seVal.TemporalEval.TimestampMeasurementErrors))
         }
         if ($null -ne $acceptanceCriteria) {
-            $mdLines.Add(("- Acceptance: StructuralDecode=``{0}``, FidelityPSNR=``{1}``, ProlongedStabilityProven=``{2}``, WudfIdentity=``{3}``" -f `
-                $acceptanceCriteria.StructuralDecodeValidated, $acceptanceCriteria.FidelityPsnrValidated, $acceptanceCriteria.ProlongedStabilityProven, $wudfIdentityStatus))
+            $mdLines.Add(("- Acceptance: StructuralDecode=``{0}``, FidelityPSNR=``{1}``, ProlongedStabilityProven=``{2}``, WudfIdentity=``{3}``, HasEstimatedPercentiles=``{4}``" -f `
+                $acceptanceCriteria.StructuralDecodeValidated, $acceptanceCriteria.FidelityPsnrValidated, $acceptanceCriteria.ProlongedStabilityProven, $wudfIdentityStatus, $hasEstimatedPercentiles))
+        }
+        $mdLines.Add('')
+        $mdLines.Add('## Latency & Percentile Methodology')
+        $mdLines.Add(("- HasEstimatedPercentiles: ``{0}`` | AuditedMetrics: ``{1}`` | EstimatedOrTruncatedMetrics: ``{2}``" -f `
+            $hasEstimatedPercentiles, $latencyMethodologyAudit.Count, $latencySamplingAudit.Count))
+        $mdLines.Add('- Exact vs Estimated Percentiles: ``ExactPopulation`` (``PercentilesAreEstimated=false``, ``SamplesTruncated=false``) computes exact nearest-rank percentiles over all ``SampleCount == StoredSampleCount <= 65536`` samples. Above 65536 samples (``SamplesTruncated=true``), ``MinUs``/``AvgUs``/``MaxUs`` remain exact across all ``SampleCount`` samples while ``P50Us``/``P95Us``/``P99Us`` use ``ReservoirSampledEstimate_AlgorithmR`` (``PercentilesAreEstimated=true``) over ``StoredSampleCount=65536`` uniform samples. When ``PercentilesAvailable=false`` (``PercentileMethod=NotAvailable``), ``P50Us``/``P95Us``/``P99Us`` are emitted in JSON as ``null`` instead of ``0``.')
+        foreach ($seKey in $subprofileEvaluations.Keys) {
+            $subAudits = @($latencyMethodologyAudit | Where-Object { $_.Subprofile -eq $seKey })
+            $exactCnt = @($subAudits | Where-Object { $_.PercentileMethod -eq 'ExactPopulation' }).Count
+            $estCnt = @($subAudits | Where-Object { $_.PercentilesAreEstimated }).Count
+            $naCnt = @($subAudits | Where-Object { -not $_.PercentilesAvailable }).Count
+            $mdLines.Add(("- Subprofile ``{0}``: Audited=``{1}`` (Exact=``{2}``, Estimated=``{3}``, NotAvailable=``{4}``)" -f `
+                $seKey, $subAudits.Count, $exactCnt, $estCnt, $naCnt))
+        }
+        foreach ($tm in $latencySamplingAudit) {
+            $mdLines.Add(("- Estimated/Truncated Metric ``{0}`` (Scope=``{1}``, Metric=``{2}``): PercentileMethod=``{3}``, PercentilesAreEstimated=``{4}``, SamplesTruncated=``{5}``, SampleCount=``{6}``, StoredSampleCount=``{7}``" -f `
+                $tm.Subprofile, $tm.Scope, $tm.MetricName, $tm.PercentileMethod, $tm.PercentilesAreEstimated, $tm.SamplesTruncated, $tm.SampleCount, $tm.StoredSampleCount))
         }
         $mdLines.Add('')
         $mdLines.Add('## Rollback Actions')
@@ -2259,6 +2445,9 @@ return [pscustomobject]@{
     ProcessResourceSummary        = $processResourceSummary
     HostSummary                   = $hostSummary
     AcceptanceCriteria            = $acceptanceCriteria
+    HasEstimatedPercentiles       = $hasEstimatedPercentiles
+    LatencySamplingAudit          = $latencySamplingAudit
+    LatencyMethodologyAudit       = $latencyMethodologyAudit
     DiagnosticsResult             = $diagResult
     RollbackActions               = @($rollbackActions.ToArray())
     PostRollbackInstances         = $postRollbackInstances

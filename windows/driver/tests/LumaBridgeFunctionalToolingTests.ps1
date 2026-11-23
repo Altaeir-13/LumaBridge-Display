@@ -2927,19 +2927,66 @@ function New-M01MockHostPayload {
         [int]$ServerProcessId = 8768,
         [bool]$SummaryComplete = $true,
         [bool]$FrameTargetReached = $true,
-        [bool]$StimulusStarted = $true
+        [bool]$StimulusStarted = $true,
+        [int]$DurationMsOverride = 0,
+        [int]$ActiveStreamingDurationMsOverride = -1,
+        [bool]$QpcClockValid = $true,
+        [uint64]$QpcFrequency = 10000000,
+        [bool]$SafetyExecutionTimeoutHit = $false
     )
 
-    $durUs = [uint64]([Math]::Max(1, $DurationSec) * 1000000)
-    $sampleCount = [uint64]([Math]::Max(1, $Frames))
+    $durUs = if ($DurationMsOverride -gt 0) {
+        [uint64]$DurationMsOverride * [uint64]1000
+    }
+    else {
+        [uint64]([Math]::Max(1, $DurationSec) * 1000000)
+    }
+    $activeDurUs = if ($ActiveStreamingDurationMsOverride -ge 0) {
+        [uint64]$ActiveStreamingDurationMsOverride * [uint64]1000
+    }
+    else {
+        $durUs
+    }
+    $sampleCount = [uint64]$Frames
+    $hasSamples = ($sampleCount -gt 0)
+    $isEstimated = ($sampleCount -gt 65536)
+    $storedCount = if ($isEstimated) { [uint64]65536 } else { $sampleCount }
+    $pctMethod = if (-not $hasSamples) {
+        'NotAvailable'
+    }
+    elseif ($isEstimated) {
+        'ReservoirSampledEstimate_AlgorithmR'
+    }
+    else {
+        'ExactPopulation'
+    }
+    $nvSampleCount = [uint64]$NvencEncoded
+    $nvHasSamples = ($nvSampleCount -gt 0)
+    $nvIsEstimated = ($nvSampleCount -gt 65536)
+    $nvStoredCount = if ($nvIsEstimated) { [uint64]65536 } else { $nvSampleCount }
+    $nvPctMethod = if (-not $nvHasSamples) {
+        'NotAvailable'
+    }
+    elseif ($nvIsEstimated) {
+        'ReservoirSampledEstimate_AlgorithmR'
+    }
+    else {
+        'ExactPopulation'
+    }
     return [pscustomobject]@{
         RunId                        = $RunId
         HostProcessId                = 4401
         ServerProcessId              = $ServerProcessId
         SummaryComplete              = $SummaryComplete
-        ExitReason                   = $(if ($DurationSec -ge 30) { 'DurationElapsed' } else { 'FrameTargetReached' })
-        HostProcessExitedNormally    = $true
-        TransportHealthy             = $true
+        ExitReason                   = $(if ($SafetyExecutionTimeoutHit) { 'SafetyExecutionTimeout' } elseif (-not $QpcClockValid -or $QpcFrequency -eq 0) { 'InvalidQpcClock' } elseif ($DurationSec -ge 30) { 'DurationElapsed' } else { 'FrameTargetReached' })
+        HostProcessExitedNormally    = (-not $SafetyExecutionTimeoutHit -and $QpcClockValid -and ($QpcFrequency -gt 0))
+        TransportHealthy             = ($QpcClockValid -and ($QpcFrequency -gt 0))
+        QpcClockValid                = $QpcClockValid
+        QpcFrequency                 = $QpcFrequency
+        DurationCountsConnected      = ($DurationSec -ge 30)
+        RequestedDurationUs          = $durUs
+        DurationTargetReached        = (-not $SafetyExecutionTimeoutHit)
+        SafetyExecutionTimeoutHit    = $SafetyExecutionTimeoutHit
         NegotiatedTransportMode      = 'GpuSharedNtHandle'
         FallbackToCpuActivated       = $false
         GpuFramesOpened              = 3
@@ -2955,7 +3002,10 @@ function New-M01MockHostPayload {
         PreConnectFramesReceived     = 0
         FrameTargetReached           = $FrameTargetReached
         MinFramesReached             = ($Frames -ge 1)
+        TotalExecutionDurationUs     = $durUs
         TotalConnectedDurationUs     = $durUs
+        ActiveStreamingDurationUs    = $activeDurUs
+        LiveStreamingDurationUs      = $activeDurUs
         SustainedLiveFps             = $SustainedFps
         ObservedActiveFps            = $SustainedFps
         ReceiveFps                   = $SustainedFps
@@ -2967,7 +3017,7 @@ function New-M01MockHostPayload {
         LastFrameWidth               = $Width
         LastFrameHeight              = $Height
         LastProtocolStatus           = 'Ok'
-        AvgEndToEndLatencyUs         = 850
+        AvgEndToEndLatencyUs         = $(if ($hasSamples) { 850 } else { 0 })
         TimestampMeasurementErrors   = 0
         OutOfOrderSequenceCount      = 0
         NonMonotonicTimestampCount   = 0
@@ -2978,11 +3028,41 @@ function New-M01MockHostPayload {
         ValidCoreTimestampSamples    = $Frames
         ValidLiveTimestampSamples    = $Frames
         ValidPresentTimestampSamples = $Frames
-        CoreTimestampCoveragePercent = 100.0
-        LiveTimestampCoveragePercent = 100.0
-        PresentTimestampCoveragePercent = 100.0
-        EndToEndLatency              = [pscustomobject]@{ Available = ($Frames -gt 0); SampleCount = $sampleCount; StoredSampleCount = $sampleCount; SamplesTruncated = $false; ReservoirSampled = $false; AvgUs = 850; P95Us = 1200; P99Us = 1400 }
-        LiveEndToEndLatency          = [pscustomobject]@{ Available = ($Frames -gt 0); SampleCount = $sampleCount; StoredSampleCount = $sampleCount; SamplesTruncated = $false; ReservoirSampled = $false; AvgUs = 850; P95Us = 1200; P99Us = 1400 }
+        CoreTimestampCoveragePercent = $(if ($Frames -gt 0) { 100.0 } else { 0.0 })
+        LiveTimestampCoveragePercent = $(if ($Frames -gt 0) { 100.0 } else { 0.0 })
+        PresentTimestampCoveragePercent = $(if ($Frames -gt 0) { 100.0 } else { 0.0 })
+        EndToEndLatency              = [pscustomobject]@{
+            Available               = $hasSamples
+            PercentilesAvailable    = $hasSamples
+            PercentilesAreEstimated = $isEstimated
+            PercentileMethod        = $pctMethod
+            SampleCount             = $sampleCount
+            StoredSampleCount       = $storedCount
+            SamplesTruncated        = $isEstimated
+            ReservoirSampled        = $isEstimated
+            MinUs                   = $(if ($hasSamples) { 500 } else { 0 })
+            AvgUs                   = $(if ($hasSamples) { 850 } else { 0 })
+            MaxUs                   = $(if ($hasSamples) { 1600 } else { 0 })
+            P50Us                   = $(if ($hasSamples) { 840 } else { $null })
+            P95Us                   = $(if ($hasSamples) { 1200 } else { $null })
+            P99Us                   = $(if ($hasSamples) { 1400 } else { $null })
+        }
+        LiveEndToEndLatency          = [pscustomobject]@{
+            Available               = $hasSamples
+            PercentilesAvailable    = $hasSamples
+            PercentilesAreEstimated = $isEstimated
+            PercentileMethod        = $pctMethod
+            SampleCount             = $sampleCount
+            StoredSampleCount       = $storedCount
+            SamplesTruncated        = $isEstimated
+            ReservoirSampled        = $isEstimated
+            MinUs                   = $(if ($hasSamples) { 500 } else { 0 })
+            AvgUs                   = $(if ($hasSamples) { 850 } else { 0 })
+            MaxUs                   = $(if ($hasSamples) { 1600 } else { 0 })
+            P50Us                   = $(if ($hasSamples) { 840 } else { $null })
+            P95Us                   = $(if ($hasSamples) { 1200 } else { $null })
+            P99Us                   = $(if ($hasSamples) { 1400 } else { $null })
+        }
         Nvenc                        = [pscustomobject]@{
             Initialized                       = $true
             Width                             = $Width
@@ -2993,8 +3073,47 @@ function New-M01MockHostPayload {
             EncodedQueueDrops                 = $EncodedQueueDrops
             TotalBitstreamBytes               = ([uint64]([Math]::Max(1, $NvencEncoded)) * 30000)
             InvalidTimestampCount             = 0
-            ExtractToBitstreamCoveragePercent = 100.0
+            ExtractToBitstreamCoveragePercent = $(if ($nvHasSamples) { 100.0 } else { 0.0 })
             EncoderOutputFps                  = $EncoderOutputFps
+            EncodeLatencyUs                   = [pscustomobject]@{
+                Available               = $nvHasSamples
+                PercentilesAvailable    = $nvHasSamples
+                PercentilesAreEstimated = $nvIsEstimated
+                PercentileMethod        = $nvPctMethod
+                SampleCount             = $nvSampleCount
+                StoredSampleCount       = $nvStoredCount
+                SamplesTruncated        = $nvIsEstimated
+                ReservoirSampled        = $nvIsEstimated
+                P50Us                   = $(if ($nvHasSamples) { 900 } else { $null })
+                P95Us                   = $(if ($nvHasSamples) { 1300 } else { $null })
+                P99Us                   = $(if ($nvHasSamples) { 1500 } else { $null })
+            }
+            PresentToBitstreamLatencyUs       = [pscustomobject]@{
+                Available               = $nvHasSamples
+                PercentilesAvailable    = $nvHasSamples
+                PercentilesAreEstimated = $nvIsEstimated
+                PercentileMethod        = $nvPctMethod
+                SampleCount             = $nvSampleCount
+                StoredSampleCount       = $nvStoredCount
+                SamplesTruncated        = $nvIsEstimated
+                ReservoirSampled        = $nvIsEstimated
+                P50Us                   = $(if ($nvHasSamples) { 1400 } else { $null })
+                P95Us                   = $(if ($nvHasSamples) { 1900 } else { $null })
+                P99Us                   = $(if ($nvHasSamples) { 2100 } else { $null })
+            }
+            ExtractToBitstreamLatencyUs       = [pscustomobject]@{
+                Available               = $nvHasSamples
+                PercentilesAvailable    = $nvHasSamples
+                PercentilesAreEstimated = $nvIsEstimated
+                PercentileMethod        = $nvPctMethod
+                SampleCount             = $nvSampleCount
+                StoredSampleCount       = $nvStoredCount
+                SamplesTruncated        = $nvIsEstimated
+                ReservoirSampled        = $nvIsEstimated
+                P50Us                   = $(if ($nvHasSamples) { 1200 } else { $null })
+                P95Us                   = $(if ($nvHasSamples) { 1700 } else { $null })
+                P99Us                   = $(if ($nvHasSamples) { 1900 } else { $null })
+            }
         }
         H264DecodeValidation         = [pscustomobject]@{
             Passed                    = $true
@@ -3950,6 +4069,248 @@ Invoke-UnitTest -Name 'M01_S08_HostSecurityVbsHvciAndServicesReadOnlyDiagnostics
     Assert-True ($null -ne $prereqOut.RequiredServices.WUDFRd) 'Live Prerequisites exposes RequiredServices.WUDFRd'
     Assert-True ($null -ne $prereqOut.ApiAvailability) 'Live Prerequisites exposes ApiAvailability'
     Assert-True (-not [string]::IsNullOrWhiteSpace($prereqOut.HostOs.Architecture)) 'Live HostOs exposes Architecture'
+}
+
+# 50. M0.2.1: Benchmark30s eliminates 95% discount — rejects 28.500s & 29.999s, accepts 30.000s connected
+Invoke-UnitTest -Name 'M021_Benchmark30sRejects28500MsAnd29999MsAndAccepts30000Ms' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+
+    foreach ($tc in @(
+        @{ Name = '28500ms'; DurMs = 28500; Frames = 1764; ExpectPass = $false },
+        @{ Name = '29999ms'; DurMs = 29999; Frames = 1799; ExpectPass = $false },
+        @{ Name = '30000ms'; DurMs = 30000; Frames = 1800; ExpectPass = $true }
+    )) {
+        $h = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey ("M021_B30_{0}" -f $tc.Name)
+        $durCapture = $tc.DurMs
+        $framesCapture = $tc.Frames
+        $h.State.HostHandler = {
+            param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+            $payload = New-M01MockHostPayload -RunId $runIdVal -Frames $framesCapture -DurationSec 30 -DurationMsOverride $durCapture -ActiveStreamingDurationMsOverride $durCapture -NvencSubmitted $framesCapture -NvencEncoded $framesCapture -H264Decoded $framesCapture
+            # Inflate execution wall clock beyond 30s to prove TotalConnectedDurationUs (not TotalExecutionDurationUs) gates pass/fail.
+            $payload.TotalExecutionDurationUs = [uint64]35000000
+            $payload | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+            return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] ok'); StdErr = @(); DryRun = $false }
+        }.GetNewClosure()
+
+        $outDir = Join-Path $caseDir ("out_b30_{0}" -f $tc.Name)
+        Invoke-WithModuleMocks -GlobalMocks $h.Mocks -ModuleMocks $h.Mocks -Body {
+            if ($tc.ExpectPass) {
+                $res = & $valScript -Configuration Release -TestProfile Benchmark30s -BenchmarkDurationSec 30 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $h.State.StagingDir -OutputDir $outDir -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+                Assert-Equal $res.AcceptanceCriteria.Benchmark30sPassed $true '30000ms connected passes Benchmark30s'
+                Assert-Equal $res.SubprofileEvaluations.Benchmark30s.DurationOk $true 'Benchmark30s DurationOk=true at 30000ms'
+            }
+            else {
+                Assert-Throws {
+                    & $valScript -Configuration Release -TestProfile Benchmark30s -BenchmarkDurationSec 30 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $h.State.StagingDir -OutputDir $outDir -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+                } -ExpectedPattern 'Benchmark30sPassed' -Message ("Connected {0} (<30000ms) must fail Benchmark30s" -f $tc.Name)
+                $rep = Get-Content -LiteralPath (Join-Path $outDir 'functional-validation-report.json') -Raw | ConvertFrom-Json
+                Assert-Equal $rep.SubprofileEvaluations.Benchmark30s.DurationOk $false ("DurationOk=false for {0}" -f $tc.Name)
+                Assert-Equal $rep.AcceptanceCriteria.Benchmark30sPassed $false ("Benchmark30sPassed=false for {0}" -f $tc.Name)
+            }
+        }
+    }
+}
+
+# 51. M0.2.1: ProlongedStability 180s rejects 171s & 179.999s and accepts 180.000s (ProlongedStabilityProven=true)
+Invoke-UnitTest -Name 'M021_ProlongedStability180sRejects171sAnd179999MsAndAccepts180000Ms' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+
+    foreach ($tc in @(
+        @{ Name = '171000ms'; DurMs = 171000; Frames = 10584; ExpectPass = $false },
+        @{ Name = '179999ms'; DurMs = 179999; Frames = 10799; ExpectPass = $false },
+        @{ Name = '180000ms'; DurMs = 180000; Frames = 10800; ExpectPass = $true }
+    )) {
+        $h = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey ("M021_Stab_{0}" -f $tc.Name)
+        $durCapture = $tc.DurMs
+        $framesCapture = $tc.Frames
+        $h.State.HostHandler = {
+            param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+            $payload = New-M01MockHostPayload -RunId $runIdVal -Frames $framesCapture -DurationSec 180 -DurationMsOverride $durCapture -ActiveStreamingDurationMsOverride $durCapture -NvencSubmitted $framesCapture -NvencEncoded $framesCapture -H264Decoded $framesCapture
+            $payload.TotalExecutionDurationUs = [uint64]190000000
+            $payload | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+            return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] ok'); StdErr = @(); DryRun = $false }
+        }.GetNewClosure()
+
+        $outDir = Join-Path $caseDir ("out_stab_{0}" -f $tc.Name)
+        Invoke-WithModuleMocks -GlobalMocks $h.Mocks -ModuleMocks $h.Mocks -Body {
+            if ($tc.ExpectPass) {
+                $res = & $valScript -Configuration Release -TestProfile ProlongedStability -StabilityDurationSec 180 -MinProlongedStabilitySec 180 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $h.State.StagingDir -OutputDir $outDir -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+                Assert-Equal $res.AcceptanceCriteria.ProlongedStabilityPassed $true '180000ms connected passes ProlongedStability'
+                Assert-Equal $res.AcceptanceCriteria.ProlongedStabilityProven $true '180000ms connected sets ProlongedStabilityProven=true'
+            }
+            else {
+                Assert-Throws {
+                    & $valScript -Configuration Release -TestProfile ProlongedStability -StabilityDurationSec 180 -MinProlongedStabilitySec 180 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $h.State.StagingDir -OutputDir $outDir -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+                } -ExpectedPattern 'ProlongedStabilityPassed' -Message ("Connected {0} (<180000ms) must fail ProlongedStability" -f $tc.Name)
+                $rep = Get-Content -LiteralPath (Join-Path $outDir 'functional-validation-report.json') -Raw | ConvertFrom-Json
+                Assert-Equal $rep.AcceptanceCriteria.ProlongedStabilityProven $false ("ProlongedStabilityProven=false for {0}" -f $tc.Name)
+            }
+        }
+    }
+}
+
+# 52. M0.2.1: Invalid QPC clock, idle connected pipe, and safety wall-clock timeout are all rejected
+Invoke-UnitTest -Name 'M021_InvalidQpcClockIdleConnectedPipeAndSafetyTimeoutRejected' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+
+    # Case A: QpcClockValid = false & QpcFrequency = 0
+    $hQpc = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'M021_InvalidQpc'
+    $hQpc.State.HostHandler = {
+        param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+        $payload = New-M01MockHostPayload -RunId $runIdVal -Frames 60 -DurationSec 2 -QpcClockValid $false -QpcFrequency 0
+        $payload | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+        return [pscustomobject]@{ ExitCode = 1; TimedOut = $false; ProcessId = 4401; Output = @(); StdErr = @('InvalidQpcClock'); DryRun = $false }
+    }
+    $outQpc = Join-Path $caseDir 'out_qpc_fail'
+    Invoke-WithModuleMocks -GlobalMocks $hQpc.Mocks -ModuleMocks $hQpc.Mocks -Body {
+        Assert-Throws {
+            & $valScript -Configuration Release -TestProfile Smoke -StagingDir $hQpc.State.StagingDir -OutputDir $outQpc -HostExecutablePath $hQpc.State.FakeHostExe -CertificateThumbprint $hQpc.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        } -ExpectedPattern 'RollbackClean=True' -Message 'Invalid QPC clock (QpcClockValid=false, QpcFrequency=0) must fail Smoke'
+    }
+    $repQpc = Get-Content -LiteralPath (Join-Path $outQpc 'functional-validation-report.json') -Raw | ConvertFrom-Json
+    Assert-Equal $repQpc.SubprofileEvaluations.Smoke.QpcClockOk $false 'QpcClockOk=false recorded'
+
+    # Case B: Idle connected pipe (30s connected, short burst or 0 active span -> ActiveStreamingDurationUs = 1000ms)
+    $hIdle = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'M021_IdlePipe'
+    $hIdle.State.HostHandler = {
+        param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+        $payload = New-M01MockHostPayload -RunId $runIdVal -Frames 1800 -DurationSec 30 -DurationMsOverride 30000 -ActiveStreamingDurationMsOverride 1000 -NvencSubmitted 1800 -NvencEncoded 1800 -H264Decoded 1800
+        $payload | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+        return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] ok'); StdErr = @(); DryRun = $false }
+    }
+    $outIdle = Join-Path $caseDir 'out_idle_pipe'
+    Invoke-WithModuleMocks -GlobalMocks $hIdle.Mocks -ModuleMocks $hIdle.Mocks -Body {
+        Assert-Throws {
+            & $valScript -Configuration Release -TestProfile Benchmark30s -BenchmarkDurationSec 30 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $hIdle.State.StagingDir -OutputDir $outIdle -HostExecutablePath $hIdle.State.FakeHostExe -CertificateThumbprint $hIdle.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        } -ExpectedPattern 'Benchmark30sPassed' -Message 'Burst + 29s idle connected pipe must fail Benchmark30s ActiveStreamingOk gate'
+    }
+    $repIdle = Get-Content -LiteralPath (Join-Path $outIdle 'functional-validation-report.json') -Raw | ConvertFrom-Json
+    Assert-Equal $repIdle.SubprofileEvaluations.Benchmark30s.ActiveStreamingOk $false 'ActiveStreamingOk=false for 1s burst over 30s connection'
+
+    # Case C: SafetyExecutionTimeoutHit = true
+    $hTimeout = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'M021_SafetyTo'
+    $hTimeout.State.HostHandler = {
+        param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+        $payload = New-M01MockHostPayload -RunId $runIdVal -Frames 900 -DurationSec 30 -DurationMsOverride 15000 -ActiveStreamingDurationMsOverride 15000 -NvencSubmitted 900 -NvencEncoded 900 -H264Decoded 900 -SafetyExecutionTimeoutHit $true
+        $payload | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+        return [pscustomobject]@{ ExitCode = 1; TimedOut = $false; ProcessId = 4401; Output = @(); StdErr = @('SafetyExecutionTimeout'); DryRun = $false }
+    }
+    $outTo = Join-Path $caseDir 'out_safety_to'
+    Invoke-WithModuleMocks -GlobalMocks $hTimeout.Mocks -ModuleMocks $hTimeout.Mocks -Body {
+        Assert-Throws {
+            & $valScript -Configuration Release -TestProfile Benchmark30s -BenchmarkDurationSec 30 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $hTimeout.State.StagingDir -OutputDir $outTo -HostExecutablePath $hTimeout.State.FakeHostExe -CertificateThumbprint $hTimeout.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        } -ExpectedPattern 'Benchmark30sPassed' -Message 'SafetyExecutionTimeoutHit=true must fail Benchmark30s'
+    }
+    $repTo = Get-Content -LiteralPath (Join-Path $outTo 'functional-validation-report.json') -Raw | ConvertFrom-Json
+    Assert-Equal $repTo.SubprofileEvaluations.Benchmark30s.SafetyExecutionTimeoutHit $true 'SafetyExecutionTimeoutHit=true recorded'
+}
+
+# 53. M0.2.1: Percentile methodology audits Host + NVENC metrics across exact (<=65536), estimated (>65536), and null (0 samples)
+Invoke-UnitTest -Name 'M021_PercentileMethodologyAuditsHostAndNvencExactEstimatedAndNullUnavailable' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+
+    # Case A: 65536 samples -> ExactPopulation (HasEstimatedPercentiles=false)
+    $hExact = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'M021_PctExact'
+    $hExact.State.HostHandler = {
+        param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+        $payload = New-M01MockHostPayload -RunId $runIdVal -Frames 65536 -DurationSec 180 -DurationMsOverride 180000 -ActiveStreamingDurationMsOverride 180000 -NvencSubmitted 65536 -NvencEncoded 65536 -H264Decoded 65536
+        # Include an unused metric with 0 samples & JSON null percentiles to verify NotAvailable/null handling
+        $payload | Add-Member -NotePropertyName 'HostVerifyAckLatency' -NotePropertyValue ([pscustomobject]@{
+            Available = $false; PercentilesAvailable = $false; PercentilesAreEstimated = $false; PercentileMethod = 'NotAvailable';
+            SampleCount = 0; StoredSampleCount = 0; SamplesTruncated = $false; ReservoirSampled = $false;
+            MinUs = 0; AvgUs = 0; MaxUs = 0; P50Us = $null; P95Us = $null; P99Us = $null; LastUs = 0
+        })
+        $payload | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+        return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] ok'); StdErr = @(); DryRun = $false }
+    }
+    $outExact = Join-Path $caseDir 'out_pct_exact'
+    Invoke-WithModuleMocks -GlobalMocks $hExact.Mocks -ModuleMocks $hExact.Mocks -Body {
+        $resExact = & $valScript -Configuration Release -TestProfile ProlongedStability -StabilityDurationSec 180 -MinProlongedStabilitySec 180 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $hExact.State.StagingDir -OutputDir $outExact -HostExecutablePath $hExact.State.FakeHostExe -CertificateThumbprint $hExact.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        Assert-Equal $resExact.HasEstimatedPercentiles $false '65536 samples must have HasEstimatedPercentiles=false'
+        Assert-Equal @($resExact.LatencySamplingAudit).Count 0 '65536 samples must have empty LatencySamplingAudit'
+        $hostLiveAudit = @($resExact.LatencyMethodologyAudit | Where-Object { $_.MetricName -eq 'LiveEndToEndLatency' })[0]
+        $nvEncAudit = @($resExact.LatencyMethodologyAudit | Where-Object { $_.MetricName -eq 'Nvenc.EncodeLatencyUs' })[0]
+        $ackAudit = @($resExact.LatencyMethodologyAudit | Where-Object { $_.MetricName -eq 'HostVerifyAckLatency' })[0]
+        Assert-Equal $hostLiveAudit.PercentileMethod 'ExactPopulation' 'Host LiveEndToEndLatency uses ExactPopulation at 65536'
+        Assert-Equal $nvEncAudit.PercentileMethod 'ExactPopulation' 'Nvenc.EncodeLatencyUs uses ExactPopulation at 65536'
+        Assert-Equal $ackAudit.PercentileMethod 'NotAvailable' '0-sample metric uses NotAvailable'
+        Assert-Equal $ackAudit.PercentilesAvailable $false '0-sample metric sets PercentilesAvailable=false'
+        $repExactJson = Get-Content -LiteralPath $resExact.ReportJsonPath -Raw | ConvertFrom-Json
+        Assert-Equal $repExactJson.HasEstimatedPercentiles $false 'Report JSON persists HasEstimatedPercentiles=false'
+        Assert-True (@($repExactJson.LatencyMethodologyAudit).Count -ge 4) 'Report JSON persists LatencyMethodologyAudit'
+    }
+
+    # Case B: 65537+ samples (e.g. 216000) -> ReservoirSampledEstimate_AlgorithmR on Host & NVENC + Markdown section
+    $hEst = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'M021_PctEst'
+    $hEst.State.HostHandler = {
+        param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+        $payload = New-M01MockHostPayload -RunId $runIdVal -Frames 216000 -DurationSec 180 -DurationMsOverride 180000 -ActiveStreamingDurationMsOverride 180000 -NvencSubmitted 216000 -NvencEncoded 216000 -H264Decoded 216000
+        $payload | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+        return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] ok'); StdErr = @(); DryRun = $false }
+    }
+    $outEst = Join-Path $caseDir 'out_pct_est'
+    Invoke-WithModuleMocks -GlobalMocks $hEst.Mocks -ModuleMocks $hEst.Mocks -Body {
+        $resEst = & $valScript -Configuration Release -TestProfile ProlongedStability -StabilityDurationSec 180 -MinProlongedStabilitySec 180 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $hEst.State.StagingDir -OutputDir $outEst -HostExecutablePath $hEst.State.FakeHostExe -CertificateThumbprint $hEst.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        Assert-Equal $resEst.HasEstimatedPercentiles $true '216000 samples must set HasEstimatedPercentiles=true'
+        $hostTrunc = @($resEst.LatencySamplingAudit | Where-Object { $_.MetricName -eq 'LiveEndToEndLatency' })
+        $nvTrunc = @($resEst.LatencySamplingAudit | Where-Object { $_.MetricName -eq 'Nvenc.EncodeLatencyUs' })
+        Assert-Equal $hostTrunc.Count 1 'Host LiveEndToEndLatency recorded in LatencySamplingAudit'
+        Assert-Equal $nvTrunc.Count 1 'Nvenc.EncodeLatencyUs recorded in LatencySamplingAudit'
+        Assert-Equal $nvTrunc[0].Scope 'Nvenc' 'NVENC metric scope tagged Nvenc'
+        Assert-Equal $nvTrunc[0].PercentileMethod 'ReservoirSampledEstimate_AlgorithmR' 'NVENC metric uses ReservoirSampledEstimate_AlgorithmR'
+        Assert-Equal $nvTrunc[0].PercentilesAreEstimated $true 'NVENC metric PercentilesAreEstimated=true'
+        $mdText = Get-Content -LiteralPath (Join-Path $outEst 'functional-validation-report.md') -Raw
+        Assert-True ($mdText -match '## Latency & Percentile Methodology') 'Markdown report contains Latency & Percentile Methodology heading'
+        Assert-True ($mdText -match 'ReservoirSampledEstimate_AlgorithmR') 'Markdown report documents ReservoirSampledEstimate_AlgorithmR'
+        Assert-True ($mdText -match 'Nvenc\.EncodeLatencyUs') 'Markdown report lists estimated NVENC metric'
+    }
+}
+
+# 54. M0.2.1: Benchmark30s and ProlongedStability DryRun forward --duration-counts-connected & --max-execution-ms
+Invoke-UnitTest -Name 'M021_ProlongedDryRunForwardsConnectedDurationAndSafetyExecutionFlags' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+    $h = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'M021_DryFlags'
+    $global:LbTestState['M021_CapturedDryArgs'] = New-Object System.Collections.Generic.List[object]
+
+    $mocks = @{}
+    foreach ($k in $h.Mocks.Keys) { $mocks[$k] = $h.Mocks[$k] }
+    $mocks['Invoke-LumaBridgeHostProcess'] = {
+        [CmdletBinding()]
+        param([string]$ExecutablePath, [string[]]$Arguments = @(), [int]$HardTimeoutMs = 90000, [int]$ResourceSampleIntervalSec = 1, [Nullable[int]]$WudfProcessId = $null, [switch]$DryRun)
+        if ($DryRun) {
+            $entry = [pscustomobject]@{
+                Args        = @($Arguments)
+                CommandLine = ($Arguments -join ' ')
+            }
+            $null = $global:LbTestState['M021_CapturedDryArgs'].Add($entry)
+            return [pscustomobject]@{ DryRun = $true; CommandLine = $entry.CommandLine; Arguments = $entry.Args }
+        }
+        return [pscustomobject]@{ ExitCode = 0; TimedOut = $false }
+    }
+
+    Invoke-WithModuleMocks -GlobalMocks $mocks -ModuleMocks $mocks -Body {
+        $dryFull = & $valScript -Configuration Release -TestProfile Full -BenchmarkDurationSec 30 -StabilityDurationSec 180 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $h.State.StagingDir -OutputDir (Join-Path $caseDir 'out_dry_full') -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -SkipDriverInstall -DryRun
+        Assert-Equal $dryFull.DryRun $true 'DryRun Full returns DryRun=true'
+        $captured = $global:LbTestState['M021_CapturedDryArgs']
+        Assert-Equal $captured.Count 3 'DryRun Full captures Smoke, Benchmark30s, and ProlongedStability host calls'
+        $b30Call = @($captured | Where-Object { $_.Args -contains '30000' })
+        $stabCall = @($captured | Where-Object { $_.Args -contains '180000' })
+        Assert-True ($b30Call.Count -eq 1) 'Benchmark30s dry-run invocation captured'
+        Assert-True ($stabCall.Count -eq 1) 'ProlongedStability dry-run invocation captured'
+        $b30Args = @($b30Call[0].Args)
+        $stabArgs = @($stabCall[0].Args)
+        Assert-True ($b30Args -contains '--duration-counts-connected') 'Benchmark30s forwards --duration-counts-connected'
+        Assert-True ($b30Args -contains '--max-execution-ms') 'Benchmark30s forwards --max-execution-ms'
+        Assert-True ($stabArgs -contains '--duration-counts-connected') 'ProlongedStability forwards --duration-counts-connected'
+        Assert-True ($stabArgs -contains '--max-execution-ms') 'ProlongedStability forwards --max-execution-ms'
+        Assert-True ($dryFull.Benchmark30sHostPreview.CommandLine -match '--duration-counts-connected') 'Benchmark30sHostPreview exposes --duration-counts-connected'
+        Assert-True ($dryFull.StabilityHostPreview.CommandLine -match '--max-execution-ms') 'StabilityHostPreview exposes --max-execution-ms'
+    }
 }
 
 try {
