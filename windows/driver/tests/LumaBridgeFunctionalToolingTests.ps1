@@ -1968,6 +1968,166 @@ Invoke-UnitTest -Name 'DiagnosticStageBuildManifestAndSubkeyBreadcrumbs' -TestBo
     Assert-Equal $parsedManifest.DllSha256 $stageResult.DllSha256 'JSON manifest DllSha256 matches result'
 }
 
+# 29. Observability fixes: VerifyProviders top-level flag, unclamped ETL query despite old PnP events, and TraceLogging recovery
+Invoke-UnitTest -Name 'ObservabilityVerifyProvidersAndUnclampedEtlTraceLoggingRecovery' -TestBody {
+    param($caseDir)
+
+    $c = Get-LumaBridgeDriverConstants
+    $mockLogmanLines = @(
+        'Name:                 LumaBridgeIddCore',
+        ('Provider:             {0}' -f $c.LumaBridgeTraceProviderGuid),
+        ('Provider:             {0}' -f $c.IddCxManifestProviderGuid),
+        ('Provider:             {0}' -f $c.IddCxWppProviderGuid),
+        ('Provider:             {0}' -f $c.UmdfOperationalProviderGuid),
+        ('Provider:             {0}' -f $c.WdfCoreWppProviderGuid),
+        ('Provider:             {0}' -f $c.WerKernelProviderGuid)
+    )
+    $global:LbTestState['MockLogmanLines'] = $mockLogmanLines
+
+    Invoke-WithModuleMocks -GlobalMocks @{
+        'Invoke-LumaBridgeExternalCommand' = {
+            param([string]$FilePath, [string[]]$Arguments, [switch]$DryRun)
+            return [pscustomobject]@{
+                ExitCode = 0
+                Output   = $global:LbTestState['MockLogmanLines']
+                DryRun   = $false
+            }
+        }
+    } -Body {
+        $verifyOut = & (Join-Path $scriptsDir 'Invoke-LumaBridgeEtwTrace.ps1') -Action VerifyProviders
+        Assert-Equal $verifyOut.AllProvidersVerified $true 'VerifyProviders exposes top-level AllProvidersVerified=$true'
+        Assert-Equal $verifyOut.ProviderVerification.AllProvidersVerified $true 'VerifyProviders preserves nested ProviderVerification.AllProvidersVerified=$true'
+        Assert-Equal @($verifyOut.MissingProviderGuids).Count 0 'VerifyProviders exposes empty MissingProviderGuids at top level'
+    }
+
+    # Test targeted TraceLogging recovery when Pass 1 hits MaxMatchedEvents cap with GUID-only event
+    $dummyEtl = Join-Path $caseDir 'obs_test.etl'
+    [System.IO.File]::WriteAllBytes($dummyEtl, [byte[]]@(1, 2, 3, 4))
+    $global:LbTestState['ReaderCalls'] = 0
+
+    Invoke-WithModuleMocks -ModuleMocks @{
+        'Get-LumaBridgeEtlTraceStats' = {
+            param([string]$EtlPath)
+            return [pscustomobject]@{ Available = $true; CircularWrapWarning = $null; Error = '' }
+        }
+        'Invoke-LumaBridgeEtlXPathReader' = {
+            param([string]$EtlPath, [string]$XPath, [int]$MaxMatchedEvents)
+            $global:LbTestState['ReaderCalls'] = [int]$global:LbTestState['ReaderCalls'] + 1
+            if ($global:LbTestState['ReaderCalls'] -eq 1) {
+                return [pscustomobject]@{
+                    LimitReached = $true
+                    Events       = @(
+                        [pscustomobject]@{
+                            TimeCreated  = '2026-11-22T12:00:00.000Z'
+                            ProviderName = ''
+                            ProviderId   = '{d92bcb52-fa78-406f-a9a5-2037509fadea}'
+                            Id           = 10
+                            LevelDisplay = 'Information'
+                            ProcessId    = 8768
+                            ThreadId     = 100
+                            Message      = ''
+                            Properties   = @()
+                        }
+                    )
+                }
+            }
+            return [pscustomobject]@{
+                LimitReached = $false
+                Events       = @(
+                    [pscustomobject]@{
+                        TimeCreated  = '2026-11-22T12:00:05.000Z'
+                        ProviderName = ''
+                        ProviderId   = '{a7e4c910-5b32-4f8e-9d21-7c3a1b8e4f01}'
+                        Id           = 0
+                        LevelDisplay = 'Information'
+                        ProcessId    = 8768
+                        ThreadId     = 200
+                        Message      = '[LB-DRIVER] [INFO] pid=8768 tid=200 stage=AdapterInitFinished status=0x00000000 state=AdapterReady lastOk=AdapterInitAsync msg="ok"'
+                        Properties   = @('INFO', '8768', '200', 'AdapterInitFinished', '0', 'AdapterReady', 'AdapterInitAsync', 'ok')
+                    },
+                    [pscustomobject]@{
+                        TimeCreated  = '2026-11-22T12:00:06.000Z'
+                        ProviderName = ''
+                        ProviderId   = '{a7e4c910-5b32-4f8e-9d21-7c3a1b8e4f01}'
+                        Id           = 1
+                        LevelDisplay = 'Information'
+                        ProcessId    = 8768
+                        ThreadId     = 200
+                        Message      = '[LB-DRIVER] [METRICS/ETL] stage=MonitorAssignSwapChain fields=29'
+                        Properties   = @('MonitorAssignSwapChain', 'AdapterReady', 'Arrived', 'Active', 'True', '19', '19', '0', '60', '60', 'True', '19', '19', '19', '0', '0', '0', '0', '1', '19', '120', '450', '0', '0', '0', '0', '1024', '2048', '100')
+                    }
+                )
+            }
+        }
+    } -Body {
+        $etlSummary = Get-LumaBridgeEtlEventSummary -EtlPath $dummyEtl -MaxMatchedEvents 500
+        Assert-Equal $global:LbTestState['ReaderCalls'] 2 'Targeted second pass executes when LimitReached=true and LumaBridgeEvents=0'
+        Assert-Equal $etlSummary.TargetedLumaBridgeQueryUsed $true 'TargetedLumaBridgeQueryUsed flag set'
+        Assert-Equal @($etlSummary.LumaBridgeEvents).Count 2 'Both GUID-only TraceLogging events recovered'
+
+        $stageSum = Get-LumaBridgeDriverTraceStageSummary -EtlEvents @($etlSummary.LumaBridgeEvents)
+        Assert-Equal $stageSum.DriverEntryReached $true 'DriverEntryReached detected from GUID-only TraceLogging event'
+        Assert-Equal $stageSum.StageRecordCount 1 '29-field DriverMetrics event not misparsed as 8-field DriverStage record'
+        Assert-Equal $stageSum.LastStage 'AdapterInitFinished' 'LastStage extracted from GUID-only DriverStage record'
+    }
+
+    # Verify Collect-LumaBridgeDiagnostics does not clamp ETL StartTimeUtc/EndTimeUtc to older PnP events
+    $diagOutDir = Join-Path $caseDir 'diag_out'
+    $fakeSetupLog = Join-Path $caseDir 'setupapi_obs.log'
+    [System.IO.File]::WriteAllText($fakeSetupLog, '')
+    $global:LbTestState['CapturedEtlStart'] = 'NOT_SET'
+    $global:LbTestState['CapturedEtlEnd'] = 'NOT_SET'
+
+    Invoke-WithModuleMocks -GlobalMocks @{
+        'Get-LumaBridgeEventChannelStatus' = {
+            return @([pscustomobject]@{ LogName = 'Microsoft-Windows-Kernel-PnP/Configuration'; IsEnabled = $true; LogType = 'Operational'; RecordCount = 1; QueryError = '' })
+        }
+        'Get-LumaBridgeDiagnosticEvents' = {
+            param([int]$LookbackMinutes, [string[]]$InstanceIds, [string[]]$PublishedInfNames, [object[]]$ChannelStatus)
+            return @(
+                [pscustomobject]@{
+                    LogName       = 'Microsoft-Windows-Kernel-PnP/Configuration'
+                    TimeCreated   = '2026-11-22T11:00:00.000Z'
+                    LevelDisplay  = 'Information'
+                    Id            = 400
+                    EventRecordId = 1
+                    ProcessId     = 4
+                    ProviderName  = 'Microsoft-Windows-Kernel-PnP'
+                    Message       = 'Old PnP configure event'
+                }
+            )
+        }
+        'Get-LumaBridgeCrashDumpInventory' = {
+            return [pscustomobject]@{ LookbackMinutes = 60; Locations = @(); Files = @(); TotalFoundCount = 0 }
+        }
+        'Get-LumaBridgeEtlEventSummary' = {
+            param([string]$EtlPath, [string[]]$ProviderGuids = @(), [string[]]$ProviderNames = @(), [Nullable[DateTime]]$StartTimeUtc = $null, [Nullable[DateTime]]$EndTimeUtc = $null, [Nullable[int]]$ProcessId = $null, [int]$MaxMatchedEvents = 500, [switch]$ExcludeHighVolumeGraphics)
+            $global:LbTestState['CapturedEtlStart'] = $StartTimeUtc
+            $global:LbTestState['CapturedEtlEnd'] = $EndTimeUtc
+            return [pscustomobject]@{
+                EtlPath               = $EtlPath
+                Exists                = $true
+                EventCount            = 1
+                MatchedEventCount     = 1
+                MatchedLimitReached   = $false
+                FilteredOutHighVolume = $true
+                XPathUsed             = '*'
+                TraceStats            = $null
+                CircularWrapWarning   = $null
+                LumaBridgeEvents      = @()
+                Providers             = @()
+                Events                = @()
+                Error                 = ''
+            }
+        }
+    } -Body {
+        $diagRes = & (Join-Path $scriptsDir 'Collect-LumaBridgeDiagnostics.ps1') -OutputDir $diagOutDir -EtlPath $dummyEtl -SetupApiLogPath $fakeSetupLog
+        Assert-Equal $global:LbTestState['CapturedEtlStart'] $null 'Collect-LumaBridgeDiagnostics does not clamp StartTimeUtc to old PnP events'
+        Assert-Equal $global:LbTestState['CapturedEtlEnd'] $null 'Collect-LumaBridgeDiagnostics does not clamp EndTimeUtc to old PnP events'
+        Assert-True (-not [string]::IsNullOrWhiteSpace($diagRes.Summary.InferredPnpAnchorStartUtc)) 'Inferred PnP anchor window recorded informatively'
+    }
+}
+
 try {
     Write-Host ("Summary: {0} tests run, {1} assertion failures." -f $script:TestsRun, $script:TestsFailed)
 }
