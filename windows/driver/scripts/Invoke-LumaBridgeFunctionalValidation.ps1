@@ -862,107 +862,160 @@ $hostJsonPath = Join-Path -Path $OutputDir -ChildPath 'lumabridge-host-summary.j
 $reportJsonPath = Join-Path -Path $OutputDir -ChildPath 'functional-validation-report.json'
 $reportMdPath = Join-Path -Path $OutputDir -ChildPath 'functional-validation-report.md'
 
+function Write-LumaBridgePreflightFailureDiagnostic {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        $ErrorRecord,
+
+        [Parameter(Mandatory = $true)]
+        [string]$StageName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$DefaultFunction,
+
+        [bool]$IsDryRun = $false
+    )
+
+    $invInfo = if ($null -ne $ErrorRecord) { $ErrorRecord.InvocationInfo } else { $null }
+    $fnName = if ($null -ne $invInfo -and $null -ne $invInfo.MyCommand -and -not [string]::IsNullOrWhiteSpace($invInfo.MyCommand.Name)) {
+        [string]$invInfo.MyCommand.Name
+    }
+    elseif ($null -ne $invInfo -and -not [string]::IsNullOrWhiteSpace($invInfo.ScriptName)) {
+        [System.IO.Path]::GetFileName([string]$invInfo.ScriptName)
+    }
+    else {
+        $DefaultFunction
+    }
+    $errorId = if ($null -ne $ErrorRecord -and -not [string]::IsNullOrWhiteSpace($ErrorRecord.FullyQualifiedErrorId)) {
+        [string]$ErrorRecord.FullyQualifiedErrorId
+    }
+    else {
+        'UnknownErrorId'
+    }
+    $origMsg = if ($null -ne $ErrorRecord -and $null -ne $ErrorRecord.Exception) {
+        [string]$ErrorRecord.Exception.Message
+    }
+    else {
+        [string]$ErrorRecord
+    }
+    Write-Warning ("PreflightFailure: Stage='{0}' | Function='{1}' | ErrorId='{2}' | DriverInstallationStarted=False | SystemModified=False | DryRun={3} | Message='{4}'" -f `
+        $StageName, $fnName, $errorId, $IsDryRun, $origMsg)
+}
+
 # -------------------------------------------------------------------------
 # Stage 1: Non-destructive pre-checks & full initial system state snapshot
 # -------------------------------------------------------------------------
-$null = Assert-LumaBridgeAdministrator -OperationName 'Run LumaBridge M4.2.1 Functional Validation' -DryRun:$DryRun
-$prereq = & $prereqScript -Configuration $Configuration -StagingDir $StagingDir
+try {
+    $null = Assert-LumaBridgeAdministrator -OperationName 'Run LumaBridge M4.2.1 Functional Validation' -DryRun:$DryRun
+    $prereq = & $prereqScript -Configuration $Configuration -StagingDir $StagingDir
 
-if (-not $prereq.HostOs.IsSupportedWindows11) {
-    throw ("Unsupported Windows build {0}; Windows 11 x64 >= {1} is required." -f $prereq.HostOs.CurrentBuildNumber, $constants.MinimumWindows11Build)
-}
-if (-not $prereq.BuildPackage.AllFilesPresent) {
-    throw ("Missing built package files in '{0}'. Rebuild {1}|x64 first." -f $sourcePackageDir, $Configuration)
-}
-if (-not $DryRun) {
-    if ([string]::IsNullOrWhiteSpace($prereq.WdkTools.SignToolPath) -or
-        [string]::IsNullOrWhiteSpace($prereq.WdkTools.Inf2CatPath) -or
-        [string]::IsNullOrWhiteSpace($prereq.WdkTools.DevconPath)) {
-        throw 'Required WDK tools (signtool.exe, Inf2Cat.exe, devcon.exe) were not all found.'
+    if (-not $prereq.HostOs.IsSupportedWindows11) {
+        throw ("Unsupported Windows build {0}; Windows 11 x64 >= {1} is required." -f $prereq.HostOs.CurrentBuildNumber, $constants.MinimumWindows11Build)
     }
-}
-
-$initialInstances = @($prereq.PnpInstances)
-if ($initialInstances.Count -gt 1) {
-    $ids = ($initialInstances | ForEach-Object { $_.InstanceId }) -join ', '
-    throw ("Multiple '{0}' PnP instances exist ({1}); clean up duplicates before validation." -f $constants.HardwareId, $ids)
-}
-
-$preExistingInstance = if ($initialInstances.Count -eq 1) { $initialInstances[0] } else { $null }
-$initialDriverStorePackages = @(Get-LumaBridgeValidationOptionalProp -InputObject $prereq -PropertyName 'DriverStorePackages' -DefaultValue @())
-$initialSnapshot = Get-LumaBridgeInitialSystemSnapshot `
-    -PnpInstances $initialInstances `
-    -DriverStorePackages $initialDriverStorePackages `
-    -CertificateThumbprint $CertificateThumbprint `
-    -CertificateSubject $CertificateSubject `
-    -EtwSessionName $constants.EtwSessionName `
-    -DxgSessionName $constants.EtwDxgSessionName
-
-$preValidationState = if ($null -ne $preExistingInstance) {
-    [pscustomobject]@{
-        ExistedBeforeRun         = $true
-        InstanceId               = $preExistingInstance.InstanceId
-        Status                   = $preExistingInstance.Status
-        ProblemCode              = $preExistingInstance.ProblemCode
-        DriverInfPath            = Get-LumaBridgeValidationOptionalProp -InputObject $preExistingInstance -PropertyName 'DriverInfPath'
-        DriverVersion            = Get-LumaBridgeValidationOptionalProp -InputObject $preExistingInstance -PropertyName 'DriverVersion'
-        EnableVirtualMonitor     = Get-LumaBridgeValidationOptionalProp -InputObject $preExistingInstance -PropertyName 'EnableVirtualMonitor'
-        EnableFrameExtraction    = Get-LumaBridgeValidationOptionalProp -InputObject $preExistingInstance -PropertyName 'EnableFrameExtraction'
-        EnableGpuSharedTransport = Get-LumaBridgeValidationOptionalProp -InputObject $preExistingInstance -PropertyName 'EnableGpuSharedTransport'
-        AuthorizedHostUserSid    = Get-LumaBridgeValidationOptionalProp -InputObject $preExistingInstance -PropertyName 'AuthorizedHostUserSid'
+    if (-not $prereq.BuildPackage.AllFilesPresent) {
+        throw ("Missing built package files in '{0}'. Rebuild {1}|x64 first." -f $sourcePackageDir, $Configuration)
     }
-}
-else {
-    [pscustomobject]@{
-        ExistedBeforeRun         = $false
-        InstanceId               = $null
-        Status                   = $null
-        ProblemCode              = $null
-        DriverInfPath            = $null
-        DriverVersion            = $null
-        EnableVirtualMonitor     = $null
-        EnableFrameExtraction    = $null
-        EnableGpuSharedTransport = $null
-        AuthorizedHostUserSid    = $null
+    if (-not $DryRun) {
+        if ([string]::IsNullOrWhiteSpace($prereq.WdkTools.SignToolPath) -or
+            [string]::IsNullOrWhiteSpace($prereq.WdkTools.Inf2CatPath) -or
+            [string]::IsNullOrWhiteSpace($prereq.WdkTools.DevconPath)) {
+            throw 'Required WDK tools (signtool.exe, Inf2Cat.exe, devcon.exe) were not all found.'
+        }
     }
-}
 
-$initialWudfProcs = @(Get-LumaBridgeWudfHostProcesses -PnpInstances $initialInstances)
-$initialDumpInventory = Get-LumaBridgeCrashDumpInventory -LookbackMinutes 60
-$initialDumpCount = [int](Get-LumaBridgeValidationOptionalProp -InputObject $initialDumpInventory -PropertyName 'TotalFoundCount' -DefaultValue 0)
+    $initialInstances = @($prereq.PnpInstances)
+    if ($initialInstances.Count -gt 1) {
+        $ids = ($initialInstances | ForEach-Object { $_.InstanceId }) -join ', '
+        throw ("Multiple '{0}' PnP instances exist ({1}); clean up duplicates before validation." -f $constants.HardwareId, $ids)
+    }
+
+    $preExistingInstance = if ($initialInstances.Count -eq 1) { $initialInstances[0] } else { $null }
+    $initialDriverStorePackages = @(Get-LumaBridgeValidationOptionalProp -InputObject $prereq -PropertyName 'DriverStorePackages' -DefaultValue @())
+    $initialSnapshot = Get-LumaBridgeInitialSystemSnapshot `
+        -PnpInstances $initialInstances `
+        -DriverStorePackages $initialDriverStorePackages `
+        -CertificateThumbprint $CertificateThumbprint `
+        -CertificateSubject $CertificateSubject `
+        -EtwSessionName $constants.EtwSessionName `
+        -DxgSessionName $constants.EtwDxgSessionName
+
+    $preValidationState = if ($null -ne $preExistingInstance) {
+        [pscustomobject]@{
+            ExistedBeforeRun         = $true
+            InstanceId               = $preExistingInstance.InstanceId
+            Status                   = $preExistingInstance.Status
+            ProblemCode              = $preExistingInstance.ProblemCode
+            DriverInfPath            = Get-LumaBridgeValidationOptionalProp -InputObject $preExistingInstance -PropertyName 'DriverInfPath'
+            DriverVersion            = Get-LumaBridgeValidationOptionalProp -InputObject $preExistingInstance -PropertyName 'DriverVersion'
+            EnableVirtualMonitor     = Get-LumaBridgeValidationOptionalProp -InputObject $preExistingInstance -PropertyName 'EnableVirtualMonitor'
+            EnableFrameExtraction    = Get-LumaBridgeValidationOptionalProp -InputObject $preExistingInstance -PropertyName 'EnableFrameExtraction'
+            EnableGpuSharedTransport = Get-LumaBridgeValidationOptionalProp -InputObject $preExistingInstance -PropertyName 'EnableGpuSharedTransport'
+            AuthorizedHostUserSid    = Get-LumaBridgeValidationOptionalProp -InputObject $preExistingInstance -PropertyName 'AuthorizedHostUserSid'
+        }
+    }
+    else {
+        [pscustomobject]@{
+            ExistedBeforeRun         = $false
+            InstanceId               = $null
+            Status                   = $null
+            ProblemCode              = $null
+            DriverInfPath            = $null
+            DriverVersion            = $null
+            EnableVirtualMonitor     = $null
+            EnableFrameExtraction    = $null
+            EnableGpuSharedTransport = $null
+            AuthorizedHostUserSid    = $null
+        }
+    }
+
+    $initialWudfProcs = @(Get-LumaBridgeWudfHostProcesses -PnpInstances $initialInstances)
+    $initialDumpInventory = Get-LumaBridgeCrashDumpInventory -LookbackMinutes 60
+    $initialDumpCount = [int](Get-LumaBridgeValidationOptionalProp -InputObject $initialDumpInventory -PropertyName 'TotalFoundCount' -DefaultValue 0)
+}
+catch {
+    Write-LumaBridgePreflightFailureDiagnostic -ErrorRecord $_ -StageName 'Stage 1: Preflight & Initial Snapshot' -DefaultFunction 'Test-LumaBridgePrerequisites.ps1' -IsDryRun:$DryRun.IsPresent
+    throw
+}
 
 # -------------------------------------------------------------------------
 # Stage 2: Branch & build artifact validation
 # -------------------------------------------------------------------------
-$gitBranchResult = Invoke-LumaBridgeExternalCommand -FilePath 'git.exe' -Arguments @('-C', $repoRoot, 'rev-parse', '--abbrev-ref', 'HEAD')
-$currentBranch = if (@($gitBranchResult.Output).Count -gt 0) { ([string]$gitBranchResult.Output[0]).Trim() } else { '' }
-$branchAllowed = if ($AllowAnyBranch) {
-    $true
-}
-elseif ($PSBoundParameters.ContainsKey('ExpectedBranch')) {
-    $currentBranch -eq $ExpectedBranch
-}
-else {
-    $currentBranch -in @('feature/windows-gpu-shared-textures-nvenc', 'fix/m0-validation-gates-hardening', 'feature/windows-frame-extraction-ipc')
-}
-if (-not $branchAllowed) {
-    throw ("Active Git branch is '{0}', expected '{1}'. Switch branch or pass -AllowAnyBranch." -f $currentBranch, $ExpectedBranch)
-}
+try {
+    $gitBranchResult = Invoke-LumaBridgeExternalCommand -FilePath 'git.exe' -Arguments @('-C', $repoRoot, 'rev-parse', '--abbrev-ref', 'HEAD')
+    $currentBranch = if (@($gitBranchResult.Output).Count -gt 0) { ([string]$gitBranchResult.Output[0]).Trim() } else { '' }
+    $branchAllowed = if ($AllowAnyBranch) {
+        $true
+    }
+    elseif ($PSBoundParameters.ContainsKey('ExpectedBranch')) {
+        $currentBranch -eq $ExpectedBranch
+    }
+    else {
+        $currentBranch -in @('feature/windows-gpu-shared-textures-nvenc', 'fix/m0-validation-gates-hardening', 'feature/windows-frame-extraction-ipc')
+    }
+    if (-not $branchAllowed) {
+        throw ("Active Git branch is '{0}', expected '{1}'. Switch branch or pass -AllowAnyBranch." -f $currentBranch, $ExpectedBranch)
+    }
 
-$sourceInf = Join-Path -Path $sourcePackageDir -ChildPath $constants.InfFileName
-$sourceDll = Join-Path -Path $sourcePackageDir -ChildPath $constants.DllFileName
-$sourceCat = Join-Path -Path $sourcePackageDir -ChildPath $constants.CatFileName
-foreach ($reqFile in @($sourceInf, $sourceDll, $HostExecutablePath)) {
-    if (-not (Test-Path -LiteralPath $reqFile -PathType Leaf)) {
-        throw ("Required functional validation artifact not found: {0}" -f $reqFile)
+    $sourceInf = Join-Path -Path $sourcePackageDir -ChildPath $constants.InfFileName
+    $sourceDll = Join-Path -Path $sourcePackageDir -ChildPath $constants.DllFileName
+    $sourceCat = Join-Path -Path $sourcePackageDir -ChildPath $constants.CatFileName
+    foreach ($reqFile in @($sourceInf, $sourceDll, $HostExecutablePath)) {
+        if (-not (Test-Path -LiteralPath $reqFile -PathType Leaf)) {
+            throw ("Required functional validation artifact not found: {0}" -f $reqFile)
+        }
+    }
+
+    $preBuildHashes = [ordered]@{
+        InfSha256  = (Get-FileHash -LiteralPath $sourceInf -Algorithm SHA256).Hash
+        DllSha256  = (Get-FileHash -LiteralPath $sourceDll -Algorithm SHA256).Hash
+        CatSha256  = if (Test-Path -LiteralPath $sourceCat -PathType Leaf) { (Get-FileHash -LiteralPath $sourceCat -Algorithm SHA256).Hash } else { $null }
+        HostSha256 = (Get-FileHash -LiteralPath $HostExecutablePath -Algorithm SHA256).Hash
     }
 }
-
-$preBuildHashes = [ordered]@{
-    InfSha256  = (Get-FileHash -LiteralPath $sourceInf -Algorithm SHA256).Hash
-    DllSha256  = (Get-FileHash -LiteralPath $sourceDll -Algorithm SHA256).Hash
-    CatSha256  = if (Test-Path -LiteralPath $sourceCat -PathType Leaf) { (Get-FileHash -LiteralPath $sourceCat -Algorithm SHA256).Hash } else { $null }
-    HostSha256 = (Get-FileHash -LiteralPath $HostExecutablePath -Algorithm SHA256).Hash
+catch {
+    Write-LumaBridgePreflightFailureDiagnostic -ErrorRecord $_ -StageName 'Stage 2: Branch & Build Artifact Validation' -DefaultFunction 'Invoke-LumaBridgeFunctionalValidation.ps1' -IsDryRun:$DryRun.IsPresent
+    throw
 }
 
 function Add-LumaBridgeM42HostArgs {

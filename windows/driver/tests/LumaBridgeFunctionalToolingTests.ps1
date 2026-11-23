@@ -4313,6 +4313,213 @@ Invoke-UnitTest -Name 'M021_ProlongedDryRunForwardsConnectedDurationAndSafetyExe
     }
 }
 
+# 55. M0.2.2: Unambiguous Framework RuntimeInformation resolution, PSReadLine collision rejection, edge cases & security gates
+Invoke-UnitTest -Name 'M022_RuntimeInformationResolvesFrameworkUnambiguouslyAndHandlesCollisions' -TestBody {
+    param($caseDir)
+
+    $prevStrict = $true
+    Set-StrictMode -Version Latest
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Stop'
+    try {
+        # 1. Default production resolution under StrictMode + ErrorActionPreference=Stop
+        $resolvedDefault = Resolve-LumaBridgeRuntimeInformationType
+        Assert-True ([bool]$resolvedDefault.Available) 'Default Framework RuntimeInformation resolution must succeed'
+        Assert-True ($resolvedDefault.AssemblyName -in @('mscorlib', 'System.Private.CoreLib', 'System.Runtime.InteropServices.RuntimeInformation')) ("Resolved assembly '{0}' must be trusted .NET runtime assembly" -f $resolvedDefault.AssemblyName)
+        Assert-True ($null -ne $resolvedDefault.ArchitectureProperty) 'Resolved RuntimeInformation must expose static OSArchitecture property'
+
+        $archDefault = Get-LumaBridgeHostOsArchitecture
+        Assert-True ([bool]$archDefault.Available) 'Get-LumaBridgeHostOsArchitecture Available=true'
+        Assert-Equal $archDefault.Architecture 'X64' 'Host native architecture resolves to X64'
+
+        # 2. Load existing PSReadLine 2.0.0 binary and prove two RuntimeInformation types exist in AppDomain
+        $psrlMod = Get-Module -ListAvailable -Name 'PSReadLine' | Sort-Object Version | Select-Object -First 1
+        Assert-True ($null -ne $psrlMod) 'PSReadLine module must be installed on test host'
+        $psrlDll = Join-Path -Path $psrlMod.ModuleBase -ChildPath 'Microsoft.PowerShell.PSReadLine.dll'
+        Assert-True (Test-Path -LiteralPath $psrlDll -PathType Leaf) ("PSReadLine binary expected at '{0}'" -f $psrlDll)
+        $psrlAsm = [System.Reflection.Assembly]::LoadFrom($psrlDll)
+        $psrlShimType = $psrlAsm.GetType('System.Runtime.InteropServices.RuntimeInformation', $false, $false)
+        $fwType = $resolvedDefault.RuntimeType
+        Assert-True ($null -ne $psrlShimType) 'PSReadLine assembly exposes colliding System.Runtime.InteropServices.RuntimeInformation type'
+        Assert-True ($psrlShimType.FullName -ceq $fwType.FullName) 'Both assemblies define identical FullName System.Runtime.InteropServices.RuntimeInformation'
+        Assert-True ($psrlShimType.Assembly.FullName -ne $fwType.Assembly.FullName) 'Colliding types belong to distinct assemblies'
+        Assert-True ($null -eq $psrlShimType.GetProperty('OSArchitecture')) 'PSReadLine shim RuntimeInformation lacks OSArchitecture property'
+
+        # 3. DirectTypeOverride with PSReadLine shim MUST reject cleanly (no PropertyNotFoundStrict crash)
+        $rejectedShim = Get-LumaBridgeHostOsArchitecture -DirectTypeOverride $psrlShimType
+        Assert-Equal $rejectedShim.Available $false 'PSReadLine RuntimeInformation shim rejected'
+        Assert-Equal $rejectedShim.Architecture 'Unavailable' 'Rejected shim returns Unavailable instead of inventing X64'
+        Assert-True (-not [string]::IsNullOrWhiteSpace($rejectedShim.Reason)) 'Rejected shim provides diagnostic Reason'
+
+        # 4. ExplicitAssemblies with PSReadLine FIRST (load-order independence!) still selects trusted Framework assembly
+        $orderIndependent = Get-LumaBridgeHostOsArchitecture -ExplicitAssemblies @($psrlAsm, [System.Object].Assembly)
+        Assert-Equal $orderIndependent.Available $true 'Order-independent resolution succeeds when PSReadLine precedes Framework assembly'
+        Assert-Equal $orderIndependent.Architecture 'X64' 'Order-independent resolution reads X64 from Framework assembly'
+        Assert-True ($orderIndependent.AssemblyName -in @('mscorlib', 'System.Private.CoreLib')) 'Selected assembly is Framework CoreLib (not PSReadLine)'
+
+        # 5. Missing type, missing property, and null/empty value handling (never infer X64 from Is64BitOperatingSystem)
+        $nullTypeRes = Get-LumaBridgeHostOsArchitecture -DirectTypeOverride $null
+        Assert-Equal $nullTypeRes.Available $false 'Null type returns Available=false'
+        Assert-Equal $nullTypeRes.Architecture 'Unavailable' 'Null type returns Unavailable'
+
+        $noPropRes = Get-LumaBridgeHostOsArchitecture -DirectTypeOverride ([string])
+        Assert-Equal $noPropRes.Available $false 'Unrelated/no-property type returns Available=false'
+        Assert-Equal $noPropRes.Architecture 'Unavailable' 'Unrelated/no-property type returns Unavailable'
+
+        $noMatchAsmRes = Get-LumaBridgeHostOsArchitecture -ExplicitAssemblies @($psrlAsm)
+        Assert-Equal $noMatchAsmRes.Available $false 'Assemblies containing only colliding shim return Available=false'
+        Assert-Equal $noMatchAsmRes.Architecture 'Unavailable' 'Assemblies without trusted runtime return Unavailable'
+
+        $nullValRes = Get-LumaBridgeHostOsArchitecture -ValueOverrideScript { param($r) $null }
+        Assert-Equal $nullValRes.Available $false 'Null OSArchitecture value returns Available=false'
+        Assert-Equal $nullValRes.Architecture 'Unavailable' 'Null OSArchitecture value returns Unavailable'
+
+        # 6. Distinction between X86, X64, Arm, and Arm64
+        foreach ($archVal in @('X86', 'X64', 'Arm', 'Arm64')) {
+            $valRes = Get-LumaBridgeHostOsArchitecture -ValueOverrideScript ({ param($r) $archVal }).GetNewClosure()
+            Assert-Equal $valRes.Available $true ("Architecture {0} available" -f $archVal)
+            Assert-Equal $valRes.Architecture $archVal ("Architecture {0} preserved without collapsing" -f $archVal)
+        }
+
+        # 7. Security & architecture gates in Get-LumaBridgeHostSecurityState (block Unavailable and non-X64 even on 64-bit OS)
+        $baseMocks = @{
+            'Confirm-SecureBootUEFI' = { return $false }
+            'Get-CimInstance' = { return [pscustomobject]@{ VirtualizationBasedSecurityStatus = 2; SecurityServicesRunning = @(1, 2); SecurityServicesConfigured = @(1, 2) } }
+            'Get-Service' = { param([string]$Name) return [pscustomobject]@{ Status = 'Running'; StartType = 'Manual' } }
+        }
+
+        $unavailMocks = @{}
+        foreach ($k in $baseMocks.Keys) { $unavailMocks[$k] = $baseMocks[$k] }
+        $unavailMocks['Get-LumaBridgeHostOsArchitecture'] = {
+            return [pscustomobject]@{ Available = $false; Architecture = 'Unavailable'; Source = 'TestMock'; AssemblyName = $null; Reason = 'Forced unavailable arch' }
+        }
+        Invoke-WithModuleMocks -ModuleMocks $unavailMocks -Body {
+            $secUnavailArch = Get-LumaBridgeHostSecurityState
+            Assert-Equal $secUnavailArch.OsArchitecture 'Unavailable' 'Unavailable architecture propagated to SecurityState'
+            Assert-True (@($secUnavailArch.UnavailableChecks) -contains 'OsArchitecture') 'UnavailableChecks records OsArchitecture'
+            Assert-True ((@($secUnavailArch.BlockingConditions) -join ' ') -match 'Native OS architecture could not be determined') 'Unavailable architecture adds explicit BlockingCondition'
+        }
+
+        foreach ($badArch in @('X86', 'Arm', 'Arm64')) {
+            $badCapture = $badArch
+            $badMocks = @{}
+            foreach ($k in $baseMocks.Keys) { $badMocks[$k] = $baseMocks[$k] }
+            $badMocks['Get-LumaBridgeHostOsArchitecture'] = ({
+                return [pscustomobject]@{ Available = $true; Architecture = $badCapture; Source = 'TestMock'; AssemblyName = 'mscorlib'; Reason = '' }
+            }).GetNewClosure()
+            Invoke-WithModuleMocks -ModuleMocks $badMocks -Body {
+                $secBad = Get-LumaBridgeHostSecurityState
+                Assert-Equal $secBad.OsArchitecture $badCapture ("SecurityState preserves {0}" -f $badCapture)
+                Assert-True ((@($secBad.BlockingConditions) -join ' ') -match ("Unsupported native OS architecture '{0}'" -f $badCapture)) ("Non-X64 architecture {0} triggers BlockingCondition even when Is64BitOperatingSystem=True" -f $badCapture)
+            }
+        }
+
+        $x64Mocks = @{}
+        foreach ($k in $baseMocks.Keys) { $x64Mocks[$k] = $baseMocks[$k] }
+        $x64Mocks['Get-LumaBridgeHostOsArchitecture'] = {
+            return [pscustomobject]@{ Available = $true; Architecture = 'X64'; Source = 'TestMock'; AssemblyName = 'mscorlib'; Reason = '' }
+        }
+        Invoke-WithModuleMocks -ModuleMocks $x64Mocks -Body {
+            $secOk = Get-LumaBridgeHostSecurityState
+            Assert-Equal $secOk.OsArchitecture 'X64' 'X64 architecture preserved'
+            Assert-True (-not ((@($secOk.BlockingConditions) -join ' ') -match 'architecture')) 'X64 produces no architecture BlockingCondition'
+        }
+    }
+    finally {
+        $ErrorActionPreference = $prevEap
+    }
+}
+
+# 56. M0.2.2: Isolated PowerShell child process with PSReadLine 2.0.0 binary loaded runs Test-LumaBridgePrerequisites under StrictMode Latest
+Invoke-UnitTest -Name 'M022_IsolatedProcessWithPsReadLineLoadedPassesPrerequisitesUnderStrictMode' -TestBody {
+    param($caseDir)
+    $prereqPath = (Resolve-Path -LiteralPath (Join-Path -Path $scriptsDir -ChildPath 'Test-LumaBridgePrerequisites.ps1')).Path
+    $psrlMod = Get-Module -ListAvailable -Name 'PSReadLine' | Sort-Object Version | Select-Object -First 1
+    Assert-True ($null -ne $psrlMod) 'PSReadLine module available for isolated child process test'
+    $psrlDll = Join-Path -Path $psrlMod.ModuleBase -ChildPath 'Microsoft.PowerShell.PSReadLine.dll'
+    Assert-True (Test-Path -LiteralPath $psrlDll -PathType Leaf) 'Microsoft.PowerShell.PSReadLine.dll present for isolated child process'
+
+    $childScript = @"
+Set-StrictMode -Version Latest
+`$ErrorActionPreference = 'Stop'
+Import-Module PSReadLine -ErrorAction Stop
+Add-Type -Path '$($psrlDll -replace "'", "''")'
+`$types = @([AppDomain]::CurrentDomain.GetAssemblies() | ForEach-Object {
+    try { `$_.GetType('System.Runtime.InteropServices.RuntimeInformation', `$false, `$false) } catch { `$null }
+} | Where-Object { `$null -ne `$_ })
+if (`$types.Count -lt 2) {
+    throw "Expected >= 2 colliding RuntimeInformation types in AppDomain, found `$(`$types.Count)"
+}
+`$hasPsrl = (@(`$types | Where-Object { `$_.Assembly.GetName().Name -eq 'Microsoft.PowerShell.PSReadLine' -and `$null -eq `$_.GetProperty('OSArchitecture') }).Count -ge 1)
+if (-not `$hasPsrl) {
+    throw 'Expected PSReadLine RuntimeInformation type without OSArchitecture in isolated child AppDomain'
+}
+`$jsonText = & '$($prereqPath -replace "'", "''")' -Configuration Release -AsJson
+Write-Output '---JSON_START---'
+Write-Output `$jsonText
+"@
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($childScript))
+    $rawOut = & powershell.exe -NoProfile -NonInteractive -EncodedCommand $encoded 2>&1
+    $childExit = $LASTEXITCODE
+    $joined = ($rawOut | ForEach-Object { [string]$_ }) -join "`n"
+    Assert-Equal $childExit 0 ("Isolated PSReadLine child process failed (exit={0}): {1}" -f $childExit, $joined)
+    $markerIdx = $joined.IndexOf('---JSON_START---')
+    Assert-True ($markerIdx -ge 0) 'Isolated child emitted JSON payload'
+    $jsonPart = $joined.Substring($markerIdx + '---JSON_START---'.Length).Trim()
+    $parsed = $jsonPart | ConvertFrom-Json
+    Assert-Equal $parsed.HostOs.Architecture 'X64' 'Prerequisites Architecture=X64 with PSReadLine 2.0.0 loaded under StrictMode Latest'
+    Assert-Equal $parsed.HostOs.IsSupportedWindows11 $true 'Prerequisites IsSupportedWindows11=true'
+}
+
+# 57. M0.2.2: Preflight Stage 1 failures emit structured diagnostic warning without DryRun side effects and preserve original exception
+Invoke-UnitTest -Name 'M022_PreflightFailureEmitsStructuredDiagnosticAndPreservesOriginalException' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+    $h = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'M022_PreflightDiag'
+
+    $failMocks = @{}
+    foreach ($k in $h.Mocks.Keys) { $failMocks[$k] = $h.Mocks[$k] }
+    $failMocks['Get-LumaBridgeInitialSystemSnapshot'] = {
+        param($PnpInstances, $DriverStorePackages, $CertificateThumbprint, $CertificateSubject, $EtwSessionName, $DxgSessionName)
+        throw ([System.Management.Automation.PropertyNotFoundException]::new('Simulated Stage 1 PropertyNotFoundStrict'))
+    }
+
+    Invoke-WithModuleMocks -GlobalMocks $failMocks -ModuleMocks $failMocks -Body {
+        # Case A: Non-DryRun preflight failure preserves original exception and warns that driver install did NOT start
+        $caughtA = $null
+        $warnA = @()
+        try {
+            $null = & $valScript -Configuration Release -TestProfile Benchmark30s -StagingDir $h.State.StagingDir -OutputDir (Join-Path $caseDir 'out_fail_nondry') -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -SkipDriverInstall -WarningVariable warnA -WarningAction SilentlyContinue
+        }
+        catch {
+            $caughtA = $_
+        }
+        Assert-True ($null -ne $caughtA) 'Stage 1 failure must re-throw'
+        Assert-True ($caughtA.Exception -is [System.Management.Automation.PropertyNotFoundException]) 'Original PropertyNotFoundException preserved'
+        Assert-True ($caughtA.Exception.Message -match 'Simulated Stage 1 PropertyNotFoundStrict') 'Original error message preserved'
+        $warnTextA = ($warnA | ForEach-Object { [string]$_ }) -join "`n"
+        Assert-True ($warnTextA -match "PreflightFailure: Stage='Stage 1: Preflight & Initial Snapshot'") 'Structured warning names Stage 1'
+        Assert-True ($warnTextA -match 'DriverInstallationStarted=False') 'Structured warning explicitly states DriverInstallationStarted=False'
+        Assert-True ($warnTextA -match 'Function=') 'Structured warning identifies failing function'
+        Assert-True ($warnTextA -match 'ErrorId=') 'Structured warning records FullyQualifiedErrorId'
+
+        # Case B: DryRun preflight failure writes zero directories/files while emitting structured warning
+        $dryFailOut = Join-Path $caseDir 'out_fail_dry'
+        $caughtB = $null
+        $warnB = @()
+        try {
+            $null = & $valScript -Configuration Release -TestProfile Benchmark30s -StagingDir $h.State.StagingDir -OutputDir $dryFailOut -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -DryRun -WarningVariable warnB -WarningAction SilentlyContinue
+        }
+        catch {
+            $caughtB = $_
+        }
+        Assert-True ($null -ne $caughtB) 'DryRun Stage 1 failure re-throws cleanly'
+        $warnTextB = ($warnB | ForEach-Object { [string]$_ }) -join "`n"
+        Assert-True ($warnTextB -match 'DryRun=True') 'DryRun warning records DryRun=True'
+        Assert-True (-not (Test-Path -LiteralPath $dryFailOut)) 'DryRun preflight failure creates no output directory'
+    }
+}
+
 try {
     Write-Host ("Summary: {0} tests run, {1} assertion failures." -f $script:TestsRun, $script:TestsFailed)
 }

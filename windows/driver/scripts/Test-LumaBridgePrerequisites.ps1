@@ -43,6 +43,12 @@ $secProp = {
     }
     return $Default
 }
+$resolvedOsArch = & $secProp 'OsArchitecture' $null
+if ([string]::IsNullOrWhiteSpace([string]$resolvedOsArch)) {
+    $archFallbackInfo = Get-LumaBridgeHostOsArchitecture
+    $resolvedOsArch = $archFallbackInfo.Architecture
+}
+$isSupportedWindows11 = ($is64BitOs -and ($resolvedOsArch -ieq 'X64') -and ($buildNumber -ge $constants.MinimumWindows11Build))
 
 $wudfCandidates = @(
     (Join-Path -Path $env:SystemRoot -ChildPath 'System32\Drivers\UMDF\WUDFx02000.dll'),
@@ -96,7 +102,7 @@ $report = [pscustomobject]@{
         CurrentBuildNumber   = $buildNumber
         UBR                  = $ubr
         Is64BitOs            = $is64BitOs
-        Architecture         = (& $secProp 'OsArchitecture' ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()))
+        Architecture         = $resolvedOsArch
         IsSupportedWindows11 = $isSupportedWindows11
     }
     SecurityState             = [pscustomobject]@{

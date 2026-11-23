@@ -3252,6 +3252,280 @@ function Resolve-LumaBridgeVerifiedWudfHostProcess {
     }
 }
 
+function Resolve-LumaBridgeRuntimeInformationType {
+    [CmdletBinding()]
+    param(
+        [System.Reflection.Assembly[]]$ExplicitAssemblies,
+
+        [type]$DirectTypeOverride
+    )
+
+    $trustedAssemblies = @{
+        'mscorlib'                                          = 'b77a5c561934e089'
+        'System.Private.CoreLib'                            = '7cec85d7bea7798e'
+        'System.Runtime.InteropServices.RuntimeInformation' = 'b03f5f7f11d50a3a'
+    }
+    $targetFullName = 'System.Runtime.InteropServices.RuntimeInformation'
+    $bindingFlags = ([System.Reflection.BindingFlags]::Public -bor [System.Reflection.BindingFlags]::Static)
+    $rejectedReasons = New-Object System.Collections.Generic.List[string]
+
+    $validateCandidateType = {
+        param([type]$CandidateType, [string]$LookupSource)
+        if ($null -eq $CandidateType) {
+            return $null
+        }
+        if ($CandidateType.FullName -cne $targetFullName) {
+            $rejectedReasons.Add(("{0}: unexpected FullName '{1}'" -f $LookupSource, $CandidateType.FullName))
+            return $null
+        }
+        $asm = $CandidateType.Assembly
+        $asmNameObj = if ($null -ne $asm) { $asm.GetName() } else { $null }
+        $asmSimpleName = if ($null -ne $asmNameObj) { [string]$asmNameObj.Name } else { '' }
+        $asmFullName = if ($null -ne $asm) { [string]$asm.FullName } else { '' }
+        $pktBytes = if ($null -ne $asmNameObj) { $asmNameObj.GetPublicKeyToken() } else { $null }
+        $pktHex = if ($null -ne $pktBytes -and $pktBytes.Length -gt 0) {
+            (($pktBytes | ForEach-Object { $_.ToString('x2') }) -join '')
+        }
+        else {
+            ''
+        }
+
+        if (-not $trustedAssemblies.ContainsKey($asmSimpleName)) {
+            $rejectedReasons.Add(("{0}: rejected untrusted/colliding assembly '{1}' (token={2})" -f $LookupSource, $asmFullName, $pktHex))
+            return $null
+        }
+        $expectedToken = $trustedAssemblies[$asmSimpleName]
+        if ($pktHex -ine $expectedToken) {
+            $rejectedReasons.Add(("{0}: assembly '{1}' token '{2}' != expected '{3}'" -f $LookupSource, $asmSimpleName, $pktHex, $expectedToken))
+            return $null
+        }
+
+        $archProp = $CandidateType.GetProperty('OSArchitecture', $bindingFlags)
+        if ($null -eq $archProp) {
+            $rejectedReasons.Add(("{0}: type in '{1}' does not expose public static property 'OSArchitecture'" -f $LookupSource, $asmSimpleName))
+            return $null
+        }
+
+        return [pscustomobject]@{
+            Available            = $true
+            RuntimeType          = $CandidateType
+            ArchitectureProperty = $archProp
+            AssemblyName         = $asmSimpleName
+            AssemblyFullName     = $asmFullName
+            PublicKeyTokenHex    = $pktHex
+            Source               = $LookupSource
+            Reason               = ''
+        }
+    }
+
+    if ($PSBoundParameters.ContainsKey('DirectTypeOverride')) {
+        if ($null -eq $DirectTypeOverride) {
+            return [pscustomobject]@{
+                Available            = $false
+                RuntimeType          = $null
+                ArchitectureProperty = $null
+                AssemblyName         = $null
+                AssemblyFullName     = $null
+                PublicKeyTokenHex    = $null
+                Source               = 'DirectTypeOverride'
+                Reason               = 'DirectTypeOverride was null.'
+            }
+        }
+        $validated = & $validateCandidateType $DirectTypeOverride 'DirectTypeOverride'
+        if ($null -ne $validated) {
+            return $validated
+        }
+        return [pscustomobject]@{
+            Available            = $false
+            RuntimeType          = $null
+            ArchitectureProperty = $null
+            AssemblyName         = $null
+            AssemblyFullName     = $null
+            PublicKeyTokenHex    = $null
+            Source               = 'DirectTypeOverride'
+            Reason               = $(if ($rejectedReasons.Count -gt 0) { ($rejectedReasons -join '; ') } else { 'DirectTypeOverride validation failed.' })
+        }
+    }
+
+    if ($PSBoundParameters.ContainsKey('ExplicitAssemblies')) {
+        if ($null -ne $ExplicitAssemblies) {
+            foreach ($asmCandidate in $ExplicitAssemblies) {
+                if ($null -eq $asmCandidate) {
+                    continue
+                }
+                $candType = $null
+                try {
+                    $candType = $asmCandidate.GetType($targetFullName, $false, $false)
+                }
+                catch {
+                    $candType = $null
+                }
+                $asmLabel = $asmCandidate.GetName().Name
+                $validated = & $validateCandidateType $candType ("ExplicitAssembly:{0}" -f $asmLabel)
+                if ($null -ne $validated) {
+                    return $validated
+                }
+            }
+        }
+        return [pscustomobject]@{
+            Available            = $false
+            RuntimeType          = $null
+            ArchitectureProperty = $null
+            AssemblyName         = $null
+            AssemblyFullName     = $null
+            PublicKeyTokenHex    = $null
+            Source               = 'ExplicitAssemblies'
+            Reason               = $(if ($rejectedReasons.Count -gt 0) { ($rejectedReasons -join '; ') } else { 'No trusted RuntimeInformation type found in ExplicitAssemblies.' })
+        }
+    }
+
+    # Explicit runtime-qualified lookup avoiding PowerShell unqualified type collision (e.g. PSReadLine shim).
+    $lookupAttempts = @(
+        [pscustomobject]@{
+            Source = 'CoreLibAssemblyGetType'
+            Getter = { ([System.Object].Assembly).GetType($targetFullName, $false, $false) }
+        },
+        [pscustomobject]@{
+            Source = 'QualifiedType:System.Runtime.InteropServices.RuntimeInformation'
+            Getter = { [System.Type]::GetType('System.Runtime.InteropServices.RuntimeInformation, System.Runtime.InteropServices.RuntimeInformation', $false, $false) }
+        },
+        [pscustomobject]@{
+            Source = 'QualifiedType:mscorlib'
+            Getter = { [System.Type]::GetType('System.Runtime.InteropServices.RuntimeInformation, mscorlib', $false, $false) }
+        },
+        [pscustomobject]@{
+            Source = 'QualifiedType:System.Private.CoreLib'
+            Getter = { [System.Type]::GetType('System.Runtime.InteropServices.RuntimeInformation, System.Private.CoreLib', $false, $false) }
+        }
+    )
+
+    foreach ($attempt in $lookupAttempts) {
+        $candType = $null
+        try {
+            $candType = & $attempt.Getter
+        }
+        catch {
+            $candType = $null
+        }
+        $validated = & $validateCandidateType $candType $attempt.Source
+        if ($null -ne $validated) {
+            return $validated
+        }
+    }
+
+    return [pscustomobject]@{
+        Available            = $false
+        RuntimeType          = $null
+        ArchitectureProperty = $null
+        AssemblyName         = $null
+        AssemblyFullName     = $null
+        PublicKeyTokenHex    = $null
+        Source               = 'FrameworkLookup'
+        Reason               = $(if ($rejectedReasons.Count -gt 0) { ($rejectedReasons -join '; ') } else { 'Trusted .NET RuntimeInformation type with OSArchitecture property was not found.' })
+    }
+}
+
+function Get-LumaBridgeHostOsArchitecture {
+    [CmdletBinding()]
+    param(
+        [System.Reflection.Assembly[]]$ExplicitAssemblies,
+
+        [type]$DirectTypeOverride,
+
+        [scriptblock]$ValueOverrideScript
+    )
+
+    $resolveParams = @{}
+    if ($PSBoundParameters.ContainsKey('ExplicitAssemblies')) {
+        $resolveParams['ExplicitAssemblies'] = $ExplicitAssemblies
+    }
+    if ($PSBoundParameters.ContainsKey('DirectTypeOverride')) {
+        $resolveParams['DirectTypeOverride'] = $DirectTypeOverride
+    }
+
+    $resolved = Resolve-LumaBridgeRuntimeInformationType @resolveParams
+    if ($null -eq $resolved -or (-not [bool]$resolved.Available)) {
+        return [pscustomobject]@{
+            Available         = $false
+            Architecture      = 'Unavailable'
+            ResolvedTypeName  = $null
+            AssemblyName      = $null
+            AssemblyFullName  = $null
+            PublicKeyTokenHex = $null
+            Source            = $(if ($null -ne $resolved) { $resolved.Source } else { 'Unknown' })
+            Reason            = $(if ($null -ne $resolved -and -not [string]::IsNullOrWhiteSpace($resolved.Reason)) { $resolved.Reason } else { 'RuntimeInformation type unavailable.' })
+        }
+    }
+
+    $rawVal = $null
+    try {
+        if ($PSBoundParameters.ContainsKey('ValueOverrideScript') -and $null -ne $ValueOverrideScript) {
+            $rawVal = & $ValueOverrideScript $resolved
+        }
+        else {
+            $rawVal = $resolved.ArchitectureProperty.GetValue($null, $null)
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            Available         = $false
+            Architecture      = 'Unavailable'
+            ResolvedTypeName  = $resolved.RuntimeType.FullName
+            AssemblyName      = $resolved.AssemblyName
+            AssemblyFullName  = $resolved.AssemblyFullName
+            PublicKeyTokenHex = $resolved.PublicKeyTokenHex
+            Source            = $resolved.Source
+            Reason            = ("Failed to read OSArchitecture: {0}" -f $_.Exception.Message)
+        }
+    }
+
+    if ($null -eq $rawVal) {
+        return [pscustomobject]@{
+            Available         = $false
+            Architecture      = 'Unavailable'
+            ResolvedTypeName  = $resolved.RuntimeType.FullName
+            AssemblyName      = $resolved.AssemblyName
+            AssemblyFullName  = $resolved.AssemblyFullName
+            PublicKeyTokenHex = $resolved.PublicKeyTokenHex
+            Source            = $resolved.Source
+            Reason            = 'RuntimeInformation.OSArchitecture returned null.'
+        }
+    }
+
+    $rawStr = ([string]$rawVal).Trim()
+    if ([string]::IsNullOrWhiteSpace($rawStr)) {
+        return [pscustomobject]@{
+            Available         = $false
+            Architecture      = 'Unavailable'
+            ResolvedTypeName  = $resolved.RuntimeType.FullName
+            AssemblyName      = $resolved.AssemblyName
+            AssemblyFullName  = $resolved.AssemblyFullName
+            PublicKeyTokenHex = $resolved.PublicKeyTokenHex
+            Source            = $resolved.Source
+            Reason            = 'RuntimeInformation.OSArchitecture returned empty string.'
+        }
+    }
+
+    $normalized = switch -Regex ($rawStr) {
+        '^X86$'   { 'X86'; break }
+        '^X64$'   { 'X64'; break }
+        '^Arm$'   { 'Arm'; break }
+        '^Arm64$' { 'Arm64'; break }
+        default   { $rawStr; break }
+    }
+
+    return [pscustomobject]@{
+        Available         = $true
+        Architecture      = $normalized
+        ResolvedTypeName  = $resolved.RuntimeType.FullName
+        AssemblyName      = $resolved.AssemblyName
+        AssemblyFullName  = $resolved.AssemblyFullName
+        PublicKeyTokenHex = $resolved.PublicKeyTokenHex
+        Source            = $resolved.Source
+        Reason            = ''
+    }
+}
+
 function Get-LumaBridgeHostSecurityState {
     [CmdletBinding()]
     param()
@@ -3406,7 +3680,11 @@ function Get-LumaBridgeHostSecurityState {
         }
     }
 
-    $osArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+    $archInfo = Get-LumaBridgeHostOsArchitecture
+    $osArch = $archInfo.Architecture
+    if (-not $archInfo.Available) {
+        $unavailableChecks.Add('OsArchitecture')
+    }
     $osReg = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
     $osBuild = if ($null -ne $osReg -and ($osReg.PSObject.Properties.Name -contains 'CurrentBuildNumber')) { [int]$osReg.CurrentBuildNumber } else { [Environment]::OSVersion.Version.Build }
     $osUbr = if ($null -ne $osReg -and ($osReg.PSObject.Properties.Name -contains 'UBR') -and $null -ne $osReg.UBR) { [int]$osReg.UBR } else { 0 }
@@ -3462,6 +3740,12 @@ function Get-LumaBridgeHostSecurityState {
     if ($testSigningState -eq 'Disabled') {
         $blockingConditions.Add('TestSigning is Disabled (required for self-signed test packages unless -SkipTestSigningCheck with trusted CA).')
     }
+    if (-not $archInfo.Available) {
+        $blockingConditions.Add(("Native OS architecture could not be determined reliably ({0})." -f $archInfo.Reason))
+    }
+    elseif ($osArch -ine 'X64') {
+        $blockingConditions.Add(("Unsupported native OS architecture '{0}'; X64 is required for LumaBridge x64 UMDF driver." -f $osArch))
+    }
     if (-not [Environment]::Is64BitOperatingSystem) {
         $blockingConditions.Add('64-bit OS is required for LumaBridge x64 UMDF driver.')
     }
@@ -3488,6 +3772,8 @@ function Get-LumaBridgeHostSecurityState {
         HvciSource              = $hvciSource
         HvciRegistryEnabled     = $hvciRegistryEnabled
         OsArchitecture          = $osArch
+        OsArchitectureSource    = $archInfo.Source
+        OsArchitectureAssembly  = $archInfo.AssemblyName
         OsBuild                 = $osBuild
         OsUbr                   = $osUbr
         RequiredServices        = [pscustomobject]$serviceStates
@@ -5295,6 +5581,8 @@ Export-ModuleMember -Function @(
     'Get-LumaBridgeDefaultStagingDirectory',
     'Assert-LumaBridgeIsolatedStagingDirectory',
     'Get-LumaBridgeWdkToolPath',
+    'Resolve-LumaBridgeRuntimeInformationType',
+    'Get-LumaBridgeHostOsArchitecture',
     'Get-LumaBridgeHostSecurityState',
     'Get-LumaBridgeCertificateStoreSnapshot',
     'Get-LumaBridgeDisplayTopologySnapshot',
