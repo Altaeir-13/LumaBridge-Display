@@ -1,7 +1,13 @@
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include "../LumaBridgeIddDriver/SwapChainProcessor.h"
 #include "../LumaBridgeIddDriver/FrameExtractor.h"
 #include "../LumaBridgeIddDriver/FrameIpcProtocol.h"
 #include "../LumaBridgeIddDriver/FrameTransport.h"
+#include "../LumaBridgeIddDriver/SharedTexturePool.h"
+#include "../../host/VirtualDisplayStimulus.h"
 
 #include <d3d11.h>
 #include <dxgi1_4.h>
@@ -134,6 +140,33 @@ CreateSyntheticTexture(
     return SUCCEEDED(device->CreateTexture2D(&desc, &init, &outTex)) && outTex != nullptr;
 }
 
+bool
+CreateD3d11DeviceWithLuid(
+    ComPtr<ID3D11Device>& outDevice,
+    ComPtr<ID3D11DeviceContext>& outContext,
+    LUID& outAdapterLuid,
+    const char*& outKind
+    ) noexcept
+{
+    outAdapterLuid = LUID{0, 0};
+    if (!CreateTestD3d11Device(outDevice, outContext, outKind))
+    {
+        return false;
+    }
+    ComPtr<IDXGIDevice> dxgiDev;
+    ComPtr<IDXGIAdapter> adapter;
+    if (SUCCEEDED(outDevice.As(&dxgiDev)) && dxgiDev != nullptr &&
+        SUCCEEDED(dxgiDev->GetAdapter(&adapter)) && adapter != nullptr)
+    {
+        DXGI_ADAPTER_DESC desc{};
+        if (SUCCEEDED(adapter->GetDesc(&desc)))
+        {
+            outAdapterLuid = desc.AdapterLuid;
+        }
+    }
+    return true;
+}
+
 std::filesystem::path
 ResolveHostExecutablePath()
 {
@@ -231,22 +264,119 @@ ExtractJsonDouble(
 }
 
 bool
-LaunchHostProcessAndWait(
+ExtractJsonNumberInScope(
+    const std::string& jsonText,
+    const char* sectionKey,
+    const char* subSectionKey,
+    const char* valueKey,
+    uint64_t& outValue
+    )
+{
+    size_t searchPos = 0U;
+    if (sectionKey != nullptr)
+    {
+        const std::string needle = std::string("\"") + sectionKey + "\":";
+        const size_t pos = jsonText.find(needle, searchPos);
+        if (pos == std::string::npos)
+        {
+            return false;
+        }
+        searchPos = pos + needle.size();
+    }
+    if (subSectionKey != nullptr)
+    {
+        const std::string needle = std::string("\"") + subSectionKey + "\":";
+        const size_t pos = jsonText.find(needle, searchPos);
+        if (pos == std::string::npos)
+        {
+            return false;
+        }
+        searchPos = pos + needle.size();
+    }
+    const std::string needle = std::string("\"") + valueKey + "\":";
+    const size_t pos = jsonText.find(needle, searchPos);
+    if (pos == std::string::npos)
+    {
+        return false;
+    }
+    size_t valPos = pos + needle.size();
+    while (valPos < jsonText.size() && (jsonText[valPos] == ' ' || jsonText[valPos] == '\t'))
+    {
+        ++valPos;
+    }
+    if (valPos >= jsonText.size() || jsonText[valPos] < '0' || jsonText[valPos] > '9')
+    {
+        return false;
+    }
+    char* endPtr = nullptr;
+    outValue = std::strtoull(jsonText.c_str() + valPos, &endPtr, 10);
+    return endPtr != (jsonText.c_str() + valPos);
+}
+
+bool
+ExtractJsonDoubleInScope(
+    const std::string& jsonText,
+    const char* sectionKey,
+    const char* subSectionKey,
+    const char* valueKey,
+    double& outValue
+    )
+{
+    size_t searchPos = 0U;
+    if (sectionKey != nullptr)
+    {
+        const std::string needle = std::string("\"") + sectionKey + "\":";
+        const size_t pos = jsonText.find(needle, searchPos);
+        if (pos == std::string::npos)
+        {
+            return false;
+        }
+        searchPos = pos + needle.size();
+    }
+    if (subSectionKey != nullptr)
+    {
+        const std::string needle = std::string("\"") + subSectionKey + "\":";
+        const size_t pos = jsonText.find(needle, searchPos);
+        if (pos == std::string::npos)
+        {
+            return false;
+        }
+        searchPos = pos + needle.size();
+    }
+    const std::string needle = std::string("\"") + valueKey + "\":";
+    const size_t pos = jsonText.find(needle, searchPos);
+    if (pos == std::string::npos)
+    {
+        return false;
+    }
+    size_t valPos = pos + needle.size();
+    while (valPos < jsonText.size() && (jsonText[valPos] == ' ' || jsonText[valPos] == '\t'))
+    {
+        ++valPos;
+    }
+    if (valPos >= jsonText.size())
+    {
+        return false;
+    }
+    char* endPtr = nullptr;
+    outValue = std::strtod(jsonText.c_str() + valPos, &endPtr);
+    return endPtr != (jsonText.c_str() + valPos);
+}
+
+bool
+LaunchHostProcessWithCustomArgsAndWait(
     const std::filesystem::path& hostExe,
     const std::wstring& pipeName,
-    uint32_t maxFrames,
+    const std::wstring& extraArgs,
     const std::filesystem::path& jsonSummaryPath,
-    DWORD& outExitCode
+    DWORD& outExitCode,
+    DWORD waitTimeoutMs = 30000U
     )
 {
     outExitCode = 1U;
     std::wstring cmdLine =
         L"\"" + hostExe.wstring() + L"\"" +
-        L" --pipe \"" + pipeName + L"\"" +
-        L" --max-frames " + std::to_wstring(maxFrames) +
-        L" --connect-timeout-ms 5000" +
-        L" --io-timeout-ms 1000" +
-        L" --verify-synthetic-pattern" +
+        L" --pipe \"" + pipeName + L"\" " + extraArgs +
         L" --json-summary \"" + jsonSummaryPath.wstring() + L"\"" +
         L" --quiet";
 
@@ -271,7 +401,7 @@ LaunchHostProcessAndWait(
         return false;
     }
 
-    const DWORD waitRes = WaitForSingleObject(pi.hProcess, 15000U);
+    const DWORD waitRes = WaitForSingleObject(pi.hProcess, waitTimeoutMs);
     if (waitRes != WAIT_OBJECT_0)
     {
         (void)TerminateProcess(pi.hProcess, 1U);
@@ -284,6 +414,25 @@ LaunchHostProcessAndWait(
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     return gotExit != FALSE;
+}
+
+bool
+LaunchHostProcessAndWait(
+    const std::filesystem::path& hostExe,
+    const std::wstring& pipeName,
+    uint32_t maxFrames,
+    const std::filesystem::path& jsonSummaryPath,
+    DWORD& outExitCode
+    )
+{
+    return LaunchHostProcessWithCustomArgsAndWait(
+        hostExe,
+        pipeName,
+        L"--max-frames " + std::to_wstring(maxFrames) +
+        L" --connect-timeout-ms 5000 --io-timeout-ms 1000 --verify-synthetic-pattern",
+        jsonSummaryPath,
+        outExitCode,
+        15000U);
 }
 
 std::filesystem::path
@@ -1012,6 +1161,622 @@ TestEndToEndThroughputAndLatencyBenchmark720pAnd1080p()
     RunResolutionBenchmarkPass(device.Get(), context.Get(), driverKind, hostExe, 1920U, 1080U, 30U, 11U);
 }
 
+enum class BenchmarkPipelineMode
+{
+    CpuStagingM4_1_1 = 0,
+    GpuSharedPhaseA = 1,
+    GpuSharedPlusNvencPhaseB = 2,
+};
+
+struct ControlledBenchmarkResult
+{
+    bool Passed{false};
+    uint64_t FramesValid{0ULL};
+    uint64_t CopyAvgUs{0ULL};
+    uint64_t CopyP95Us{0ULL};
+    uint64_t IpcAvgUs{0ULL};
+    uint64_t GpuSyncWaitAvgUs{0ULL};
+    uint64_t NvencEncodeAvgUs{0ULL};
+    uint64_t NvencEncodeP95Us{0ULL};
+    uint64_t HostAvgE2EUs{0ULL};
+    uint64_t HostP95E2EUs{0ULL};
+    uint64_t PresentToBitstreamAvgUs{0ULL};
+    uint64_t BytesTransferredOverPipe{0ULL};
+    uint64_t TotalBitstreamBytes{0ULL};
+    uint64_t CpuStagingReadsPerformed{0ULL};
+    uint64_t GpuFramesOpened{0ULL};
+    uint64_t NvencFramesEncoded{0ULL};
+    uint64_t NvencKeyFramesEncoded{0ULL};
+    uint64_t ConnectedDurationUs{0ULL};
+    double AverageExecutionFps{0.0};
+    double ConnectedFps{0.0};
+    double ObservedActiveFps{0.0};
+    double EncoderOutputFps{0.0};
+    double MinYPsnrDb{0.0};
+    double MinUvPsnrDb{0.0};
+};
+
+ControlledBenchmarkResult
+RunControlledPipelinePass(
+    ID3D11Device* device,
+    ID3D11DeviceContext* context,
+    LUID adapterLuid,
+    const std::filesystem::path& hostExe,
+    BenchmarkPipelineMode mode,
+    uint32_t width,
+    uint32_t height,
+    uint32_t frameCount,
+    uint32_t pipeIndex,
+    bool verifySynthetic,
+    bool verifyH264Decode
+    )
+{
+    ControlledBenchmarkResult res{};
+
+    constexpr uint32_t kPrebuiltRing = 4U;
+    std::vector<ComPtr<ID3D11Texture2D>> ringTextures(kPrebuiltRing);
+    for (uint32_t i = 0U; i < kPrebuiltRing; ++i)
+    {
+        EXPECT_TRUE(CreateSyntheticTexture(device, width, height, i + 1U, ringTextures[i]));
+        if (ringTextures[i] == nullptr)
+        {
+            return res;
+        }
+    }
+
+    wchar_t pipeBuf[128]{};
+    _snwprintf_s(
+        pipeBuf,
+        ARRAYSIZE(pipeBuf),
+        _TRUNCATE,
+        L"\\\\.\\pipe\\LumaBridgeM42Bench_%lu_%u",
+        GetCurrentProcessId(),
+        pipeIndex);
+    const std::wstring pipeName(pipeBuf);
+
+    const bool useGpu = (mode != BenchmarkPipelineMode::CpuStagingM4_1_1);
+    D3d11SharedTexturePool gpuPool;
+    if (useGpu)
+    {
+        EXPECT_EQ(gpuPool.Configure(
+            kDefaultSharedTexturePoolSize,
+            nullptr,
+            false,
+            true,
+            true,
+            true,
+            25U), S_OK);
+        gpuPool.SetDevice(device, context, adapterLuid);
+    }
+
+    FrameTransportConfig serverCfg;
+    serverCfg.SetPipeName(pipeName.c_str());
+    serverCfg.MaxQueueDepth = 3U;
+    serverCfg.BufferPoolSize = 5U;
+    serverCfg.AdapterLuid = adapterLuid;
+    serverCfg.EnableGpuSharedTransport = useGpu;
+    serverCfg.AllowCpuFallbackWhenGpuNegotiated = !useGpu;
+    serverCfg.SharedTexturePool = useGpu ? &gpuPool : nullptr;
+    serverCfg.SharedTexturePoolSize = kDefaultSharedTexturePoolSize;
+
+    FrameIpcServer server;
+    EXPECT_EQ(server.Start(serverCfg), S_OK);
+
+    D3d11FrameExtractor cpuExtractor;
+    if (!useGpu)
+    {
+        cpuExtractor.SetDevice(device, context);
+    }
+
+    wchar_t tagBuf[48]{};
+    _snwprintf_s(
+        tagBuf,
+        ARRAYSIZE(tagBuf),
+        _TRUNCATE,
+        L"m42_%u_%ux%u_%u",
+        static_cast<uint32_t>(mode),
+        width,
+        height,
+        pipeIndex);
+    const std::filesystem::path jsonPath = MakeTempJsonPath(tagBuf);
+    std::filesystem::remove(jsonPath);
+
+    std::wstring extraArgs =
+        L"--max-frames " + std::to_wstring(frameCount) +
+        L" --require-max-frames --connect-timeout-ms 5000 --io-timeout-ms 1500";
+    if (useGpu)
+    {
+        extraArgs += L" --transport gpu --require-gpu-shared";
+    }
+    else
+    {
+        extraArgs += L" --transport cpu";
+    }
+    if (verifySynthetic)
+    {
+        extraArgs += L" --verify-synthetic-pattern";
+    }
+    if (mode == BenchmarkPipelineMode::GpuSharedPlusNvencPhaseB)
+    {
+        extraArgs += L" --nvenc --require-nvenc --nvenc-bitrate-bps 20000000 --nvenc-gop 60";
+        if (verifyH264Decode)
+        {
+            extraArgs += L" --nvenc-force-idr-every 5 --verify-h264-decode";
+        }
+    }
+
+    std::atomic<bool> producerOk{true};
+    std::atomic<bool> stopRequested{false};
+    std::thread producer([&]() {
+        const ULONGLONG connWaitStart = GetTickCount64();
+        while (!stopRequested.load(std::memory_order_acquire))
+        {
+            const auto snap = server.GetMetricsSnapshot();
+            if (snap.ActiveHostConnections > 0U &&
+                (!useGpu || server.ShouldProduceGpuSharedFrame()))
+            {
+                break;
+            }
+            if ((GetTickCount64() - connWaitStart) > 8000ULL)
+            {
+                producerOk = false;
+                return;
+            }
+            SwitchToThread();
+        }
+
+        LARGE_INTEGER qpcLi{};
+        for (uint32_t i = 0U; i < frameCount; ++i)
+        {
+            const ULONGLONG slotWaitStart = GetTickCount64();
+            while (!stopRequested.load(std::memory_order_acquire))
+            {
+                const auto sSnap = server.GetMetricsSnapshot();
+                const auto pSnap = gpuPool.GetMetricsSnapshot();
+                const bool queueReady = (sSnap.QueueDepth < 2U);
+                const bool poolReady = (!useGpu || ((pSnap.QueuedSlots + pSnap.InUseByHostSlots) < 3U));
+                if (queueReady && poolReady)
+                {
+                    break;
+                }
+                if ((GetTickCount64() - slotWaitStart) > 8000ULL)
+                {
+                    producerOk = false;
+                    return;
+                }
+                SwitchToThread();
+            }
+
+            auto slot = server.AcquireBufferSlot();
+            if (slot == nullptr)
+            {
+                producerOk = false;
+                return;
+            }
+
+            const uint32_t patternFrame = (i % kPrebuiltRing) + 1U;
+            (void)QueryPerformanceCounter(&qpcLi);
+            FrameExtractionInput in{};
+            in.SourceTexture = ringTextures[i % kPrebuiltRing].Get();
+            in.PresentationFrameNumber = patternFrame;
+            in.PresentDisplayQpcTime = static_cast<uint64_t>(qpcLi.QuadPart);
+            in.Flags = static_cast<uint32_t>(FrameIpcFlags::SyntheticTestFrame);
+
+            if (useGpu)
+            {
+                const SharedTextureExtractResult ext = gpuPool.ExtractToSharedTexture(in, *slot, true);
+                if (FAILED(ext.HResult) || !ext.GpuCopied)
+                {
+                    server.RecycleBufferSlot(std::move(slot));
+                    producerOk = false;
+                    return;
+                }
+            }
+            else
+            {
+                const FrameExtractionResult ext = cpuExtractor.ExtractFrame(in, *slot);
+                if (FAILED(ext.HResult) || !ext.PixelsCopied)
+                {
+                    server.RecycleBufferSlot(std::move(slot));
+                    producerOk = false;
+                    return;
+                }
+            }
+
+            bool evicted = false;
+            if (FAILED(server.EnqueueFrame(std::move(slot), evicted)))
+            {
+                producerOk = false;
+                return;
+            }
+        }
+    });
+
+    DWORD exitCode = 1U;
+    const bool launchedOk = LaunchHostProcessWithCustomArgsAndWait(
+        hostExe,
+        pipeName,
+        extraArgs,
+        jsonPath,
+        exitCode,
+        45000U);
+    stopRequested.store(true, std::memory_order_release);
+    producer.join();
+
+    EXPECT_TRUE(launchedOk);
+    EXPECT_TRUE(producerOk.load());
+    EXPECT_EQ(exitCode, 0UL);
+
+    const std::string jsonText = ReadFileText(jsonPath);
+    EXPECT_TRUE(!jsonText.empty());
+
+    uint64_t crcErr = 99ULL;
+    uint64_t patErr = 99ULL;
+    uint64_t protoErr = 99ULL;
+    uint64_t openErr = 99ULL;
+    uint64_t syncTimeout = 99ULL;
+    uint64_t luidErr = 99ULL;
+    EXPECT_TRUE(ExtractJsonNumber(jsonText, "FramesValid", res.FramesValid));
+    EXPECT_TRUE(ExtractJsonNumber(jsonText, "ChecksumMismatches", crcErr));
+    EXPECT_TRUE(ExtractJsonNumber(jsonText, "SyntheticPatternMismatches", patErr));
+    EXPECT_TRUE(ExtractJsonNumber(jsonText, "ProtocolErrors", protoErr));
+    EXPECT_TRUE(ExtractJsonNumber(jsonText, "GpuSharedOpenFailures", openErr));
+    EXPECT_TRUE(ExtractJsonNumber(jsonText, "GpuSyncTimeouts", syncTimeout));
+    EXPECT_TRUE(ExtractJsonNumber(jsonText, "AdapterMismatchErrors", luidErr));
+    EXPECT_TRUE(ExtractJsonNumber(jsonText, "BytesReceived", res.BytesTransferredOverPipe));
+    EXPECT_TRUE(ExtractJsonNumber(jsonText, "CpuStagingReadsPerformed", res.CpuStagingReadsPerformed));
+    EXPECT_TRUE(ExtractJsonNumber(jsonText, "GpuFramesOpened", res.GpuFramesOpened));
+    EXPECT_TRUE(ExtractJsonNumber(jsonText, "TotalConnectedDurationUs", res.ConnectedDurationUs));
+    EXPECT_TRUE(ExtractJsonDouble(jsonText, "AverageExecutionFps", res.AverageExecutionFps));
+    EXPECT_TRUE(ExtractJsonDouble(jsonText, "ConnectedFps", res.ConnectedFps));
+    EXPECT_TRUE(ExtractJsonDouble(jsonText, "ObservedActiveFps", res.ObservedActiveFps));
+
+    EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "CopyLatency", nullptr, "AvgUs", res.CopyAvgUs));
+    EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "CopyLatency", nullptr, "P95Us", res.CopyP95Us));
+    EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "IpcTransitLatency", nullptr, "AvgUs", res.IpcAvgUs));
+    EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "GpuSyncWaitLatency", nullptr, "AvgUs", res.GpuSyncWaitAvgUs));
+    EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "EndToEndLatency", nullptr, "AvgUs", res.HostAvgE2EUs));
+    EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "EndToEndLatency", nullptr, "P95Us", res.HostP95E2EUs));
+
+    if (mode == BenchmarkPipelineMode::GpuSharedPlusNvencPhaseB)
+    {
+        EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "Nvenc", nullptr, "NvencFramesEncoded", res.NvencFramesEncoded));
+        EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "Nvenc", nullptr, "NvencKeyFramesEncoded", res.NvencKeyFramesEncoded));
+        EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "Nvenc", nullptr, "TotalBitstreamBytes", res.TotalBitstreamBytes));
+        EXPECT_TRUE(ExtractJsonDoubleInScope(jsonText, "Nvenc", nullptr, "EncoderOutputFps", res.EncoderOutputFps));
+        EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "Nvenc", "EncodeLatencyUs", "AvgUs", res.NvencEncodeAvgUs));
+        EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "Nvenc", "EncodeLatencyUs", "P95Us", res.NvencEncodeP95Us));
+        EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "Nvenc", "PresentToBitstreamLatencyUs", "AvgUs", res.PresentToBitstreamAvgUs));
+        if (verifyH264Decode)
+        {
+            EXPECT_TRUE(jsonText.find("\"Passed\": true") != std::string::npos);
+            (void)ExtractJsonDoubleInScope(jsonText, "H264DecodeValidation", nullptr, "MinYPsnrDb", res.MinYPsnrDb);
+            (void)ExtractJsonDoubleInScope(jsonText, "H264DecodeValidation", nullptr, "MinUvPsnrDb", res.MinUvPsnrDb);
+        }
+    }
+
+    EXPECT_EQ(res.FramesValid, static_cast<uint64_t>(frameCount));
+    EXPECT_EQ(crcErr, 0ULL);
+    EXPECT_EQ(patErr, 0ULL);
+    EXPECT_EQ(protoErr, 0ULL);
+    EXPECT_EQ(openErr, 0ULL);
+    EXPECT_EQ(syncTimeout, 0ULL);
+    EXPECT_EQ(luidErr, 0ULL);
+
+    if (useGpu)
+    {
+        EXPECT_TRUE(jsonText.find("\"NegotiatedTransportMode\": \"GpuSharedNtHandle\"") != std::string::npos);
+        EXPECT_TRUE(jsonText.find("\"FallbackToCpuActivated\": false") != std::string::npos);
+        EXPECT_TRUE(res.GpuFramesOpened >= 1ULL && res.GpuFramesOpened <= kDefaultSharedTexturePoolSize);
+        if (!verifySynthetic)
+        {
+            EXPECT_EQ(res.CpuStagingReadsPerformed, 0ULL);
+        }
+    }
+    else
+    {
+        EXPECT_TRUE(jsonText.find("\"NegotiatedTransportMode\": \"CpuStagingPipe\"") != std::string::npos);
+    }
+
+    server.Stop();
+    if (useGpu)
+    {
+        const auto poolSnap = gpuPool.GetMetricsSnapshot();
+        EXPECT_EQ(poolSnap.QueuedSlots, 0U);
+        EXPECT_EQ(poolSnap.InUseByHostSlots, 0U);
+        gpuPool.Shutdown();
+    }
+    std::filesystem::remove(jsonPath);
+
+    res.Passed = (exitCode == 0UL && res.FramesValid == static_cast<uint64_t>(frameCount));
+    return res;
+}
+
+void
+TestVirtualDisplayStimulusHighResTimer60FpsVerification()
+{
+    const auto candidates = lumabridge::host::EnumerateActiveDisplayCandidates();
+    if (candidates.empty())
+    {
+        std::printf("[INFO] VirtualDisplayStimulus60Fps: skipped (no active desktop display candidates).\n");
+        return;
+    }
+
+    std::wstring targetDisplay = candidates.front().DeviceName;
+    for (const auto& c : candidates)
+    {
+        if (lumabridge::host::detail::HasValidBounds(c) && lumabridge::host::detail::IsLumaBridgeCandidate(c))
+        {
+            targetDisplay = c.DeviceName;
+            break;
+        }
+    }
+
+    lumabridge::host::VirtualDisplayStimulus stimulus;
+    const bool started = stimulus.Start(60U, targetDisplay);
+    EXPECT_TRUE(started);
+    if (!started)
+    {
+        return;
+    }
+
+    Sleep(1500U);
+    stimulus.Stop();
+    const auto snap = stimulus.GetMetricsSnapshot();
+
+    std::printf(
+        "[INFO] VirtualDisplayStimulus 60Hz pacing: display=\"%ls\" hiResTimer=%u ticks=%llu paints=%llu "
+        "achievedFps=%.2f tickAvgUs=%llu tickP95Us=%llu tickMaxUs=%llu\n",
+        snap.DisplayDeviceName.c_str(),
+        snap.HighResolutionTimerUsed ? 1U : 0U,
+        static_cast<unsigned long long>(snap.TicksPresented),
+        static_cast<unsigned long long>(snap.PaintCount),
+        snap.AchievedFps,
+        static_cast<unsigned long long>(snap.TickIntervalAvgUs),
+        static_cast<unsigned long long>(snap.TickIntervalP95Us),
+        static_cast<unsigned long long>(snap.TickIntervalMaxUs));
+
+    EXPECT_TRUE(snap.CompletedCleanly);
+    EXPECT_TRUE(snap.HighResolutionTimerUsed);
+    EXPECT_TRUE(snap.TicksPresented >= 80ULL);
+    EXPECT_TRUE(snap.AchievedFps >= 57.0 && snap.AchievedFps <= 63.0);
+}
+
+void
+TestEndToEndPhaseAGpuSharedTextureSeparateHostProcess720pAnd1080p()
+{
+    const std::filesystem::path hostExe = ResolveHostExecutablePath();
+    EXPECT_TRUE(!hostExe.empty());
+    if (hostExe.empty())
+    {
+        return;
+    }
+
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    LUID adapterLuid{};
+    const char* driverKind = nullptr;
+    EXPECT_TRUE(CreateD3d11DeviceWithLuid(device, context, adapterLuid, driverKind));
+    if (device == nullptr || context == nullptr)
+    {
+        return;
+    }
+
+    // 1. 720p with synthetic pixel verification across process boundary.
+    const auto r720 = RunControlledPipelinePass(
+        device.Get(),
+        context.Get(),
+        adapterLuid,
+        hostExe,
+        BenchmarkPipelineMode::GpuSharedPhaseA,
+        1280U,
+        720U,
+        12U,
+        20U,
+        true,
+        false);
+    EXPECT_TRUE(r720.Passed);
+
+    // 2. 1080p WITH synthetic pattern verification (proves visual integrity across processes).
+    const auto r1080Verify = RunControlledPipelinePass(
+        device.Get(),
+        context.Get(),
+        adapterLuid,
+        hostExe,
+        BenchmarkPipelineMode::GpuSharedPhaseA,
+        1920U,
+        1080U,
+        12U,
+        21U,
+        true,
+        false);
+    EXPECT_TRUE(r1080Verify.Passed);
+
+    // 3. 1080p NORMAL GPU mode (NO synthetic readback) -> proves CpuStagingReadsPerformed == 0.
+    const auto r1080Normal = RunControlledPipelinePass(
+        device.Get(),
+        context.Get(),
+        adapterLuid,
+        hostExe,
+        BenchmarkPipelineMode::GpuSharedPhaseA,
+        1920U,
+        1080U,
+        16U,
+        22U,
+        false,
+        false);
+    EXPECT_TRUE(r1080Normal.Passed);
+    EXPECT_EQ(r1080Normal.CpuStagingReadsPerformed, 0ULL);
+
+    std::printf(
+        "[INFO] Phase A Separate Process (%s): 720p connFps=%.2f syncUs=%llu | 1080p(normal, cpuReads=%llu, opened=%llu) execFps=%.2f connFps=%.2f copyUs=%llu e2eUs=%llu pipeBytes=%llu\n",
+        driverKind,
+        r720.ConnectedFps,
+        static_cast<unsigned long long>(r720.GpuSyncWaitAvgUs),
+        static_cast<unsigned long long>(r1080Normal.CpuStagingReadsPerformed),
+        static_cast<unsigned long long>(r1080Normal.GpuFramesOpened),
+        r1080Normal.AverageExecutionFps,
+        r1080Normal.ConnectedFps,
+        static_cast<unsigned long long>(r1080Normal.CopyAvgUs),
+        static_cast<unsigned long long>(r1080Normal.HostAvgE2EUs),
+        static_cast<unsigned long long>(r1080Normal.BytesTransferredOverPipe));
+}
+
+void
+TestEndToEndPhaseBGpuSharedTexturePlusNvencAndIndependentDecode720pAnd1080p()
+{
+    const std::filesystem::path hostExe = ResolveHostExecutablePath();
+    EXPECT_TRUE(!hostExe.empty());
+    if (hostExe.empty())
+    {
+        return;
+    }
+
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    LUID adapterLuid{};
+    const char* driverKind = nullptr;
+    EXPECT_TRUE(CreateD3d11DeviceWithLuid(device, context, adapterLuid, driverKind));
+    if (device == nullptr || context == nullptr)
+    {
+        return;
+    }
+
+    const auto nv720 = RunControlledPipelinePass(
+        device.Get(),
+        context.Get(),
+        adapterLuid,
+        hostExe,
+        BenchmarkPipelineMode::GpuSharedPlusNvencPhaseB,
+        1280U,
+        720U,
+        12U,
+        30U,
+        false,
+        true);
+    EXPECT_TRUE(nv720.Passed);
+    EXPECT_EQ(nv720.CpuStagingReadsPerformed, 0ULL);
+    EXPECT_EQ(nv720.NvencFramesEncoded, 12ULL);
+    EXPECT_TRUE(nv720.NvencKeyFramesEncoded >= 2ULL);
+
+    const auto nv1080 = RunControlledPipelinePass(
+        device.Get(),
+        context.Get(),
+        adapterLuid,
+        hostExe,
+        BenchmarkPipelineMode::GpuSharedPlusNvencPhaseB,
+        1920U,
+        1080U,
+        12U,
+        31U,
+        false,
+        true);
+    EXPECT_TRUE(nv1080.Passed);
+    EXPECT_EQ(nv1080.CpuStagingReadsPerformed, 0ULL);
+    EXPECT_EQ(nv1080.NvencFramesEncoded, 12ULL);
+    EXPECT_TRUE(nv1080.NvencKeyFramesEncoded >= 2ULL);
+
+    std::printf(
+        "[INFO] Phase B Separate Process+NVENC (%s): 720p encAvgUs=%llu presentToBsUs=%llu bsBytes=%llu | 1080p encAvgUs=%llu presentToBsUs=%llu bsBytes=%llu\n",
+        driverKind,
+        static_cast<unsigned long long>(nv720.NvencEncodeAvgUs),
+        static_cast<unsigned long long>(nv720.PresentToBitstreamAvgUs),
+        static_cast<unsigned long long>(nv720.TotalBitstreamBytes),
+        static_cast<unsigned long long>(nv1080.NvencEncodeAvgUs),
+        static_cast<unsigned long long>(nv1080.PresentToBitstreamAvgUs),
+        static_cast<unsigned long long>(nv1080.TotalBitstreamBytes));
+}
+
+void
+TestEndToEndControlledThreeWayBenchmark720pAnd1080p()
+{
+    const std::filesystem::path hostExe = ResolveHostExecutablePath();
+    EXPECT_TRUE(!hostExe.empty());
+    if (hostExe.empty())
+    {
+        return;
+    }
+
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    LUID adapterLuid{};
+    const char* driverKind = nullptr;
+    EXPECT_TRUE(CreateD3d11DeviceWithLuid(device, context, adapterLuid, driverKind));
+    if (device == nullptr || context == nullptr)
+    {
+        return;
+    }
+
+    constexpr uint32_t kBenchFrames = 120U;
+    struct ResSpec
+    {
+        uint32_t Width;
+        uint32_t Height;
+        uint32_t BasePipe;
+    };
+    const ResSpec resolutions[] = {
+        {1280U, 720U, 40U},
+        {1920U, 1080U, 50U},
+    };
+
+    for (const auto& r : resolutions)
+    {
+        const auto aCpu = RunControlledPipelinePass(
+            device.Get(), context.Get(), adapterLuid, hostExe,
+            BenchmarkPipelineMode::CpuStagingM4_1_1,
+            r.Width, r.Height, kBenchFrames, r.BasePipe + 0U, false, false);
+        const auto bGpu = RunControlledPipelinePass(
+            device.Get(), context.Get(), adapterLuid, hostExe,
+            BenchmarkPipelineMode::GpuSharedPhaseA,
+            r.Width, r.Height, kBenchFrames, r.BasePipe + 1U, false, false);
+        const auto cNvenc = RunControlledPipelinePass(
+            device.Get(), context.Get(), adapterLuid, hostExe,
+            BenchmarkPipelineMode::GpuSharedPlusNvencPhaseB,
+            r.Width, r.Height, kBenchFrames, r.BasePipe + 2U, false, false);
+
+        EXPECT_TRUE(aCpu.Passed);
+        EXPECT_TRUE(bGpu.Passed);
+        EXPECT_TRUE(cNvenc.Passed);
+        EXPECT_EQ(bGpu.CpuStagingReadsPerformed, 0ULL);
+        EXPECT_EQ(cNvenc.CpuStagingReadsPerformed, 0ULL);
+
+        std::printf(
+            "\n=== CONTROLLED 3-WAY BENCHMARK %ux%u (%u frames, %s) ===\n"
+            "  [A] M4.1.1 CPU Staging + Named Pipe : execFps=%.2f connFps=%.2f activeFps=%.2f (connMs=%llu) | copyAvg=%lluus p95=%lluus | ipcAvg=%lluus | e2eAvg=%lluus p95=%lluus | pipeBytes=%llu\n"
+            "  [B] M4.2 Phase A GPU Shared Texture  : execFps=%.2f connFps=%.2f activeFps=%.2f (connMs=%llu) | copyAvg=%lluus p95=%lluus | ipcAvg=%lluus | syncAvg=%lluus | e2eAvg=%lluus p95=%lluus | pipeBytes=%llu | cpuReads=%llu\n"
+            "  [C] M4.2 Phase B GPU + NVENC H.264   : execFps=%.2f connFps=%.2f activeFps=%.2f (connMs=%llu) | copyAvg=%lluus | ipcAvg=%lluus | syncAvg=%lluus | nvencAvg=%lluus p95=%lluus | presentToBs=%lluus | outFps=%.2f | bsBytes=%llu\n",
+            r.Width, r.Height, kBenchFrames, driverKind,
+            aCpu.AverageExecutionFps, aCpu.ConnectedFps, aCpu.ObservedActiveFps,
+            static_cast<unsigned long long>(aCpu.ConnectedDurationUs / 1000ULL),
+            static_cast<unsigned long long>(aCpu.CopyAvgUs),
+            static_cast<unsigned long long>(aCpu.CopyP95Us),
+            static_cast<unsigned long long>(aCpu.IpcAvgUs),
+            static_cast<unsigned long long>(aCpu.HostAvgE2EUs),
+            static_cast<unsigned long long>(aCpu.HostP95E2EUs),
+            static_cast<unsigned long long>(aCpu.BytesTransferredOverPipe),
+            bGpu.AverageExecutionFps, bGpu.ConnectedFps, bGpu.ObservedActiveFps,
+            static_cast<unsigned long long>(bGpu.ConnectedDurationUs / 1000ULL),
+            static_cast<unsigned long long>(bGpu.CopyAvgUs),
+            static_cast<unsigned long long>(bGpu.CopyP95Us),
+            static_cast<unsigned long long>(bGpu.IpcAvgUs),
+            static_cast<unsigned long long>(bGpu.GpuSyncWaitAvgUs),
+            static_cast<unsigned long long>(bGpu.HostAvgE2EUs),
+            static_cast<unsigned long long>(bGpu.HostP95E2EUs),
+            static_cast<unsigned long long>(bGpu.BytesTransferredOverPipe),
+            static_cast<unsigned long long>(bGpu.CpuStagingReadsPerformed),
+            cNvenc.AverageExecutionFps, cNvenc.ConnectedFps, cNvenc.ObservedActiveFps,
+            static_cast<unsigned long long>(cNvenc.ConnectedDurationUs / 1000ULL),
+            static_cast<unsigned long long>(cNvenc.CopyAvgUs),
+            static_cast<unsigned long long>(cNvenc.IpcAvgUs),
+            static_cast<unsigned long long>(cNvenc.GpuSyncWaitAvgUs),
+            static_cast<unsigned long long>(cNvenc.NvencEncodeAvgUs),
+            static_cast<unsigned long long>(cNvenc.NvencEncodeP95Us),
+            static_cast<unsigned long long>(cNvenc.PresentToBitstreamAvgUs),
+            cNvenc.EncoderOutputFps,
+            static_cast<unsigned long long>(cNvenc.TotalBitstreamBytes));
+    }
+}
+
 template <typename Fn>
 void
 RunTest(
@@ -1041,6 +1806,10 @@ main()
     RunTest("EndToEndHostDisconnectAndReconnectDuringActiveSwapChainLoop", TestEndToEndHostDisconnectAndReconnectDuringActiveSwapChainLoop);
     RunTest("EndToEndSmokeDurationExitAndMinFramesVsTargetCli", TestEndToEndSmokeDurationExitAndMinFramesVsTargetCli);
     RunTest("EndToEndThroughputAndLatencyBenchmark720pAnd1080p", TestEndToEndThroughputAndLatencyBenchmark720pAnd1080p);
+    RunTest("VirtualDisplayStimulusHighResTimer60FpsVerification", TestVirtualDisplayStimulusHighResTimer60FpsVerification);
+    RunTest("EndToEndPhaseAGpuSharedTextureSeparateHostProcess720pAnd1080p", TestEndToEndPhaseAGpuSharedTextureSeparateHostProcess720pAnd1080p);
+    RunTest("EndToEndPhaseBGpuSharedTexturePlusNvencAndIndependentDecode720pAnd1080p", TestEndToEndPhaseBGpuSharedTexturePlusNvencAndIndependentDecode720pAnd1080p);
+    RunTest("EndToEndControlledThreeWayBenchmark720pAnd1080p", TestEndToEndControlledThreeWayBenchmark720pAnd1080p);
 
     std::printf("Summary: %d tests run, %d assertion failures.\n", g_TestsRun, g_TestsFailed);
     return (g_TestsFailed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;

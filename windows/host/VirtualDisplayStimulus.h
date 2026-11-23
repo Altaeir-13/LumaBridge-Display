@@ -49,10 +49,14 @@ struct StimulusMetricsSnapshot
     bool Started{false};
     bool Active{false};
     bool CompletedCleanly{false};
+    bool HighResolutionTimerUsed{false};
     uint32_t TargetFps{60U};
     uint64_t TicksPresented{0ULL};
     uint64_t PaintCount{0ULL};
     uint64_t DurationUs{0ULL};
+    uint64_t TickIntervalAvgUs{0ULL};
+    uint64_t TickIntervalP95Us{0ULL};
+    uint64_t TickIntervalMaxUs{0ULL};
     double AchievedFps{0.0};
     std::wstring DisplayDeviceName{};
     int32_t BoundsLeft{0};
@@ -416,6 +420,8 @@ public:
 
         m_ticksPresented.store(0ULL, std::memory_order_relaxed);
         m_paintCount.store(0ULL, std::memory_order_relaxed);
+        m_tickIntervalsUs.clear();
+        m_highResTimerUsed = false;
         m_threadStartOk = false;
         m_threadError.clear();
 
@@ -460,8 +466,24 @@ public:
         CleanupEvents();
 
         m_snapshot.Active = false;
+        m_snapshot.HighResolutionTimerUsed = m_highResTimerUsed;
         m_snapshot.TicksPresented = m_ticksPresented.load(std::memory_order_relaxed);
         m_snapshot.PaintCount = m_paintCount.load(std::memory_order_relaxed);
+        if (!m_tickIntervalsUs.empty())
+        {
+            std::vector<uint64_t> sorted = m_tickIntervalsUs;
+            std::sort(sorted.begin(), sorted.end());
+            uint64_t sumUs = 0ULL;
+            for (uint64_t v : sorted)
+            {
+                sumUs += v;
+            }
+            m_snapshot.TickIntervalAvgUs = sumUs / sorted.size();
+            m_snapshot.TickIntervalMaxUs = sorted.back();
+            const size_t rank = (95U * sorted.size() + 99U) / 100U;
+            const size_t idx = (rank > 0U && (rank - 1U) < sorted.size()) ? (rank - 1U) : (sorted.size() - 1U);
+            m_snapshot.TickIntervalP95Us = sorted[idx];
+        }
         if (m_startQpc > 0ULL && m_endQpc > m_startQpc && m_qpcFreq > 0ULL)
         {
             m_snapshot.DurationUs = ((m_endQpc - m_startQpc) * 1000000ULL) / m_qpcFreq;
@@ -661,13 +683,35 @@ private:
         m_threadStartOk = true;
         (void)SetEvent(m_readyEvent);
 
-        const uint64_t intervalUs = 1000000ULL / static_cast<uint64_t>(targetFps);
-        const DWORD intervalMs = static_cast<DWORD>(std::max<uint64_t>(1ULL, intervalUs / 1000ULL));
+        // Use a high-resolution waitable timer + absolute QPC deadline pacing to avoid the
+        // 15.625ms Windows scheduler tick quantization that throttled 16ms relative waits to ~37.3 FPS.
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+        constexpr DWORD kCreateWaitableTimerHighResolution = 0x00000002U;
+#else
+        constexpr DWORD kCreateWaitableTimerHighResolution = CREATE_WAITABLE_TIMER_HIGH_RESOLUTION;
+#endif
+        HANDLE pacingTimer = CreateWaitableTimerExW(
+            nullptr,
+            nullptr,
+            kCreateWaitableTimerHighResolution,
+            TIMER_ALL_ACCESS);
+        if (pacingTimer != nullptr)
+        {
+            m_highResTimerUsed = true;
+        }
+        else
+        {
+            pacingTimer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
+        }
+
+        const uint64_t intervalQpc = std::max<uint64_t>(1ULL, m_qpcFreq / static_cast<uint64_t>(targetFps));
+        uint64_t nextDeadlineQpc = m_startQpc;
+        uint64_t prevTickQpc = 0ULL;
+        const uint64_t spinThresholdQpc = std::max<uint64_t>(1ULL, (m_qpcFreq * 250ULL) / 1000000ULL);
 
         for (;;)
         {
-            const DWORD waitRes = MsgWaitForMultipleObjects(1U, &m_stopEvent, FALSE, intervalMs, QS_ALLINPUT);
-            if (waitRes == WAIT_OBJECT_0)
+            if (WaitForSingleObject(m_stopEvent, 0U) == WAIT_OBJECT_0)
             {
                 break;
             }
@@ -688,9 +732,82 @@ private:
                 break;
             }
 
+            LARGE_INTEGER nowLi{};
+            (void)QueryPerformanceCounter(&nowLi);
+            const uint64_t nowQpc = (nowLi.QuadPart > 0) ? static_cast<uint64_t>(nowLi.QuadPart) : m_startQpc;
+
+            if (nowQpc < nextDeadlineQpc)
+            {
+                const uint64_t remQpc = nextDeadlineQpc - nowQpc;
+                if (pacingTimer != nullptr && remQpc > spinThresholdQpc)
+                {
+                    const uint64_t waitQpc = remQpc - spinThresholdQpc;
+                    const uint64_t wait100Ns = std::max<uint64_t>(1ULL, (waitQpc * 10000000ULL) / m_qpcFreq);
+                    LARGE_INTEGER dueTime{};
+                    dueTime.QuadPart = -static_cast<LONGLONG>(wait100Ns);
+                    (void)SetWaitableTimer(pacingTimer, &dueTime, 0L, nullptr, nullptr, FALSE);
+                    const HANDLE waitHandles[2] = {m_stopEvent, pacingTimer};
+                    const DWORD waitRes = MsgWaitForMultipleObjects(2U, waitHandles, FALSE, INFINITE, QS_ALLINPUT);
+                    if (waitRes == WAIT_OBJECT_0)
+                    {
+                        break;
+                    }
+                    continue;
+                }
+                else if (pacingTimer == nullptr)
+                {
+                    const DWORD sleepMs = static_cast<DWORD>((remQpc * 1000ULL) / m_qpcFreq);
+                    if (sleepMs > 0U)
+                    {
+                        const DWORD waitRes = MsgWaitForMultipleObjects(1U, &m_stopEvent, FALSE, sleepMs, QS_ALLINPUT);
+                        if (waitRes == WAIT_OBJECT_0)
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+
+                while (WaitForSingleObject(m_stopEvent, 0U) != WAIT_OBJECT_0)
+                {
+                    LARGE_INTEGER spinLi{};
+                    (void)QueryPerformanceCounter(&spinLi);
+                    if (static_cast<uint64_t>(spinLi.QuadPart) >= nextDeadlineQpc)
+                    {
+                        break;
+                    }
+                    SwitchToThread();
+                }
+                if (WaitForSingleObject(m_stopEvent, 0U) == WAIT_OBJECT_0)
+                {
+                    break;
+                }
+            }
+
+            LARGE_INTEGER presentLi{};
+            (void)QueryPerformanceCounter(&presentLi);
+            const uint64_t presentQpc = (presentLi.QuadPart > 0) ? static_cast<uint64_t>(presentLi.QuadPart) : nextDeadlineQpc;
+            if (prevTickQpc > 0ULL && presentQpc >= prevTickQpc && m_tickIntervalsUs.size() < 65536U)
+            {
+                m_tickIntervalsUs.push_back(((presentQpc - prevTickQpc) * 1000000ULL) / m_qpcFreq);
+            }
+            prevTickQpc = presentQpc;
+
+            nextDeadlineQpc += intervalQpc;
+            if (presentQpc > nextDeadlineQpc + (intervalQpc * 2ULL))
+            {
+                // Resynchronize after an OS stall without burst catch-up.
+                nextDeadlineQpc = presentQpc + intervalQpc;
+            }
+
             m_ticksPresented.fetch_add(1ULL, std::memory_order_relaxed);
             (void)InvalidateRect(hwnd, nullptr, FALSE);
             (void)UpdateWindow(hwnd);
+        }
+
+        if (pacingTimer != nullptr)
+        {
+            CloseHandle(pacingTimer);
         }
 
         LARGE_INTEGER endLi{};
@@ -725,6 +842,8 @@ private:
     uint64_t m_qpcFreq{10000000ULL};
     uint64_t m_startQpc{0ULL};
     uint64_t m_endQpc{0ULL};
+    bool m_highResTimerUsed{false};
+    std::vector<uint64_t> m_tickIntervalsUs{};
     bool m_threadStartOk{false};
     std::string m_threadError{};
 };
