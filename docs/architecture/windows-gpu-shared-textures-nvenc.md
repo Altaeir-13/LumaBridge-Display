@@ -130,32 +130,57 @@ Isto separa de forma limpa o ritmo do estímulo (`60,13 FPS`) de gargalos de com
 
 ---
 
-## 8. Benchmark Controlado (RTX 3060 Ti, 120 quadros por modo)
+### Resultados Atualizados (M4.2.1 — RTX 3060 Ti, 120 quadros por modo + Benchmark Prolongado 30 s 1080p60)
 
-Resultados medidos em processo real separado (`FrameEndToEndIntegrationTests.exe` + `lumabridge-host.exe`, configuração `Release|x64`, adaptador `Hardware` RTX 3060 Ti, leitura de pixel CPU no caminho normal `cpuReads = 0` nos modos GPU):
+Resultados medidos em processo real separado (`FrameEndToEndIntegrationTests.exe` + `lumabridge-host.exe`, `Release|x64`, adaptador `Hardware` RTX 3060 Ti, leitura de pixel CPU no caminho normal `cpuReads = 0` nos modos GPU):
 
 | Resolução | Modo | FPS Conectado | FPS Ativo | FPS Saída NVENC | Cópia Produtor (Avg / p95) | Trânsito IPC (Avg) | Sync Mutex GPU (Avg) | Codificação NVENC (Avg / p95) | Latência Host E2E (Avg / p95) | Bytes no Pipe / Bitstream |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| **1280×720** | **[A] M4.1.1 CPU Staging** | 118,31 | 119,49 | — | 784 / 1.828 µs | 698 µs | — | — | 1.782 / 2.988 µs | 442.380.480 B (pipe) |
-| **1280×720** | **[B] M4.2 Fase A GPU Shared** | 6.666,67 | *(18 ms total)* | — | 0 / 1 µs | 1.892 µs | 34 µs | — | 5.601 / 509 µs | 16.320 B (pipe) |
-| **1280×720** | **[C] M4.2 Fase B GPU + NVENC** | 437,99 | 442,15 | **518,61** | 0 µs | 4.053 µs | 23 µs | 1.847 / 1.978 µs | — *(presentToBs 14.317 µs em burst)* | 4.697.269 B (H.264) |
-| **1920×1080** | **[A] M4.1.1 CPU Staging** | 51,94 | 52,41 | — | 1.234 / 1.456 µs | 1.807 µs | — | — | 18.405 / 22.927 µs | 995.340.480 B (pipe) |
-| **1920×1080** | **[B] M4.2 Fase A GPU Shared** | 6.079,03 | *(19 ms total)* | — | 0 / 1 µs | 1.847 µs | 32 µs | — | 5.488 / 478 µs | **16.320 B** (**60.989× menor**) |
-| **1920×1080** | **[C] M4.2 Fase B GPU + NVENC** | 294,45 | **296,29** | **324,78** | 0 µs | 5.123 µs | 25 µs | **2.999 / 3.152 µs** | — *(presentToBs 18.619 µs em burst)* | **4.779.806 B** (**208× menor**) |
+| **1280×720** | **[A] M4.1.1 CPU Staging** | 104,33 | 105,24 | — | 752 / 1.352 µs | 999 µs | — | — | 5.487 / 10.643 µs | 442.380.480 B (pipe) |
+| **1280×720** | **[B] M4.2 Fase A GPU Shared** | 3.912,11 | *(30 ms total)* | — | 0 / 1 µs | 157 µs | 44 µs | — | 392 / 655 µs | 16.320 B (pipe) |
+| **1280×720** | **[C] M4.2 Fase B GPU + NVENC** | 451,68 | 454,38 | **461,56** | 8 µs | 2.172 µs | 29 µs | 2.071 / 2.399 µs | — *(presentToBs 8.596 µs em burst)* | 4.697.269 B (H.264) |
+| **1920×1080** | **[A] M4.1.1 CPU Staging** | 49,97 | 50,45 | — | 1.229 / 1.860 µs | 1.817 µs | — | — | 12.649 / 21.825 µs | 995.340.480 B (pipe) |
+| **1920×1080** | **[B] M4.2 Fase A GPU Shared** | 4.422,82 | *(27 ms total)* | — | 0 / 1 µs | 204 µs | 36 µs | — | 535 / 2.576 µs | **16.320 B** (**60.989× menor**) |
+| **1920×1080** | **[C] M4.2 Fase B GPU + NVENC** | 292,68 | **293,42** | **296,27** | 1 µs | 3.368 µs | 35 µs | **3.272 / 3.825 µs** | — *(presentToBs 13.307 µs em burst)* | **4.779.806 B** (**208× menor**) |
 
-*Observações de medição:*
-- Nos testes em rajada (`burst` sem cadência de 60 Hz), o produtor enfileira até o limite da fila à frente do codificador (~10–15 ms de fila observável em `presentToBs` durante saturação de 120 quadros contínuos); sob cadência constante de 60 Hz (`16,67 ms`/quadro), o codificador conclui cada frame 1080p em **~3,00 ms** sem acúmulo de fila.
-- Validação independente com decodificador CPU Media Foundation (`Microsoft H.264 Video Decoder MFT`, `NvencEncoderTests`): 8/8 quadros decodificados, 0 erros NAL/decodificação, **PSNR mínimo Y = 46,54 dB (média 49,05 dB) e UV = 41,24 dB (média 44,06 dB)**.
+#### Benchmark Prolongado 30 s @ 60 FPS em 1920×1080 (`EndToEndProlonged1080p60GpuNvenc30SecondBenchmark`, 1.800 quadros):
+- **Taxa sustentada:** Estímulo `60,000 FPS`, `HostLiveFPS = 60,002 FPS`, `EncoderOutputFps = 60,002 FPS`, `1800/1800` decodificados sem erros NAL/MFT.
+- **Cobertura e consistência temporal:** `Core = 100,0%`, `Live = 100,0%`, `ExtractToBitstream = 100,0%`, `TimestampMeasurementErrors = 0`, `CpuStagingReadsPerformed = 0`.
+- **Latências e jitter (com pré-aquecimento):** `HostLiveE2E` média `202 µs` (`p95 = 247 µs`, `p99 = 529 µs`), `InterFrameJitter` média `256 µs`, espera no pool (`avg = 93 µs`, `max = 14.460 µs`, pico de ocupação `2/4` slots).
+- **Sub-etapas NVENC (`1800` quadros):** inicialização pré-aquecida `35.158 µs`; codificação média `5.686 µs` (`p95 = 10.162 µs`, `p99 = 12.997 µs`) dividida em `FormatPrepare = 0 µs`, `EncodePicture = 254 µs`, `BitstreamLockCopy = 5.430 µs`; `ExtractToBitstream p99 = 13.339 µs` (redução de ~18,6× frente ao pico frio anterior de `248.577 µs`).
+- **Fidelidade PSNR sintética entre processos (`--verify-h264-psnr`, `cpuReads = 0`):** `720p` (`minY = 47,70 dB`, `minUv = 40,85 dB`) e `1080p` (`minY = 41,03 dB`, `minUv = 36,88 dB`) com `FidelityPsnrValidated = true`.
 
 ---
 
-## 9. Procedimento de Validação Windows e Caminho para Linux
+## 9. Telemetria Causal e Diagnóstico de Picos (M4.2.1)
+
+1. **Causa raiz dos 120 `TimestampMeasurementErrors` e `LiveEndToEndLatency.SampleCount = 0`:** Conforme o WDK (`IddCx.h`), `IDDCX_METADATA::PresentDisplayQPCTime` representa o **alvo futuro de VSync** agendado pelo DWM (`PresentDisplayQPCTime > acquireQpc`), e não quando o quadro foi capturado. O driver (`Adapter.cpp`) passou a normalizar causalmente o timestamp usando `SwapChainAcquireQpcTime` quando o metadado é alvo futuro (`PresentDisplayQpcWasFutureTarget`), preservando o valor bruto para diagnóstico e aceitando `PresentDisplayQpcTime == 0` como campo opcional sem contaminar os intervalos centrais (`Extract -> ServerSend -> HostRecv -> Ack`).
+2. **Causa raiz do pico `p99 = 248 ms` e ordenação quadrática:** A criação preguiçosa do dispositivo D3D11, da sessão NVENC e do MFT decoder acontecia no Quadro 1, além de `.Summarize()` reordenar vetores a cada frame no hot path (`O(N² log N)` em sessões longas). O pré-aquecimento antes de `RunLoop` (`PrewarmD3d11Device`, `NvencH264Encoder::Initialize`, `H264StreamValidationSession::PrewarmDecoder`) e a movimentação de `.Summarize()` para `GetMetricsSnapshot()` eliminaram o gargalo.
+3. **Cobertura temporal e critérios de aceitação estritos:** `SequenceAndTimestampsConsistent` exige `TimestampMeasurementErrors == 0`, monotonicidade de sequência e timestamps, amostras reais mensuráveis (`Available = true`, nunca mascarando ausência com `0 µs`) e cobertura `>= 95%`. Execuções ao vivo sem padrão sintético reportam `StructuralDecodeValidated = true` e `FidelityPsnrValidated = false`; testes de 120 quadros nunca recebem `ProlongedStabilityProven = true`.
+
+---
+
+## 10. Procedimento de Validação Windows e Caminho para Linux
 
 ### Validação em Host Windows 11 Real
 ```powershell
+# Previa Dry Run (Benchmark 30s 1080p60 GPU + NVENC + Decode)
 powershell -NoProfile -ExecutionPolicy Bypass -File .\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 `
     -Configuration Release `
-    -TestProfile Both `
+    -TestProfile Benchmark30s `
+    -BenchmarkDurationSec 30 `
+    -TransportMode Gpu `
+    -RequireGpuShared `
+    -EnableNvenc `
+    -RequireNvenc `
+    -VerifyH264Decode `
+    -DryRun
+
+# Execucao real como Administrador (solicita confirmacao explicita e garante rollback em finally)
+powershell -NoProfile -ExecutionPolicy Bypass -File .\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 `
+    -Configuration Release `
+    -TestProfile Benchmark30s `
+    -BenchmarkDurationSec 30 `
     -TransportMode Gpu `
     -RequireGpuShared `
     -EnableNvenc `
@@ -163,7 +188,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\windows\driver\scripts\Inv
     -VerifyH264Decode `
     -CreateTestCertificateIfMissing -TrustCertificate -AllowUntrustedChain
 ```
-O script habilita temporariamente `EnableFrameExtraction=1` (e `EnableGpuSharedTransport` se explicitado) e garante o rollback completo no bloco `finally` (`EnableFrameExtraction=0`, remoção/restauração de `AuthorizedHostUserSid` e `EnableGpuSharedTransport`, encerramento de ETW e reinício do adaptador).
+O script habilita temporariamente `EnableFrameExtraction=1` (e `EnableGpuSharedTransport` se explicitado) e garante o rollback completo no bloco `finally` (`EnableFrameExtraction=0`, remoção/restauração de `AuthorizedHostUserSid` e `EnableGpuSharedTransport`, encerramento de ETW e reinício do adaptador). Para estabilidade prolongada de 2 a 5 minutos, utilize `-TestProfile ProlongedStability -StabilityDurationSec 120` (ou `-TestProfile Full`).
 
 ### Caminho Posterior para Transmissão Linux (M5+)
 1. **Empacotamento de Rede em `lumabridge-host.exe`:** Consumir pacotes `EncodedFramePacket` de `EncodedFrameQueue` (já entregues em `Annex-B` com SPS/PPS pré-anexados a cada IDR e `PresentDisplayQpcTime` / `FrameSequence`), fragmentando em datagramas UDP/QUIC/RTP com cabeçalho mínimo de sequência, timestamp monotônico e indicador de keyframe.

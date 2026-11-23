@@ -7,8 +7,8 @@ Processo Windows separado de `WUDFHost.exe` que se conecta ao endpoint IPC local
 Em ambiente `x64` do Visual Studio (`VsDevCmd.bat -arch=amd64 -host_arch=amd64`):
 
 ```bat
-cl /nologo /std:c++17 /W4 /WX /EHsc /Od /Zi /MDd /DUNICODE /D_UNICODE /Iwindows\host /Iwindows\driver\LumaBridgeIddDriver windows\host\main.cpp windows\host\FrameConsumer.cpp windows\host\NvencH264Encoder.cpp windows\host\H264BitstreamValidator.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\lumabridge-host.exe /link d3d11.lib dxgi.lib advapi32.lib user32.lib gdi32.lib mfplat.lib mfuuid.lib wmcodecdspuuid.lib ole32.lib
-cl /nologo /std:c++17 /W4 /WX /EHsc /O2 /Zi /MD /DNDEBUG /DUNICODE /D_UNICODE /Iwindows\host /Iwindows\driver\LumaBridgeIddDriver windows\host\main.cpp windows\host\FrameConsumer.cpp windows\host\NvencH264Encoder.cpp windows\host\H264BitstreamValidator.cpp /Fowindows\driver\x64\Release\ /Fe:windows\driver\x64\Release\lumabridge-host.exe /link d3d11.lib dxgi.lib advapi32.lib user32.lib gdi32.lib mfplat.lib mfuuid.lib wmcodecdspuuid.lib ole32.lib
+cl /nologo /std:c++17 /W4 /WX /EHsc /Od /Zi /MDd /DUNICODE /D_UNICODE /Iwindows\host /Iwindows\driver\LumaBridgeIddDriver windows\host\main.cpp windows\host\FrameConsumer.cpp windows\host\NvencH264Encoder.cpp windows\host\H264BitstreamValidator.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\lumabridge-host.exe /link d3d11.lib dxgi.lib advapi32.lib user32.lib gdi32.lib mfplat.lib mfuuid.lib wmcodecdspuuid.lib ole32.lib psapi.lib
+cl /nologo /std:c++17 /W4 /WX /EHsc /O2 /Zi /MD /DNDEBUG /DUNICODE /D_UNICODE /Iwindows\host /Iwindows\driver\LumaBridgeIddDriver windows\host\main.cpp windows\host\FrameConsumer.cpp windows\host\NvencH264Encoder.cpp windows\host\H264BitstreamValidator.cpp /Fowindows\driver\x64\Release\ /Fe:windows\driver\x64\Release\lumabridge-host.exe /link d3d11.lib dxgi.lib advapi32.lib user32.lib gdi32.lib mfplat.lib mfuuid.lib wmcodecdspuuid.lib ole32.lib psapi.lib
 ```
 
 ## Opcoes de linha de comando
@@ -30,12 +30,14 @@ cl /nologo /std:c++17 /W4 /WX /EHsc /O2 /Zi /MD /DNDEBUG /DUNICODE /D_UNICODE /I
 - `--nvenc-gop <frames>`: intervalo de GOP / IDR em frames (padrao: `120`)
 - `--nvenc-force-idr-every <N>`: solicita keyframe IDR explicitamente a cada `N` frames codificados
 - `--nvenc-color-format <auto|argb|nv12>`: seleciona entrada direta `ARGB/ABGR` ou conversao GPU `ID3D11VideoProcessor` (`BGRA8 -> NV12`)
-- `--verify-h264-decode`: inspeciona NALs Annex-B (`SPS`/`PPS`/`IDR`) e decodifica via `Microsoft H.264 Video Decoder MFT` (Media Foundation), calculando PSNR quando `--verify-synthetic-pattern` estiver ativo
+- `--verify-h264-decode`: inspeciona NALs Annex-B (`SPS`/`PPS`/`IDR`) e decodifica via `Microsoft H.264 Video Decoder MFT` (Media Foundation), mantendo `FidelityPsnrValidated=false` quando executado sobre desktop real sem referencia sintetica
+- `--verify-h264-psnr`: ativa `--verify-h264-decode` e valida PSNR (`MinYPsnrDb`/`MinUvPsnrDb`/`MinCombinedPsnrDb`) contra padrao sintetico BGRA8 conhecido (`FidelityPsnrValidated=true`), mantendo `CpuStagingReadsPerformed=0` no caminho GPU
+- `--prewarm-width <px>` / `--prewarm-height <px>`: pre-aquece dispositivo D3D11, sessao NVENC e decoder Media Foundation antes de conectar (padrao `1920x1080`; `0` desativa pre-aquecimento de sessao), eliminando o pico frio do Quadro 1
 - `--visual-stimulus`: renderiza janela de movimento sintetico com timer de alta resolucao (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`) diretamente no monitor virtual LumaBridge ativo
 - `--require-virtual-stimulus`: falha com codigo de saida nao-zero se o estimulo visual nao conseguir identificar o display virtual
 - `--stimulus-fps <fps>`: taxa alvo de atualizacao do estimulo visual (`1..120`, padrao `60`)
 - `--stimulus-display <gdiName>`: override explicito opcional do display GDI (ex.: `\\.\DISPLAY2`)
-- `--json-summary <caminho>`: grava resumo JSON nao visual com metricas de GPU pool, NVENC, decoder H.264, breakdown QPC e status do estimulo
+- `--json-summary <caminho>`: grava resumo JSON nao visual com metricas de GPU pool, breakdown de sub-etapas NVENC (`FormatPrepare`, `EncodePicture`, `BitstreamLockCopy`, `EncodedQueueWait`), cobertura temporal (`TemporalTelemetry`), `Available` em estatisticas de latencia, `ResourceUsage` (host + `WUDFHost.exe`), decoder H.264 e status do estimulo
 - `--quiet`: omite log por frame no stdout
 
 ## Limites e privacidade
