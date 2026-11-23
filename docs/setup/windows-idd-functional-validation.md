@@ -139,17 +139,22 @@ Remover os certificados temporarios de teste das stores `CurrentUser\My`, `Local
 | 9 | **Ausencia de monitores fantasmas e leaks** | Desabilitar `EnableVirtualMonitor = 0`, reiniciar e executar `pnputil /remove-device` + `/delete-driver`. | Nenhum monitor fantasma permanece listado em *Gerenciador de Dispositivos -> Monitores* ou Configuracoes de Tela; `WUDFHost.exe` encerra sem handles abertos ou crash dump. |
 | 10 | **Extracao M4.1 opt-in e consumo em `lumabridge-host.exe`** | Com `EnableVirtualMonitor = 1`, definir `REG_DWORD EnableFrameExtraction = 1` na chave `Device Parameters` (ou `Device Parameters\LumaBridgeIddDriver`), reiniciar o dispositivo, executar `lumabridge-host.exe --max-frames 30 --json-summary <temp.json>` e testar desconexao/reconexao. | `lumabridge-host.exe` autentica no Named Pipe `\\.\pipe\LumaBridgeFrameIpc_v1`, recebe frames reais (`FramesDelivered` == `FramesReceived`, `ChecksumMismatches = 0`, `ProtocolErrors = 0`), desconexao nao trava o driver (`FramesDroppedByBackpressure` atua normalmente) e `EnableFrameExtraction = 0` restaura o modo sem copia. |
 
-## 6. Validacao controlada da extracao M4.1 e rollback especifico
+## 6. Validacao controlada da extracao M4.1 / M4.1.1 (Perfis A e B) e rollback
 
-Utilize preferencialmente o script automatizado `Invoke-LumaBridgeFunctionalValidation.ps1`, que executa todas as 11 etapas com `$signResult.StagingDir`, configura o broker `AuthorizedHostUserSid`, valida criterios de aceitacao e executa rollback automatico em bloco `finally`:
+Utilize preferencialmente o script automatizado `Invoke-LumaBridgeFunctionalValidation.ps1`, que separa formalmente dois perfis usando `$signResult.StagingDir`:
+
+- **Perfil A (`-TestProfile Smoke`):** valida integridade ponta a ponta do driver instalado exigindo no minimo `1` frame real valido (`--min-frames 1 --max-frames 60 --duration-ms 5000`), sem exigir 60 frames em desktop estatico nem confundir termino normal por duracao ou timeouts recuperaveis de ociosidade com falha de transporte.
+- **Perfil B (`-TestProfile Performance` ou `Both`):** executa estimulo visual diagnostico controlado exclusivamente no display virtual identificado (`--visual-stimulus --require-virtual-stimulus --require-max-frames`) para medir entrega continua real, breakdown de latencia QPC (`min`/`avg`/`p50`/`p95`/`p99`/`max`), separacao entre `QueueWaitLatency` pre-conexao e `LiveEndToEndLatency`, FPS medio total vs. FPS ativo sustentado.
 
 ```powershell
-# Previa sem efeitos colaterais:
-.\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 -Configuration Release -DryRun
+# Previa sem efeitos colaterais (dois perfis):
+.\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 -Configuration Release -TestProfile Both -DryRun
 
-# Execucao real como Administrador (solicita confirmacao manual antes de instalar/alterar dispositivo):
-.\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 -Configuration Release -CreateTestCertificateIfMissing -TrustCertificate
+# Execucao real como Administrador (solicita confirmacao manual antes de atualizar/instalar driver e habilitar extracao):
+.\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 -Configuration Release -TestProfile Both -CreateTestCertificateIfMissing -TrustCertificate
 ```
+
+> **Escopo do rollback em `finally`:** o runner reverte deterministicamente a sessao ETW, `EnableFrameExtraction=0`, `AuthorizedHostUserSid` e `EnableVirtualMonitor` ao estado anterior (e remove o dispositivo caso `-FullUninstallOnExit` ou falha na primeira instalacao), registrando em `RollbackIncompleteReasons` qualquer pendencia pos-rollback. Se o dispositivo ja possuia uma versao anterior instalada e `-SkipDriverInstall` nao foi usado, o rollback restaura parametros/registro, mas **nao realiza downgrade automatico do binario de driver anterior** (remocao completa requer `-FullUninstallOnExit`).
 
 Caso execute manualmente os passos individuais em PowerShell **como Administrador**:
 

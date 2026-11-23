@@ -2,6 +2,7 @@
 #include "../LumaBridgeIddDriver/FrameIpcProtocol.h"
 #include "../LumaBridgeIddDriver/FrameTransport.h"
 #include "../../host/FrameConsumer.h"
+#include "../../host/VirtualDisplayStimulus.h"
 
 #include <aclapi.h>
 #include <sddl.h>
@@ -1293,6 +1294,547 @@ TestProcessIntegrityAndAnonymousSqosRejectionBeforePixels()
     }
 }
 
+void
+TestPoolCapacityLimitsExhaustionAndAllocationFailureRollback()
+{
+    // 1. Exact exhaustion: BufferPoolSize = 3, MaxQueueDepth = 1.
+    //    State under test: 1 slot queued + 1 slot held in IPC worker/peer + 1 slot in extraction.
+    //    Acquiring again evicts the 1 queued frame (no over-allocation); acquiring ONE more time
+    //    when queue is empty and all 3 slots are in-flight MUST return nullptr without allocating #4.
+    {
+        const std::wstring pipeName = MakeUniquePipeName(18U);
+        FrameTransportConfig serverCfg;
+        serverCfg.SetPipeName(pipeName.c_str());
+        serverCfg.MaxQueueDepth = 1U;
+        serverCfg.BufferPoolSize = 3U;
+
+        FrameIpcServer server;
+        EXPECT_EQ(server.Start(serverCfg), S_OK);
+
+        auto initialSnap = server.GetMetricsSnapshot();
+        EXPECT_EQ(initialSnap.TotalPoolSlots, 3U);
+        EXPECT_EQ(initialSnap.FreePoolSlots, 3U);
+        EXPECT_EQ(initialSnap.InFlightSlots, 0U);
+
+        // Slot #1 -> enqueue so it sits in m_queue (depth=1), Slot #2 & #3 held in-flight (extraction/transit).
+        auto s1 = server.AcquireBufferSlot();
+        EXPECT_TRUE(s1 != nullptr);
+        EXPECT_TRUE(s1->Pixels.Resize(64U * 64U * 4U));
+        s1->FrameSequence = 1ULL;
+        s1->Width = 64U;
+        s1->Height = 64U;
+        s1->RowPitchBytes = 64U * 4U;
+        s1->Format = static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
+        s1->PayloadCrc32 = ComputeFrameCrc32(s1->Pixels.data(), s1->Pixels.size());
+        bool evicted = false;
+        EXPECT_EQ(server.EnqueueFrame(std::move(s1), evicted), S_OK);
+
+        auto s2 = server.AcquireBufferSlot();
+        auto s3 = server.AcquireBufferSlot();
+        EXPECT_TRUE(s2 != nullptr);
+        EXPECT_TRUE(s3 != nullptr);
+
+        auto midSnap = server.GetMetricsSnapshot();
+        EXPECT_EQ(midSnap.TotalPoolSlots, 3U);
+        EXPECT_EQ(midSnap.FreePoolSlots, 0U);
+        EXPECT_EQ(midSnap.QueueDepth, 1U);
+        EXPECT_EQ(midSnap.InFlightSlots, 2U);
+
+        // Acquiring #4 when Free==0 and Queue==1 evicts the queued frame (#1) cleanly without exceeding 3 slots.
+        auto s4FromEviction = server.AcquireBufferSlot();
+        EXPECT_TRUE(s4FromEviction != nullptr);
+        auto fullInFlightSnap = server.GetMetricsSnapshot();
+        EXPECT_EQ(fullInFlightSnap.TotalPoolSlots, 3U);
+        EXPECT_EQ(fullInFlightSnap.FreePoolSlots, 0U);
+        EXPECT_EQ(fullInFlightSnap.QueueDepth, 0U);
+        EXPECT_EQ(fullInFlightSnap.InFlightSlots, 3U);
+        EXPECT_EQ(fullInFlightSnap.QueueEvictionsByBackpressure, 1ULL);
+
+        // Acquiring #5 when Free==0, Queue==0, and all 3 slots are checked out in-flight MUST return nullptr!
+        auto s5Exhausted = server.AcquireBufferSlot();
+        EXPECT_TRUE(s5Exhausted == nullptr);
+        auto exhaustedSnap = server.GetMetricsSnapshot();
+        EXPECT_EQ(exhaustedSnap.TotalPoolSlots, 3U);
+        EXPECT_EQ(exhaustedSnap.InFlightSlots, 3U);
+        EXPECT_EQ(exhaustedSnap.PoolExhaustionDrops, 1ULL);
+        EXPECT_EQ(exhaustedSnap.FramesDroppedByBackpressure, 2ULL);
+
+        // Recycling one slot restores capacity cleanly.
+        server.RecycleBufferSlot(std::move(s2));
+        auto s6 = server.AcquireBufferSlot();
+        EXPECT_TRUE(s6 != nullptr);
+
+        server.RecycleBufferSlot(std::move(s3));
+        server.RecycleBufferSlot(std::move(s4FromEviction));
+        server.RecycleBufferSlot(std::move(s6));
+
+        auto cleanSnap = server.GetMetricsSnapshot();
+        EXPECT_EQ(cleanSnap.TotalPoolSlots, 3U);
+        EXPECT_EQ(cleanSnap.FreePoolSlots, 3U);
+        EXPECT_EQ(cleanSnap.InFlightSlots, 0U);
+        EXPECT_EQ(cleanSnap.QueueDepth, 0U);
+
+        server.Stop();
+        auto stoppedSnap = server.GetMetricsSnapshot();
+        EXPECT_EQ(stoppedSnap.TotalPoolSlots, 0U);
+        EXPECT_EQ(stoppedSnap.FreePoolSlots, 0U);
+        EXPECT_EQ(stoppedSnap.InFlightSlots, 0U);
+    }
+
+    // 2. Allocation failure handling and counter rollback (PreallocatePoolOnStart = false + Start fail).
+    {
+        const std::wstring pipeName = MakeUniquePipeName(19U);
+        FrameTransportConfig failStartCfg;
+        failStartCfg.SetPipeName(pipeName.c_str());
+        failStartCfg.BufferPoolSize = 3U;
+
+        FrameIpcServer server;
+        server.SetSimulateSlotAllocationFailureForTesting(true);
+        EXPECT_EQ(server.Start(failStartCfg), E_OUTOFMEMORY);
+        EXPECT_TRUE(!server.IsRunning());
+        EXPECT_EQ(server.GetMetricsSnapshot().TotalPoolSlots, 0U);
+        EXPECT_EQ(server.GetMetricsSnapshot().PoolAllocationFailures, 1ULL);
+
+        server.SetSimulateSlotAllocationFailureForTesting(false);
+
+        FrameTransportConfig lazyCfg;
+        lazyCfg.SetPipeName(pipeName.c_str());
+        lazyCfg.MaxQueueDepth = 1U;
+        lazyCfg.BufferPoolSize = 3U;
+        lazyCfg.PreallocatePoolOnStart = false;
+        EXPECT_EQ(server.Start(lazyCfg), S_OK);
+        EXPECT_EQ(server.GetMetricsSnapshot().TotalPoolSlots, 0U);
+
+        // First slot succeeds -> Total=1, InFlight=1.
+        auto first = server.AcquireBufferSlot();
+        EXPECT_TRUE(first != nullptr);
+        EXPECT_EQ(server.GetMetricsSnapshot().TotalPoolSlots, 1U);
+        EXPECT_EQ(server.GetMetricsSnapshot().InFlightSlots, 1U);
+
+        // Next slot hits simulated new(std::nothrow)==nullptr -> counters roll back cleanly to Total=1, InFlight=1!
+        server.SetSimulateSlotAllocationFailureForTesting(true);
+        auto failed = server.AcquireBufferSlot();
+        EXPECT_TRUE(failed == nullptr);
+        const auto rollbackSnap = server.GetMetricsSnapshot();
+        EXPECT_EQ(rollbackSnap.TotalPoolSlots, 1U);
+        EXPECT_EQ(rollbackSnap.InFlightSlots, 1U);
+        EXPECT_EQ(rollbackSnap.PoolAllocationFailures, 1ULL);
+        EXPECT_EQ(rollbackSnap.FramesDroppedByBackpressure, 1ULL);
+
+        // Clearing fault allows subsequent allocation up to BufferPoolSize=3.
+        server.SetSimulateSlotAllocationFailureForTesting(false);
+        auto second = server.AcquireBufferSlot();
+        EXPECT_TRUE(second != nullptr);
+        EXPECT_EQ(server.GetMetricsSnapshot().TotalPoolSlots, 2U);
+        server.RecycleBufferSlot(std::move(first));
+        server.RecycleBufferSlot(std::move(second));
+        server.Stop();
+    }
+}
+
+void
+TestSmokeExitReasonsIdleDesktopAndRecoverableVsPartialTimeouts()
+{
+    // Case A: Idle desktop with zero frames -> normal DurationElapsed, TransportHealthy=true, LastError=S_OK.
+    {
+        const std::wstring pipeName = MakeUniquePipeName(20U);
+        FrameTransportConfig serverCfg;
+        serverCfg.SetPipeName(pipeName.c_str());
+        FrameIpcServer server;
+        EXPECT_EQ(server.Start(serverCfg), S_OK);
+
+        HostConsumerConfig hostCfg;
+        hostCfg.PipeName = pipeName;
+        hostCfg.IoTimeoutMs = 80U;
+        hostCfg.MaxDurationMs = 260U;
+        hostCfg.MaxFrames = 60ULL;
+        hostCfg.MinFrames = 0ULL;
+        hostCfg.RequireFrameTarget = false;
+
+        FrameConsumer consumer(hostCfg);
+        EXPECT_EQ(consumer.RunLoop(), S_OK);
+
+        const auto snap = consumer.GetMetricsSnapshot();
+        EXPECT_EQ(snap.ExitReason, HostExitReason::DurationElapsed);
+        EXPECT_TRUE(snap.HostProcessExitedNormally);
+        EXPECT_TRUE(snap.TransportHealthy);
+        EXPECT_EQ(snap.FramesReceived, 0ULL);
+        EXPECT_EQ(snap.RecoverableIoTimeouts >= 1ULL, true);
+        EXPECT_EQ(snap.FatalIoTimeouts, 0ULL);
+        EXPECT_EQ(snap.PartialMessageTimeouts, 0ULL);
+        EXPECT_EQ(snap.LastErrorHResult, S_OK);
+        EXPECT_TRUE(snap.TotalIdleWaitDurationUs > 0ULL);
+        server.Stop();
+    }
+
+    // Case B: Single valid frame delivered cleanly.
+    {
+        const std::wstring pipeName = MakeUniquePipeName(21U);
+        FrameTransportConfig serverCfg;
+        serverCfg.SetPipeName(pipeName.c_str());
+        FrameIpcServer server;
+        EXPECT_EQ(server.Start(serverCfg), S_OK);
+
+        bool evicted = false;
+        EXPECT_EQ(server.EnqueueFrame(MakeSyntheticExtractedFrame(1ULL, 10U, 64U, 64U), evicted), S_OK);
+
+        HostConsumerConfig hostCfg;
+        hostCfg.PipeName = pipeName;
+        hostCfg.IoTimeoutMs = 80U;
+        hostCfg.MaxDurationMs = 220U;
+        hostCfg.MaxFrames = 60ULL;
+        hostCfg.MinFrames = 1ULL;
+        hostCfg.RequireFrameTarget = false;
+        hostCfg.VerifySyntheticPattern = true;
+
+        FrameConsumer consumer(hostCfg);
+        EXPECT_EQ(consumer.RunLoop(), S_OK);
+
+        const auto snap = consumer.GetMetricsSnapshot();
+        EXPECT_EQ(snap.ExitReason, HostExitReason::DurationElapsed);
+        EXPECT_TRUE(snap.HostProcessExitedNormally);
+        EXPECT_TRUE(snap.TransportHealthy);
+        EXPECT_EQ(snap.FramesValid, 1ULL);
+        EXPECT_TRUE(snap.MinFramesReached);
+        EXPECT_TRUE(!snap.FrameTargetReached);
+        EXPECT_EQ(snap.PreConnectFramesReceived, 1ULL);
+        EXPECT_EQ(snap.LiveFramesReceived, 0ULL);
+        EXPECT_TRUE(!snap.FpsSampleSufficient);
+        EXPECT_EQ(snap.ObservedActiveFps, 0.0);
+        server.Stop();
+    }
+
+    // Case C: Three valid frames with target 60 -> smoke passes cleanly while distinguishing target not reached,
+    //         and recoverable boundary timeout recovers cleanly for the next frame.
+    {
+        const std::wstring pipeName = MakeUniquePipeName(22U);
+        FrameTransportConfig serverCfg;
+        serverCfg.SetPipeName(pipeName.c_str());
+        FrameIpcServer server;
+        EXPECT_EQ(server.Start(serverCfg), S_OK);
+
+        HostConsumerConfig hostCfg;
+        hostCfg.PipeName = pipeName;
+        hostCfg.IoTimeoutMs = 80U;
+        hostCfg.VerifySyntheticPattern = true;
+        FrameConsumer consumer(hostCfg);
+        EXPECT_EQ(consumer.Connect(2000U), S_OK);
+
+        // Boundary timeout with 0 frames sent must NOT drop connection.
+        FrameIpcFrameHeader tmpHdr{};
+        std::vector<uint8_t> tmpPixels;
+        EXPECT_EQ(consumer.ReceiveNextFrame(tmpHdr, tmpPixels, 70U), HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+        EXPECT_EQ(consumer.GetMetricsSnapshot().RecoverableIoTimeouts, 1ULL);
+        EXPECT_EQ(consumer.GetMetricsSnapshot().FatalIoTimeouts, 0ULL);
+        EXPECT_TRUE(consumer.GetMetricsSnapshot().Connected);
+        EXPECT_TRUE(consumer.GetMetricsSnapshot().TransportHealthy);
+
+        // Next 3 live frames still transfer cleanly on the SAME synchronized pipe!
+        for (uint32_t i = 1U; i <= 3U; ++i)
+        {
+            bool evicted = false;
+            EXPECT_EQ(server.EnqueueFrame(MakeSyntheticExtractedFrame(i, i, 64U, 64U), evicted), S_OK);
+            EXPECT_EQ(consumer.ReceiveNextFrame(tmpHdr, tmpPixels, 1000U), S_OK);
+        }
+
+        const auto snap = consumer.GetMetricsSnapshot();
+        EXPECT_EQ(snap.FramesValid, 3ULL);
+        EXPECT_EQ(snap.LiveFramesReceived, 3ULL);
+        EXPECT_EQ(snap.ChecksumMismatches, 0ULL);
+        EXPECT_TRUE(snap.TransportHealthy);
+        EXPECT_EQ(snap.RecoverableIoTimeouts, 1ULL);
+        consumer.Disconnect();
+        server.Stop();
+    }
+
+    // Case D: Partial envelope and mid-payload timeouts close pipe immediately and mark fatal timeout.
+    {
+        const std::wstring pipeName = MakeUniquePipeName(23U);
+        HANDLE serverPipe = CreateNamedPipeW(
+            pipeName.c_str(),
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            1U,
+            65536U,
+            65536U,
+            0U,
+            nullptr);
+        EXPECT_TRUE(serverPipe != INVALID_HANDLE_VALUE);
+
+        std::thread rawServer([&]() {
+            ConnectNamedPipe(serverPipe, nullptr);
+            FrameIpcClientHello cHello{};
+            ReadAllSync(serverPipe, &cHello, sizeof(cHello));
+
+            FrameIpcServerHello sHello{};
+            sHello.Envelope = InitEnvelope(FrameIpcMessageType::ServerHello, sizeof(sHello));
+            sHello.Status = static_cast<uint32_t>(FrameIpcStatus::Ok);
+            sHello.ServerProcessId = GetCurrentProcessId();
+            sHello.SessionId = 88ULL;
+            sHello.MaxQueueDepth = 3U;
+            WriteAllSync(serverPipe, &sHello, sizeof(sHello));
+
+            // Write ONLY 6 bytes of 16-byte FrameIpcEnvelope, then stall past IoTimeoutMs!
+            uint8_t partialEnv[6]{0x4C, 0x42, 0x49, 0x46, 0x01, 0x00};
+            WriteAllSync(serverPipe, partialEnv, sizeof(partialEnv));
+            Sleep(250U);
+            CloseHandle(serverPipe);
+        });
+
+        HostConsumerConfig cfg;
+        cfg.PipeName = pipeName;
+        cfg.IoTimeoutMs = 90U;
+        cfg.MaxDurationMs = 1000U;
+        FrameConsumer consumer(cfg);
+        const HRESULT runHr = consumer.RunLoop();
+        rawServer.join();
+
+        EXPECT_EQ(runHr, HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+        const auto snap = consumer.GetMetricsSnapshot();
+        EXPECT_EQ(snap.ExitReason, HostExitReason::FatalIoTimeout);
+        EXPECT_TRUE(!snap.HostProcessExitedNormally);
+        EXPECT_TRUE(!snap.TransportHealthy);
+        EXPECT_EQ(snap.FatalIoTimeouts, 1ULL);
+        EXPECT_EQ(snap.PartialMessageTimeouts, 1ULL);
+        EXPECT_EQ(snap.RecoverableIoTimeouts, 0ULL);
+    }
+
+    // Case E: Mid-payload timeout (full header sent, partial payload stalls).
+    {
+        const std::wstring pipeName = MakeUniquePipeName(24U);
+        HANDLE serverPipe = CreateNamedPipeW(
+            pipeName.c_str(),
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            1U,
+            65536U,
+            65536U,
+            0U,
+            nullptr);
+        EXPECT_TRUE(serverPipe != INVALID_HANDLE_VALUE);
+
+        std::thread rawServer([&]() {
+            ConnectNamedPipe(serverPipe, nullptr);
+            FrameIpcClientHello cHello{};
+            ReadAllSync(serverPipe, &cHello, sizeof(cHello));
+
+            LARGE_INTEGER freq{};
+            QueryPerformanceFrequency(&freq);
+            FrameIpcServerHello sHello{};
+            sHello.Envelope = InitEnvelope(FrameIpcMessageType::ServerHello, sizeof(sHello));
+            sHello.Status = static_cast<uint32_t>(FrameIpcStatus::Ok);
+            sHello.ServerProcessId = GetCurrentProcessId();
+            sHello.SessionId = 99ULL;
+            sHello.MaxQueueDepth = 3U;
+            WriteAllSync(serverPipe, &sHello, sizeof(sHello));
+
+            FrameIpcFrameHeader hdr{};
+            hdr.Envelope = InitEnvelope(FrameIpcMessageType::FrameHeader, sizeof(hdr));
+            hdr.SessionId = 99ULL;
+            hdr.FrameSequence = 1ULL;
+            hdr.Width = 64U;
+            hdr.Height = 64U;
+            hdr.RowPitchBytes = 256U;
+            hdr.PixelFormat = static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
+            hdr.PayloadSizeBytes = 64U * 64U * 4U;
+            hdr.QpcFrequency = static_cast<uint64_t>(freq.QuadPart);
+            hdr.ExtractCompleteQpcTime = 1000ULL;
+            hdr.ServerSendQpcTime = 1010ULL;
+            WriteAllSync(serverPipe, &hdr, sizeof(hdr));
+
+            std::vector<uint8_t> partialPayload(512U, 0xAAU);
+            WriteAllSync(serverPipe, partialPayload.data(), partialPayload.size());
+            Sleep(250U);
+            CloseHandle(serverPipe);
+        });
+
+        HostConsumerConfig cfg;
+        cfg.PipeName = pipeName;
+        cfg.IoTimeoutMs = 90U;
+        cfg.MaxDurationMs = 1000U;
+        FrameConsumer consumer(cfg);
+        const HRESULT runHr = consumer.RunLoop();
+        rawServer.join();
+
+        EXPECT_EQ(runHr, HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+        const auto snap = consumer.GetMetricsSnapshot();
+        EXPECT_EQ(snap.ExitReason, HostExitReason::FatalIoTimeout);
+        EXPECT_TRUE(!snap.TransportHealthy);
+        EXPECT_EQ(snap.FatalIoTimeouts, 1ULL);
+        EXPECT_EQ(snap.PartialMessageTimeouts, 1ULL);
+    }
+}
+
+void
+TestDeterministicFpsGuardrailsTimestampValidationAndVirtualDisplaySelection()
+{
+    // 1. Small-sample FPS guardrails (3 frames in 37 ms burst over 15s execution -> insufficient active sample).
+    constexpr uint64_t kFreq = 10000000ULL;
+    const HostFpsBreakdown smallBurst = ComputeHostFpsBreakdown(
+        3ULL,
+        0ULL,
+        15000000ULL,
+        14990000ULL,
+        kFreq * 10ULL,
+        kFreq * 10ULL + 370000ULL,
+        0ULL,
+        0ULL,
+        kFreq);
+    EXPECT_TRUE(!smallBurst.FpsSampleSufficient);
+    EXPECT_EQ(smallBurst.ObservedActiveFps, 0.0);
+    EXPECT_TRUE(smallBurst.AverageExecutionFps > 0.19 && smallBurst.AverageExecutionFps < 0.21);
+
+    // Sufficient sample (60 frames over 1s -> ObservedActiveFps ~ 59-60 FPS).
+    const HostFpsBreakdown steadyRun = ComputeHostFpsBreakdown(
+        60ULL,
+        59ULL,
+        1200000ULL,
+        1100000ULL,
+        kFreq * 1ULL,
+        kFreq * 2ULL,
+        kFreq * 1ULL + 200000ULL,
+        kFreq * 2ULL,
+        kFreq);
+    EXPECT_TRUE(steadyRun.FpsSampleSufficient);
+    EXPECT_TRUE(steadyRun.ObservedActiveFps > 58.9 && steadyRun.ObservedActiveFps < 59.1);
+    EXPECT_TRUE(steadyRun.SustainedLiveFps > 50.0);
+
+    // 2. QPC frequency mismatch & out-of-order timestamp rejection (must report error, not wrapped latency).
+    FrameIpcFrameHeader hdr{};
+    hdr.Envelope = InitEnvelope(FrameIpcMessageType::FrameHeader, sizeof(hdr));
+    hdr.QpcFrequency = kFreq + 1ULL;
+    hdr.PresentDisplayQpcTime = 1000ULL;
+    hdr.ExtractCompleteQpcTime = 2000ULL;
+    hdr.ServerSendQpcTime = 3000ULL;
+    const ValidatedFrameIntervals freqMismatch = ComputeValidatedFrameIntervals(hdr, 4000ULL, 5000ULL, kFreq, true);
+    EXPECT_TRUE(!freqMismatch.Valid);
+    EXPECT_TRUE(freqMismatch.QpcFrequencyMismatch);
+
+    hdr.QpcFrequency = kFreq;
+    hdr.ServerSendQpcTime = 1500ULL; // < ExtractCompleteQpcTime (2000) -> invalid out-of-order!
+    const ValidatedFrameIntervals outOfOrder = ComputeValidatedFrameIntervals(hdr, 4000ULL, 5000ULL, kFreq, true);
+    EXPECT_TRUE(!outOfOrder.Valid);
+    EXPECT_TRUE(outOfOrder.OutOfOrderTimestamps);
+
+    hdr.ServerSendQpcTime = 3000ULL;
+    hdr.Flags = PackFrameFlags(static_cast<uint32_t>(FrameIpcFlags::PreConnectQueuedFrame), 850ULL);
+    const ValidatedFrameIntervals validIntervals = ComputeValidatedFrameIntervals(hdr, 4000ULL, 5000ULL, kFreq, true);
+    EXPECT_TRUE(validIntervals.Valid);
+    EXPECT_TRUE(validIntervals.PreConnectQueued);
+    EXPECT_EQ(validIntervals.CopyUs, 850ULL);
+    EXPECT_EQ(validIntervals.QueueWaitUs, 100ULL);
+    EXPECT_EQ(validIntervals.IpcTransitUs, 100ULL);
+    EXPECT_EQ(validIntervals.HostVerifyAckUs, 100ULL);
+    EXPECT_EQ(validIntervals.EndToEndUs, 200ULL);
+
+    // 3. Percentile summary validation.
+    std::vector<uint64_t> latSamples{500ULL, 100ULL, 300ULL, 900ULL, 200ULL, 400ULL, 700ULL, 800ULL, 600ULL, 1000ULL};
+    const LatencySummaryStats stats = ComputeLatencySummary(latSamples, 1000ULL);
+    EXPECT_EQ(stats.SampleCount, 10ULL);
+    EXPECT_EQ(stats.MinUs, 100ULL);
+    EXPECT_EQ(stats.MaxUs, 1000ULL);
+    EXPECT_EQ(stats.P50Us, 500ULL);
+    EXPECT_EQ(stats.P95Us, 1000ULL);
+    EXPECT_EQ(stats.P99Us, 1000ULL);
+
+    // 4. Virtual display stimulus selection guardrails: refuse physical monitor when no virtual display exists.
+    DisplayCandidateInfo physical{};
+    physical.DeviceName = L"\\\\.\\DISPLAY1";
+    physical.AdapterString = L"NVIDIA GeForce RTX 3060 Ti";
+    physical.MonitorString = L"Generic PnP Monitor";
+    physical.BoundsWidth = 2560U;
+    physical.BoundsHeight = 1440U;
+    physical.Active = true;
+    physical.Primary = true;
+    physical.IsIndirectWired = false;
+
+    const auto onlyPhysical = DiscoverVirtualDisplayFromCandidates({physical});
+    EXPECT_TRUE(!onlyPhysical.Identified);
+
+    DisplayCandidateInfo virtualDisp{};
+    virtualDisp.DeviceName = L"\\\\.\\DISPLAY2";
+    virtualDisp.AdapterString = L"NVIDIA GeForce RTX 3060 Ti";
+    virtualDisp.MonitorString = L"Generic PnP Monitor";
+    virtualDisp.MonitorDeviceId = L"MONITOR\\DEFAULT_MONITOR\\{1234}";
+    virtualDisp.BoundsLeft = 2560;
+    virtualDisp.BoundsTop = 0;
+    virtualDisp.BoundsWidth = 1920U;
+    virtualDisp.BoundsHeight = 1080U;
+    virtualDisp.Active = true;
+    virtualDisp.Primary = false;
+    virtualDisp.IsIndirectWired = true;
+
+    const auto multiMon = DiscoverVirtualDisplayFromCandidates({physical, virtualDisp});
+    EXPECT_TRUE(multiMon.Identified);
+    EXPECT_TRUE(multiMon.Selected.DeviceName == L"\\\\.\\DISPLAY2");
+}
+
+void
+TestRepeatedSessionsMemoryBoundedness()
+{
+    const std::wstring pipeName = MakeUniquePipeName(25U);
+    FrameTransportConfig serverCfg;
+    serverCfg.SetPipeName(pipeName.c_str());
+    serverCfg.MaxQueueDepth = 3U;
+    serverCfg.BufferPoolSize = 5U;
+
+    FrameIpcServer server;
+    EXPECT_EQ(server.Start(serverCfg), S_OK);
+
+    HostConsumerConfig cCfg;
+    cCfg.PipeName = pipeName;
+    cCfg.VerifySyntheticPattern = true;
+    FrameConsumer consumer(cCfg);
+
+    for (uint32_t sess = 0U; sess < 8U; ++sess)
+    {
+        EXPECT_EQ(consumer.Connect(2000U), S_OK);
+        for (uint32_t f = 1U; f <= 3U; ++f)
+        {
+            const uint64_t seq = static_cast<uint64_t>(sess) * 3ULL + f;
+            auto slot = server.AcquireBufferSlot();
+            EXPECT_TRUE(slot != nullptr);
+            constexpr uint32_t kW = 1920U;
+            constexpr uint32_t kH = 1080U;
+            uint32_t pitch = 0U;
+            uint32_t bytes = 0U;
+            EXPECT_TRUE(ComputeTightRowPitchBytes(kW, pitch));
+            EXPECT_TRUE(ComputeValidatedFramePayloadBytes(kW, kH, pitch, bytes));
+            EXPECT_TRUE(slot->Pixels.Resize(bytes));
+            EXPECT_TRUE(GenerateSyntheticTestPatternBgra8(static_cast<uint32_t>(seq), kW, kH, slot->Pixels.data(), slot->Pixels.size()));
+            slot->FrameSequence = seq;
+            slot->PresentationFrameNumber = static_cast<uint32_t>(seq);
+            slot->Width = kW;
+            slot->Height = kH;
+            slot->RowPitchBytes = pitch;
+            slot->Format = static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
+            slot->PayloadCrc32 = ComputeFrameCrc32(slot->Pixels.data(), slot->Pixels.size());
+
+            bool evicted = false;
+            EXPECT_EQ(server.EnqueueFrame(std::move(slot), evicted), S_OK);
+
+            FrameIpcFrameHeader hdr{};
+            std::vector<uint8_t> pixels;
+            EXPECT_EQ(consumer.ReceiveNextFrame(hdr, pixels, 2000U), S_OK);
+            EXPECT_EQ(hdr.FrameSequence, seq);
+        }
+        consumer.Disconnect();
+
+        const auto sSnap = server.GetMetricsSnapshot();
+        EXPECT_EQ(sSnap.TotalPoolSlots, 5U);
+        EXPECT_EQ(sSnap.InFlightSlots, 0U);
+        EXPECT_EQ(sSnap.QueueDepth, 0U);
+    }
+
+    const auto cSnap = consumer.GetMetricsSnapshot();
+    EXPECT_EQ(cSnap.SessionsCompleted, 8ULL);
+    EXPECT_EQ(cSnap.ConnectCount, 8ULL);
+    EXPECT_EQ(cSnap.FramesValid, 24ULL);
+    EXPECT_EQ(cSnap.ChecksumMismatches, 0ULL);
+    EXPECT_TRUE(cSnap.TransportHealthy);
+    server.Stop();
+}
+
 template <typename Fn>
 void
 RunTest(
@@ -1331,6 +1873,10 @@ main()
     RunTest("CrossUserSidAuthorizationAndRestrictedDaclRejection", TestCrossUserSidAuthorizationAndRestrictedDaclRejection);
     RunTest("CrossSessionAndSpoofedSessionRejection", TestCrossSessionAndSpoofedSessionRejection);
     RunTest("ProcessIntegrityAndAnonymousSqosRejectionBeforePixels", TestProcessIntegrityAndAnonymousSqosRejectionBeforePixels);
+    RunTest("PoolCapacityLimitsExhaustionAndAllocationFailureRollback", TestPoolCapacityLimitsExhaustionAndAllocationFailureRollback);
+    RunTest("SmokeExitReasonsIdleDesktopAndRecoverableVsPartialTimeouts", TestSmokeExitReasonsIdleDesktopAndRecoverableVsPartialTimeouts);
+    RunTest("DeterministicFpsGuardrailsTimestampValidationAndVirtualDisplaySelection", TestDeterministicFpsGuardrailsTimestampValidationAndVirtualDisplaySelection);
+    RunTest("RepeatedSessionsMemoryBoundedness", TestRepeatedSessionsMemoryBoundedness);
 
     std::printf("Summary: %d tests run, %d assertion failures.\n", g_TestsRun, g_TestsFailed);
     return (g_TestsFailed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;

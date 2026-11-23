@@ -1,15 +1,17 @@
 <#
 .SYNOPSIS
     Executes the end-to-end Windows 11 functional validation workflow for LumaBridgeIddDriver
-    (M4.1 real D3D11 frame extraction + hardened Named Pipe IPC + lumabridge-host.exe)
-    with non-destructive pre-checks, cryptographic/hash verification, ETW provider checks,
-    authorized installation, time-bounded host execution, diagnostics collection, and
-    guaranteed automatic rollback in a finally block.
+    (M4.1/M4.1.1 real D3D11 frame extraction + hardened Named Pipe IPC + lumabridge-host.exe)
+    with explicit separation between Functional Smoke Test and Continuous Frame Performance Test,
+    plus guaranteed rollback in finally.
 #>
 [CmdletBinding()]
 param(
     [ValidateSet('Debug', 'Release')]
     [string]$Configuration = 'Release',
+
+    [ValidateSet('Smoke', 'Performance', 'Both')]
+    [string]$TestProfile = 'Smoke',
 
     [string]$StagingDir,
 
@@ -31,11 +33,25 @@ param(
 
     [string]$AuthorizedHostUserSid,
 
+    [ValidateRange(1, 1000)]
+    [int]$SmokeMinFrames = 1,
+
     [ValidateRange(1, 10000)]
-    [int]$MaxFrames = 30,
+    [int]$MaxFrames = 60,
 
     [ValidateRange(500, 120000)]
-    [int]$HostDurationMs = 15000,
+    [int]$HostDurationMs = 5000,
+
+    [ValidateRange(1, 10000)]
+    [int]$PerformanceTargetFrames = 60,
+
+    [ValidateRange(500, 120000)]
+    [int]$PerformanceDurationMs = 10000,
+
+    [ValidateRange(1, 120)]
+    [int]$StimulusFps = 60,
+
+    [string]$StimulusDisplayName,
 
     [ValidateRange(500, 30000)]
     [int]$ConnectTimeoutMs = 5000,
@@ -128,6 +144,9 @@ if ($effectiveAuthorizedUserSid -notmatch '^S-1-[0-9-]+$') {
 }
 
 $effectiveAllowUntrusted = ($AllowUntrustedChain -or (-not $TrustCertificate))
+$runSmokeProfile = ($TestProfile -in @('Smoke', 'Both'))
+$runPerfProfile = ($TestProfile -in @('Performance', 'Both'))
+
 $prereqScript = Join-Path -Path $PSScriptRoot -ChildPath 'Test-LumaBridgePrerequisites.ps1'
 $signingScript = Join-Path -Path $PSScriptRoot -ChildPath 'Invoke-LumaBridgePackageSigning.ps1'
 $etwScript = Join-Path -Path $PSScriptRoot -ChildPath 'Invoke-LumaBridgeEtwTrace.ps1'
@@ -139,14 +158,16 @@ $uninstallScript = Join-Path -Path $PSScriptRoot -ChildPath 'Uninstall-LumaBridg
 $etwDir = Join-Path -Path $OutputDir -ChildPath 'etw'
 $diagDir = Join-Path -Path $OutputDir -ChildPath 'diagnostics'
 $installFailDiagDir = Join-Path -Path $OutputDir -ChildPath 'install-failure-diag'
+$hostSmokeJsonPath = Join-Path -Path $OutputDir -ChildPath 'lumabridge-host-smoke-summary.json'
+$hostPerfJsonPath = Join-Path -Path $OutputDir -ChildPath 'lumabridge-host-performance-summary.json'
 $hostJsonPath = Join-Path -Path $OutputDir -ChildPath 'lumabridge-host-summary.json'
 $reportJsonPath = Join-Path -Path $OutputDir -ChildPath 'functional-validation-report.json'
 $reportMdPath = Join-Path -Path $OutputDir -ChildPath 'functional-validation-report.md'
 
 # -------------------------------------------------------------------------
-# Stage 1: Pre-checks non-destrutivas
+# Stage 1: Non-destructive pre-checks & prior state preservation
 # -------------------------------------------------------------------------
-$null = Assert-LumaBridgeAdministrator -OperationName 'Run LumaBridge M4.1 Functional Validation' -DryRun:$DryRun
+$null = Assert-LumaBridgeAdministrator -OperationName 'Run LumaBridge M4.1.1 Functional Validation' -DryRun:$DryRun
 $prereq = & $prereqScript -Configuration $Configuration -StagingDir $StagingDir
 
 if (-not $prereq.HostOs.IsSupportedWindows11) {
@@ -170,6 +191,33 @@ if ($initialInstances.Count -gt 1) {
 }
 
 $preExistingInstance = if ($initialInstances.Count -eq 1) { $initialInstances[0] } else { $null }
+$preValidationState = if ($null -ne $preExistingInstance) {
+    [pscustomobject]@{
+        ExistedBeforeRun      = $true
+        InstanceId            = $preExistingInstance.InstanceId
+        Status                = $preExistingInstance.Status
+        ProblemCode           = $preExistingInstance.ProblemCode
+        DriverInfPath         = Get-LumaBridgeValidationOptionalProp -InputObject $preExistingInstance -PropertyName 'DriverInfPath'
+        DriverVersion         = Get-LumaBridgeValidationOptionalProp -InputObject $preExistingInstance -PropertyName 'DriverVersion'
+        EnableVirtualMonitor  = Get-LumaBridgeValidationOptionalProp -InputObject $preExistingInstance -PropertyName 'EnableVirtualMonitor'
+        EnableFrameExtraction = Get-LumaBridgeValidationOptionalProp -InputObject $preExistingInstance -PropertyName 'EnableFrameExtraction'
+        AuthorizedHostUserSid = Get-LumaBridgeValidationOptionalProp -InputObject $preExistingInstance -PropertyName 'AuthorizedHostUserSid'
+    }
+}
+else {
+    [pscustomobject]@{
+        ExistedBeforeRun      = $false
+        InstanceId            = $null
+        Status                = $null
+        ProblemCode           = $null
+        DriverInfPath         = $null
+        DriverVersion         = $null
+        EnableVirtualMonitor  = $null
+        EnableFrameExtraction = $null
+        AuthorizedHostUserSid = $null
+    }
+}
+
 $initialWudfProcs = @(Get-LumaBridgeWudfHostProcesses -PnpInstances $initialInstances)
 $initialDumpInventory = Get-LumaBridgeCrashDumpInventory -LookbackMinutes 60
 $initialDumpCount = [int](Get-LumaBridgeValidationOptionalProp -InputObject $initialDumpInventory -PropertyName 'TotalFoundCount' -DefaultValue 0)
@@ -199,6 +247,45 @@ $preBuildHashes = [ordered]@{
     HostSha256 = (Get-FileHash -LiteralPath $HostExecutablePath -Algorithm SHA256).Hash
 }
 
+function Build-SmokeHostArgs {
+    param([string]$JsonOut)
+    return @(
+        '--pipe', '\\.\pipe\LumaBridgeFrameIpc_v1',
+        '--min-frames', "$SmokeMinFrames",
+        '--max-frames', "$MaxFrames",
+        '--duration-ms', "$HostDurationMs",
+        '--connect-timeout-ms', "$ConnectTimeoutMs",
+        '--io-timeout-ms', "$IoTimeoutMs",
+        '--reconnect',
+        '--json-summary', $JsonOut
+    )
+}
+
+function Build-PerfHostArgs {
+    param([string]$JsonOut)
+    $list = New-Object System.Collections.Generic.List[string]
+    foreach ($item in @(
+        '--pipe', '\\.\pipe\LumaBridgeFrameIpc_v1',
+        '--max-frames', "$PerformanceTargetFrames",
+        '--require-max-frames',
+        '--duration-ms', "$PerformanceDurationMs",
+        '--connect-timeout-ms', "$ConnectTimeoutMs",
+        '--io-timeout-ms', "$IoTimeoutMs",
+        '--reconnect',
+        '--visual-stimulus',
+        '--require-virtual-stimulus',
+        '--stimulus-fps', "$StimulusFps",
+        '--json-summary', $JsonOut
+    )) {
+        $list.Add($item)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($StimulusDisplayName)) {
+        $list.Add('--stimulus-display')
+        $list.Add($StimulusDisplayName)
+    }
+    return @($list.ToArray())
+}
+
 if ($DryRun) {
     $signingDry = & $signingScript `
         -Configuration $Configuration `
@@ -216,16 +303,18 @@ if ($DryRun) {
     $dryInstId = if ($null -ne $preExistingInstance) { $preExistingInstance.InstanceId } else { 'ROOT\DISPLAY\<instance>' }
     $null = & $virtMonScript -Action Enable -InstanceId $dryInstId -DryRun
     Write-Host ("[DRY-RUN] Stage 8: Would set REG_SZ AuthorizedHostUserSid='{0}' and REG_DWORD EnableFrameExtraction=1 on '{1}' then restart PnP device" -f $effectiveAuthorizedUserSid, $dryInstId) -ForegroundColor Cyan
-    $hostArgsDry = @(
-        '--pipe', '\\.\pipe\LumaBridgeFrameIpc_v1',
-        '--max-frames', "$MaxFrames",
-        '--duration-ms', "$HostDurationMs",
-        '--connect-timeout-ms', "$ConnectTimeoutMs",
-        '--io-timeout-ms', "$IoTimeoutMs",
-        '--reconnect',
-        '--json-summary', $hostJsonPath
-    )
-    $hostDry = Invoke-LumaBridgeHostProcess -ExecutablePath $HostExecutablePath -Arguments $hostArgsDry -HardTimeoutMs $HostHardTimeoutMs -DryRun
+
+    $smokeDry = $null
+    if ($runSmokeProfile) {
+        $smokeHardMs = [Math]::Max($HostHardTimeoutMs, ($HostDurationMs + $ConnectTimeoutMs + 5000))
+        $smokeDry = Invoke-LumaBridgeHostProcess -ExecutablePath $HostExecutablePath -Arguments (Build-SmokeHostArgs -JsonOut $hostSmokeJsonPath) -HardTimeoutMs $smokeHardMs -DryRun
+    }
+    $perfDry = $null
+    if ($runPerfProfile) {
+        $perfHardMs = [Math]::Max($HostHardTimeoutMs, ($PerformanceDurationMs + $ConnectTimeoutMs + 5000))
+        $perfDry = Invoke-LumaBridgeHostProcess -ExecutablePath $HostExecutablePath -Arguments (Build-PerfHostArgs -JsonOut $hostPerfJsonPath) -HardTimeoutMs $perfHardMs -DryRun
+    }
+
     $etwStopDry = & $etwScript -Action Stop -OutputDir $etwDir -IncludeDxgKrnl:$IncludeDxgKrnl -DryRun
     $diagDry = & $diagScript -Configuration $Configuration -StagingDir $StagingDir -OutputDir $diagDir -DryRun
     Write-Host ("[DRY-RUN] Stage 11 (finally rollback): Would stop active ETW, revert EnableFrameExtraction=0, clear AuthorizedHostUserSid, restore EnableVirtualMonitor, restart device{0}, and write report '{1}'" -f $(if ($FullUninstallOnExit) { ' and run Uninstall-LumaBridgeDriver.ps1' } else { '' }), $reportJsonPath) -ForegroundColor Cyan
@@ -233,7 +322,9 @@ if ($DryRun) {
     return [pscustomobject]@{
         DryRun                = $true
         Configuration         = $Configuration
+        TestProfile           = $TestProfile
         Branch                = $currentBranch
+        PreValidationState    = $preValidationState
         PlannedStagingDir     = $StagingDir
         PlannedOutputDir      = $OutputDir
         HostExecutablePath    = $HostExecutablePath
@@ -241,7 +332,9 @@ if ($DryRun) {
         PreBuildHashes        = $preBuildHashes
         SigningPreview        = $signingDry
         EtwStartPreview       = $etwStartDry
-        HostPreview           = $hostDry
+        SmokeHostPreview      = $smokeDry
+        PerfHostPreview       = $perfDry
+        HostPreview           = $(if ($null -ne $perfDry) { $perfDry } else { $smokeDry })
         EtwStopPreview        = $etwStopDry
         DiagnosticsPreview    = $diagDry
         PlannedReportJsonPath = $reportJsonPath
@@ -250,8 +343,8 @@ if ($DryRun) {
 }
 
 # Explicit operator authorization check prior to Stage 3/5/6 system or store mutations.
-$authPrompt = "Execute controlled Windows M4.1 functional validation (Staging='{0}', Install={1}, EnableVirtualMonitor=1, EnableFrameExtraction=1, HostMaxFrames={2}, DurationMs={3}, AutoRollback=finally)" -f `
-    $StagingDir, (-not $SkipDriverInstall), $MaxFrames, $HostDurationMs
+$authPrompt = "Execute controlled Windows M4.1.1 validation (Profile='{0}', Staging='{1}', InstallOrUpdateDriver={2}, EnableVirtualMonitor=1, EnableFrameExtraction=1, Rollback='Registry/ETW parameters reverted in finally; driver package downgrade NOT implemented')" -f `
+    $TestProfile, $StagingDir, (-not $SkipDriverInstall)
 if (-not (Confirm-LumaBridgeAction -PromptMessage $authPrompt -Force:$Force)) {
     throw 'Functional validation cancelled because explicit authorization was not granted.'
 }
@@ -313,7 +406,12 @@ $etwStartResult = $null
 $etwVerifyResult = $null
 $etwStopResult = $null
 $installResult = $null
+$installedBindingCheck = $null
 $virtMonEnableResult = $null
+$smokeHostResult = $null
+$smokeSummary = $null
+$perfHostResult = $null
+$perfSummary = $null
 $hostProcResult = $null
 $hostSummary = $null
 $diagResult = $null
@@ -322,8 +420,19 @@ $postRunDumpInventory = $null
 $acceptanceCriteria = $null
 $validationError = $null
 $rollbackActions = New-Object System.Collections.Generic.List[string]
+$rollbackIncompleteReasons = New-Object System.Collections.Generic.List[string]
 $rollbackClean = $false
 $postRollbackInstances = @()
+
+$rollbackScopeNote = if ($FullUninstallOnExit) {
+    'Rolls back ETW, temporary registry parameters (EnableFrameExtraction=0, AuthorizedHostUserSid, EnableVirtualMonitor), and removes device/driver package via Uninstall-LumaBridgeDriver.ps1.'
+}
+elseif ($SkipDriverInstall) {
+    'Rolls back ETW and temporary registry parameters (EnableFrameExtraction=0, AuthorizedHostUserSid, EnableVirtualMonitor) on the existing installed driver.'
+}
+else {
+    'Rolls back ETW and temporary registry parameters (EnableFrameExtraction=0, AuthorizedHostUserSid, EnableVirtualMonitor). Does NOT downgrade/restore an older pre-existing driver binary unless -FullUninstallOnExit uninstalls on exit.'
+}
 
 try {
     # ---------------------------------------------------------------------
@@ -364,6 +473,11 @@ try {
         throw ("Adapter '{0}' unhealthy after Stage 6 (Status='{1}', ProblemCode={2}, ProblemStatus={3})." -f $targetInstance.InstanceId, $targetInstance.Status, $targetInstance.ProblemCode, $targetInstance.ProblemStatusHex)
     }
 
+    if (Get-Command -Name 'Test-LumaBridgeDeviceDriverBinding' -ErrorAction SilentlyContinue) {
+        $stagedInfPath = Join-Path -Path $signedStagingDir -ChildPath $constants.InfFileName
+        $installedBindingCheck = Test-LumaBridgeDeviceDriverBinding -Instance $targetInstance -ExpectedInfPath $stagedInfPath
+    }
+
     # ---------------------------------------------------------------------
     # Stage 7: Virtual monitor activation
     # ---------------------------------------------------------------------
@@ -402,22 +516,41 @@ try {
     }
 
     # ---------------------------------------------------------------------
-    # Stage 9: Time-bounded lumabridge-host.exe execution
+    # Stage 9: Time-bounded lumabridge-host.exe execution (Profile A / Profile B)
     # ---------------------------------------------------------------------
-    $effectiveHardTimeoutMs = [Math]::Max($HostHardTimeoutMs, ($HostDurationMs + $ConnectTimeoutMs + 5000))
-    $hostArgs = @(
-        '--pipe', '\\.\pipe\LumaBridgeFrameIpc_v1',
-        '--max-frames', "$MaxFrames",
-        '--duration-ms', "$HostDurationMs",
-        '--connect-timeout-ms', "$ConnectTimeoutMs",
-        '--io-timeout-ms', "$IoTimeoutMs",
-        '--reconnect',
-        '--json-summary', $hostJsonPath
-    )
-    $hostProcResult = Invoke-LumaBridgeHostProcess -ExecutablePath $HostExecutablePath -Arguments $hostArgs -HardTimeoutMs $effectiveHardTimeoutMs
+    if ($runSmokeProfile) {
+        $smokeHardTimeoutMs = [Math]::Max($HostHardTimeoutMs, ($HostDurationMs + $ConnectTimeoutMs + 5000))
+        $smokeHostResult = Invoke-LumaBridgeHostProcess `
+            -ExecutablePath $HostExecutablePath `
+            -Arguments (Build-SmokeHostArgs -JsonOut $hostSmokeJsonPath) `
+            -HardTimeoutMs $smokeHardTimeoutMs
+        if (Test-Path -LiteralPath $hostSmokeJsonPath -PathType Leaf) {
+            $smokeSummary = Get-Content -LiteralPath $hostSmokeJsonPath -Raw | ConvertFrom-Json
+            Copy-Item -LiteralPath $hostSmokeJsonPath -Destination $hostJsonPath -Force
+        }
+        $hostProcResult = $smokeHostResult
+        $hostSummary = $smokeSummary
+    }
 
-    if (Test-Path -LiteralPath $hostJsonPath -PathType Leaf) {
-        $hostSummary = Get-Content -LiteralPath $hostJsonPath -Raw | ConvertFrom-Json
+    $smokeFramesValidCount = if ($null -ne $smokeSummary) {
+        [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $smokeSummary -PropertyName 'FramesValid' -DefaultValue (Get-LumaBridgeValidationOptionalProp -InputObject $smokeSummary -PropertyName 'FramesReceived' -DefaultValue 0))
+    }
+    else { [uint64]0 }
+
+    if ($runPerfProfile -and ((-not $runSmokeProfile) -or ($smokeFramesValidCount -ge [uint64]$SmokeMinFrames))) {
+        $perfHardTimeoutMs = [Math]::Max($HostHardTimeoutMs, ($PerformanceDurationMs + $ConnectTimeoutMs + 5000))
+        $perfHostResult = Invoke-LumaBridgeHostProcess `
+            -ExecutablePath $HostExecutablePath `
+            -Arguments (Build-PerfHostArgs -JsonOut $hostPerfJsonPath) `
+            -HardTimeoutMs $perfHardTimeoutMs
+        if (Test-Path -LiteralPath $hostPerfJsonPath -PathType Leaf) {
+            $perfSummary = Get-Content -LiteralPath $hostPerfJsonPath -Raw | ConvertFrom-Json
+            if ($null -eq $smokeSummary) {
+                Copy-Item -LiteralPath $hostPerfJsonPath -Destination $hostJsonPath -Force
+                $hostProcResult = $perfHostResult
+                $hostSummary = $perfSummary
+            }
+        }
     }
 
     # ---------------------------------------------------------------------
@@ -445,7 +578,6 @@ try {
     $postRunDumpInventory = Get-LumaBridgeCrashDumpInventory -LookbackMinutes 60
     $postDumpCount = [int](Get-LumaBridgeValidationOptionalProp -InputObject $postRunDumpInventory -PropertyName 'TotalFoundCount' -DefaultValue 0)
 
-    # Evaluate acceptance criteria strictly from collected evidence
     $cmProbNone = ($null -ne $targetInstance -and $targetInstance.Status -ieq 'OK' -and [int]$targetInstance.ProblemCode -eq 0)
 
     $stageSummary = if ($null -ne $diagResult -and $null -ne $diagResult.Summary) {
@@ -472,48 +604,96 @@ try {
 
     $virtualMonitorActive = ($null -ne $targetInstance -and [int]$targetInstance.EnableVirtualMonitor -eq 1)
 
-    $framesReceived = if ($null -ne $hostSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $hostSummary -PropertyName 'FramesReceived' -DefaultValue 0) } else { [uint64]0 }
-    $checksumMismatches = if ($null -ne $hostSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $hostSummary -PropertyName 'ChecksumMismatches' -DefaultValue 1) } else { [uint64]1 }
-    $protocolErrors = if ($null -ne $hostSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $hostSummary -PropertyName 'ProtocolErrors' -DefaultValue 1) } else { [uint64]1 }
-    $lastFrameSeq = if ($null -ne $hostSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $hostSummary -PropertyName 'LastFrameSequence' -DefaultValue 0) } else { [uint64]0 }
-    $lastProtocolStatus = if ($null -ne $hostSummary) { [string](Get-LumaBridgeValidationOptionalProp -InputObject $hostSummary -PropertyName 'LastProtocolStatus' -DefaultValue 'Unknown') } else { 'Missing' }
-    $avgLatUs = if ($null -ne $hostSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $hostSummary -PropertyName 'AvgEndToEndLatencyUs' -DefaultValue 0) } else { [uint64]0 }
+    $primaryEvalSummary = if ($null -ne $smokeSummary) { $smokeSummary } else { $perfSummary }
+    $primaryEvalProc = if ($null -ne $smokeHostResult) { $smokeHostResult } else { $perfHostResult }
 
-    $hostSucceeded = ($null -ne $hostProcResult -and (-not $hostProcResult.TimedOut) -and ($hostProcResult.ExitCode -eq 0))
-    $hostReceivedFrames = ($hostSucceeded -and ($framesReceived -gt 0))
-    $crc32Valid = ($null -ne $hostSummary -and $framesReceived -gt 0 -and $checksumMismatches -eq 0)
-    $sequenceAndTimestampsOk = ($null -ne $hostSummary -and $lastFrameSeq -ge 1 -and $protocolErrors -eq 0 -and $avgLatUs -ge 0)
+    $framesReceived = if ($null -ne $primaryEvalSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $primaryEvalSummary -PropertyName 'FramesReceived' -DefaultValue 0) } else { [uint64]0 }
+    $framesValid = if ($null -ne $primaryEvalSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $primaryEvalSummary -PropertyName 'FramesValid' -DefaultValue $framesReceived) } else { [uint64]0 }
+    $checksumMismatches = if ($null -ne $primaryEvalSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $primaryEvalSummary -PropertyName 'ChecksumMismatches' -DefaultValue 1) } else { [uint64]1 }
+    $protocolErrors = if ($null -ne $primaryEvalSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $primaryEvalSummary -PropertyName 'ProtocolErrors' -DefaultValue 1) } else { [uint64]1 }
+    $fatalIoTimeouts = if ($null -ne $primaryEvalSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $primaryEvalSummary -PropertyName 'FatalIoTimeouts' -DefaultValue 0) } else { [uint64]0 }
+    $fatalIpcErrors = if ($null -ne $primaryEvalSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $primaryEvalSummary -PropertyName 'FatalIpcErrors' -DefaultValue 0) } else { [uint64]0 }
+    $lastFrameSeq = if ($null -ne $primaryEvalSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $primaryEvalSummary -PropertyName 'LastFrameSequence' -DefaultValue 0) } else { [uint64]0 }
+    $lastProtocolStatus = if ($null -ne $primaryEvalSummary) { [string](Get-LumaBridgeValidationOptionalProp -InputObject $primaryEvalSummary -PropertyName 'LastProtocolStatus' -DefaultValue 'Unknown') } else { 'Missing' }
+    $connectCount = if ($null -ne $primaryEvalSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $primaryEvalSummary -PropertyName 'ConnectCount' -DefaultValue 0) } else { [uint64]0 }
+    $hostTransportHealthy = if ($null -ne $primaryEvalSummary) { [bool](Get-LumaBridgeValidationOptionalProp -InputObject $primaryEvalSummary -PropertyName 'TransportHealthy' -DefaultValue $false) } else { $false }
+    $frameTargetReached = if ($null -ne $primaryEvalSummary) { [bool](Get-LumaBridgeValidationOptionalProp -InputObject $primaryEvalSummary -PropertyName 'FrameTargetReached' -DefaultValue $false) } else { $false }
+
+    $hostExitedNormally = ($null -ne $primaryEvalProc -and (-not $primaryEvalProc.TimedOut) -and ($primaryEvalProc.ExitCode -eq 0))
+    $ipcConnected = ($connectCount -ge 1)
+    $transportHealthy = ($hostTransportHealthy -and $protocolErrors -eq 0 -and $checksumMismatches -eq 0 -and $fatalIoTimeouts -eq 0 -and $fatalIpcErrors -eq 0)
+    $crc32Valid = ($framesValid -ge 1 -and $checksumMismatches -eq 0)
+    $sequenceAndTimestampsOk = ($null -ne $primaryEvalSummary -and $lastFrameSeq -ge 1 -and $protocolErrors -eq 0)
     $noUnauthorizedIpcClients = ($lastProtocolStatus -ne 'UnauthorizedClient')
     $noNewCrashDumps = ($postDumpCount -le $initialDumpCount)
     $wudfProcessHealthy = ($postRunWudfProcs.Count -ge 1 -or $null -eq $preExistingInstance)
+
+    $functionalSmokePassed = (
+        $runSmokeProfile -and
+        $cmProbNone -and
+        $adapterInitFinishedOk -and
+        $virtualMonitorActive -and
+        $ipcConnected -and
+        $hostExitedNormally -and
+        ($framesValid -ge [uint64]$SmokeMinFrames) -and
+        $crc32Valid -and
+        $sequenceAndTimestampsOk -and
+        $transportHealthy -and
+        $noUnauthorizedIpcClients -and
+        $noNewCrashDumps -and
+        $wudfProcessHealthy
+    )
+
+    $perfExecuted = ($null -ne $perfHostResult)
+    $perfFramesValid = if ($null -ne $perfSummary) { [uint64](Get-LumaBridgeValidationOptionalProp -InputObject $perfSummary -PropertyName 'FramesValid' -DefaultValue 0) } else { [uint64]0 }
+    $perfTransportHealthy = if ($null -ne $perfSummary) { [bool](Get-LumaBridgeValidationOptionalProp -InputObject $perfSummary -PropertyName 'TransportHealthy' -DefaultValue $false) } else { $false }
+    $perfTargetReachedFlag = if ($null -ne $perfSummary) { [bool](Get-LumaBridgeValidationOptionalProp -InputObject $perfSummary -PropertyName 'FrameTargetReached' -DefaultValue $false) } else { $false }
+    $perfStim = if ($null -ne $perfSummary) { Get-LumaBridgeValidationOptionalProp -InputObject $perfSummary -PropertyName 'VisualStimulus' -DefaultValue $null } else { $null }
+    $perfStimStarted = ($null -ne $perfStim -and [bool](Get-LumaBridgeValidationOptionalProp -InputObject $perfStim -PropertyName 'VirtualDisplayIdentified' -DefaultValue $false) -and [bool](Get-LumaBridgeValidationOptionalProp -InputObject $perfStim -PropertyName 'Started' -DefaultValue $false))
+    $perfTargetReached = (
+        $perfExecuted -and
+        (-not $perfHostResult.TimedOut) -and
+        ($perfHostResult.ExitCode -eq 0) -and
+        $perfTransportHealthy -and
+        $perfTargetReachedFlag -and
+        ($perfFramesValid -ge [uint64]$PerformanceTargetFrames) -and
+        $perfStimStarted
+    )
+
+    $smokeGateOk = (-not $runSmokeProfile) -or $functionalSmokePassed
+    $perfGateOk = (-not $runPerfProfile) -or $perfTargetReached
+    $allPassed = ($cmProbNone -and $adapterInitFinishedOk -and $virtualMonitorActive -and $noUnauthorizedIpcClients -and $noNewCrashDumps -and $wudfProcessHealthy -and $smokeGateOk -and $perfGateOk)
 
     $acceptanceCriteria = [pscustomobject]@{
         CmProbNone                      = $cmProbNone
         AdapterInitFinishedOk           = $adapterInitFinishedOk
         VirtualMonitorActive            = $virtualMonitorActive
-        HostProcessSucceeded            = $hostSucceeded
-        HostReceivedFrames              = $hostReceivedFrames
+        IpcConnected                    = $ipcConnected
+        HostProcessExitedNormally       = $hostExitedNormally
+        HostProcessSucceeded            = $hostExitedNormally
+        FramesReceived                  = $framesReceived
+        FramesValid                     = $framesValid
+        HostReceivedFrames              = ($framesValid -ge 1)
+        FrameTargetReached              = $(if ($null -ne $perfSummary) { $perfTargetReachedFlag } else { $frameTargetReached })
+        FunctionalSmokePassed           = $functionalSmokePassed
+        PerformanceTestExecuted         = $perfExecuted
+        PerformanceTargetReached        = $perfTargetReached
+        TransportHealthy                = $transportHealthy
         Crc32Valid                      = $crc32Valid
         SequenceAndTimestampsConsistent = $sequenceAndTimestampsOk
         NoUnauthorizedIpcClients        = $noUnauthorizedIpcClients
         NoNewCrashDumps                 = $noNewCrashDumps
         WudfProcessHealthy              = $wudfProcessHealthy
-        AllPassed                       = (
-            $cmProbNone -and
-            $adapterInitFinishedOk -and
-            $virtualMonitorActive -and
-            $hostReceivedFrames -and
-            $crc32Valid -and
-            $sequenceAndTimestampsOk -and
-            $noUnauthorizedIpcClients -and
-            $noNewCrashDumps -and
-            $wudfProcessHealthy
-        )
+        RollbackClean                   = $false
+        AllPassed                       = $allPassed
     }
 
-    if (-not $acceptanceCriteria.AllPassed) {
-        $failedFlags = @($acceptanceCriteria.PSObject.Properties | Where-Object { $_.Name -ne 'AllPassed' -and -not [bool]$_.Value } | ForEach-Object { $_.Name }) -join ', '
-        throw ("Functional validation acceptance criteria not satisfied: {0}" -f $failedFlags)
+    if (-not $allPassed) {
+        $failedFlags = @($acceptanceCriteria.PSObject.Properties | Where-Object { $_.Name -notin @('AllPassed', 'RollbackClean', 'FramesReceived', 'FramesValid', 'FrameTargetReached', 'PerformanceTestExecuted', 'PerformanceTargetReached') -and -not [bool]$_.Value } | ForEach-Object { $_.Name })
+        if ($runPerfProfile -and -not $perfTargetReached) {
+            $failedFlags += 'PerformanceTargetReached'
+        }
+        throw ("Functional validation acceptance criteria not satisfied: {0}" -f ($failedFlags -join ', '))
     }
 }
 catch {
@@ -530,7 +710,9 @@ finally {
             $rollbackActions.Add('Stopped active ETW trace session during finally rollback')
         }
         catch {
-            $rollbackActions.Add(("Failed stopping ETW session in finally: {0}" -f $_.Exception.Message))
+            $msg = ("Failed stopping ETW session in finally: {0}" -f $_.Exception.Message)
+            $rollbackActions.Add($msg)
+            $rollbackIncompleteReasons.Add($msg)
         }
     }
 
@@ -541,7 +723,9 @@ finally {
                 $rollbackActions.Add(("Reverted EnableFrameExtraction=0 on '{0}'" -f $targetInstance.InstanceId))
             }
             catch {
-                $rollbackActions.Add(("Failed reverting EnableFrameExtraction=0 on '{0}': {1}" -f $targetInstance.InstanceId, $_.Exception.Message))
+                $msg = ("Failed reverting EnableFrameExtraction=0 on '{0}': {1}" -f $targetInstance.InstanceId, $_.Exception.Message)
+                $rollbackActions.Add($msg)
+                $rollbackIncompleteReasons.Add($msg)
             }
         }
 
@@ -557,7 +741,9 @@ finally {
                 }
             }
             catch {
-                $rollbackActions.Add(("Failed reverting AuthorizedHostUserSid on '{0}': {1}" -f $targetInstance.InstanceId, $_.Exception.Message))
+                $msg = ("Failed reverting AuthorizedHostUserSid on '{0}': {1}" -f $targetInstance.InstanceId, $_.Exception.Message)
+                $rollbackActions.Add($msg)
+                $rollbackIncompleteReasons.Add($msg)
             }
         }
 
@@ -574,7 +760,9 @@ finally {
                 $rollbackActions.Add('Executed Uninstall-LumaBridgeDriver.ps1 during finally rollback')
             }
             catch {
-                $rollbackActions.Add(("Uninstall-LumaBridgeDriver.ps1 failed in finally: {0}" -f $_.Exception.Message))
+                $msg = ("Uninstall-LumaBridgeDriver.ps1 failed in finally: {0}" -f $_.Exception.Message)
+                $rollbackActions.Add($msg)
+                $rollbackIncompleteReasons.Add($msg)
             }
         }
         else {
@@ -584,7 +772,9 @@ finally {
                     $rollbackActions.Add(("Reverted EnableVirtualMonitor=0 on '{0}'" -f $targetInstance.InstanceId))
                 }
                 catch {
-                    $rollbackActions.Add(("Failed reverting EnableVirtualMonitor=0 on '{0}': {1}" -f $targetInstance.InstanceId, $_.Exception.Message))
+                    $msg = ("Failed reverting EnableVirtualMonitor=0 on '{0}': {1}" -f $targetInstance.InstanceId, $_.Exception.Message)
+                    $rollbackActions.Add($msg)
+                    $rollbackIncompleteReasons.Add($msg)
                 }
             }
 
@@ -594,7 +784,9 @@ finally {
                     $rollbackActions.Add(("Restarted device '{0}' to apply rolled-back parameters" -f $targetInstance.InstanceId))
                 }
                 catch {
-                    $rollbackActions.Add(("Failed restarting device '{0}' in finally: {1}" -f $targetInstance.InstanceId, $_.Exception.Message))
+                    $msg = ("Failed restarting device '{0}' in finally: {1}" -f $targetInstance.InstanceId, $_.Exception.Message)
+                    $rollbackActions.Add($msg)
+                    $rollbackIncompleteReasons.Add($msg)
                 }
             }
         }
@@ -605,51 +797,82 @@ finally {
             $rollbackActions.Add('Executed fallback Uninstall-LumaBridgeDriver.ps1 during finally rollback')
         }
         catch {
-            $rollbackActions.Add(("Fallback Uninstall-LumaBridgeDriver.ps1 failed in finally: {0}" -f $_.Exception.Message))
+            $msg = ("Fallback Uninstall-LumaBridgeDriver.ps1 failed in finally: {0}" -f $_.Exception.Message)
+            $rollbackActions.Add($msg)
+            $rollbackIncompleteReasons.Add($msg)
         }
     }
 
     try {
         $postRollbackInstances = @(Get-LumaBridgePnpInstances)
         if ($FullUninstallOnExit -or ($didFreshDriverInstall -and -not $driverInstallCompleted)) {
-            $rollbackClean = ($postRollbackInstances.Count -eq 0)
+            $rollbackClean = ($postRollbackInstances.Count -eq 0) -and ($rollbackIncompleteReasons.Count -eq 0)
+            if ($postRollbackInstances.Count -ne 0) {
+                $rollbackIncompleteReasons.Add(("Expected 0 PnP instances after full uninstall, found {0}" -f $postRollbackInstances.Count))
+            }
         }
         elseif ($postRollbackInstances.Count -eq 1) {
             $rbInst = $postRollbackInstances[0]
             $extReset = ($null -eq $rbInst.EnableFrameExtraction -or [int]$rbInst.EnableFrameExtraction -eq 0)
             $monReset = ($hadPreExistingVirtMon -or $null -eq $rbInst.EnableVirtualMonitor -or [int]$rbInst.EnableVirtualMonitor -eq 0)
+            $sidReset = if ([string]::IsNullOrWhiteSpace($hadPreExistingAuthSid)) {
+                [string]::IsNullOrWhiteSpace((Get-LumaBridgeValidationOptionalProp -InputObject $rbInst -PropertyName 'AuthorizedHostUserSid' -DefaultValue ''))
+            }
+            else {
+                (Get-LumaBridgeValidationOptionalProp -InputObject $rbInst -PropertyName 'AuthorizedHostUserSid' -DefaultValue '') -eq $hadPreExistingAuthSid
+            }
             $devHealthy = ($rbInst.Status -ieq 'OK' -and ($null -eq $rbInst.ProblemCode -or [int]$rbInst.ProblemCode -eq 0))
-            $rollbackClean = ($extReset -and $monReset -and $devHealthy)
+            if (-not $extReset) { $rollbackIncompleteReasons.Add(("EnableFrameExtraction remained {0} after rollback" -f $rbInst.EnableFrameExtraction)) }
+            if (-not $monReset) { $rollbackIncompleteReasons.Add(("EnableVirtualMonitor remained {0} after rollback" -f $rbInst.EnableVirtualMonitor)) }
+            if (-not $sidReset) { $rollbackIncompleteReasons.Add('AuthorizedHostUserSid did not match pre-validation value after rollback') }
+            if (-not $devHealthy) { $rollbackIncompleteReasons.Add(("Post-rollback device unhealthy (Status='{0}', ProblemCode={1})" -f $rbInst.Status, $rbInst.ProblemCode)) }
+            $rollbackClean = ($extReset -and $monReset -and $sidReset -and $devHealthy -and ($rollbackIncompleteReasons.Count -eq 0))
         }
         else {
-            $rollbackClean = ($null -eq $preExistingInstance)
+            $rollbackClean = ($null -eq $preExistingInstance) -and ($rollbackIncompleteReasons.Count -eq 0)
+            if ($null -ne $preExistingInstance) {
+                $rollbackIncompleteReasons.Add(("Pre-existing PnP instance '{0}' missing after rollback" -f $preExistingInstance.InstanceId))
+            }
         }
     }
     catch {
         $rollbackClean = $false
-        $rollbackActions.Add(("Post-rollback verification failed: {0}" -f $_.Exception.Message))
+        $rollbackIncompleteReasons.Add(("Post-rollback verification failed: {0}" -f $_.Exception.Message))
+    }
+
+    if ($null -ne $acceptanceCriteria) {
+        $acceptanceCriteria.RollbackClean = $rollbackClean
     }
 
     $reportPayload = [pscustomobject]@{
-        CompletedAtUtc        = (Get-Date).ToUniversalTime().ToString('o')
-        Configuration         = $Configuration
-        Branch                = $currentBranch
-        SignedStagingDir      = $signedStagingDir
-        CertificateThumbprint = $signedThumbprint
-        AuthorizedHostUserSid = $effectiveAuthorizedUserSid
-        PreBuildHashes        = $preBuildHashes
-        PostSignBuildHashes   = $postSignBuildHashes
-        PackageVerified       = [bool]$packageVerify.SignerCertificatesMatch
-        EtwVerifyResult       = $etwVerifyResult
-        HostProcessResult     = $hostProcResult
-        HostSummary           = $hostSummary
-        AcceptanceCriteria    = $acceptanceCriteria
-        ValidationSucceeded   = ([string]::IsNullOrWhiteSpace($validationError))
-        ValidationError       = $validationError
-        RollbackActions       = @($rollbackActions.ToArray())
-        RollbackClean         = $rollbackClean
-        PostRollbackInstances = $postRollbackInstances
-        OutputDir             = $OutputDir
+        CompletedAtUtc            = (Get-Date).ToUniversalTime().ToString('o')
+        Configuration             = $Configuration
+        TestProfile               = $TestProfile
+        Branch                    = $currentBranch
+        PreValidationState        = $preValidationState
+        SignedStagingDir          = $signedStagingDir
+        CertificateThumbprint     = $signedThumbprint
+        AuthorizedHostUserSid     = $effectiveAuthorizedUserSid
+        PreBuildHashes            = $preBuildHashes
+        PostSignBuildHashes       = $postSignBuildHashes
+        PackageVerified           = [bool]$packageVerify.SignerCertificatesMatch
+        InstalledBindingCheck     = $installedBindingCheck
+        EtwVerifyResult           = $etwVerifyResult
+        SmokeHostProcessResult    = $smokeHostResult
+        SmokeHostSummary          = $smokeSummary
+        PerfHostProcessResult     = $perfHostResult
+        PerfHostSummary           = $perfSummary
+        HostProcessResult         = $hostProcResult
+        HostSummary               = $hostSummary
+        AcceptanceCriteria        = $acceptanceCriteria
+        ValidationSucceeded       = ([string]::IsNullOrWhiteSpace($validationError))
+        ValidationError           = $validationError
+        RollbackScopeNote         = $rollbackScopeNote
+        RollbackActions           = @($rollbackActions.ToArray())
+        RollbackIncompleteReasons = @($rollbackIncompleteReasons.ToArray())
+        RollbackClean             = $rollbackClean
+        PostRollbackInstances     = $postRollbackInstances
+        OutputDir                 = $OutputDir
     }
 
     try {
@@ -659,23 +882,46 @@ finally {
         $reportPayload | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $reportJsonPath -Encoding UTF8
 
         $mdLines = New-Object System.Collections.Generic.List[string]
-        $mdLines.Add('# LumaBridge M4.1 Functional Validation Report')
+        $mdLines.Add('# LumaBridge M4.1.1 Functional Validation Report')
         $mdLines.Add('')
         $mdLines.Add(("- Completed UTC: ``{0}``" -f $reportPayload.CompletedAtUtc))
-        $mdLines.Add(("- Branch: ``{0}`` | Configuration: ``{1}``" -f $currentBranch, $Configuration))
+        $mdLines.Add(("- Branch: ``{0}`` | Configuration: ``{1}`` | Profile: ``{2}``" -f $currentBranch, $Configuration, $TestProfile))
         $mdLines.Add(("- Staged Package (``StagingDir``): ``{0}``" -f $signedStagingDir))
         $mdLines.Add(("- Validation Succeeded: ``{0}`` | Rollback Clean: ``{1}``" -f $reportPayload.ValidationSucceeded, $rollbackClean))
+        $mdLines.Add(("- Rollback Scope: {0}" -f $rollbackScopeNote))
         if (-not [string]::IsNullOrWhiteSpace($validationError)) {
             $mdLines.Add(("- Error: ``{0}``" -f $validationError))
         }
-        if ($null -ne $hostSummary) {
-            $mdLines.Add(("- Host Consumer: Frames=``{0}``, ChecksumMismatches=``{1}``, ProtocolErrors=``{2}``, ReceiveFps=``{3}``, AvgE2EUs=``{4}``" -f `
-                $hostSummary.FramesReceived, $hostSummary.ChecksumMismatches, $hostSummary.ProtocolErrors, $hostSummary.ReceiveFps, $hostSummary.AvgEndToEndLatencyUs))
+        if ($null -ne $smokeSummary) {
+            $mdLines.Add(("- Smoke Host: ExitReason=``{0}``, Frames=``{1}``, Valid=``{2}``, Live=``{3}``, PreConn=``{4}``, ExecFps=``{5}``, TransportHealthy=``{6}``" -f `
+                (Get-LumaBridgeValidationOptionalProp $smokeSummary 'ExitReason' 'Unknown'), `
+                $smokeSummary.FramesReceived, `
+                (Get-LumaBridgeValidationOptionalProp $smokeSummary 'FramesValid' $smokeSummary.FramesReceived), `
+                (Get-LumaBridgeValidationOptionalProp $smokeSummary 'LiveFramesReceived' 0), `
+                (Get-LumaBridgeValidationOptionalProp $smokeSummary 'PreConnectFramesReceived' 0), `
+                (Get-LumaBridgeValidationOptionalProp $smokeSummary 'AverageExecutionFps' $smokeSummary.ReceiveFps), `
+                (Get-LumaBridgeValidationOptionalProp $smokeSummary 'TransportHealthy' $false)))
+        }
+        if ($null -ne $perfSummary) {
+            $mdLines.Add(("- Performance Host: ExitReason=``{0}``, Frames=``{1}``, TargetReached=``{2}``, ActiveFps=``{3}``, LiveFps=``{4}``, LiveE2EAvgUs=``{5}``" -f `
+                (Get-LumaBridgeValidationOptionalProp $perfSummary 'ExitReason' 'Unknown'), `
+                $perfSummary.FramesReceived, `
+                (Get-LumaBridgeValidationOptionalProp $perfSummary 'FrameTargetReached' $false), `
+                (Get-LumaBridgeValidationOptionalProp $perfSummary 'ObservedActiveFps' $perfSummary.ReceiveFps), `
+                (Get-LumaBridgeValidationOptionalProp $perfSummary 'SustainedLiveFps' 0), `
+                $perfSummary.AvgEndToEndLatencyUs))
         }
         $mdLines.Add('')
         $mdLines.Add('## Rollback Actions')
         foreach ($act in $rollbackActions) {
             $mdLines.Add(("- {0}" -f $act))
+        }
+        if ($rollbackIncompleteReasons.Count -gt 0) {
+            $mdLines.Add('')
+            $mdLines.Add('## Rollback Incomplete Reasons')
+            foreach ($inc in $rollbackIncompleteReasons) {
+                $mdLines.Add(("- {0}" -f $inc))
+            }
         }
         $mdLines | Set-Content -LiteralPath $reportMdPath -Encoding UTF8
     }
@@ -684,22 +930,29 @@ finally {
 }
 
 if (-not [string]::IsNullOrWhiteSpace($validationError)) {
-    throw ("LumaBridge M4.1 functional validation failed: {0}. RollbackClean={1}. Report='{2}'." -f $validationError, $rollbackClean, $reportJsonPath)
+    throw ("LumaBridge M4.1.1 functional validation failed: {0}. RollbackClean={1}. Report='{2}'." -f $validationError, $rollbackClean, $reportJsonPath)
 }
 
 return [pscustomobject]@{
-    ValidationSucceeded   = $true
-    RollbackClean         = $rollbackClean
-    Configuration         = $Configuration
-    Branch                = $currentBranch
-    StagingDir            = $signedStagingDir
-    OutputDir             = $OutputDir
-    ReportJsonPath        = $reportJsonPath
-    ReportMdPath          = $reportMdPath
-    HostSummaryPath       = $hostJsonPath
-    HostSummary           = $hostSummary
-    AcceptanceCriteria    = $acceptanceCriteria
-    DiagnosticsResult     = $diagResult
-    RollbackActions       = @($rollbackActions.ToArray())
-    PostRollbackInstances = $postRollbackInstances
+    ValidationSucceeded       = $true
+    RollbackClean             = $rollbackClean
+    RollbackIncompleteReasons = @($rollbackIncompleteReasons.ToArray())
+    RollbackScopeNote         = $rollbackScopeNote
+    Configuration             = $Configuration
+    TestProfile               = $TestProfile
+    Branch                    = $currentBranch
+    StagingDir                = $signedStagingDir
+    OutputDir                 = $OutputDir
+    ReportJsonPath            = $reportJsonPath
+    ReportMdPath              = $reportMdPath
+    HostSummaryPath           = $hostJsonPath
+    SmokeSummaryPath          = $hostSmokeJsonPath
+    PerfSummaryPath           = $hostPerfJsonPath
+    SmokeSummary              = $smokeSummary
+    PerfSummary               = $perfSummary
+    HostSummary               = $hostSummary
+    AcceptanceCriteria        = $acceptanceCriteria
+    DiagnosticsResult         = $diagResult
+    RollbackActions           = @($rollbackActions.ToArray())
+    PostRollbackInstances     = $postRollbackInstances
 }

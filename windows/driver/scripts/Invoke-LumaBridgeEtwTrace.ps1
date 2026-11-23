@@ -373,11 +373,13 @@ switch ($Action) {
         }
 
         $copiedAutoLoggerPath = $null
-        if (-not [string]::IsNullOrWhiteSpace($rdpIddAutoLoggerSource) -and (Test-Path -LiteralPath $rdpIddAutoLoggerSource)) {
+        if (-not [string]::IsNullOrWhiteSpace($rdpIddAutoLoggerSource)) {
             $targetAutoLoggerPath = Join-Path -Path $OutputDir -ChildPath 'Microsoft-Windows-Rdp-Graphics-RdpIdd-Trace.etl'
             try {
-                Copy-Item -LiteralPath $rdpIddAutoLoggerSource -Destination $targetAutoLoggerPath -Force -ErrorAction Stop
-                $copiedAutoLoggerPath = $targetAutoLoggerPath
+                if (Test-Path -LiteralPath $rdpIddAutoLoggerSource -ErrorAction Stop) {
+                    Copy-Item -LiteralPath $rdpIddAutoLoggerSource -Destination $targetAutoLoggerPath -Force -ErrorAction Stop
+                    $copiedAutoLoggerPath = $targetAutoLoggerPath
+                }
             }
             catch {
                 $copiedAutoLoggerPath = $null

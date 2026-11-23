@@ -2344,6 +2344,172 @@ Invoke-UnitTest -Name 'FunctionalValidationScriptDryRunAndFinallyRollbackOnFailu
     Assert-Equal $st2.EnableMon 0 'finally reverted EnableVirtualMonitor=0 after Stage 8 exception'
 }
 
+# 31. Host stdout/stderr capture, hard timeout handling, and two-profile Smoke vs Performance validation
+Invoke-UnitTest -Name 'HostProcessOutputCaptureGlobalTimeoutAndTwoProfileRunner' -TestBody {
+    param($caseDir)
+
+    # 1. Verify Invoke-LumaBridgeHostProcess captures stdout + stderr cleanly via ReadToEndAsync
+    $psExe = (Get-Command powershell.exe).Source
+    $capRes = Invoke-LumaBridgeHostProcess -ExecutablePath $psExe -Arguments @('-NoProfile', '-Command', '[Console]::Out.WriteLine("LB_STDOUT_OK"); [Console]::Error.WriteLine("LB_STDERR_OK"); exit 0') -HardTimeoutMs 10000
+    Assert-Equal $capRes.ExitCode 0 'Capture helper exits 0'
+    Assert-Equal $capRes.TimedOut $false 'Capture helper did not time out'
+    Assert-True ($capRes.Output -contains 'LB_STDOUT_OK') 'Invoke-LumaBridgeHostProcess captures stdout lines non-empty'
+    Assert-True ($capRes.StdErr -contains 'LB_STDERR_OK') 'Invoke-LumaBridgeHostProcess captures stderr lines non-empty'
+
+    # 2. Verify global hard timeout kills hung child process and marks TimedOut=true
+    $timeoutRes = Invoke-LumaBridgeHostProcess -ExecutablePath $psExe -Arguments @('-NoProfile', '-Command', '[Console]::Out.WriteLine("BEFORE_HANG"); [Console]::Out.Flush(); Start-Sleep -Seconds 30') -HardTimeoutMs 600
+    Assert-Equal $timeoutRes.TimedOut $true 'Global hard timeout terminates hung process cleanly'
+    Assert-Equal $timeoutRes.ExitCode -1 'Global hard timeout returns ExitCode=-1'
+
+    # 3. Verify two-profile runner separates FunctionalSmokePassed from PerformanceTestExecuted/Reached
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+    $certInfo = New-EphemeralTestCertificate -OutDirectory (Join-Path $caseDir 'certs') -NamePrefix 'val2prof'
+    $stgDir = Join-Path $caseDir 'stg_prof'
+    $outSmokeOnly = Join-Path $caseDir 'out_smoke_only'
+    $outBothFailPerf = Join-Path $caseDir 'out_both_fail_perf'
+    $fakeHostExe = Join-Path $caseDir 'lumabridge-host.exe'
+    [System.IO.File]::WriteAllBytes($fakeHostExe, [byte[]]@(0x4D, 0x5A, 0x90, 0x00))
+
+    $c = Get-LumaBridgeDriverConstants
+    $mockLogmanLines = @(
+        'Name:                 LumaBridgeIddCore',
+        ('Provider:             {0}' -f $c.LumaBridgeTraceProviderGuid),
+        ('Provider:             {0}' -f $c.IddCxManifestProviderGuid),
+        ('Provider:             {0}' -f $c.IddCxWppProviderGuid),
+        ('Provider:             {0}' -f $c.UmdfOperationalProviderGuid),
+        ('Provider:             {0}' -f $c.WdfCoreWppProviderGuid),
+        ('Provider:             {0}' -f $c.WerKernelProviderGuid)
+    )
+
+    $global:LbTestState['ProfMock'] = [ordered]@{
+        CertInfo    = $certInfo
+        Signtool    = Get-LumaBridgeWdkToolPath -ToolName 'signtool.exe'
+        LogmanLines = $mockLogmanLines
+        EnableMon   = 0
+        EnableExt   = 0
+        AuthSid     = $null
+        EtwRunning  = $false
+        PerfFails   = $false
+    }
+
+    $profMocks = @{
+        'Assert-LumaBridgeAdministrator'            = { [CmdletBinding()] param([string]$OperationName, [switch]$DryRun) return $true }
+        'Get-LumaBridgeHostSecurityState'           = { [CmdletBinding()] param() return [pscustomobject]@{ SecureBoot = 'Disabled'; TestSigning = 'Enabled' } }
+        'Find-LumaBridgeSigningCertificate'         = { [CmdletBinding()] param([string]$CertificateThumbprint, [string]$CertificateSubject) return $global:LbTestState['ProfMock'].CertInfo.Certificate }
+        'Export-LumaBridgeCertificateFile'          = { [CmdletBinding()] param($Certificate, [string]$FilePath) [System.IO.File]::WriteAllBytes($FilePath, $Certificate.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)) }
+        'Get-LumaBridgePnpInstances'                = {
+            [CmdletBinding()] param([string]$HardwareId)
+            $st = $global:LbTestState['ProfMock']
+            return @([pscustomobject]@{
+                InstanceId            = 'ROOT\DISPLAY\0000'
+                FriendlyName          = 'LumaBridge Indirect Display Adapter'
+                Status                = 'OK'
+                ProblemCode           = 0
+                ProblemStatus         = 0
+                ProblemStatusHex      = '0x00000000'
+                Present               = $true
+                HardwareIds           = @('Root\LumaBridgeIddDriver')
+                DriverInfPath         = 'oem99.inf'
+                DriverProvider        = 'LumaBridge'
+                DriverVersion         = '22.0.0.1'
+                DriverService         = 'WUDFRd'
+                UpperFilters          = @('IndirectKmd')
+                LowerFilters          = @()
+                ConfigurationId       = 'oem99.inf:Root\LumaBridgeIddDriver'
+                DeviceParametersPath  = 'MOCK:\ROOT\DISPLAY\0000\Device Parameters'
+                EnableVirtualMonitor  = $st.EnableMon
+                EnableFrameExtraction = $st.EnableExt
+                AuthorizedHostUserSid = $st.AuthSid
+                StartupDiagnostics    = [pscustomobject]@{ LastStage = 'AdapterInitFinished'; LastSuccessfulStage = 'AdapterInitFinished'; LastStatusHex = '0x00000000'; LastErrorStatusHex = '0x00000000' }
+            })
+        }
+        'Set-LumaBridgeDeviceEnableVirtualMonitor'  = { [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value) $global:LbTestState['ProfMock'].EnableMon = $Value }
+        'Get-LumaBridgeDeviceEnableVirtualMonitor'  = { [CmdletBinding()] param([string]$DeviceParametersPath) return $global:LbTestState['ProfMock'].EnableMon }
+        'Set-LumaBridgeDeviceEnableFrameExtraction' = { [CmdletBinding()] param([string]$DeviceParametersPath, [int]$Value) $global:LbTestState['ProfMock'].EnableExt = $Value }
+        'Get-LumaBridgeDeviceEnableFrameExtraction' = { [CmdletBinding()] param([string]$DeviceParametersPath) return $global:LbTestState['ProfMock'].EnableExt }
+        'Set-LumaBridgeDeviceAuthorizedHostUserSid' = { [CmdletBinding()] param([string]$DeviceParametersPath, [string]$SidString, [switch]$Clear) if ($Clear -or [string]::IsNullOrWhiteSpace($SidString)) { $global:LbTestState['ProfMock'].AuthSid = $null } else { $global:LbTestState['ProfMock'].AuthSid = $SidString } }
+        'Get-LumaBridgeDeviceAuthorizedHostUserSid' = { [CmdletBinding()] param([string]$DeviceParametersPath) return $global:LbTestState['ProfMock'].AuthSid }
+        'Get-LumaBridgeWudfHostProcesses'           = { [CmdletBinding()] param($PnpInstances, $RecentEvents, $DebugTraceLines) return @([pscustomobject]@{ Id = 8768; IsLumaBridgeHost = $true; AssociationMethod = 'LoadedModule'; WorkingSetMB = 30.0; PrivateMemoryMB = 15.0; HandleCount = 400 }) }
+        'Get-LumaBridgeCrashDumpInventory'          = { [CmdletBinding()] param([int]$LookbackMinutes) return [pscustomobject]@{ LookbackMinutes = $LookbackMinutes; Locations = @(); Files = @(); TotalFoundCount = 0 } }
+        'Get-LumaBridgeEventChannelStatus'            = { [CmdletBinding()] param($ChannelNames) return @() }
+        'Get-LumaBridgeDiagnosticEvents'            = { [CmdletBinding()] param($LookbackMinutes, $InstanceIds, $PublishedInfNames, $ChannelStatus) return @() }
+        'Get-LumaBridgeSetupApiLogExcerpt'          = { [CmdletBinding()] param($SetupApiLogPath, $InstanceIds, $PublishedInfNames, $MaxMatchedSections) return [pscustomobject]@{ LogPath = $SetupApiLogPath; Exists = $false; AccessDenied = $false; Error = ''; MatchedSectionCount = 0; WdfSchemaWarnings = @(); DeviceStartProblemLines = @(); Sections = @(); RawExcerptText = '' } }
+        'Get-LumaBridgeDriverStorePackages'         = { [CmdletBinding()] param($InfFilter) return @() }
+        'Get-LumaBridgeEtlEventSummary'             = { [CmdletBinding()] param($EtlPath, $StartTimeUtc, $EndTimeUtc, $ProcessId, [int]$MaxMatchedEvents = 500, [switch]$ExcludeHighVolumeGraphics) return [pscustomobject]@{ EtlPath = $EtlPath; Exists = $true; EventCount = 1; MatchedEventCount = 1; MatchedLimitReached = $false; FilteredOutHighVolume = $true; XPathUsed = '*'; TraceStats = $null; CircularWrapWarning = $null; LumaBridgeEvents = @(); Providers = @(); Events = @(); Error = '' } }
+        'Invoke-LumaBridgeExternalCommand'          = {
+            [CmdletBinding()] param([string]$FilePath, [string[]]$Arguments = @(), [switch]$DryRun)
+            $st = $global:LbTestState['ProfMock']
+            if ($FilePath -like '*git*') { return [pscustomobject]@{ ExitCode = 0; Output = @('feature/windows-frame-extraction-ipc'); DryRun = $false } }
+            if ($FilePath -ieq $st.Signtool -and $Arguments[0] -eq 'sign') {
+                $out = & $FilePath sign /fd SHA256 /f $st.CertInfo.PfxPath /p $st.CertInfo.Password $Arguments[-1] 2>&1
+                if ($LASTEXITCODE -ne 0) { throw 'mock signtool sign error' }
+                return [pscustomobject]@{ ExitCode = 0; Output = @($out); DryRun = $false }
+            }
+            if ($FilePath -like '*Inf2Cat*' -or ($FilePath -ieq $st.Signtool -and $Arguments[0] -eq 'verify')) {
+                $out = & $FilePath @Arguments 2>&1
+                if ($LASTEXITCODE -ne 0) { throw 'mock verify error' }
+                return [pscustomobject]@{ ExitCode = 0; Output = @($out); DryRun = $false }
+            }
+            if ($FilePath -like '*logman*') {
+                if ($Arguments[0] -eq 'query' -and $Arguments[1] -eq 'LumaBridgeIddDxg') { throw 'not found' }
+                if ($Arguments[0] -eq 'query') { return [pscustomobject]@{ ExitCode = 0; Output = $st.LogmanLines; DryRun = $false } }
+            }
+            return [pscustomobject]@{ ExitCode = 0; Output = @('OK'); DryRun = $false }
+        }
+        'Invoke-LumaBridgeHostProcess'              = {
+            [CmdletBinding()] param([string]$ExecutablePath, [string[]]$Arguments = @(), [int]$HardTimeoutMs = 30000, [switch]$DryRun)
+            $jsonIdx = [Array]::IndexOf($Arguments, '--json-summary')
+            $jsonPath = $Arguments[$jsonIdx + 1]
+            $isPerf = ($Arguments -contains '--require-max-frames')
+            $st = $global:LbTestState['ProfMock']
+            if (-not $isPerf) {
+                $payload = [pscustomobject]@{
+                    ExitReason = 'DurationElapsed'; HostProcessExitedNormally = $true; TransportHealthy = $true;
+                    ConnectCount = 1; FramesReceived = 3; FramesValid = 3; FrameTargetReached = $false;
+                    MinFramesReached = $true; ChecksumMismatches = 0; ProtocolErrors = 0; FatalIoTimeouts = 0; FatalIpcErrors = 0;
+                    LastFrameSequence = 33; LastProtocolStatus = 'Ok'; AvgEndToEndLatencyUs = 1200; ReceiveFps = 0.6
+                }
+                $payload | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+                return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Output = @('[LB-HOST] Summary: frames=3'); StdErr = @(); DryRun = $false }
+            }
+            else {
+                $failPerf = $st.PerfFails
+                $payload = [pscustomobject]@{
+                    ExitReason = 'DurationElapsed'; HostProcessExitedNormally = $true; TransportHealthy = $true;
+                    ConnectCount = 1; FramesReceived = $(if ($failPerf) { 12 } else { 60 }); FramesValid = $(if ($failPerf) { 12 } else { 60 });
+                    FrameTargetReached = (-not $failPerf); ChecksumMismatches = 0; ProtocolErrors = 0; FatalIoTimeouts = 0; FatalIpcErrors = 0;
+                    LastFrameSequence = 93; LastProtocolStatus = 'Ok'; AvgEndToEndLatencyUs = 45000; ReceiveFps = 58.5;
+                    VisualStimulus = [pscustomobject]@{ VirtualDisplayIdentified = $true; Started = $true }
+                }
+                $payload | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+                return [pscustomobject]@{ ExitCode = $(if ($failPerf) { 1 } else { 0 }); TimedOut = $false; Output = @('[LB-HOST] Summary: perf'); StdErr = @(); DryRun = $false }
+            }
+        }
+    }
+
+    Invoke-WithModuleMocks -GlobalMocks $profMocks -ModuleMocks $profMocks -Body {
+        $smokeRes = & $valScript -Configuration Release -TestProfile Smoke -StagingDir $stgDir -OutputDir $outSmokeOnly -HostExecutablePath $fakeHostExe -CertificateThumbprint $certInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        Assert-Equal $smokeRes.ValidationSucceeded $true 'Smoke profile passes on 3 valid frames (<60) when host exits 0 cleanly'
+        Assert-Equal $smokeRes.AcceptanceCriteria.FunctionalSmokePassed $true 'FunctionalSmokePassed is true'
+        Assert-Equal $smokeRes.AcceptanceCriteria.FrameTargetReached $false 'Smoke faithfully records FrameTargetReached=false for 3/60'
+        Assert-Equal $smokeRes.AcceptanceCriteria.PerformanceTestExecuted $false 'Smoke profile does not mark PerformanceTestExecuted=true'
+        Assert-Equal $smokeRes.AcceptanceCriteria.PerformanceTargetReached $false 'Smoke profile does not mark unexecuted PerformanceTest as passed'
+        Assert-Equal $smokeRes.RollbackClean $true 'RollbackClean is true after Smoke'
+    }
+
+    $global:LbTestState['ProfMock'].PerfFails = $true
+    Invoke-WithModuleMocks -GlobalMocks $profMocks -ModuleMocks $profMocks -Body {
+        Assert-Throws {
+            & $valScript -Configuration Release -TestProfile Both -StagingDir $stgDir -OutputDir $outBothFailPerf -HostExecutablePath $fakeHostExe -CertificateThumbprint $certInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        } -ExpectedPattern 'PerformanceTargetReached.*RollbackClean=True' -Message 'Profile Both rejects missed perf target while keeping clean rollback'
+    }
+    $failBothReport = Get-Content -LiteralPath (Join-Path $outBothFailPerf 'functional-validation-report.json') -Raw | ConvertFrom-Json
+    Assert-Equal $failBothReport.AcceptanceCriteria.FunctionalSmokePassed $true 'Smoke remained passed even when Perf target failed'
+    Assert-Equal $failBothReport.AcceptanceCriteria.PerformanceTestExecuted $true 'PerformanceTestExecuted recorded true'
+    Assert-Equal $failBothReport.AcceptanceCriteria.PerformanceTargetReached $false 'PerformanceTargetReached recorded false'
+    Assert-Equal $failBothReport.RollbackClean $true 'RollbackClean=true after Perf failure'
+}
+
 try {
     Write-Host ("Summary: {0} tests run, {1} assertion failures." -f $script:TestsRun, $script:TestsFailed)
 }

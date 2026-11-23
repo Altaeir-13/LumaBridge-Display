@@ -867,61 +867,72 @@ function Invoke-LumaBridgeHostProcess {
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
 
-    $stdoutLines = New-Object System.Collections.Generic.List[string]
-    $stderrLines = New-Object System.Collections.Generic.List[string]
     $proc = [System.Diagnostics.Process]::new()
     $proc.StartInfo = $psi
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
-    $outSub = $null
-    $errSub = $null
     try {
-        $outSub = Register-ObjectEvent -InputObject $proc -EventName 'OutputDataReceived' -Action {
-            if ($null -ne $EventArgs.Data) {
-                $Event.MessageData.Add($EventArgs.Data)
-            }
-        } -MessageData $stdoutLines
-        $errSub = Register-ObjectEvent -InputObject $proc -EventName 'ErrorDataReceived' -Action {
-            if ($null -ne $EventArgs.Data) {
-                $Event.MessageData.Add($EventArgs.Data)
-            }
-        } -MessageData $stderrLines
-
         if (-not $proc.Start()) {
             throw ("Failed to start host consumer executable: {0}" -f $ExecutablePath)
         }
-        $proc.BeginOutputReadLine()
-        $proc.BeginErrorReadLine()
+
+        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        $stderrTask = $proc.StandardError.ReadToEndAsync()
 
         $exited = $proc.WaitForExit($HardTimeoutMs)
         $timedOut = $false
         if (-not $exited) {
             $timedOut = $true
             try { $proc.Kill() } catch { }
-            try { $proc.WaitForExit(3000) } catch { }
+            try { $null = $proc.WaitForExit(3000) } catch { }
         }
         else {
-            # Flush remaining async output buffers once process exits cleanly.
+            # Ensure native process handle and stdio handles are completely drained.
             $proc.WaitForExit()
+        }
+        $stopwatch.Stop()
+
+        $rawStdout = ''
+        $rawStderr = ''
+        try {
+            if ($stdoutTask.Wait(3000)) {
+                $rawStdout = $stdoutTask.Result
+            }
+        }
+        catch { }
+        try {
+            if ($stderrTask.Wait(3000)) {
+                $rawStderr = $stderrTask.Result
+            }
+        }
+        catch { }
+
+        $stdoutLines = if ([string]::IsNullOrEmpty($rawStdout)) {
+            @()
+        }
+        else {
+            @($rawStdout -split "\r?\n" | Where-Object { $_ -ne '' })
+        }
+        $stderrLines = if ([string]::IsNullOrEmpty($rawStderr)) {
+            @()
+        }
+        else {
+            @($rawStderr -split "\r?\n" | Where-Object { $_ -ne '' })
         }
 
         $exitCode = if ($timedOut) { -1 } else { [int]$proc.ExitCode }
         return [pscustomobject]@{
-            ExitCode = $exitCode
-            TimedOut = $timedOut
-            Output   = @($stdoutLines.ToArray())
-            StdErr   = @($stderrLines.ToArray())
-            DryRun   = $false
+            ExitCode   = $exitCode
+            TimedOut   = $timedOut
+            DurationMs = [Math]::Round($stopwatch.Elapsed.TotalMilliseconds, 2)
+            Output     = $stdoutLines
+            StdErr     = $stderrLines
+            RawStdOut  = $rawStdout
+            RawStdErr  = $rawStderr
+            DryRun     = $false
         }
     }
     finally {
-        if ($null -ne $outSub) {
-            try { Unregister-Event -SubscriptionId $outSub.Id -ErrorAction SilentlyContinue } catch { }
-            try { Remove-Job -Id $outSub.Id -Force -ErrorAction SilentlyContinue } catch { }
-        }
-        if ($null -ne $errSub) {
-            try { Unregister-Event -SubscriptionId $errSub.Id -ErrorAction SilentlyContinue } catch { }
-            try { Remove-Job -Id $errSub.Id -Force -ErrorAction SilentlyContinue } catch { }
-        }
         if ($null -ne $proc) {
             try {
                 if (-not $proc.HasExited) {

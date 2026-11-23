@@ -183,10 +183,10 @@ windows\driver\x64\Debug\VirtualMonitorLifecycleTests.exe
 cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\FrameExtractionTests.cpp windows\driver\LumaBridgeIddDriver\FrameExtractor.cpp windows\driver\LumaBridgeIddDriver\FrameTransport.cpp windows\driver\LumaBridgeIddDriver\SwapChainProcessor.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\FrameExtractionTests.exe /link d3d11.lib dxgi.lib advapi32.lib
 windows\driver\x64\Debug\FrameExtractionTests.exe
 
-cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\FrameIpcTests.cpp windows\driver\LumaBridgeIddDriver\FrameTransport.cpp windows\host\FrameConsumer.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\FrameIpcTests.exe /link advapi32.lib
+cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\FrameIpcTests.cpp windows\driver\LumaBridgeIddDriver\FrameTransport.cpp windows\host\FrameConsumer.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\FrameIpcTests.exe /link advapi32.lib user32.lib gdi32.lib
 windows\driver\x64\Debug\FrameIpcTests.exe
 
-cl /nologo /std:c++17 /W4 /WX /EHsc /O2 windows\host\main.cpp windows\host\FrameConsumer.cpp /Fowindows\driver\x64\Release\ /Fe:windows\driver\x64\Release\lumabridge-host.exe /link advapi32.lib
+cl /nologo /std:c++17 /W4 /WX /EHsc /O2 windows\host\main.cpp windows\host\FrameConsumer.cpp /Fowindows\driver\x64\Release\ /Fe:windows\driver\x64\Release\lumabridge-host.exe /link advapi32.lib user32.lib gdi32.lib
 cl /nologo /std:c++17 /W4 /WX /EHsc /O2 windows\driver\tests\FrameEndToEndIntegrationTests.cpp windows\driver\LumaBridgeIddDriver\FrameExtractor.cpp windows\driver\LumaBridgeIddDriver\FrameTransport.cpp windows\driver\LumaBridgeIddDriver\SwapChainProcessor.cpp /Fowindows\driver\x64\Release\ /Fe:windows\driver\x64\Release\FrameEndToEndIntegrationTests.exe /link d3d11.lib dxgi.lib advapi32.lib
 windows\driver\x64\Release\FrameEndToEndIntegrationTests.exe
 ```

@@ -795,25 +795,34 @@ RunResolutionBenchmarkPass(
 
     const std::string jsonText = ReadFileText(jsonPath);
     uint64_t framesRecv = 0ULL;
+    uint64_t framesValid = 0ULL;
     uint64_t crcErr = 99ULL;
     uint64_t patErr = 99ULL;
     uint64_t hostAvgE2E = 0ULL;
     uint64_t hostMaxE2E = 0ULL;
     double hostFps = 0.0;
+    double activeFps = 0.0;
     EXPECT_TRUE(ExtractJsonNumber(jsonText, "FramesReceived", framesRecv));
+    EXPECT_TRUE(ExtractJsonNumber(jsonText, "FramesValid", framesValid));
     EXPECT_TRUE(ExtractJsonNumber(jsonText, "ChecksumMismatches", crcErr));
     EXPECT_TRUE(ExtractJsonNumber(jsonText, "SyntheticPatternMismatches", patErr));
     EXPECT_TRUE(ExtractJsonNumber(jsonText, "AvgEndToEndLatencyUs", hostAvgE2E));
     EXPECT_TRUE(ExtractJsonNumber(jsonText, "MaxEndToEndLatencyUs", hostMaxE2E));
     EXPECT_TRUE(ExtractJsonDouble(jsonText, "ReceiveFps", hostFps));
+    EXPECT_TRUE(ExtractJsonDouble(jsonText, "ObservedActiveFps", activeFps));
     EXPECT_EQ(framesRecv, static_cast<uint64_t>(frameCount));
+    EXPECT_EQ(framesValid, static_cast<uint64_t>(frameCount));
     EXPECT_EQ(crcErr, 0ULL);
     EXPECT_EQ(patErr, 0ULL);
+    EXPECT_TRUE(jsonText.find("\"TransportHealthy\": true") != std::string::npos);
+    EXPECT_TRUE(jsonText.find("\"FrameTargetReached\": true") != std::string::npos);
+    EXPECT_TRUE(jsonText.find("\"FpsSampleSufficient\": true") != std::string::npos);
+    EXPECT_TRUE(activeFps > 0.0);
 
     const auto sSnap = server.GetMetricsSnapshot();
     const uint64_t avgCopyUs = totalCopyUs.load() / frameCount;
     std::printf(
-        "[BENCH] %s %ux%u (%u frames): avgCopyUs=%llu maxCopyUs=%llu avgDeliveryUs=%llu hostAvgE2EUs=%llu hostMaxE2EUs=%llu hostReceiveFps=%.2f\n",
+        "[BENCH] %s %ux%u (%u frames): avgCopyUs=%llu maxCopyUs=%llu avgDeliveryUs=%llu hostAvgE2EUs=%llu hostMaxE2EUs=%llu activeFps=%.2f\n",
         driverKind,
         width,
         height,
@@ -823,9 +832,160 @@ RunResolutionBenchmarkPass(
         static_cast<unsigned long long>(sSnap.AvgDeliveryLatencyUs),
         static_cast<unsigned long long>(hostAvgE2E),
         static_cast<unsigned long long>(hostMaxE2E),
-        hostFps);
+        activeFps);
 
     std::filesystem::remove(jsonPath);
+    server.Stop();
+}
+
+void
+TestEndToEndSmokeDurationExitAndMinFramesVsTargetCli()
+{
+    const std::filesystem::path hostExe = ResolveHostExecutablePath();
+    EXPECT_TRUE(!hostExe.empty());
+    if (hostExe.empty())
+    {
+        return;
+    }
+
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    const char* driverKind = nullptr;
+    EXPECT_TRUE(CreateTestD3d11Device(device, context, driverKind));
+    if (device == nullptr || context == nullptr)
+    {
+        return;
+    }
+
+    wchar_t pipeBuf[128]{};
+    _snwprintf_s(
+        pipeBuf,
+        ARRAYSIZE(pipeBuf),
+        _TRUNCATE,
+        L"\\\\.\\pipe\\LumaBridgeSmokeCli_%lu",
+        GetCurrentProcessId());
+    const std::wstring pipeName(pipeBuf);
+
+    FrameTransportConfig serverCfg;
+    serverCfg.SetPipeName(pipeName.c_str());
+    serverCfg.MaxQueueDepth = 3U;
+    serverCfg.BufferPoolSize = 5U;
+
+    FrameIpcServer server;
+    EXPECT_EQ(server.Start(serverCfg), S_OK);
+
+    D3d11FrameExtractor extractor;
+    extractor.SetDevice(device.Get(), context.Get());
+
+    auto enqueueThreeFrames = [&]() -> bool {
+        for (uint32_t i = 1U; i <= 3U; ++i)
+        {
+            ComPtr<ID3D11Texture2D> tex;
+            if (!CreateSyntheticTexture(device.Get(), 640U, 360U, i, tex))
+            {
+                return false;
+            }
+            auto slot = server.AcquireBufferSlot();
+            if (slot == nullptr)
+            {
+                return false;
+            }
+            FrameExtractionInput in{};
+            in.SourceTexture = tex.Get();
+            in.PresentationFrameNumber = i;
+            in.Flags = static_cast<uint32_t>(FrameIpcFlags::SyntheticTestFrame);
+            const FrameExtractionResult ext = extractor.ExtractFrame(in, *slot);
+            tex.Reset();
+            if (FAILED(ext.HResult) || !ext.PixelsCopied)
+            {
+                server.RecycleBufferSlot(std::move(slot));
+                return false;
+            }
+            bool evicted = false;
+            if (FAILED(server.EnqueueFrame(std::move(slot), evicted)))
+            {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    auto runCustomCli = [&](const std::wstring& extraArgs, const std::filesystem::path& jsonOut, DWORD& outExit) -> bool {
+        outExit = 99U;
+        std::wstring cmdLine =
+            L"\"" + hostExe.wstring() + L"\"" +
+            L" --pipe \"" + pipeName + L"\" " + extraArgs +
+            L" --json-summary \"" + jsonOut.wstring() + L"\" --quiet";
+        std::vector<wchar_t> cmdBuf(cmdLine.begin(), cmdLine.end());
+        cmdBuf.push_back(L'\0');
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi{};
+        if (CreateProcessW(hostExe.c_str(), cmdBuf.data(), nullptr, nullptr, FALSE, 0U, nullptr, nullptr, &si, &pi) == FALSE)
+        {
+            return false;
+        }
+        const DWORD waitRes = WaitForSingleObject(pi.hProcess, 10000U);
+        if (waitRes != WAIT_OBJECT_0)
+        {
+            (void)TerminateProcess(pi.hProcess, 1U);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            return false;
+        }
+        const BOOL ok = GetExitCodeProcess(pi.hProcess, &outExit);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return ok != FALSE;
+    };
+
+    // 1. Smoke mode (--min-frames 1 --max-frames 60 --duration-ms 350): 3 pre-connect frames arrive,
+    //    then idle desktop -> ExitCode=0 while accurately reporting FrameTargetReached=false and PreConnect=3!
+    EXPECT_TRUE(enqueueThreeFrames());
+    const std::filesystem::path smokeJson = MakeTempJsonPath(L"smoke_ok");
+    std::filesystem::remove(smokeJson);
+    DWORD smokeExit = 99U;
+    EXPECT_TRUE(runCustomCli(
+        L"--min-frames 1 --max-frames 60 --duration-ms 350 --io-timeout-ms 80 --connect-timeout-ms 2000 --verify-synthetic-pattern",
+        smokeJson,
+        smokeExit));
+    EXPECT_EQ(smokeExit, 0UL);
+    const std::string smokeText = ReadFileText(smokeJson);
+    uint64_t smokeValid = 0ULL;
+    uint64_t smokePreConn = 0ULL;
+    uint64_t smokeFatalTimeouts = 99ULL;
+    uint64_t smokeRecTimeouts = 0ULL;
+    EXPECT_TRUE(ExtractJsonNumber(smokeText, "FramesValid", smokeValid));
+    EXPECT_TRUE(ExtractJsonNumber(smokeText, "PreConnectFramesReceived", smokePreConn));
+    EXPECT_TRUE(ExtractJsonNumber(smokeText, "FatalIoTimeouts", smokeFatalTimeouts));
+    EXPECT_TRUE(ExtractJsonNumber(smokeText, "RecoverableIoTimeouts", smokeRecTimeouts));
+    EXPECT_EQ(smokeValid, 3ULL);
+    EXPECT_EQ(smokePreConn, 3ULL);
+    EXPECT_EQ(smokeFatalTimeouts, 0ULL);
+    EXPECT_TRUE(smokeRecTimeouts >= 1ULL);
+    EXPECT_TRUE(smokeText.find("\"ExitReason\": \"DurationElapsed\"") != std::string::npos);
+    EXPECT_TRUE(smokeText.find("\"TransportHealthy\": true") != std::string::npos);
+    EXPECT_TRUE(smokeText.find("\"MinFramesReached\": true") != std::string::npos);
+    EXPECT_TRUE(smokeText.find("\"FrameTargetReached\": false") != std::string::npos);
+    EXPECT_TRUE(smokeText.find("\"FpsSampleSufficient\": false") != std::string::npos);
+    std::filesystem::remove(smokeJson);
+
+    // 2. Strict performance target mode (--require-max-frames): 3 frames < 60 -> ExitCode=1 cleanly.
+    EXPECT_TRUE(enqueueThreeFrames());
+    const std::filesystem::path targetMissJson = MakeTempJsonPath(L"target_miss");
+    std::filesystem::remove(targetMissJson);
+    DWORD targetMissExit = 0U;
+    EXPECT_TRUE(runCustomCli(
+        L"--max-frames 60 --require-max-frames --duration-ms 300 --io-timeout-ms 80 --connect-timeout-ms 2000 --verify-synthetic-pattern",
+        targetMissJson,
+        targetMissExit));
+    EXPECT_EQ(targetMissExit, 1UL);
+    const std::string missText = ReadFileText(targetMissJson);
+    EXPECT_TRUE(missText.find("\"ExitReason\": \"DurationElapsed\"") != std::string::npos);
+    EXPECT_TRUE(missText.find("\"TransportHealthy\": true") != std::string::npos);
+    EXPECT_TRUE(missText.find("\"FrameTargetReached\": false") != std::string::npos);
+    std::filesystem::remove(targetMissJson);
+
     server.Stop();
 }
 
@@ -879,6 +1039,7 @@ main()
 {
     RunTest("EndToEndRealD3d11ExtractionToSeparateHostProcess720pAnd1080p", TestEndToEndRealD3d11ExtractionToSeparateHostProcess720pAnd1080p);
     RunTest("EndToEndHostDisconnectAndReconnectDuringActiveSwapChainLoop", TestEndToEndHostDisconnectAndReconnectDuringActiveSwapChainLoop);
+    RunTest("EndToEndSmokeDurationExitAndMinFramesVsTargetCli", TestEndToEndSmokeDurationExitAndMinFramesVsTargetCli);
     RunTest("EndToEndThroughputAndLatencyBenchmark720pAnd1080p", TestEndToEndThroughputAndLatencyBenchmark720pAnd1080p);
 
     std::printf("Summary: %d tests run, %d assertion failures.\n", g_TestsRun, g_TestsFailed);
