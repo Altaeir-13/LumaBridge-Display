@@ -120,7 +120,7 @@ pnputil /delete-driver oemXX.inf /uninstall
 
 Remover os certificados temporarios de teste das stores `CurrentUser\My`, `LocalMachine\Root` e `LocalMachine\TrustedPublisher` **somente por thumbprint SHA-1 exato** (`certutil -delstore <Store> <Thumbprint>`) e restaurar `testsigning off` caso tenha sido alterado em VM.
 
-## 5. Plano de testes funcionais (9 cenarios)
+## 5. Plano de testes funcionais (10 cenarios)
 
 | # | Cenario | Procedimento | Criterio de aceitacao esperado |
 |---|---|---|---|
@@ -133,3 +133,33 @@ Remover os certificados temporarios de teste das stores `CurrentUser\My`, `Local
 | 7 | **Recuperacao de falhas graficas** | Simular reset de GPU / TDR controlado (ou troca de adaptador de renderizacao). | `DXGI_ERROR_DEVICE_REMOVED` / `DXGI_ERROR_DEVICE_RESET` encerra a thread trabalhadora limpando `hSwapChain` uma unica vez; circuit breaker (`kMaxConsecutiveSwapChainFailures = 5`) impede loop infinito caso a falha persista. |
 | 8 | **Consumo de CPU, GPU e memoria** | Monitorar `WUDFHost.exe` no Gerenciador de Tarefas / Resource Monitor em idle (desktop estatico) e com movimento por 5 minutos. | Consumo proximo a `0%` de CPU com desktop estatico (sem busy-wait); memoria privada de `WUDFHost.exe` estavel sem crescimento continuo. |
 | 9 | **Ausencia de monitores fantasmas e leaks** | Desabilitar `EnableVirtualMonitor = 0`, reiniciar e executar `pnputil /remove-device` + `/delete-driver`. | Nenhum monitor fantasma permanece listado em *Gerenciador de Dispositivos -> Monitores* ou Configuracoes de Tela; `WUDFHost.exe` encerra sem handles abertos ou crash dump. |
+| 10 | **Extracao M4.1 opt-in e consumo em `lumabridge-host.exe`** | Com `EnableVirtualMonitor = 1`, definir `REG_DWORD EnableFrameExtraction = 1` na chave `Device Parameters` (ou `Device Parameters\LumaBridgeIddDriver`), reiniciar o dispositivo, executar `lumabridge-host.exe --max-frames 30 --json-summary <temp.json>` e testar desconexao/reconexao. | `lumabridge-host.exe` autentica no Named Pipe `\\.\pipe\LumaBridgeFrameIpc_v1`, recebe frames reais (`FramesDelivered` == `FramesReceived`, `ChecksumMismatches = 0`, `ProtocolErrors = 0`), desconexao nao trava o driver (`FramesDroppedByBackpressure` atua normalmente) e `EnableFrameExtraction = 0` restaura o modo sem copia. |
+
+## 6. Validacao controlada da extracao M4.1 e rollback especifico
+
+1. **Habilitacao opt-in (Admin, apos instalacao controlada e `EnableVirtualMonitor = 1`):**
+   ```powershell
+   $dev = Get-PnpDevice | Where-Object { $_.InstanceId -like 'ROOT\DISPLAY\*' -and $_.FriendlyName -like '*LumaBridge*' } | Select-Object -First 1
+   $devParams = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($dev.InstanceId)\Device Parameters"
+   New-ItemProperty -LiteralPath $devParams -Name 'EnableFrameExtraction' -PropertyType DWord -Value 1 -Force | Out-Null
+   pnputil /restart-device $dev.InstanceId
+   ```
+2. **Captura ETW + execucao do host consumidor em processo separado:**
+   ```powershell
+   .\windows\driver\scripts\Invoke-LumaBridgeEtwTrace.ps1 -Action Start -Force
+   $verify = .\windows\driver\scripts\Invoke-LumaBridgeEtwTrace.ps1 -Action VerifyProviders
+   $verify.AllProvidersVerified # deve retornar True
+   .\windows\driver\x64\Release\lumabridge-host.exe --max-frames 30 --json-summary "$env:TEMP\lb-host-summary.json"
+   .\windows\driver\scripts\Invoke-LumaBridgeEtwTrace.ps1 -Action Stop -Force
+   .\windows\driver\scripts\Collect-LumaBridgeDiagnostics.ps1 -Configuration Release -EtlPath "$env:LOCALAPPDATA\LumaBridgeDisplay\Diagnostics\Etw\LumaBridgeIddCore.etl"
+   ```
+3. **Rollback imediato para modo sem extracao (ou desinstalacao completa):**
+   ```powershell
+   New-ItemProperty -LiteralPath $devParams -Name 'EnableFrameExtraction' -PropertyType DWord -Value 0 -Force | Out-Null
+   pnputil /restart-device $dev.InstanceId
+   ```
+   Para rollback total do pacote e certificado, utilize `Uninstall-LumaBridgeDriver.ps1`.
+
+4. **Riscos ainda nao resolvidos na etapa M4.1:**
+   - O caminho atual de M4.1 utiliza staging D3D11 + copia CPU via Named Pipe (em vez de NT shared handles GPU-to-GPU), atingindo ~48.63 FPS em `1920x1080` com verificacao CRC/padrao ativa no hardware RTX 3060 Ti; 1080p60 sustentado para streaming interativo dependera do path GPU compartilhado + NVENC em M4.2.
+   - A execucao dentro do `WUDFHost.exe` real em sistema operacional com `EnableFrameExtraction = 1` depende de instalacao controlada autorizada e nao foi executada automaticamente neste ambiente.
