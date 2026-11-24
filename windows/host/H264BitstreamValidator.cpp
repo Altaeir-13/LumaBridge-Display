@@ -462,6 +462,7 @@ struct H264IndependentDecoder::Impl final
     bool MftProvidesSamples{false};
     std::string DecoderName{"None"};
     ComPtr<IMFTransform> Decoder{};
+    DecoderLifecycleDiagnostics Lifecycle{};
 
     HRESULT ConfigureOutputNv12Type() noexcept
     {
@@ -745,6 +746,8 @@ struct H264IndependentDecoder::Impl final
 
     void Cleanup() noexcept
     {
+        const bool hadActiveState = (Decoder != nullptr) || MfStarted || ComInitializedBySelf || Initialized;
+        const DWORD callerTid = GetCurrentThreadId();
         if (Decoder != nullptr)
         {
             (void)Decoder->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0U);
@@ -755,11 +758,26 @@ struct H264IndependentDecoder::Impl final
         {
             (void)MFShutdown();
             MfStarted = false;
+            ++Lifecycle.MfShutdownCount;
         }
         if (ComInitializedBySelf)
         {
             CoUninitialize();
             ComInitializedBySelf = false;
+            ++Lifecycle.ComUninitCount;
+            Lifecycle.ComUninitThreadId = callerTid;
+            if (Lifecycle.ComInitThreadId != 0U && callerTid != Lifecycle.ComInitThreadId)
+            {
+                Lifecycle.ComThreadAffinityPreserved = false;
+            }
+        }
+        if (hadActiveState)
+        {
+            Lifecycle.ShutdownThreadId = callerTid;
+            if (Lifecycle.OwnerThreadId != 0U && callerTid != Lifecycle.OwnerThreadId)
+            {
+                Lifecycle.ShutdownThreadAffinityPreserved = false;
+            }
         }
         Initialized = false;
         Width = 0U;
@@ -797,10 +815,14 @@ H264IndependentDecoder::Initialize(
         return E_INVALIDARG;
     }
 
+    const DWORD initTid = GetCurrentThreadId();
+    m_impl->Lifecycle.OwnerThreadId = initTid;
     const HRESULT comHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (SUCCEEDED(comHr))
     {
         m_impl->ComInitializedBySelf = true;
+        ++m_impl->Lifecycle.ComInitCount;
+        m_impl->Lifecycle.ComInitThreadId = initTid;
     }
     else if (comHr != RPC_E_CHANGED_MODE)
     {
@@ -814,6 +836,7 @@ H264IndependentDecoder::Initialize(
         return hr;
     }
     m_impl->MfStarted = true;
+    ++m_impl->Lifecycle.MfStartupCount;
     m_impl->Width = width;
     m_impl->Height = height;
     m_impl->CodedWidth = width;
@@ -977,6 +1000,12 @@ H264IndependentDecoder::GetDecoderName() const noexcept
     return (m_impl != nullptr) ? m_impl->DecoderName : std::string("None");
 }
 
+DecoderLifecycleDiagnostics
+H264IndependentDecoder::GetLifecycleDiagnostics() const noexcept
+{
+    return (m_impl != nullptr) ? m_impl->Lifecycle : DecoderLifecycleDiagnostics{};
+}
+
 HRESULT
 H264IndependentDecoder::DecodePacket(
     const uint8_t* annexBBytes,
@@ -1055,6 +1084,25 @@ H264IndependentDecoder::Drain(
     return m_impl->DrainAvailableOutputs(outDecodedFrames);
 }
 
+H264StreamValidationSession::H264StreamValidationSession(
+    IH264Decoder* externalDecoder
+    ) noexcept
+    : m_externalDecoder(externalDecoder)
+{
+}
+
+IH264Decoder*
+H264StreamValidationSession::ActiveDecoder() noexcept
+{
+    return (m_externalDecoder != nullptr) ? m_externalDecoder : &m_ownedDecoder;
+}
+
+const IH264Decoder*
+H264StreamValidationSession::ActiveDecoder() const noexcept
+{
+    return (m_externalDecoder != nullptr) ? m_externalDecoder : &m_ownedDecoder;
+}
+
 void
 H264StreamValidationSession::Configure(
     bool enabled,
@@ -1065,6 +1113,8 @@ H264StreamValidationSession::Configure(
 {
     Shutdown();
     m_enabled = enabled;
+    m_drainFailed = false;
+    m_latencyConsolidationCount = 0ULL;
     m_targetFps = (targetFps > 0U) ? targetFps : 60U;
     m_verifySyntheticPsnr = verifySyntheticPsnr;
     m_minPsnrDb = minPsnrDb;
@@ -1103,30 +1153,31 @@ H264StreamValidationSession::PrewarmDecoder(
         return E_INVALIDARG;
     }
 
+    IH264Decoder* decoder = ActiveDecoder();
     const uint32_t effectiveFps = (targetFps > 0U) ? targetFps : m_targetFps;
-    if (m_decoder.IsInitialized() && m_width == width && m_height == height)
+    if (decoder->IsInitialized() && m_width == width && m_height == height)
     {
         m_summary.DecoderInitialized = true;
-        m_summary.DecoderName = m_decoder.GetDecoderName();
+        m_summary.DecoderName = decoder->GetDecoderName();
         return S_OK;
     }
 
-    if (m_decoder.IsInitialized())
+    if (decoder->IsInitialized())
     {
         std::vector<DecodedNv12Frame> tail;
-        if (SUCCEEDED(m_decoder.Drain(tail)))
+        if (SUCCEEDED(decoder->Drain(tail)))
         {
             ProcessDecodedFrames(tail);
         }
-        m_decoder.Shutdown();
+        decoder->Shutdown();
         m_width = 0U;
         m_height = 0U;
     }
 
-    const HRESULT initHr = m_decoder.Initialize(width, height, effectiveFps);
-    m_summary.DecoderInitialized = SUCCEEDED(initHr) && m_decoder.IsInitialized();
-    m_summary.DecoderName = m_decoder.GetDecoderName();
-    if (SUCCEEDED(initHr) && m_decoder.IsInitialized())
+    const HRESULT initHr = decoder->Initialize(width, height, effectiveFps);
+    m_summary.DecoderInitialized = SUCCEEDED(initHr) && decoder->IsInitialized();
+    m_summary.DecoderName = decoder->GetDecoderName();
+    if (SUCCEEDED(initHr) && decoder->IsInitialized())
     {
         m_width = width;
         m_height = height;
@@ -1227,23 +1278,24 @@ H264StreamValidationSession::SubmitPacket(
         m_summary.NonIdrCount += nalSummary.NonIdrSliceCount;
     }
 
-    if (!m_decoder.IsInitialized() || m_width != packet.Width || m_height != packet.Height)
+    IH264Decoder* decoder = ActiveDecoder();
+    if (!decoder->IsInitialized() || m_width != packet.Width || m_height != packet.Height)
     {
-        if (m_decoder.IsInitialized())
+        if (decoder->IsInitialized())
         {
             std::vector<DecodedNv12Frame> tail;
-            if (SUCCEEDED(m_decoder.Drain(tail)))
+            if (SUCCEEDED(decoder->Drain(tail)))
             {
                 ProcessDecodedFrames(tail);
             }
         }
 
-        const HRESULT initHr = m_decoder.Initialize(packet.Width, packet.Height, m_targetFps);
-        m_summary.DecoderInitialized = SUCCEEDED(initHr) && m_decoder.IsInitialized();
-        m_summary.DecoderName = m_decoder.GetDecoderName();
-        if (FAILED(initHr))
+        const HRESULT initHr = decoder->Initialize(packet.Width, packet.Height, m_targetFps);
+        m_summary.DecoderInitialized = SUCCEEDED(initHr) && decoder->IsInitialized();
+        m_summary.DecoderName = decoder->GetDecoderName();
+        if (FAILED(initHr) || !decoder->IsInitialized())
         {
-            m_summary.LastHResult = initHr;
+            m_summary.LastHResult = FAILED(initHr) ? initHr : E_FAIL;
             ++m_summary.DecodeFailures;
             return;
         }
@@ -1255,7 +1307,7 @@ H264StreamValidationSession::SubmitPacket(
     LARGE_INTEGER decEndLi{};
     (void)QueryPerformanceCounter(&decStartLi);
     std::vector<DecodedNv12Frame> decoded;
-    const HRESULT decHr = m_decoder.DecodePacket(
+    const HRESULT decHr = decoder->DecodePacket(
         packet.Bitstream.data(),
         packet.Bitstream.size(),
         packet.PresentationFrameNumber,
@@ -1267,7 +1319,6 @@ H264StreamValidationSession::SubmitPacket(
             static_cast<uint64_t>(decEndLi.QuadPart - decStartLi.QuadPart),
             m_qpcFrequency);
         m_mftDecodeLatTracker.Record(decUs);
-        m_summary.MftDecodeLatencyUs = m_mftDecodeLatTracker.Summarize();
     }
     if (FAILED(decHr))
     {
@@ -1287,13 +1338,14 @@ H264StreamValidationSession::Finish() noexcept
         return;
     }
 
-    if (m_decoder.IsInitialized())
+    IH264Decoder* decoder = ActiveDecoder();
+    if (decoder->IsInitialized())
     {
         LARGE_INTEGER drainStartLi{};
         LARGE_INTEGER drainEndLi{};
         (void)QueryPerformanceCounter(&drainStartLi);
         std::vector<DecodedNv12Frame> tail;
-        const HRESULT drainHr = m_decoder.Drain(tail);
+        const HRESULT drainHr = decoder->Drain(tail);
         (void)QueryPerformanceCounter(&drainEndLi);
         if (drainStartLi.QuadPart > 0 && drainEndLi.QuadPart >= drainStartLi.QuadPart && m_qpcFrequency > 0ULL && !tail.empty())
         {
@@ -1304,6 +1356,7 @@ H264StreamValidationSession::Finish() noexcept
         }
         if (FAILED(drainHr) && drainHr != E_NOT_VALID_STATE)
         {
+            m_drainFailed = true;
             m_summary.LastHResult = drainHr;
             ++m_summary.DecodeFailures;
         }
@@ -1313,6 +1366,7 @@ H264StreamValidationSession::Finish() noexcept
         }
     }
     m_summary.MftDecodeLatencyUs = m_mftDecodeLatTracker.Summarize();
+    ++m_latencyConsolidationCount;
 
     const bool structuralOk =
         m_summary.Enabled &&
@@ -1321,6 +1375,7 @@ H264StreamValidationSession::Finish() noexcept
         m_summary.FramesDecoded > 0ULL &&
         m_summary.NalParseFailures == 0ULL &&
         m_summary.DecodeFailures == 0ULL &&
+        !m_drainFailed &&
         m_summary.SpsCount > 0ULL &&
         m_summary.PpsCount > 0ULL &&
         m_summary.IdrCount > 0ULL;
@@ -1339,7 +1394,7 @@ H264StreamValidationSession::Finish() noexcept
 void
 H264StreamValidationSession::Shutdown() noexcept
 {
-    m_decoder.Shutdown();
+    ActiveDecoder()->Shutdown();
     m_width = 0U;
     m_height = 0U;
     m_sumYPsnrDb = 0.0;
@@ -1352,6 +1407,24 @@ H264ValidationSummary
 H264StreamValidationSession::GetSummary() const noexcept
 {
     return m_summary;
+}
+
+uint64_t
+H264StreamValidationSession::GetLatencyConsolidationCount() const noexcept
+{
+    return m_latencyConsolidationCount;
+}
+
+bool
+H264StreamValidationSession::HasDrainFailure() const noexcept
+{
+    return m_drainFailed;
+}
+
+DecoderLifecycleDiagnostics
+H264StreamValidationSession::GetDecoderLifecycleDiagnostics() const noexcept
+{
+    return ActiveDecoder()->GetLifecycleDiagnostics();
 }
 
 } // namespace lumabridge::host

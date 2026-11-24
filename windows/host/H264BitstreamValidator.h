@@ -113,12 +113,79 @@ PsnrVerificationResult VerifyDecodedNv12AgainstSyntheticBgra8(
     double minRequiredPsnrDb = 25.0
     ) noexcept;
 
+/// Tracks COM and Media Foundation initialization/shutdown balance and thread affinity for decoder ownership diagnostics.
+struct DecoderLifecycleDiagnostics
+{
+    uint32_t ComInitCount{0U};
+    uint32_t ComUninitCount{0U};
+    uint32_t MfStartupCount{0U};
+    uint32_t MfShutdownCount{0U};
+    DWORD ComInitThreadId{0U};
+    DWORD ComUninitThreadId{0U};
+    DWORD OwnerThreadId{0U};
+    DWORD ShutdownThreadId{0U};
+    bool ComThreadAffinityPreserved{true};
+    bool ShutdownThreadAffinityPreserved{true};
+
+    bool ComBalanced() const noexcept
+    {
+        return ComThreadAffinityPreserved &&
+               (ComInitCount == ComUninitCount) &&
+               (ComInitCount == 0U || ComInitThreadId == ComUninitThreadId);
+    }
+
+    bool MfBalanced() const noexcept
+    {
+        return MfStartupCount == MfShutdownCount;
+    }
+
+    bool ShutdownOnOwnerThread() const noexcept
+    {
+        return ShutdownThreadAffinityPreserved &&
+               (OwnerThreadId == 0U || ShutdownThreadId == OwnerThreadId);
+    }
+};
+
+/// Abstract H.264 decoder seam allowing independent Media Foundation or deterministic mock decoders.
+class IH264Decoder
+{
+public:
+    virtual ~IH264Decoder() = default;
+
+    virtual HRESULT Initialize(
+        uint32_t width,
+        uint32_t height,
+        uint32_t targetFps = 60U
+        ) noexcept = 0;
+
+    virtual void Shutdown() noexcept = 0;
+
+    virtual bool IsInitialized() const noexcept = 0;
+    virtual std::string GetDecoderName() const noexcept = 0;
+
+    virtual HRESULT DecodePacket(
+        const uint8_t* annexBBytes,
+        size_t annexBSizeBytes,
+        uint32_t presentationFrameNumber,
+        std::vector<DecodedNv12Frame>& outDecodedFrames
+        ) noexcept = 0;
+
+    virtual HRESULT Drain(
+        std::vector<DecodedNv12Frame>& outDecodedFrames
+        ) noexcept = 0;
+
+    virtual DecoderLifecycleDiagnostics GetLifecycleDiagnostics() const noexcept
+    {
+        return {};
+    }
+};
+
 /// Independent CPU/Media Foundation H.264 decoder (CLSID_CMSH264DecoderMFT with MFTEnumEx fallback).
-class H264IndependentDecoder final
+class H264IndependentDecoder final : public IH264Decoder
 {
 public:
     H264IndependentDecoder() noexcept;
-    ~H264IndependentDecoder();
+    ~H264IndependentDecoder() override;
 
     H264IndependentDecoder(const H264IndependentDecoder&) = delete;
     H264IndependentDecoder& operator=(const H264IndependentDecoder&) = delete;
@@ -127,12 +194,12 @@ public:
         uint32_t width,
         uint32_t height,
         uint32_t targetFps = 60U
-        ) noexcept;
+        ) noexcept override;
 
-    void Shutdown() noexcept;
+    void Shutdown() noexcept override;
 
-    bool IsInitialized() const noexcept;
-    std::string GetDecoderName() const noexcept;
+    bool IsInitialized() const noexcept override;
+    std::string GetDecoderName() const noexcept override;
 
     /// Submits one Annex-B frame packet to the independent H.264 decoder and collects any immediately produced NV12 frames.
     HRESULT DecodePacket(
@@ -140,12 +207,14 @@ public:
         size_t annexBSizeBytes,
         uint32_t presentationFrameNumber,
         std::vector<DecodedNv12Frame>& outDecodedFrames
-        ) noexcept;
+        ) noexcept override;
 
     /// Drains all buffered frames from the decoder at end of stream.
     HRESULT Drain(
         std::vector<DecodedNv12Frame>& outDecodedFrames
-        ) noexcept;
+        ) noexcept override;
+
+    DecoderLifecycleDiagnostics GetLifecycleDiagnostics() const noexcept override;
 
 private:
     struct Impl;
@@ -156,6 +225,8 @@ private:
 class H264StreamValidationSession final
 {
 public:
+    explicit H264StreamValidationSession(IH264Decoder* externalDecoder = nullptr) noexcept;
+
     void Configure(
         bool enabled,
         uint32_t targetFps,
@@ -175,12 +246,18 @@ public:
     void Shutdown() noexcept;
 
     H264ValidationSummary GetSummary() const noexcept;
+    uint64_t GetLatencyConsolidationCount() const noexcept;
+    bool HasDrainFailure() const noexcept;
+    DecoderLifecycleDiagnostics GetDecoderLifecycleDiagnostics() const noexcept;
 
 private:
+    IH264Decoder* ActiveDecoder() noexcept;
+    const IH264Decoder* ActiveDecoder() const noexcept;
     void ProcessDecodedFrames(const std::vector<DecodedNv12Frame>& frames) noexcept;
 
     bool m_enabled{false};
     bool m_verifySyntheticPsnr{false};
+    bool m_drainFailed{false};
     uint32_t m_targetFps{60U};
     double m_minPsnrDb{25.0};
     uint32_t m_width{0U};
@@ -190,8 +267,10 @@ private:
     double m_sumCombinedPsnrDb{0.0};
     uint64_t m_psnrSamples{0ULL};
     uint64_t m_qpcFrequency{10000000ULL};
+    uint64_t m_latencyConsolidationCount{0ULL};
     ReservoirLatencyAccumulator m_mftDecodeLatTracker{};
-    H264IndependentDecoder m_decoder{};
+    H264IndependentDecoder m_ownedDecoder{};
+    IH264Decoder* m_externalDecoder{nullptr};
     H264ValidationSummary m_summary{};
 };
 
