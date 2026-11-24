@@ -1,5 +1,7 @@
+#include "AsyncH264ValidationWorker.h"
 #include "FrameConsumer.h"
 #include "H264BitstreamValidator.h"
+#include "HostGateEvaluator.h"
 #include "NvencH264Encoder.h"
 #include "VirtualDisplayStimulus.h"
 
@@ -8,186 +10,13 @@
 
 #include <algorithm>
 #include <cmath>
-#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cwchar>
-#include <deque>
 #include <fstream>
-#include <mutex>
 #include <string>
-#include <thread>
 
 namespace {
-
-class AsyncH264ValidationWorker final
-{
-public:
-    static constexpr size_t kMaxQueueCapacity = 256U;
-
-    explicit AsyncH264ValidationWorker(
-        lumabridge::host::H264StreamValidationSession& session
-        ) noexcept
-        : m_session(session)
-    {
-    }
-
-    ~AsyncH264ValidationWorker()
-    {
-        StopAndDrain();
-    }
-
-    AsyncH264ValidationWorker(const AsyncH264ValidationWorker&) = delete;
-    AsyncH264ValidationWorker& operator=(const AsyncH264ValidationWorker&) = delete;
-
-    bool Start(
-        uint32_t prewarmWidth,
-        uint32_t prewarmHeight,
-        uint32_t prewarmFps
-        ) noexcept
-    {
-        StopAndDrain();
-        m_stopRequested = false;
-        m_ready = false;
-        m_started = true;
-        try
-        {
-            m_worker = std::thread(
-                &AsyncH264ValidationWorker::WorkerProc,
-                this,
-                prewarmWidth,
-                prewarmHeight,
-                prewarmFps);
-        }
-        catch (...)
-        {
-            m_started = false;
-            return false;
-        }
-
-        std::unique_lock<std::mutex> lock(m_mutex);
-        m_readyCv.wait(lock, [this]() { return m_ready; });
-        return true;
-    }
-
-    void Enqueue(lumabridge::host::EncodedFramePacket&& packet) noexcept
-    {
-        if (!m_started)
-        {
-            m_session.SubmitPacket(packet);
-            return;
-        }
-
-        std::unique_lock<std::mutex> lock(m_mutex);
-        m_notFullCv.wait(lock, [this]() {
-            return m_stopRequested || m_queue.size() < kMaxQueueCapacity;
-        });
-        if (!m_stopRequested)
-        {
-            try
-            {
-                m_queue.push_back(std::move(packet));
-            }
-            catch (...)
-            {
-            }
-        }
-        lock.unlock();
-        m_notEmptyCv.notify_one();
-    }
-
-    void StopAndDrain() noexcept
-    {
-        if (!m_started)
-        {
-            return;
-        }
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_stopRequested = true;
-        }
-        m_notEmptyCv.notify_all();
-        m_notFullCv.notify_all();
-        if (m_worker.joinable())
-        {
-            m_worker.join();
-        }
-        m_started = false;
-    }
-
-private:
-    void WorkerProc(
-        uint32_t prewarmWidth,
-        uint32_t prewarmHeight,
-        uint32_t prewarmFps
-        ) noexcept
-    {
-        const HRESULT comHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        const bool comInitialized = SUCCEEDED(comHr);
-
-        if (prewarmWidth > 0U && prewarmHeight > 0U)
-        {
-            (void)m_session.PrewarmDecoder(prewarmWidth, prewarmHeight, prewarmFps);
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_ready = true;
-        }
-        m_readyCv.notify_one();
-
-        for (;;)
-        {
-            lumabridge::host::EncodedFramePacket pkt{};
-            bool hasPacket = false;
-            bool done = false;
-            {
-                std::unique_lock<std::mutex> lock(m_mutex);
-                m_notEmptyCv.wait(lock, [this]() {
-                    return m_stopRequested || !m_queue.empty();
-                });
-                if (!m_queue.empty())
-                {
-                    pkt = std::move(m_queue.front());
-                    m_queue.pop_front();
-                    hasPacket = true;
-                }
-                else if (m_stopRequested)
-                {
-                    done = true;
-                }
-            }
-
-            if (hasPacket)
-            {
-                m_notFullCv.notify_one();
-                m_session.SubmitPacket(pkt);
-                continue;
-            }
-            if (done)
-            {
-                break;
-            }
-        }
-
-        m_session.Finish();
-        if (comInitialized)
-        {
-            CoUninitialize();
-        }
-    }
-
-    lumabridge::host::H264StreamValidationSession& m_session;
-    std::mutex m_mutex{};
-    std::condition_variable m_notEmptyCv{};
-    std::condition_variable m_notFullCv{};
-    std::condition_variable m_readyCv{};
-    std::deque<lumabridge::host::EncodedFramePacket> m_queue{};
-    std::thread m_worker{};
-    bool m_started{false};
-    bool m_stopRequested{false};
-    bool m_ready{false};
-};
 
 HANDLE g_ConsoleStopEvent = nullptr;
 
@@ -734,179 +563,9 @@ WriteLatencyStatsJsonWithIndent(
         << indent << "}" << (trailingComma ? "," : "") << "\n";
 }
 
-struct HostGateConfig
-{
-    std::wstring RunId{};
-    bool RequireGpuShared{false};
-    bool EnableNvenc{false};
-    bool RequireNvenc{false};
-    bool VerifyH264Decode{false};
-    bool VerifyH264Psnr{false};
-    bool RequireVirtualStimulus{false};
-    bool RequireValidTimestamps{false};
-    uint32_t RequireWidth{0U};
-    uint32_t RequireHeight{0U};
-    double MinNvencEncodeRatio{0.0};
-    double MaxNvencDropRatio{1.0};
-    uint64_t MinNvencEncodedFrames{0ULL};
-};
-
-struct HostGateEvaluation
-{
-    bool IntegrityOk{false};
-    bool MinFramesOk{false};
-    bool MaxTargetOk{false};
-    bool DurationOk{false};
-    bool StimulusOk{false};
-    bool TransportContractOk{false};
-    bool GpuTransportOk{false};
-    bool NvencOk{false};
-    bool H264DecodeOk{false};
-    bool H264PsnrOk{false};
-    bool TimestampsOk{false};
-    bool ResolutionOk{false};
-    bool OverallExitOk{false};
-};
-
-HostGateEvaluation
-EvaluateHostGates(
-    const lumabridge::host::HostConsumerConfig& config,
-    const lumabridge::host::HostConsumerMetricsSnapshot& metrics,
-    const lumabridge::host::StimulusMetricsSnapshot& stimSnap,
-    const lumabridge::host::NvencMetricsSnapshot& nvencSnap,
-    const lumabridge::host::H264ValidationSummary& h264Snap,
-    const HostGateConfig& gateCfg,
-    bool nvencInitFatal,
-    HRESULT nvencLastHr,
-    HRESULT runHr
-    ) noexcept
-{
-    HostGateEvaluation eval{};
-    eval.IntegrityOk =
-        (metrics.ChecksumMismatches == 0ULL) &&
-        (metrics.SyntheticPatternMismatches == 0ULL) &&
-        (metrics.ProtocolErrors == 0ULL);
-    eval.MinFramesOk = (metrics.FramesValid >= config.MinFrames);
-    eval.MaxTargetOk = (!config.RequireFrameTarget) || metrics.FrameTargetReached;
-    eval.StimulusOk = (!gateCfg.RequireVirtualStimulus) || (stimSnap.VirtualDisplayIdentified && stimSnap.Started);
-    eval.TransportContractOk =
-        (metrics.TransportContractViolations == 0ULL) &&
-        (metrics.UnexpectedCpuFramesInGpuSession == 0ULL) &&
-        (metrics.UnexpectedGpuFramesInCpuSession == 0ULL) &&
-        (!gateCfg.RequireGpuShared || metrics.CpuFramesReceived == 0ULL);
-    eval.GpuTransportOk =
-        (!gateCfg.RequireGpuShared) ||
-        (metrics.NegotiatedTransportMode == lumabridge::ipc::FrameIpcTransportMode::GpuSharedNtHandle &&
-         !metrics.FallbackToCpuActivated &&
-         eval.TransportContractOk &&
-         metrics.GpuFramesReceived > 0ULL &&
-         metrics.CpuFramesReceived == 0ULL &&
-         metrics.UnexpectedCpuFramesInGpuSession == 0ULL &&
-         metrics.TransportContractViolations == 0ULL &&
-         metrics.GpuFramesOpened > 0ULL &&
-         metrics.GpuSharedOpenFailures == 0ULL &&
-         metrics.GpuSyncTimeouts == 0ULL &&
-         metrics.AdapterMismatchErrors == 0ULL &&
-         (config.VerifySyntheticPattern || metrics.CpuStagingReadsPerformed == 0ULL));
-
-    bool nvencOk = !gateCfg.RequireNvenc;
-    if (gateCfg.RequireNvenc)
-    {
-        const uint64_t minEncoded = (std::max)(1ULL, gateCfg.MinNvencEncodedFrames);
-        const bool baseNvencOk =
-            !nvencInitFatal &&
-            SUCCEEDED(nvencLastHr) &&
-            nvencSnap.NvencFramesEncoded >= minEncoded &&
-            nvencSnap.TotalBitstreamBytes > 0ULL;
-        const bool ratioOk =
-            (gateCfg.MinNvencEncodeRatio <= 0.0) ||
-            (metrics.FramesValid > 0ULL &&
-             (static_cast<double>(nvencSnap.NvencFramesEncoded) / static_cast<double>(metrics.FramesValid)) >=
-                 gateCfg.MinNvencEncodeRatio);
-        const uint64_t totalDrops = nvencSnap.NvencDroppedFrames + nvencSnap.EncodedQueueDrops;
-        const bool dropsOk =
-            (gateCfg.MaxNvencDropRatio >= 1.0) ||
-            (nvencSnap.NvencFramesSubmitted > 0ULL &&
-             (static_cast<double>(totalDrops) / static_cast<double>(nvencSnap.NvencFramesSubmitted)) <=
-                 gateCfg.MaxNvencDropRatio);
-        nvencOk = baseNvencOk && ratioOk && dropsOk;
-    }
-    eval.NvencOk = nvencOk;
-    eval.H264DecodeOk = (!gateCfg.VerifyH264Decode) || h264Snap.Passed;
-    eval.H264PsnrOk = (!gateCfg.VerifyH264Psnr) || h264Snap.FidelityPsnrValidated;
-
-    bool timestampsOk = true;
-    if (gateCfg.RequireValidTimestamps)
-    {
-        const bool liveSamplesOk =
-            (metrics.LiveFramesReceived == 0ULL) ||
-            (metrics.LiveTimestampCoveragePercent >= 95.0 &&
-             metrics.LiveEndToEndLatency.Available &&
-             metrics.LiveEndToEndLatency.SampleCount > 0ULL);
-        const bool nvencTsOk =
-            (nvencSnap.NvencFramesEncoded == 0ULL) ||
-            (nvencSnap.InvalidTimestampCount == 0ULL &&
-             nvencSnap.ExtractToBitstreamCoveragePercent >= 95.0);
-        timestampsOk =
-            (metrics.TimestampMeasurementErrors == 0ULL) &&
-            (metrics.OutOfOrderSequenceCount == 0ULL) &&
-            (metrics.NonMonotonicTimestampCount == 0ULL) &&
-            (metrics.MissingCoreTimestampCount == 0ULL) &&
-            (metrics.FutureTimestampErrorCount == 0ULL) &&
-            (metrics.IncompatibleTimestampUnitsCount == 0ULL) &&
-            (metrics.QpcFrequencyMismatchCount == 0ULL) &&
-            (metrics.CoreTimestampCoveragePercent >= 95.0) &&
-            liveSamplesOk &&
-            nvencTsOk;
-    }
-    eval.TimestampsOk = timestampsOk;
-
-    bool resolutionOk = true;
-    if (gateCfg.RequireWidth > 0U || gateCfg.RequireHeight > 0U)
-    {
-        const bool frameDimOk =
-            (metrics.FramesValid > 0ULL) &&
-            (gateCfg.RequireWidth == 0U || metrics.LastFrameWidth == gateCfg.RequireWidth) &&
-            (gateCfg.RequireHeight == 0U || metrics.LastFrameHeight == gateCfg.RequireHeight);
-        const bool nvencDimOk =
-            (!gateCfg.EnableNvenc || !nvencSnap.Initialized) ||
-            ((gateCfg.RequireWidth == 0U || nvencSnap.Width == gateCfg.RequireWidth) &&
-             (gateCfg.RequireHeight == 0U || nvencSnap.Height == gateCfg.RequireHeight));
-        resolutionOk = frameDimOk && nvencDimOk;
-    }
-    eval.ResolutionOk = resolutionOk;
-
-    bool durationOk = metrics.QpcClockValid && (metrics.QpcFrequency > 0ULL) && !metrics.SafetyExecutionTimeoutHit;
-    if (durationOk && config.MaxDurationMs > 0U && config.DurationCountsConnected)
-    {
-        const bool hasActiveFrames =
-            (metrics.FramesValid > 0ULL) &&
-            (metrics.FramesValid < 2ULL || metrics.ActiveStreamingDurationUs > 0ULL);
-        durationOk =
-            metrics.DurationTargetReached &&
-            (metrics.TotalConnectedDurationUs >= metrics.RequestedDurationUs) &&
-            hasActiveFrames;
-    }
-    eval.DurationOk = durationOk;
-
-    eval.OverallExitOk =
-        SUCCEEDED(runHr) &&
-        metrics.HostProcessExitedNormally &&
-        metrics.TransportHealthy &&
-        eval.IntegrityOk &&
-        eval.MinFramesOk &&
-        eval.MaxTargetOk &&
-        eval.DurationOk &&
-        eval.StimulusOk &&
-        eval.TransportContractOk &&
-        eval.GpuTransportOk &&
-        eval.NvencOk &&
-        eval.H264DecodeOk &&
-        eval.H264PsnrOk &&
-        eval.TimestampsOk &&
-        eval.ResolutionOk;
-    return eval;
-}
+using lumabridge::host::EvaluateHostGates;
+using lumabridge::host::HostGateConfig;
+using lumabridge::host::HostGateEvaluation;
 
 void
 WriteLatencyStatsJson(
@@ -927,6 +586,7 @@ WriteJsonSummary(
     const lumabridge::host::StimulusMetricsSnapshot& stimulus,
     const lumabridge::host::NvencMetricsSnapshot& nvenc,
     const lumabridge::host::H264ValidationSummary& h264Validation,
+    const lumabridge::host::H264WorkerMetricsSnapshot& h264Worker,
     const ProcessResourceReport& hostResources,
     const ProcessResourceReport& serverResources,
     DWORD logicalProcessorCount,
@@ -968,6 +628,14 @@ WriteJsonSummary(
 
     char h264HrBuf[16]{};
     _snprintf_s(h264HrBuf, sizeof(h264HrBuf), _TRUNCATE, "0x%08lX", static_cast<unsigned long>(h264Validation.LastHResult));
+
+    char h264WorkerHrBuf[16]{};
+    _snprintf_s(
+        h264WorkerHrBuf,
+        sizeof(h264WorkerHrBuf),
+        _TRUNCATE,
+        "0x%08lX",
+        static_cast<unsigned long>(h264Worker.LastHResult));
 
     char utcNowBuf[40]{};
     FormatUtcIso8601Now(utcNowBuf, sizeof(utcNowBuf));
@@ -1170,7 +838,30 @@ WriteJsonSummary(
         << "    \"MinCombinedPsnrDb\": " << h264Validation.MinCombinedPsnrDb << ",\n"
         << "    \"AvgCombinedPsnrDb\": " << h264Validation.AvgCombinedPsnrDb << ",\n"
         << "    \"Passed\": " << (h264Validation.Passed ? "true" : "false") << ",\n"
-        << "    \"LastHResult\": \"" << h264HrBuf << "\",\n";
+        << "    \"LastHResult\": \"" << h264HrBuf << "\",\n"
+        << "    \"Worker\": {\n"
+        << "      \"Enabled\": " << (h264Worker.Enabled ? "true" : "false") << ",\n"
+        << "      \"Healthy\": " << (h264Worker.Healthy ? "true" : "false") << ",\n"
+        << "      \"SynchronousFallbackActive\": " << (h264Worker.SynchronousFallbackActive ? "true" : "false") << ",\n"
+        << "      \"QueueCapacity\": " << h264Worker.QueueCapacity << ",\n"
+        << "      \"PacketsEnqueued\": " << h264Worker.PacketsEnqueued << ",\n"
+        << "      \"PacketsDequeued\": " << h264Worker.PacketsDequeued << ",\n"
+        << "      \"PacketsProcessed\": " << h264Worker.PacketsProcessed << ",\n"
+        << "      \"PacketsRejected\": " << h264Worker.PacketsRejected << ",\n"
+        << "      \"QueuePeakDepth\": " << h264Worker.QueuePeakDepth << ",\n"
+        << "      \"QueuePendingAtShutdown\": " << h264Worker.QueuePendingAtShutdown << ",\n"
+        << "      \"QueueRemainingAtExit\": " << h264Worker.QueueRemainingAtExit << ",\n"
+        << "      \"QueueFullWaitCount\": " << h264Worker.QueueFullWaitCount << ",\n"
+        << "      \"QueueWaitTimeoutCount\": " << h264Worker.QueueWaitTimeoutCount << ",\n"
+        << "      \"WorkerFailureCount\": " << h264Worker.WorkerFailureCount << ",\n"
+        << "      \"DrainDeadlineExceeded\": " << (h264Worker.DrainDeadlineExceeded ? "true" : "false") << ",\n"
+        << "      \"ComBalanced\": " << (h264Worker.ComBalanced ? "true" : "false") << ",\n"
+        << "      \"WorkerComInitCount\": " << h264Worker.WorkerComInitCount << ",\n"
+        << "      \"WorkerComUninitCount\": " << h264Worker.WorkerComUninitCount << ",\n"
+        << "      \"CompletionState\": \"" << EscapeJsonString(lumabridge::host::H264WorkerCompletionStateToString(h264Worker.CompletionState)) << "\",\n"
+        << "      \"LastHResult\": \"" << h264WorkerHrBuf << "\",\n"
+        << "      \"LastErrorMessage\": \"" << EscapeJsonString(h264Worker.LastErrorMessage) << "\"\n"
+        << "    },\n";
     WriteLatencyStatsJsonWithIndent(out, "    ", "MftDecodeLatencyUs", h264Validation.MftDecodeLatencyUs, false);
     out << "  },\n";
 
@@ -1672,6 +1363,7 @@ wmain(
             const lumabridge::host::HostConsumerMetricsSnapshot emptyMetrics{};
             const lumabridge::host::NvencMetricsSnapshot emptyNvenc{};
             const lumabridge::host::H264ValidationSummary emptyH264{};
+            const lumabridge::host::H264WorkerMetricsSnapshot emptyH264Worker{};
             const ProcessResourceReport emptyRes{};
             const HostGateEvaluation preGateEval = EvaluateHostGates(
                 config,
@@ -1679,6 +1371,7 @@ wmain(
                 stimPreSnap,
                 emptyNvenc,
                 emptyH264,
+                emptyH264Worker,
                 gateConfig,
                 false,
                 S_OK,
@@ -1690,6 +1383,7 @@ wmain(
                 stimPreSnap,
                 emptyNvenc,
                 emptyH264,
+                emptyH264Worker,
                 emptyRes,
                 emptyRes,
                 logicalCpuCount,
@@ -1730,8 +1424,8 @@ wmain(
         stimulusFps,
         verifyH264Psnr || config.VerifySyntheticPattern,
         25.0);
-    AsyncH264ValidationWorker asyncH264Worker(h264Validator);
-    bool asyncH264WorkerStarted = false;
+    lumabridge::host::AsyncH264ValidationWorker asyncH264Worker(h264Validator);
+    bool loggedWorkerEnqueueFailure = false;
 
     bool nvencInitialized = false;
     bool nvencInitFatal = false;
@@ -1785,10 +1479,14 @@ wmain(
 
         if (verifyH264Decode)
         {
-            asyncH264WorkerStarted = asyncH264Worker.Start(prewarmWidth, prewarmHeight, stimulusFps);
-            if (!asyncH264WorkerStarted && prewarmWidth > 0U && prewarmHeight > 0U)
+            if (!asyncH264Worker.Start(prewarmWidth, prewarmHeight, stimulusFps))
             {
-                (void)h264Validator.PrewarmDecoder(prewarmWidth, prewarmHeight, stimulusFps);
+                const auto wSnap = asyncH264Worker.GetMetricsSnapshot();
+                std::fprintf(
+                    stderr,
+                    "[LB-HOST] Async H.264 validation worker startup failed (hr=0x%08lX): %s\n",
+                    static_cast<unsigned long>(wSnap.LastHResult),
+                    wSnap.LastErrorMessage.c_str());
             }
         }
     }
@@ -1842,6 +1540,7 @@ wmain(
          &serverBaselineCaptured,
          &nvencEncoder,
          &asyncH264Worker,
+         &loggedWorkerEnqueueFailure,
          &nvencInitialized,
          &nvencInitFatal,
          &nvencLastHr,
@@ -1959,22 +1658,44 @@ wmain(
                 }
                 if (verifyH264Decode)
                 {
-                    asyncH264Worker.Enqueue(std::move(pkt));
+                    const auto enqStatus = asyncH264Worker.Enqueue(std::move(pkt));
+                    if (enqStatus != lumabridge::host::H264WorkerEnqueueStatus::Enqueued &&
+                        enqStatus != lumabridge::host::H264WorkerEnqueueStatus::ProcessedSynchronously &&
+                        !loggedWorkerEnqueueFailure)
+                    {
+                        loggedWorkerEnqueueFailure = true;
+                        std::fprintf(
+                            stderr,
+                            "[LB-HOST] Async H.264 worker enqueue failed (%s).\n",
+                            lumabridge::host::H264WorkerEnqueueStatusToString(enqStatus));
+                    }
                 }
             }
         });
+
+    const lumabridge::host::HostConsumerMetricsSnapshot metrics = consumer.GetMetricsSnapshot();
 
     lumabridge::host::EncodedFramePacket remainingPkt{};
     while (nvencEncoder.TryPopEncodedFrame(remainingPkt))
     {
         if (verifyH264Decode)
         {
-            asyncH264Worker.Enqueue(std::move(remainingPkt));
+            const auto enqStatus = asyncH264Worker.Enqueue(std::move(remainingPkt));
+            if (enqStatus != lumabridge::host::H264WorkerEnqueueStatus::Enqueued &&
+                enqStatus != lumabridge::host::H264WorkerEnqueueStatus::ProcessedSynchronously &&
+                !loggedWorkerEnqueueFailure)
+            {
+                loggedWorkerEnqueueFailure = true;
+                std::fprintf(
+                    stderr,
+                    "[LB-HOST] Async H.264 worker post-loop drain enqueue failed (%s).\n",
+                    lumabridge::host::H264WorkerEnqueueStatusToString(enqStatus));
+            }
         }
     }
-    if (asyncH264WorkerStarted)
+    if (verifyH264Decode)
     {
-        asyncH264Worker.StopAndDrain();
+        asyncH264Worker.StopAndDrain(metrics.SafetyExecutionTimeoutHit);
     }
     else
     {
@@ -1987,9 +1708,10 @@ wmain(
 
     stimulus.Stop();
     const lumabridge::host::StimulusMetricsSnapshot stimSnap = stimulus.GetMetricsSnapshot();
-    const lumabridge::host::HostConsumerMetricsSnapshot metrics = consumer.GetMetricsSnapshot();
     const lumabridge::host::NvencMetricsSnapshot nvencSnap = nvencEncoder.GetMetricsSnapshot();
-    const lumabridge::host::H264ValidationSummary h264Snap = h264Validator.GetSummary();
+    const lumabridge::host::H264WorkerMetricsSnapshot h264WorkerSnap = asyncH264Worker.GetMetricsSnapshot();
+    const lumabridge::host::H264ValidationSummary h264Snap =
+        verifyH264Decode ? asyncH264Worker.GetFinalSessionSummary() : h264Validator.GetSummary();
 
     const ProcessResourceSample hostEndSample = SampleProcessResources(GetCurrentProcessId(), consumer.GetD3d11Device());
     const ProcessResourceSample serverEndSample = SampleProcessResources(metrics.ServerProcessId);
@@ -2015,6 +1737,7 @@ wmain(
         stimSnap,
         nvencSnap,
         h264Snap,
+        h264WorkerSnap,
         gateConfig,
         nvencInitFatal,
         nvencLastHr,
@@ -2027,6 +1750,7 @@ wmain(
         stimSnap,
         nvencSnap,
         h264Snap,
+        h264WorkerSnap,
         hostResReport,
         serverResReport,
         logicalCpuCount,
@@ -2131,7 +1855,8 @@ wmain(
     {
         std::printf(
             "[LB-HOST] H264Decode: passed=%u mode=%s struct=%u psnrOk=%u matrix=%s packets=%llu decoded=%llu nalErr=%llu decErr=%llu "
-            "decAvgUs=%llu decP95Us=%llu decP99Us=%llu sps=%llu pps=%llu idr=%llu minY=%.2fdB minUv=%.2fdB minComb=%.2fdB\n",
+            "decAvgUs=%llu decP95Us=%llu decP99Us=%llu sps=%llu pps=%llu idr=%llu minY=%.2fdB minUv=%.2fdB minComb=%.2fdB "
+            "workerState=%s healthy=%u enq=%llu proc=%llu rej=%llu qPeak=%llu qWait=%llu qTimeout=%llu comBal=%u\n",
             h264Snap.Passed ? 1U : 0U,
             h264Snap.ValidationMode.c_str(),
             h264Snap.StructuralDecodeValidated ? 1U : 0U,
@@ -2149,7 +1874,16 @@ wmain(
             static_cast<unsigned long long>(h264Snap.IdrCount),
             h264Snap.MinYPsnrDb,
             h264Snap.MinUvPsnrDb,
-            h264Snap.MinCombinedPsnrDb);
+            h264Snap.MinCombinedPsnrDb,
+            lumabridge::host::H264WorkerCompletionStateToString(h264WorkerSnap.CompletionState),
+            h264WorkerSnap.Healthy ? 1U : 0U,
+            static_cast<unsigned long long>(h264WorkerSnap.PacketsEnqueued),
+            static_cast<unsigned long long>(h264WorkerSnap.PacketsProcessed),
+            static_cast<unsigned long long>(h264WorkerSnap.PacketsRejected),
+            static_cast<unsigned long long>(h264WorkerSnap.QueuePeakDepth),
+            static_cast<unsigned long long>(h264WorkerSnap.QueueFullWaitCount),
+            static_cast<unsigned long long>(h264WorkerSnap.QueueWaitTimeoutCount),
+            h264WorkerSnap.ComBalanced ? 1U : 0U);
     }
 
     if (hostResReport.Available || serverResReport.Available)
