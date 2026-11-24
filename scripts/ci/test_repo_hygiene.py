@@ -69,6 +69,8 @@ VALID_WORKFLOW = (
     "    timeout-minutes: 10\n"
     "    steps:\n"
     "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n"
+    "        with:\n"
+    "          persist-credentials: false\n"
     "      - run: echo ok\n"
 )
 
@@ -227,6 +229,9 @@ class RepoHygieneTests(unittest.TestCase):
                 "    continue-on-error: true\n"
                 "    steps:\n"
                 "      - uses: actions/checkout@v4\n"
+                "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n"
+                "        with:\n"
+                "          persist-credentials: true\n"
             )
             write_repo_file(repo, ".github/workflows/ci-test.yml", bad_wf)
             git(repo, "add", ".github/workflows/ci-test.yml")
@@ -240,6 +245,136 @@ class RepoHygieneTests(unittest.TestCase):
             self.assertIn("timeout-minutes", joined)
             self.assertIn("continue-on-error", joined)
             self.assertIn("40-char commit SHA", joined)
+            self.assertIn("persist-credentials: false", joined)
+
+    def test_generic_privacy_policy_allows_legitimate_emails_and_blocks_consumer_webmail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            create_clean_repo(repo)
+            safe_doc = (
+                "# Notices & Docs\n"
+                "Author noreply: 999999+contributor@users.noreply.github.com\n"
+                "Third-party attribution: legal@vendor-thirdparty.org\n"
+                "Synthetic RFC 2606 fixture: alice@example.com\n"
+                "Documentation placeholder: placeholder@example.org\n"
+                "Generic consumer placeholder: " + "placeholder" + "@gmail.com\n"
+            )
+            write_repo_file(repo, "docs/contacts.md", safe_doc)
+            git(repo, "add", "docs/contacts.md")
+
+            safe_res = check_repo_hygiene.run_checks(repo)
+            self.assertTrue(safe_res["passed"], f"Unexpected false positive: {safe_res['errors']}")
+
+            leaked_local = "synth.personal.user"
+            leaked_addr = leaked_local + "@gmail.com"
+            write_repo_file(repo, "docs/leak-email.txt", f"Contact: {leaked_addr}\n")
+            git(repo, "add", "docs/leak-email.txt")
+
+            bad_res = check_repo_hygiene.run_checks(repo)
+            self.assertFalse(bad_res["passed"])
+            joined = "\n".join(bad_res["errors"])
+            self.assertIn("Potential personal webmail address detected", joined)
+            self.assertNotIn(leaked_local, joined)
+
+    def test_dco_valid_single_and_multiple_signoffs_and_push_skip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            hist1, cutoff = create_clean_repo(repo)
+            write_repo_file(repo, "docs/multi.md", "# Multi sign-off\n")
+            git(repo, "add", "docs/multi.md")
+            msg = (
+                "docs: commit with multiple valid sign-offs\n\n"
+                "Co-reviewed and committed under DCO.\n\n"
+                "Signed-off-by: Test Maintainer <test@users.noreply.github.com>\n"
+                "Signed-off-by: Secondary Reviewer <reviewer@example.org>\n"
+            )
+            git(repo, "commit", "-m", msg)
+            head = git(repo, "rev-parse", "HEAD")
+
+            res = check_repo_hygiene.run_checks(
+                repo, dco_base=hist1, dco_head=head, dco_cutoff=cutoff
+            )
+            self.assertTrue(res["passed"], f"Expected multi sign-off to pass: {res['errors']}")
+            self.assertTrue(res["checked"]["dco_checked"])
+            self.assertEqual(res["checked"]["dco_prospective_commits"], 1)
+
+            # Simulate push / workflow_dispatch without PR DCO commit range.
+            skip_res = check_repo_hygiene.run_checks(repo)
+            self.assertTrue(skip_res["passed"], f"Unexpected failure on skip path: {skip_res['errors']}")
+            self.assertFalse(skip_res["checked"]["dco_checked"])
+            self.assertEqual(skip_res["checked"].get("dco_skip_reason"), "no_pr_commit_range_supplied")
+
+    def test_negative_dco_mismatch_body_fake_invalid_cutoff_and_incomplete_range(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _, cutoff = create_clean_repo(repo)
+
+            # 1. Signed-off-by belonging to a different author identity must fail.
+            write_repo_file(repo, "docs/mismatch.md", "# Mismatch\n")
+            git(repo, "add", "docs/mismatch.md")
+            git(
+                repo,
+                "commit",
+                "-m",
+                "docs: mismatched signoff\n\nSigned-off-by: Different Person <other@users.noreply.github.com>\n",
+            )
+            mismatch_head = git(repo, "rev-parse", "HEAD")
+            mismatch_res = check_repo_hygiene.run_checks(
+                repo, dco_base=cutoff, dco_head=mismatch_head, dco_cutoff=cutoff
+            )
+            self.assertFalse(mismatch_res["passed"])
+            self.assertTrue(any("does not match commit authorship" in e for e in mismatch_res["errors"]))
+
+            # 2. Signed-off-by buried in body followed by trailing prose is NOT a recognized Git trailer.
+            write_repo_file(repo, "docs/body-fake.md", "# Body fake\n")
+            git(repo, "add", "docs/body-fake.md")
+            fake_msg = (
+                "docs: fake signoff in body\n\n"
+                "Signed-off-by: Test Maintainer <test@users.noreply.github.com>\n\n"
+                "Paragraph after line prevents Git from treating above as a trailer.\n"
+            )
+            git(repo, "commit", "-m", fake_msg)
+            fake_head = git(repo, "rev-parse", "HEAD")
+            fake_res = check_repo_hygiene.run_checks(
+                repo, dco_base=mismatch_head, dco_head=fake_head, dco_cutoff=cutoff
+            )
+            self.assertFalse(fake_res["passed"])
+            self.assertTrue(any("Missing recognized Signed-off-by Git trailer" in e for e in fake_res["errors"]))
+
+            # 3. Invalid cutoff must NEVER be silently ignored (with or without range).
+            bad_cutoff = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+            bad_cut_res = check_repo_hygiene.run_checks(
+                repo, dco_base=cutoff, dco_head=fake_head, dco_cutoff=bad_cutoff
+            )
+            self.assertFalse(bad_cut_res["passed"])
+            self.assertFalse(bad_cut_res["checked"]["dco_checked"])
+            self.assertTrue(any("--dco-cutoff" in e for e in bad_cut_res["errors"]))
+
+            bad_cut_alone = check_repo_hygiene.run_checks(repo, dco_cutoff=bad_cutoff)
+            self.assertFalse(bad_cut_alone["passed"])
+            self.assertTrue(any("--dco-cutoff" in e for e in bad_cut_alone["errors"]))
+
+            # 4. Invalid base or head references must fail explicitly.
+            bad_base_res = check_repo_hygiene.run_checks(
+                repo, dco_base="nonexistent-ref", dco_head=fake_head, dco_cutoff=cutoff
+            )
+            self.assertFalse(bad_base_res["passed"])
+            self.assertTrue(any("--dco-base" in e for e in bad_base_res["errors"]))
+
+            bad_head_res = check_repo_hygiene.run_checks(
+                repo, dco_base=cutoff, dco_head="nonexistent-head", dco_cutoff=cutoff
+            )
+            self.assertFalse(bad_head_res["passed"])
+            self.assertTrue(any("--dco-head" in e for e in bad_head_res["errors"]))
+
+            # 5. Incomplete base/head pair must fail explicitly.
+            only_base = check_repo_hygiene.run_checks(repo, dco_base=cutoff, dco_cutoff=cutoff)
+            self.assertFalse(only_base["passed"])
+            self.assertTrue(any("Incomplete DCO range" in e for e in only_base["errors"]))
+
+            only_head = check_repo_hygiene.run_checks(repo, dco_head=fake_head, dco_cutoff=cutoff)
+            self.assertFalse(only_head["passed"])
+            self.assertTrue(any("Incomplete DCO range" in e for e in only_head["errors"]))
 
 
 if __name__ == "__main__":

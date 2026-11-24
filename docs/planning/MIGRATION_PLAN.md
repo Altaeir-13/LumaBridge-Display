@@ -17,7 +17,7 @@ Este plano separa rigorosamente a base Windows integrada em `origin/dev` (via PR
 
 ### 1.2 Pilha Windows `M4.1–M0.5.3` integrada em `origin/dev` (`23a28046`)
 
-*(Todos os avanços abaixo **já residem em `origin/dev` (`23a28046`)** via Merge commit do PR #37, mantendo `M0_INTEGRATED_IN_DEV = True`, `M0_FORMALLY_CLOSED = False` até revisão do PR de governança `M0.6`, e `M1_STARTED = False`.)*
+*(Todos os avanços abaixo **já residem em `origin/dev` (`23a28046`)** via Merge commit do PR #37; a `M0` permanece formalmente aberta até o cumprimento integral dos critérios objetivos de encerramento vinculados ao PR de governança `#38`, precedendo a abertura da `M1`.)*
 
 | Branch | Commit Head | Conteúdo Técnico Integrado em `origin/dev` (`23a28046`) | Estado de Validação |
 |---|---|---|---|
@@ -59,8 +59,8 @@ Os passos de validação funcional e integração da pilha Windows em `dev` já 
    - Execuções reais `Benchmark30s` (`30,011 s`, `1.800/1.800` quadros) e `ProlongedStability` (`180,005 s` conectados, `10.670/10.584` quadros mínimos) aprovadas em `WUDFHost.exe` com `D3d11DxgiVSync`, transporte GPU puro (`0` readbacks CPU) e `TimestampMeasurementErrors == 0`.
 2. **Concluído e integrado em `origin/dev` (`M0.4`–`M0.5.3`) — PR `#37` (`23a28046`):**
    - Consolidou via merge commits (`--no-ff`, sem squash nem rebase) `fix/m0-validation-gates-hardening` (contendo integralmente `fix/windows-idd-device-start`, `feature/windows-frame-extraction-ipc`, `feature/windows-gpu-shared-textures-nvenc`, `6b297856` e `f1d2565e`) e `docs/universal-architecture-redefinition`, com `157/157` C++, `71/71` PowerShell, `InfVerif` e `2/2` execuções controladas `9/9` E2E aprovadas na `M0.4.1` (preservando no histórico duas reprovações `p99` iniciais da `M0.4`: `30.424 us` e `33.354 us`), e foi integrado em `origin/dev` via **Merge commit `23a28046`** (árvore `7f1685f7`, `M0_INTEGRATED_IN_DEV = True`).
-3. **Em andamento (`M0.6`, aguardando revisão, checks remotos e merge) — PR `chore/m0-governance-closure -> dev`:**
-   - Publica [`LICENSE`](../../LICENSE) (`Apache-2.0` para código próprio), [`NOTICE`](../../NOTICE), [`THIRD_PARTY_NOTICES.md`](../../THIRD_PARTY_NOTICES.md) (`nvEncodeAPI.h` MIT), [`CONTRIBUTING.md`](../../CONTRIBUTING.md) (`DCO 1.1` prospectivo), [`ci-and-test-matrix.md`](../setup/ci-and-test-matrix.md), workflows iniciais `.github/workflows/ci-windows.yml` e `.github/workflows/ci-linux-hygiene.yml` e esta reconciliação documental (`M0_FORMALLY_CLOSED = False` e `M1_STARTED = False` até revisão, confirmação do CI remoto e merge definitivo em `dev`).
+3. **Governança, licenciamento e critério de encerramento formal da `M0` (`M0.6` — PR `#38` → `dev`):**
+   - Publica [`LICENSE`](../../LICENSE) (`Apache-2.0` para código próprio, preservadas licenças de terceiros), [`NOTICE`](../../NOTICE), [`THIRD_PARTY_NOTICES.md`](../../THIRD_PARTY_NOTICES.md) (`nvEncodeAPI.h` MIT), [`CONTRIBUTING.md`](../../CONTRIBUTING.md) (`DCO 1.1` prospectivo declarativo), [`ci-and-test-matrix.md`](../setup/ci-and-test-matrix.md) e os workflows iniciais `.github/workflows/ci-windows.yml` e `.github/workflows/ci-linux-hygiene.yml`. A `M0` permanece formalmente aberta até o merge do PR `#38` em `dev`, aprovação dos checks pós-merge em `dev`, reconciliação registrada de `PR #36` / `Issue #33` / `Issue #34` e verificação da proteção de `refs/heads/dev`.
 
 ---
 

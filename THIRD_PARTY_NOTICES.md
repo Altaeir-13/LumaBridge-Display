@@ -62,6 +62,8 @@ LumaBridge Display's own original source code and documentation are licensed und
 
 ## 2. Provenance Audit of External Sample References
 
+*(Engineering and historical provenance review of repository headers, Git commits, and verifiable upstream artifacts — this record does not constitute an absolute legal proof of chain-of-title or formal legal counsel.)*
+
 ### 2.1 Microsoft `Windows-driver-samples` / `IddSampleDriver`
 
 - **Audit Result:** **No source files, headers, INF templates, or EDID byte arrays from Microsoft `Windows-driver-samples` (`IddSampleDriver`) are incorporated into this repository.**

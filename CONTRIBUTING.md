@@ -190,13 +190,15 @@ Signed-off-by: Seu Nome <seu-email-ou-noreply@users.noreply.github.com>
 
 Use seu nome real ou identificador público consistente e o endereço de e-mail configurado no Git (recomenda-se o endereço `noreply` do GitHub). Não utilize nomes genéricos anônimos ou pseudônimos incompatíveis com o registro público exigido pela cláusula (d).
 
-### Vigência Prospectiva e Não Retroatividade
+### Vigência Prospectiva, Verificação Automatizada e Não Retroatividade
 
 - Esta política aplica-se **exclusivamente aos novos commits de contribuição** produzidos a partir da adoção da governança M0.6 (após o merge commit `23a2804606b02a85d915a55b75663b67bd5af58b` em `dev`).
 - **Commits históricos anteriores** à adoção da política permanecem preservados integralmente sem reescrita de histórico e **não** devem ser tratados como falha retroativa por verificações manuais ou automatizadas de DCO.
+- Em eventos `pull_request` no CI, [`scripts/ci/check_repo_hygiene.py`](scripts/ci/check_repo_hygiene.py) valida exclusivamente **trailers Git reconhecidos (`Signed-off-by`)** nos commits não mergeados posteriores ao cutoff `23a2804606b02a85d915a55b75663b67bd5af58b` (rejeitando referências inválidas ou faixas incompletas) e verifica a correspondência entre autoria (`name` e `email`) e pelo menos um trailer `Signed-off-by` bem-formado (aceitando múltiplos trailers legítimos). Eventos `push` e `workflow_dispatch` sem faixa DCO fornecida registram verificação de DCO como `SKIPPED` por contrato.
 
 ### O que o DCO NÃO é (Distinções Importantes)
 
-- **DCO ≠ assinatura criptográfica de commit (GPG/SSH):** `Signed-off-by` é uma declaração formal de autoria e direito de contribuição sob o DCO 1.1; assinatura criptográfica GPG/SSH prova a posse da chave do autor no Git e pode ser usada em conjunto, mas não substitui o trailer `Signed-off-by`.
+- **DCO é uma declaração de conformidade, não autenticação criptográfica ou prova jurídica de identidade:** o trailer `Signed-off-by` atesta o compromisso do contribuidor sob o DCO 1.1 com base nos metadados Git declarados e **não** comprova criptograficamente nem juridicamente a identidade civil do autor.
+- **DCO ≠ assinatura criptográfica de commit (GPG/SSH):** `Signed-off-by` é uma declaração formal de autoria e direito de contribuição sob o DCO 1.1; assinatura criptográfica GPG/SSH prova a posse da chave no Git e pode ser usada em conjunto, mas não substitui o trailer `Signed-off-by`.
 - **DCO ≠ certificado de assinatura de driver Windows:** nada tem relação com certificados Authenticode, `TestSigning`, EV ou WHQL usados para assinar `LumaBridgeIddDriver.dll` e `.cat`.
 - **DCO ≠ Contributor License Agreement (CLA):** o DCO não transfere nem atribui direitos autorais (copyright assignment) a uma entidade terceira; você mantém seus direitos autorais e certifica que o código é contribuído sob a licença aplicável do projeto (`Apache-2.0`).

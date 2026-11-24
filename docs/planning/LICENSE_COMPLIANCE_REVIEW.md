@@ -1,6 +1,6 @@
 # Revisão de Licenciamento e Conformidade Legal — LumaBridge Display
 
-> **Status da licença (`M0.6`):** **`Apache-2.0` aprovada pelo mantenedor para o código próprio do LumaBridge Display e política prospectiva DCO 1.1 estabelecida.** Após a conclusão da auditoria de titularidade e proveniência (verificando ausência de código copiado do `IddSampleDriver` e preservando o cabeçalho MIT de `windows/host/third_party/nvenc/nvEncodeAPI.h`), foram publicados na branch de governança `chore/m0-governance-closure`: [`LICENSE`](../../LICENSE) (Apache-2.0 integral), [`NOTICE`](../../NOTICE), [`THIRD_PARTY_NOTICES.md`](../../THIRD_PARTY_NOTICES.md) e [`CONTRIBUTING.md`](../../CONTRIBUTING.md). Nem todos os arquivos do repositório estão sujeitos à Apache-2.0 — componentes incorporados de terceiros mantêm suas licenças originais. Este documento constitui análise de engenharia e conformidade de software livre, devendo receber revisão jurídica formal caso o projeto venha a distribuir binários comerciais ou assinados em larga escala.
+> **Status da licença (`M0.6`):** **`Apache-2.0` aprovada pelo mantenedor para o código próprio do LumaBridge Display e política prospectiva declarativa DCO 1.1 estabelecida.** Após revisão técnica de engenharia sobre histórico Git, cabeçalhos de licença e checksums upstream (confirmando ausência de código copiado do `IddSampleDriver` nos arquivos inspecionados e preservando integralmente o cabeçalho MIT de `windows/host/third_party/nvenc/nvEncodeAPI.h`), foram publicados [`LICENSE`](../../LICENSE) (Apache-2.0 integral), [`NOTICE`](../../NOTICE), [`THIRD_PARTY_NOTICES.md`](../../THIRD_PARTY_NOTICES.md) e [`CONTRIBUTING.md`](../../CONTRIBUTING.md). Nem todos os arquivos do repositório estão sujeitos à Apache-2.0 — componentes incorporados de terceiros mantêm suas licenças originais. **Esta revisão constitui análise técnica de engenharia e conformidade de software livre, não equivalendo à prova jurídica absoluta de titularidade;** deverá receber revisão jurídica formal caso o projeto venha a distribuir binários comerciais ou assinados em larga escala.
 
 ---
 
@@ -93,11 +93,11 @@ Em vez de aplicar uma proibição genérica simplista a toda tecnologia associad
 
 ### Checklist de Publicação de `LICENSE` (`M0.6`)
 
-- [x] Aprovação humana da recomendação `Apache-2.0` (código próprio) + `DCO 1.1` prospectivo.
-- [x] Conferência dos cabeçalhos em `windows/` e auditoria de proveniência (`IddSampleDriver` apenas como ferramenta externa isolada em `Prepare-IddSampleReference.ps1`; `nvEncodeAPI.h` MIT verificado contra `FFmpeg/nv-codec-headers` `sdk/12.1`).
-- [x] Criação simultânea em `chore/m0-governance-closure` de:
+- [x] Aprovação humana da recomendação `Apache-2.0` (código próprio) + política declarativa `DCO 1.1` prospectivo.
+- [x] Conferência técnica dos cabeçalhos em `windows/` e revisão de proveniência (`IddSampleDriver` apenas como ferramenta externa isolada em `Prepare-IddSampleReference.ps1`; `nvEncodeAPI.h` MIT verificado contra `FFmpeg/nv-codec-headers` `sdk/12.1`), sem reivindicar prova jurídica absoluta de titularidade.
+- [x] Criação simultânea no PR de governança da `M0` (`#38`) de:
   - [`LICENSE`](../../LICENSE) (texto integral oficial Apache License 2.0 na raiz)
   - [`NOTICE`](../../NOTICE) (atribuição do projeto LumaBridge Display e referência a `nvEncodeAPI.h`)
-  - [`THIRD_PARTY_NOTICES.md`](../../THIRD_PARTY_NOTICES.md) (registrando `nvEncodeAPI.h` MIT, auditoria `IddSampleDriver` e dependências não redistribuídas de build/runtime/CI)
+  - [`THIRD_PARTY_NOTICES.md`](../../THIRD_PARTY_NOTICES.md) (registrando `nvEncodeAPI.h` MIT, revisão `IddSampleDriver` e dependências não redistribuídas de build/runtime/CI)
   - [`CONTRIBUTING.md`](../../CONTRIBUTING.md) (política prospectiva DCO 1.1 e fluxo de contribuição)
 - [ ] Configuração de verificação automatizada de licenças (`cargo-deny` quando o workspace `core/` for criado em `M1`).

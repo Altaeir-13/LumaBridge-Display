@@ -59,19 +59,53 @@ SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("github_server_token", re.compile(r"\bghs_[A-Za-z0-9]{20,}\b")),
     ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     ("slack_token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
-    ("personal_email", re.compile(r"(?i)randerson\.sdsn@gmail\.com")),
 )
 
 WINDOWS_USER_PATH_RE = re.compile(r"""(?i)[A-Za-z]:\\+Users\\+([^\\<>\s"'`*?]+)""")
 UNIX_USER_PATH_RE = re.compile(r"""(?<![A-Za-z0-9_./-])/(?:home|Users)/([^/<>$\s"'`*?]+)""")
 ALLOWED_PATH_PLACEHOLDERS = {"user", "username", "your-user", "example", "public", "default", "runner"}
 
+EMAIL_RE = re.compile(r"(?<![A-Za-z0-9._%+-])([A-Za-z0-9._%+-]+)@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)(?![A-Za-z0-9._%+-])")
+CONSUMER_PERSONAL_EMAIL_DOMAINS = {
+    "gmail.com",
+    "googlemail.com",
+    "outlook.com",
+    "hotmail.com",
+    "live.com",
+    "msn.com",
+    "yahoo.com",
+    "yahoo.com.br",
+    "icloud.com",
+    "me.com",
+    "proton.me",
+    "protonmail.com",
+    "pm.me",
+    "aol.com",
+    "uol.com.br",
+    "bol.com.br",
+    "terra.com.br",
+}
+ALLOWED_EMAIL_PLACEHOLDER_LOCALS = {
+    "user",
+    "username",
+    "example",
+    "placeholder",
+    "your-email",
+    "seu-email",
+    "seu-email-ou-noreply",
+    "author",
+    "contributor",
+    "maintainer",
+    "noreply",
+    "no-reply",
+}
+
 CONFLICT_MARKER_RE = re.compile(r"(?m)^(?:<<<<<<< |>>>>>>> )")
 FENCED_CODE_RE = re.compile(r"(?ms)```.*?```|~~~.*?~~~")
 INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
 MD_LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
 WORKFLOW_SHA_PIN_RE = re.compile(r"^[^/@]+/[^/@]+(?:/[^@]+)?@[0-9a-f]{40}$")
-SIGNED_OFF_BY_RE = re.compile(r"(?m)^Signed-off-by:\s+.+?\s+<[^<>\s@]+@[^<>\s@]+>\s*$")
+SIGN_OFF_VALUE_RE = re.compile(r"^(.+?)\s+<([^<>\s@]+@[^<>\s@]+)>$")
 
 
 def run_git(repo_root: Path, args: list[str], binary: bool = False) -> subprocess.CompletedProcess[Any]:
@@ -201,6 +235,15 @@ def check_tracked_contents(repo_root: Path, tracked_files: list[str], errors: li
             if user_seg not in ALLOWED_PATH_PLACEHOLDERS:
                 errors.append(f"Workstation-specific Unix user path detected in {rel}: /{match.group(1)}")
 
+        for match in EMAIL_RE.finditer(text):
+            local_part = match.group(1).strip().lower()
+            domain = match.group(2).strip().lower()
+            if domain in CONSUMER_PERSONAL_EMAIL_DOMAINS and local_part not in ALLOWED_EMAIL_PLACEHOLDER_LOCALS:
+                errors.append(
+                    f"Potential personal webmail address detected in {rel} (domain '{domain}'; "
+                    "use a GitHub noreply identity or synthetic example.com fixture)."
+                )
+
         if suffix == ".md":
             md_count += 1
             stripped = INLINE_CODE_RE.sub("", FENCED_CODE_RE.sub("", text))
@@ -323,8 +366,33 @@ def check_workflows(repo_root: Path, tracked_files: list[str], errors: list[str]
                         errors.append(
                             f"Workflow {rel} job '{job_id}' step {idx} action '{uses_str}' must be pinned to a 40-char commit SHA."
                         )
+                    if uses_str.startswith("actions/checkout@"):
+                        with_cfg = step.get("with")
+                        if not isinstance(with_cfg, dict) or with_cfg.get("persist-credentials") is not False:
+                            errors.append(
+                                f"Workflow {rel} job '{job_id}' step {idx} actions/checkout must explicitly set persist-credentials: false."
+                            )
 
     checked["workflows_checked"] = workflow_files
+
+
+def _normalize_identity_name(name: str) -> str:
+    """Normalize whitespace and case for declarative author/sign-off comparison."""
+    return " ".join(name.split()).casefold()
+
+
+def _verify_commit_ref(repo_root: Path, ref: str, label: str, errors: list[str]) -> str | None:
+    """Verify that a Git reference resolves cleanly to a commit object."""
+    cleaned = ref.strip()
+    if not cleaned:
+        errors.append(f"Invalid empty Git commit reference for {label}.")
+        return None
+    proc = run_git(repo_root, ["rev-parse", "--verify", f"{cleaned}^{{commit}}"])
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or "unresolved commit reference"
+        errors.append(f"Invalid Git commit reference for {label} ('{cleaned}'): {detail}")
+        return None
+    return proc.stdout.strip()
 
 
 def check_prospective_dco(
@@ -335,46 +403,111 @@ def check_prospective_dco(
     errors: list[str],
     checked: dict[str, Any],
 ) -> None:
-    """Validate Signed-off-by trailers on prospective non-merge commits only."""
-    if not dco_base or not dco_head:
+    """Validate recognized Signed-off-by Git trailers and authorship on prospective commits."""
+    base_given = dco_base is not None
+    head_given = dco_head is not None
+
+    if base_given != head_given:
+        errors.append("Incomplete DCO range: both --dco-base and --dco-head must be provided together.")
+        if dco_cutoff is not None:
+            _verify_commit_ref(repo_root, dco_cutoff, "--dco-cutoff", errors)
         checked["dco_checked"] = False
         return
 
-    rev_args = ["rev-list", "--no-merges", f"{dco_base}..{dco_head}"]
-    if dco_cutoff:
-        cutoff_verify = run_git(repo_root, ["rev-parse", "--verify", f"{dco_cutoff}^{{commit}}"])
-        if cutoff_verify.returncode == 0:
-            rev_args.append(f"^{dco_cutoff}")
+    if not base_given and not head_given:
+        if dco_cutoff is not None:
+            _verify_commit_ref(repo_root, dco_cutoff, "--dco-cutoff", errors)
+        checked["dco_checked"] = False
+        checked["dco_skip_reason"] = "no_pr_commit_range_supplied"
+        return
 
-    rev_proc = run_git(repo_root, rev_args)
+    assert dco_base is not None and dco_head is not None
+    effective_cutoff = DEFAULT_DCO_CUTOFF if dco_cutoff is None else dco_cutoff
+    resolved_base = _verify_commit_ref(repo_root, dco_base, "--dco-base", errors)
+    resolved_head = _verify_commit_ref(repo_root, dco_head, "--dco-head", errors)
+    resolved_cutoff = _verify_commit_ref(repo_root, effective_cutoff, "--dco-cutoff", errors)
+    if not resolved_base or not resolved_head or not resolved_cutoff:
+        checked["dco_checked"] = False
+        return
+
+    rev_proc = run_git(
+        repo_root,
+        ["rev-list", "--no-merges", f"{resolved_base}..{resolved_head}", f"^{resolved_cutoff}"],
+    )
     if rev_proc.returncode != 0:
         errors.append(f"Failed to enumerate commits for prospective DCO check: {rev_proc.stderr.strip()}")
+        checked["dco_checked"] = False
         return
 
     commits = [line.strip() for line in rev_proc.stdout.splitlines() if line.strip()]
-    missing_dco: list[str] = []
+    missing_or_invalid: list[str] = []
     for sha in commits:
-        msg_proc = run_git(repo_root, ["log", "-n", "1", "--format=%B", sha])
-        if msg_proc.returncode != 0:
-            errors.append(f"Failed to read commit message for {sha}")
+        meta_proc = run_git(
+            repo_root,
+            [
+                "log",
+                "-n",
+                "1",
+                "--format=%an%n%ae%n%s%x1e%(trailers:only=true,key=Signed-off-by,valueonly=true,separator=%x1f)",
+                sha,
+            ],
+        )
+        if meta_proc.returncode != 0:
+            errors.append(f"Failed to inspect commit metadata and trailers for {sha}")
             continue
-        if not SIGNED_OFF_BY_RE.search(msg_proc.stdout):
-            subj_proc = run_git(repo_root, ["log", "-n", "1", "--format=%s", sha])
-            subj = subj_proc.stdout.strip()
-            missing_dco.append(f"{sha[:12]} ({subj})")
-            errors.append(f"Missing DCO Signed-off-by trailer on prospective commit {sha[:12]}: {subj}")
+
+        header_part, _, trailer_part = meta_proc.stdout.partition("\x1e")
+        header_lines = header_part.splitlines()
+        if len(header_lines) < 3:
+            errors.append(f"Unexpected commit metadata format for {sha}")
+            continue
+        author_name, author_email, subj = header_lines[0], header_lines[1], header_lines[2]
+        trailers = [item.strip() for item in trailer_part.split("\x1f") if item.strip()]
+
+        if not trailers:
+            missing_or_invalid.append(f"{sha[:12]} ({subj})")
+            errors.append(f"Missing recognized Signed-off-by Git trailer on prospective commit {sha[:12]}: {subj}")
+            continue
+
+        matched_author = False
+        bad_trailer = False
+        expected_name = _normalize_identity_name(author_name)
+        expected_email = author_email.strip().lower()
+
+        for trailer_val in trailers:
+            match = SIGN_OFF_VALUE_RE.match(trailer_val)
+            if not match:
+                bad_trailer = True
+                errors.append(
+                    f"Malformed Signed-off-by Git trailer on prospective commit {sha[:12]}: {trailer_val}"
+                )
+                continue
+            t_name = _normalize_identity_name(match.group(1))
+            t_email = match.group(2).strip().lower()
+            if t_name == expected_name and t_email == expected_email:
+                matched_author = True
+
+        if not bad_trailer and not matched_author:
+            missing_or_invalid.append(f"{sha[:12]} ({subj})")
+            errors.append(
+                f"Signed-off-by Git trailer does not match commit authorship on prospective commit "
+                f"{sha[:12]} ({subj}); CONTRIBUTING.md requires author sign-off matching "
+                f"'{author_name} <{author_email}>'."
+            )
+        elif bad_trailer:
+            missing_or_invalid.append(f"{sha[:12]} ({subj})")
 
     checked["dco_checked"] = True
     checked["dco_prospective_commits"] = len(commits)
-    checked["dco_cutoff"] = dco_cutoff
-    checked["dco_missing"] = missing_dco
+    checked["dco_cutoff"] = resolved_cutoff
+    checked["dco_missing"] = missing_or_invalid
 
 
 def run_checks(
     repo_root: Path,
     dco_base: str | None = None,
     dco_head: str | None = None,
-    dco_cutoff: str | None = DEFAULT_DCO_CUTOFF,
+    dco_cutoff: str | None = None,
 ) -> dict[str, Any]:
     """Run all repository hygiene checks and return a structured result payload."""
     errors: list[str] = []
@@ -413,8 +546,12 @@ def write_summary(result: dict[str, Any], summary_path: Path | None, json_path: 
         lines.append(
             f"- Prospective DCO 1.1 Check: **{checked.get('dco_prospective_commits', 0)}** prospective commit(s) checked (historical cutoff `{checked.get('dco_cutoff', '')[:8]}`)"
         )
+    elif checked.get("dco_skip_reason") == "no_pr_commit_range_supplied":
+        lines.append(
+            "- Prospective DCO 1.1 Check: **SKIPPED** (no PR commit range supplied; prospective DCO validation runs on pull_request events only)"
+        )
     else:
-        lines.append("- Prospective DCO 1.1 Check: **SKIPPED** (no PR commit range supplied)")
+        lines.append("- Prospective DCO 1.1 Check: **FAILED** (invalid or incomplete DCO range/cutoff parameters)")
 
     if result["errors"]:
         lines.extend(["", "### Violations"])
@@ -436,7 +573,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json-path", type=Path, default=None)
     parser.add_argument("--dco-base", type=str, default=None)
     parser.add_argument("--dco-head", type=str, default=None)
-    parser.add_argument("--dco-cutoff", type=str, default=DEFAULT_DCO_CUTOFF)
+    parser.add_argument("--dco-cutoff", type=str, default=None)
     args = parser.parse_args(argv)
 
     result = run_checks(

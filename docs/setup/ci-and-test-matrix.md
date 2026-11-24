@@ -36,7 +36,7 @@ Um mesmo teste ou suíte pode pertencer a múltiplas categorias simultaneamente:
 | [`NvencEncoderTests.cpp`](../../windows/driver/tests/NvencEncoderTests.cpp) | 8 | `WINDOWS_TOOLCHAIN_REQUIRED`, `GPU_REQUIRED`, `NVENC_REQUIRED` | `NvencH264Encoder.*`, `H264BitstreamValidator.*`, `FrameConsumer.*`, `nvEncodeAPI.h`, `nvEncodeAPI64.dll` em runtime, GPU NVIDIA + decoder MFT | **Excluída (`0/8`)** | Requer GPU física NVIDIA e driver `nvEncodeAPI64.dll` ausentes em runners hospedados padrão. |
 
 **Resumo C++ unitário/componentes:** **8 de 10 suítes selecionadas (`143` de `157` casos esperados)**; **2 suítes excluídas (`14` casos: `6` `WDK_REQUIRED` + `8` `GPU_REQUIRED`/`NVENC_REQUIRED`)**.  
-Adicionalmente, `lumabridge-host.exe` (`windows/host/main.cpp` e módulos auxiliares) tem **compilação verificada (`WINDOWS_TOOLCHAIN_REQUIRED`)** no CI Windows sem execução operacional.
+Adicionalmente, `lumabridge-host.exe` (`windows/host/main.cpp` e módulos auxiliares) passa apenas por **compilação no CI (`compile-only`, `WINDOWS_TOOLCHAIN_REQUIRED`)** sem execução operacional, o que **não** equivale à validação real do driver `LumaBridgeIddDriver`.
 
 ---
 
@@ -103,6 +103,18 @@ Para não alterar [`LumaBridgeFunctionalToolingTests.ps1`](../../windows/driver/
 
 **Resumo PowerShell:** **21 de 71 casos selecionados**; **50 de 71 casos excluídos (`WDK_REQUIRED`)**; **soma exata = `71/71`**.
 
+### 4.3 Contabilização Consolidada (`CI` vs Inventário Histórico vs Infraestrutura Python)
+
+- **Cobertura de inventário do CI Windows hospedado:** o runner Windows executa **`143` casos C++ + `21` casos PowerShell = `164` casos** de um inventário histórico Windows de **`237` casos** (`157` C++ unitários/componentes + `9` E2E + `71` PowerShell), o que corresponde a **aproximadamente `69,2%` do inventário de casos históricos** *(e **não** a `69,2%` de cobertura de código/linhas/branches)*.
+- **Casos históricos não executados (`73` casos):** os **`73` casos restantes** (`14` C++ + `9` E2E + `50` PowerShell) são excluídos no CI hospedado por dependências ambientais (`WDK_REQUIRED`, `GPU_REQUIRED`, `NVENC_REQUIRED`, `INTERACTIVE_DESKTOP_REQUIRED`) e **não são classificados como reprovados**.
+- **Autotestes da infraestrutura Linux/Python (contagem separada):** os **`6` autotestes originais** de [`scripts/ci/test_repo_hygiene.py`](../../scripts/ci/test_repo_hygiene.py) e os **`3` casos de regressão incrementais da `M0.6.1`** (`9` autotestes unitários Python ao todo) verificam exclusivamente a infraestrutura de higiene, segurança de workflows e DCO prospectivo no workflow Linux, sendo contabilizados **separadamente** do inventário histórico de `237` casos Windows.
+- **Execução condicional do check DCO prospectivo:** em eventos `pull_request`, [`check_repo_hygiene.py`](../../scripts/ci/check_repo_hygiene.py) valida trailers Git efetivos `Signed-off-by`, correspondência com autoria e cutoff histórico `23a28046`; em eventos `push` e `workflow_dispatch` sem faixa DCO fornecida, o check de DCO registra **`SKIPPED` por contrato** (não constituindo aprovação nem falha da verificação prospectiva).
+
+### 4.4 Dependências Fixadas vs Dependências Providas pelo Runner Hospedado
+
+- **Artefatos e ações fixados por versão/revisão:** `actions/checkout` e `actions/upload-artifact` fixados por SHA completo de 40 caracteres com `persist-credentials: false`, somados aos scripts versionados em [`scripts/ci/`](../../scripts/ci/Invoke-LumaBridgeCiWindowsTests.ps1).
+- **Dependências fornecidas pelo ambiente do runner hospedado (variáveis com a imagem GitHub Actions):** SO e SDKs das imagens `windows-2025` e `ubuntu-24.04`, toolchain MSVC / Windows SDK instalada via `vswhere.exe`, PowerShell 5.1 / `PSReadLine`, codec `CLSID_CMSH264DecoderMFT` (Media Foundation) no runner Windows, além de Python 3 e PyYAML na imagem Linux.
+
 ---
 
 ## 5. Separação Estrita da Qualificação Especializada (`M0` Histórica vs CI Convencional)
@@ -113,16 +125,18 @@ O CI convencional implementado em `.github/workflows/` **NÃO comprova** e **NÃ
 2. Execução em runtime dentro do processo isolado `WUDFHost.exe` (`LOCAL SERVICE`).
 3. Instalação PnP (`Root\LumaBridgeIddDriver`) e vinculação no Driver Store (`WUDFRd` + `IndirectKmd`).
 4. Transporte real de texturas compartilhadas em GPU física (`IDXGIKeyedMutex` sem WARP).
-5. Codificação NVENC H.264 em hardware NVIDIA físico (`nvEncodeAPI64.dll`).
+5. Qualificação NVENC H.264 em hardware NVIDIA físico (`nvEncodeAPI64.dll`).
 6. Fidelidade de captura e composição real de desktop via `D3d11DxgiVSync` sem oclusão.
 7. Execução real de `Benchmark30s` (`30 s` @ `1080p60`).
 8. Execução real de `ProlongedStability` (`180 s` @ `1080p60`).
-9. Assinatura EV / Attestation / WHQL e qualificação para distribuição do driver em produção.
+9. Latência de transporte de rede / glass-to-glass (`M1`+) e assinatura EV / Attestation / WHQL para distribuição do driver em produção (`M6`).
+10. Validação real do driver por meio da compilação (`compile-only`) isolada de `lumabridge-host.exe`.
 
 A qualificação funcional completa da `M0` referente ao commit funcional `6b297856af535a1737658da97d381c19231913e4` e às revalidações locais `M0.4`/`M0.4.1` (preservando as duas reprovações `p99` iniciais da `M0.4`) permanece documentada de forma independente em [`windows-idd-functional-validation.md`](windows-idd-functional-validation.md) e na trilha especializada Windows 11 x64.
 
-### 5.1 Pendências Conhecidas Mantidas Fora do Escopo `M0.6`
+### 5.1 Pendências Conhecidas e Critério Objetivo de Encerramento da `M0`
 
-- **Issue #33 (mantida ABERTA):** ausência de persistência de `MonitorContainerId` em `PLUGPLAY_REGKEY_DEVICE` em [`Adapter.cpp`](../../windows/driver/LumaBridgeIddDriver/Adapter.cpp) / [`VirtualMonitor.cpp`](../../windows/driver/LumaBridgeIddDriver/VirtualMonitor.cpp) para cenários de reciclagem in-process ou múltiplas instâncias/monitores (a ser tratada antes da expansão multi-monitor).
-- **Issue #34:** ver auditoria detalhada por item em [`windows-idd-functional-validation.md`](windows-idd-functional-validation.md) e na revisão do PR de governança antes do encerramento formal.
-- **Rust / Cargo / FFI / `LBWP v1`:** pertencem à **`M1` (ainda não iniciada)** e não são introduzidos nesta etapa.
+- **Issue #33 (mantida ABERTA — dívida técnica aceita):** ausência de persistência de `MonitorContainerId` em `PLUGPLAY_REGKEY_DEVICE` em [`Adapter.cpp`](../../windows/driver/LumaBridgeIddDriver/Adapter.cpp) / [`VirtualMonitor.cpp`](../../windows/driver/LumaBridgeIddDriver/VirtualMonitor.cpp), a ser tratada antes da expansão para múltiplos monitores virtuais ou múltiplas instâncias dependentes de identidade persistente.
+- **Issue #34 (mantida ABERTA com escopo residual não bloqueante):** escopo funcional núcleo de `M0` validado em `6b297856`; itens operacionais residuais (monitor inicialmente desabilitado dedicado em §7.5, alternância real 720p60/1080p60, bateria dedicada de desativação/reativação, desinstalação pós-sucesso, remoção de certificado e restauração de segurança) permanecem documentados para VM descartável ou ambiente dedicado sem bloquear o encerramento da `M0` nem o início futuro da `M1`.
+- **Critério verificável de encerramento da `M0`:** a `M0` é considerada formalmente encerrada somente após integração por Merge commit do PR de governança `#38` em `dev`, aprovação dos checks pós-merge em `dev` (`Linux Repository Hygiene & Governance` e `Windows Non-Admin CI`), reconciliação registrada do `PR #36` / `Issue #33` / `Issue #34` e verificação da proteção configurada para `refs/heads/dev`.
+- **Rust / Cargo / FFI / `LBWP v1`:** pertencem à **`M1`** e não fazem parte da etapa `M0`.
