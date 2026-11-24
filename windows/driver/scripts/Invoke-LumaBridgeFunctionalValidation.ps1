@@ -61,6 +61,9 @@ param(
     [ValidateRange(1, 120)]
     [int]$StimulusFps = 60,
 
+    [ValidateSet('Auto', 'Dxgi', 'Gdi')]
+    [string]$StimulusBackend = 'Auto',
+
     [string]$StimulusDisplayName,
 
     [ValidateRange(500, 300000)]
@@ -496,6 +499,9 @@ function Test-LumaBridgeSubprofileGates {
 
         [int]$StimulusFps = 60,
 
+        [ValidateSet('Auto', 'Dxgi', 'Gdi')]
+        [string]$StimulusBackend = 'Auto',
+
         [int]$ExpectedStimulusFps = 60,
 
         [int]$ExpectedWidth = 1920,
@@ -687,10 +693,42 @@ function Test-LumaBridgeSubprofileGates {
     $h264Decoded = if ($null -ne $h264Obj) { [uint64](Get-LumaBridgeValidationOptionalProp $h264Obj 'FramesDecoded' $nvEncoded) } else { [uint64]0 }
     $h264NalErr = if ($null -ne $h264Obj) { [uint64](Get-LumaBridgeValidationOptionalProp $h264Obj 'NalParseFailures' 0) } else { [uint64]0 }
     $h264DecErr = if ($null -ne $h264Obj) { [uint64](Get-LumaBridgeValidationOptionalProp $h264Obj 'DecodeFailures' 0) } else { [uint64]0 }
+    $h264WorkerObj = if ($null -ne $h264Obj) { Get-LumaBridgeValidationOptionalProp $h264Obj 'Worker' $null } else { $null }
+    $h264WorkerHealthy = $true
+    if ($null -ne $h264WorkerObj) {
+        $hwProps = @($h264WorkerObj.PSObject.Properties.Name)
+        $hwReq = @(
+            'Healthy', 'PacketsRejected', 'QueueWaitTimeoutCount', 'WorkerFailureCount',
+            'QueueRemainingAtExit', 'PacketsEnqueued', 'PacketsProcessed',
+            'ComBalanced', 'DrainDeadlineExceeded', 'CompletionState'
+        )
+        foreach ($hwp in $hwReq) {
+            if ($hwProps -notcontains $hwp -or $null -eq $h264WorkerObj.$hwp) {
+                $h264WorkerHealthy = $false
+                break
+            }
+        }
+        if ($h264WorkerHealthy) {
+            $hwComBal = [bool]$h264WorkerObj.ComBalanced
+            $hwDrainEx = [bool]$h264WorkerObj.DrainDeadlineExceeded
+            $hwCompState = [string]$h264WorkerObj.CompletionState
+            $h264WorkerHealthy = (
+                ([bool]$h264WorkerObj.Healthy) -and
+                ($hwCompState -ceq 'NormalShutdown') -and
+                ([uint64]$h264WorkerObj.PacketsRejected -eq 0) -and
+                ([uint64]$h264WorkerObj.QueueWaitTimeoutCount -eq 0) -and
+                ([uint64]$h264WorkerObj.WorkerFailureCount -eq 0) -and
+                ([uint64]$h264WorkerObj.QueueRemainingAtExit -eq 0) -and
+                ([uint64]$h264WorkerObj.PacketsEnqueued -eq [uint64]$h264WorkerObj.PacketsProcessed) -and
+                (-not $hwDrainEx) -and
+                $hwComBal
+            )
+        }
+    }
     $h264DecodeRatioOk = ($SubprofileName -notin @('Benchmark30s', 'ProlongedStability')) -or ($h264Packets -eq 0 -and $nvEncoded -eq 0) -or (([double]$h264Decoded / [double][Math]::Max(1, $nvEncoded)) -ge $MinNvencEncodeRatio)
-    $h264Passed = ($summaryValid -and $h264Flag -and $h264Struct -and ($h264NalErr -eq 0) -and ($h264DecErr -eq 0) -and ($h264Decoded -ge 1) -and $h264DecodeRatioOk)
+    $h264Passed = ($summaryValid -and $h264Flag -and $h264Struct -and $h264WorkerHealthy -and ($h264NalErr -eq 0) -and ($h264DecErr -eq 0) -and ($h264Decoded -ge 1) -and $h264DecodeRatioOk)
     if ($VerifyH264Decode -and $summaryValid -and -not $h264Passed) {
-        $reasons.Add(("H264Decode gate failed (Passed={0}, Struct={1}, Decoded={2}/{3}, NalErr={4}, DecErr={5})." -f $h264Flag, $h264Struct, $h264Decoded, $nvEncoded, $h264NalErr, $h264DecErr))
+        $reasons.Add(("H264Decode gate failed (Passed={0}, Struct={1}, WorkerHealthy={2}, Decoded={3}/{4}, NalErr={5}, DecErr={6})." -f $h264Flag, $h264Struct, $h264WorkerHealthy, $h264Decoded, $nvEncoded, $h264NalErr, $h264DecErr))
     }
 
     $frameWidth = if ($summaryValid) { [uint32](Get-LumaBridgeValidationOptionalProp $summary 'LastFrameWidth' 0) } else { [uint32]0 }
@@ -706,8 +744,116 @@ function Test-LumaBridgeSubprofileGates {
     }
 
     $stimObj = if ($summaryValid) { Get-LumaBridgeValidationOptionalProp $summary 'VisualStimulus' $null } else { $null }
+    $stimProps = if ($null -ne $stimObj) { @($stimObj.PSObject.Properties.Name) } else { @() }
     $stimStarted = ($null -ne $stimObj -and [bool](Get-LumaBridgeValidationOptionalProp $stimObj 'VirtualDisplayIdentified' $false) -and [bool](Get-LumaBridgeValidationOptionalProp $stimObj 'Started' $false))
-    $stimTargetFpsProp = if ($null -ne $stimObj -and ($stimObj.PSObject.Properties.Name -contains 'TargetFps')) { [int]$stimObj.TargetFps } else { $StimulusFps }
+    $stimTargetFpsProp = if ($null -ne $stimObj -and ($stimProps -contains 'TargetFps')) { [int]$stimObj.TargetFps } else { $StimulusFps }
+    $stimReqBackend = if ($null -ne $stimObj -and ($stimProps -contains 'BackendRequested')) { [string]$stimObj.BackendRequested } else { $null }
+    $stimActBackend = if ($null -ne $stimObj -and ($stimProps -contains 'BackendActive')) { [string]$stimObj.BackendActive } else { $null }
+    $stimBackendOk = $true
+    if ($SubprofileName -ne 'Smoke') {
+        if (-not $summaryValid -or $null -eq $stimObj) {
+            $stimBackendOk = $false
+            if ($summaryValid) { $reasons.Add('VisualStimulus telemetry missing from host summary.') }
+        }
+        elseif ($StimulusBackend -eq 'Dxgi') {
+            $reqDxgiFields = @(
+                'VirtualDisplayIdentified',
+                'Started',
+                'BackendRequested',
+                'BackendActive',
+                'FallbackFromDxgiOccurred',
+                'PresentSucceeded',
+                'CompletedCleanly',
+                'TerminalFailure',
+                'DisplayDeviceName',
+                'IdentificationSource',
+                'LastHResult',
+                'ErrorMessage'
+            )
+            foreach ($rf in $reqDxgiFields) {
+                if ($stimProps -notcontains $rf -or $null -eq $stimObj.$rf) {
+                    $stimBackendOk = $false
+                    $reasons.Add(("Mandatory VisualStimulus.{0} field missing or null for explicit Dxgi selection." -f $rf))
+                }
+            }
+            if ($stimBackendOk) {
+                if (-not [bool]$stimObj.VirtualDisplayIdentified) { $stimBackendOk = $false; $reasons.Add('VisualStimulus.VirtualDisplayIdentified is false for Dxgi selection.') }
+                if (-not [bool]$stimObj.Started) { $stimBackendOk = $false; $reasons.Add('VisualStimulus.Started is false for Dxgi selection.') }
+                if ([string]::IsNullOrWhiteSpace([string]$stimObj.DisplayDeviceName)) { $stimBackendOk = $false; $reasons.Add('VisualStimulus.DisplayDeviceName is empty for Dxgi selection.') }
+                if ([string]::IsNullOrWhiteSpace([string]$stimObj.IdentificationSource) -or
+                    [string]$stimObj.IdentificationSource -eq 'None' -or
+                    [string]$stimObj.IdentificationSource -eq 'ExplicitTestRect') {
+                    $stimBackendOk = $false
+                    $reasons.Add('VisualStimulus.IdentificationSource is missing, None, or ExplicitTestRect for Dxgi selection.')
+                }
+                if ([string]$stimObj.BackendRequested -cne 'D3d11DxgiVSync') { $stimBackendOk = $false; $reasons.Add(("VisualStimulus.BackendRequested '{0}' != 'D3d11DxgiVSync'." -f $stimObj.BackendRequested)) }
+                if ([string]$stimObj.BackendActive -cne 'D3d11DxgiVSync') { $stimBackendOk = $false; $reasons.Add(("VisualStimulus.BackendActive '{0}' != 'D3d11DxgiVSync'." -f $stimObj.BackendActive)) }
+                if ([bool]$stimObj.FallbackFromDxgiOccurred) { $stimBackendOk = $false; $reasons.Add('VisualStimulus.FallbackFromDxgiOccurred is true when Dxgi was explicitly selected.') }
+                try {
+                    if ([uint64]$stimObj.PresentSucceeded -lt 1) {
+                        $stimBackendOk = $false
+                        $reasons.Add('VisualStimulus.PresentSucceeded must be > 0 for explicit Dxgi selection.')
+                    }
+                }
+                catch {
+                    $stimBackendOk = $false
+                    $reasons.Add('VisualStimulus.PresentSucceeded is invalid for explicit Dxgi selection.')
+                }
+                if (-not [bool]$stimObj.CompletedCleanly) { $stimBackendOk = $false; $reasons.Add('VisualStimulus.CompletedCleanly is false for explicit Dxgi selection.') }
+                if ([bool]$stimObj.TerminalFailure) { $stimBackendOk = $false; $reasons.Add('VisualStimulus.TerminalFailure is true for explicit Dxgi selection.') }
+                if ([string]$stimObj.LastHResult -ine '0x00000000') { $stimBackendOk = $false; $reasons.Add(("VisualStimulus.LastHResult '{0}' != '0x00000000'." -f $stimObj.LastHResult)) }
+                if (-not [string]::IsNullOrWhiteSpace([string]$stimObj.ErrorMessage)) { $stimBackendOk = $false; $reasons.Add(("VisualStimulus reported error: {0}" -f $stimObj.ErrorMessage)) }
+            }
+        }
+        elseif ($StimulusBackend -eq 'Gdi') {
+            $reqGdiFields = @('VirtualDisplayIdentified', 'Started', 'BackendRequested', 'BackendActive', 'CompletedCleanly', 'TerminalFailure', 'DisplayDeviceName', 'ErrorMessage')
+            foreach ($rf in $reqGdiFields) {
+                if ($stimProps -notcontains $rf -or $null -eq $stimObj.$rf) {
+                    $stimBackendOk = $false
+                    $reasons.Add(("Mandatory VisualStimulus.{0} field missing or null for explicit Gdi selection." -f $rf))
+                }
+            }
+            if ($stimBackendOk) {
+                if (-not [bool]$stimObj.VirtualDisplayIdentified -or -not [bool]$stimObj.Started -or [string]::IsNullOrWhiteSpace([string]$stimObj.DisplayDeviceName)) {
+                    $stimBackendOk = $false
+                    $reasons.Add('Virtual display identification/start invalid for explicit Gdi selection.')
+                }
+                if ([string]$stimObj.BackendRequested -cne 'GdiLegacy') { $stimBackendOk = $false; $reasons.Add(("VisualStimulus.BackendRequested '{0}' != 'GdiLegacy'." -f $stimObj.BackendRequested)) }
+                if ([string]$stimObj.BackendActive -cne 'GdiLegacy') { $stimBackendOk = $false; $reasons.Add(("VisualStimulus.BackendActive '{0}' != 'GdiLegacy'." -f $stimObj.BackendActive)) }
+                if (-not [bool]$stimObj.CompletedCleanly -or [bool]$stimObj.TerminalFailure -or -not [string]::IsNullOrWhiteSpace([string]$stimObj.ErrorMessage)) {
+                    $stimBackendOk = $false
+                    $reasons.Add('VisualStimulus failed cleanly completion check for Gdi selection.')
+                }
+                if (($stimProps -contains 'LastHResult') -and ($null -ne $stimObj.LastHResult) -and ([string]$stimObj.LastHResult -ine '0x00000000')) {
+                    $stimBackendOk = $false
+                    $reasons.Add(("VisualStimulus.LastHResult '{0}' != '0x00000000'." -f $stimObj.LastHResult))
+                }
+            }
+        }
+        else {
+            if (-not $stimStarted) {
+                $stimBackendOk = $false
+                $reasons.Add('Visual stimulus failed to identify/start on virtual display.')
+            }
+            if (($stimProps -contains 'CompletedCleanly') -and ($null -ne $stimObj.CompletedCleanly) -and (-not [bool]$stimObj.CompletedCleanly)) {
+                $stimBackendOk = $false
+                $reasons.Add('VisualStimulus.CompletedCleanly is false.')
+            }
+            if (($stimProps -contains 'TerminalFailure') -and ([bool]$stimObj.TerminalFailure)) {
+                $stimBackendOk = $false
+                $reasons.Add('VisualStimulus.TerminalFailure is true.')
+            }
+            if (($stimProps -contains 'ErrorMessage') -and (-not [string]::IsNullOrWhiteSpace([string]$stimObj.ErrorMessage))) {
+                $stimBackendOk = $false
+                $reasons.Add(("VisualStimulus reported error: {0}" -f $stimObj.ErrorMessage))
+            }
+            if (($stimProps -contains 'LastHResult') -and ($null -ne $stimObj.LastHResult) -and ([string]$stimObj.LastHResult -ine '0x00000000')) {
+                $stimBackendOk = $false
+                $reasons.Add(("VisualStimulus.LastHResult '{0}' != '0x00000000'." -f $stimObj.LastHResult))
+            }
+        }
+    }
+
     $sustainedLiveFps = if ($summaryValid) { [double](Get-LumaBridgeValidationOptionalProp $summary 'SustainedLiveFps' 0.0) } else { 0.0 }
     $observedActiveFps = if ($summaryValid) { [double](Get-LumaBridgeValidationOptionalProp $summary 'ObservedActiveFps' 0.0) } else { 0.0 }
     $receiveFps = if ($summaryValid) { [double](Get-LumaBridgeValidationOptionalProp $summary 'ReceiveFps' 0.0) } else { 0.0 }
@@ -727,9 +873,9 @@ function Test-LumaBridgeSubprofileGates {
         }
         'Performance' {
             $expectedMinFrames = [uint64]$PerformanceTargetFrames
-            $profileSpecificOk = ($stimStarted -and $frameTargetReached -and ($framesValid -ge $expectedMinFrames))
+            $profileSpecificOk = ($stimStarted -and $stimBackendOk -and $frameTargetReached -and ($framesValid -ge $expectedMinFrames))
             if ($summaryValid -and -not $profileSpecificOk) {
-                $reasons.Add(("Performance gate failed (StimStarted={0}, FrameTargetReached={1}, FramesValid={2}/{3})." -f $stimStarted, $frameTargetReached, $framesValid, $expectedMinFrames))
+                $reasons.Add(("Performance gate failed (StimStarted={0}, StimulusBackendOk={1}, FrameTargetReached={2}, FramesValid={3}/{4})." -f $stimStarted, $stimBackendOk, $frameTargetReached, $framesValid, $expectedMinFrames))
             }
         }
         default {
@@ -750,7 +896,7 @@ function Test-LumaBridgeSubprofileGates {
                 ($framesValid -ge 2)
             }
             $stimFpsOk = ($StimulusFps -eq $ExpectedStimulusFps) -and ($stimTargetFpsProp -eq $ExpectedStimulusFps)
-            $profileSpecificOk = ($qpcClockOk -and $stimStarted -and $stimFpsOk -and $durationOk -and $framesCountOk -and $sustainedFpsOk -and $activeStreamingOk -and $resolutionOk)
+            $profileSpecificOk = ($qpcClockOk -and $stimStarted -and $stimBackendOk -and $stimFpsOk -and $durationOk -and $framesCountOk -and $sustainedFpsOk -and $activeStreamingOk -and $resolutionOk)
 
             if ($summaryValid -and -not $stimStarted) { $reasons.Add('Visual stimulus failed to identify/start on virtual display.') }
             if ($summaryValid -and -not $stimFpsOk) { $reasons.Add(("Stimulus FPS config/target ({0} / {1}) != expected {2}." -f $StimulusFps, $stimTargetFpsProp, $ExpectedStimulusFps)) }
@@ -771,6 +917,7 @@ function Test-LumaBridgeSubprofileGates {
         ((-not $RequireGpuShared) -or $gpuSharedPassed) -and
         ((-not $RequireNvenc) -or $nvencPassed) -and
         ((-not $VerifyH264Decode) -or $h264Passed) -and
+        $stimBackendOk -and
         $resolutionOk -and
         $profileSpecificOk
     )
@@ -794,6 +941,9 @@ function Test-LumaBridgeSubprofileGates {
         TransportContractViolations  = $contractViolations
         NvencPassed                  = $nvencPassed
         H264DecodePassed          = $h264Passed
+        StimulusBackendPassed     = $stimBackendOk
+        StimulusBackendRequested  = $stimReqBackend
+        StimulusBackendActive     = $stimActBackend
         ResolutionOk              = $resolutionOk
         ProfileSpecificOk         = $profileSpecificOk
         Passed                    = $passed
@@ -1171,6 +1321,7 @@ function Build-PerfHostArgs {
         '--visual-stimulus',
         '--require-virtual-stimulus',
         '--stimulus-fps', "$StimulusFps",
+        '--stimulus-backend', $StimulusBackend.ToLowerInvariant(),
         '--json-summary', $JsonOut
     )) {
         $list.Add($item)
@@ -1205,6 +1356,7 @@ function Build-ProlongedHostArgs {
         '--visual-stimulus',
         '--require-virtual-stimulus',
         '--stimulus-fps', "$StimulusFps",
+        '--stimulus-backend', $StimulusBackend.ToLowerInvariant(),
         '--json-summary', $JsonOut
     )) {
         $list.Add($item)
@@ -1234,6 +1386,7 @@ if ($runStabilityProfile) {
 $benchmarkGateCriteria = [pscustomobject]@{
     ExpectedResolution        = ("{0}x{1}" -f $ExpectedBenchmarkWidth, $ExpectedBenchmarkHeight)
     ExpectedStimulusFps       = $StimulusFps
+    StimulusBackend           = $StimulusBackend
     MinBenchmarkFrameRatio    = $MinBenchmarkFrameRatio
     MinSustainedFpsRatio      = $MinSustainedFpsRatio
     MinNvencEncodeRatio       = $MinNvencEncodeRatio
@@ -1337,6 +1490,7 @@ if ($DryRun) {
         RunId                      = $runId
         Configuration              = $Configuration
         TestProfile                = $TestProfile
+        StimulusBackend            = $StimulusBackend
         StagingMode                = $stagingMode
         ReusedStagingVerification  = $reusedStagingVerification
         Branch                     = $currentBranch
@@ -1776,6 +1930,7 @@ try {
                 -VerifyH264Decode:$VerifyH264Decode `
                 -PerformanceTargetFrames ([uint64]$PerformanceTargetFrames) `
                 -StimulusFps $StimulusFps `
+                -StimulusBackend $StimulusBackend `
                 -MinNvencEncodeRatio $MinNvencEncodeRatio `
                 -MaxDropRatio $MaxDropRatio
         }
@@ -1796,6 +1951,7 @@ try {
                 -VerifyH264Decode:$VerifyH264Decode `
                 -ExpectedDurationSec $BenchmarkDurationSec `
                 -StimulusFps $StimulusFps `
+                -StimulusBackend $StimulusBackend `
                 -ExpectedStimulusFps $ExpectedBenchmarkStimulusFps `
                 -ExpectedWidth $ExpectedBenchmarkWidth `
                 -ExpectedHeight $ExpectedBenchmarkHeight `
@@ -1821,6 +1977,7 @@ try {
                 -VerifyH264Decode:$VerifyH264Decode `
                 -ExpectedDurationSec $StabilityDurationSec `
                 -StimulusFps $StimulusFps `
+                -StimulusBackend $StimulusBackend `
                 -ExpectedStimulusFps $ExpectedBenchmarkStimulusFps `
                 -ExpectedWidth $ExpectedBenchmarkWidth `
                 -ExpectedHeight $ExpectedBenchmarkHeight `
@@ -1941,6 +2098,8 @@ try {
     $gpuSharedPassed = ($evalSubList.Count -ge 1)
     $nvencPassed = ($evalSubList.Count -ge 1)
     $h264DecodePassed = ($evalSubList.Count -ge 1)
+    $stimulusBackendPassed = ($evalSubList.Count -ge 1)
+    $hasVisualStimulusSubprofile = ($runPerfProfile -or $runBenchmark30sProfile -or $runStabilityProfile)
     $truncatedMetricsList = New-Object System.Collections.Generic.List[object]
     $methodologyAuditList = New-Object System.Collections.Generic.List[object]
 
@@ -1956,6 +2115,7 @@ try {
         $gpuSharedPassed = $gpuSharedPassed -and [bool]$se.GpuSharedPassed
         $nvencPassed = $nvencPassed -and [bool]$se.NvencPassed
         $h264DecodePassed = $h264DecodePassed -and [bool]$se.H264DecodePassed
+        $stimulusBackendPassed = $stimulusBackendPassed -and [bool]$se.StimulusBackendPassed
         $hasEstimatedPercentiles = $hasEstimatedPercentiles -or [bool]$te.HasEstimatedPercentiles
         foreach ($mm in @($te.LatencyMetricsMethodology)) {
             $methodologyAuditList.Add([pscustomobject]@{
@@ -2044,6 +2204,7 @@ try {
     $perfGateOk = (-not $runPerfProfile) -or $perfTargetReached
     $bench30sGateOk = (-not $runBenchmark30sProfile) -or $bench30sPassed
     $stabilityGateOk = (-not $runStabilityProfile) -or $stabilityPassed
+    $stimulusBackendGateOk = (-not $hasVisualStimulusSubprofile) -or $stimulusBackendPassed
     $gpuGateOk = (-not $RequireGpuShared) -or $gpuSharedPassed
     $nvencGateOk = (-not $RequireNvenc) -or $nvencPassed
     $h264GateOk = (-not $VerifyH264Decode) -or $h264DecodePassed
@@ -2064,6 +2225,7 @@ try {
         $perfGateOk -and
         $bench30sGateOk -and
         $stabilityGateOk -and
+        $stimulusBackendGateOk -and
         $gpuGateOk -and
         $nvencGateOk -and
         $h264GateOk
@@ -2095,6 +2257,7 @@ try {
         Benchmark30s         = if (-not $runBenchmark30sProfile) { 'NOT_TESTED' } elseif ($null -eq $bench30sEvalObj) { 'BLOCKED' } elseif ($bench30sPassed) { 'PASS' } else { 'FAIL' }
         ProlongedStability   = if (-not $runStabilityProfile) { 'NOT_TESTED' } elseif ($null -eq $stabEvalObj) { 'BLOCKED' } elseif ($stabilityPassed) { 'PASS' } else { 'FAIL' }
         ProlongedStabilityProven = if (-not $runStabilityProfile) { 'NOT_TESTED' } elseif ($prolongedStabilityProven) { 'PASS' } else { 'FAIL' }
+        StimulusBackend      = if (-not $hasVisualStimulusSubprofile) { 'NOT_APPLICABLE' } elseif ($stimulusBackendPassed) { 'PASS' } else { 'FAIL' }
         GpuShared            = if (-not $RequireGpuShared -and $TransportMode -eq 'Cpu') { 'NOT_APPLICABLE' } elseif ($gpuSharedPassed) { 'PASS' } elseif ($RequireGpuShared) { 'FAIL' } else { 'NOT_TESTED' }
         Nvenc                = if (-not ($EnableNvenc -or $RequireNvenc)) { 'NOT_APPLICABLE' } elseif ($nvencPassed) { 'PASS' } else { 'FAIL' }
         H264StructuralDecode = if (-not $VerifyH264Decode) { 'NOT_APPLICABLE' } elseif ($structuralDecodeValidated) { 'PASS' } else { 'FAIL' }
@@ -2138,6 +2301,7 @@ try {
         ProlongedStabilityExecuted      = $stabilityExecuted
         ProlongedStabilityPassed        = $stabilityPassed
         ProlongedStabilityProven        = $prolongedStabilityProven
+        StimulusBackendPassed           = $stimulusBackendPassed
         AllSubprofilesPassed            = $allSubprofilesPassed
         TransportHealthy                = $transportHealthy
         RealGpuSyncHealthy              = $realGpuSyncHealthy
@@ -2183,6 +2347,7 @@ try {
             'PerformanceTestExecuted', 'PerformanceTargetReached',
             'Benchmark30sExecuted', 'Benchmark30sPassed',
             'ProlongedStabilityExecuted', 'ProlongedStabilityPassed', 'ProlongedStabilityProven',
+            'StimulusBackendPassed',
             'GpuSharedPassed', 'NvencPassed', 'H264DecodePassed',
             'StructuralDecodeValidated', 'FidelityPsnrValidated',
             'TimestampMeasurementErrors', 'CoreTimestampCoveragePercent',
@@ -2194,6 +2359,7 @@ try {
         if ($runPerfProfile -and -not $perfTargetReached) { $failedFlags += 'PerformanceTargetReached' }
         if ($runBenchmark30sProfile -and -not $bench30sPassed) { $failedFlags += 'Benchmark30sPassed' }
         if ($runStabilityProfile -and -not $stabilityPassed) { $failedFlags += 'ProlongedStabilityPassed' }
+        if ($hasVisualStimulusSubprofile -and -not $stimulusBackendPassed) { $failedFlags += 'StimulusBackendPassed' }
         if ($RequireGpuShared -and -not $gpuSharedPassed) { $failedFlags += 'GpuSharedPassed' }
         if ($RequireNvenc -and -not $nvencPassed) { $failedFlags += 'NvencPassed' }
         if ($VerifyH264Decode -and -not $h264DecodePassed) { $failedFlags += 'H264DecodePassed' }
@@ -2524,9 +2690,10 @@ finally {
             FunctionalSmoke      = if ($runSmokeProfile) { 'BLOCKED' } else { 'NOT_TESTED' }
             Performance          = if ($runPerfProfile) { 'BLOCKED' } else { 'NOT_TESTED' }
             Benchmark30s         = if ($runBenchmark30sProfile) { 'BLOCKED' } else { 'NOT_TESTED' }
-            ProlongedStability   = if ($runStabilityProfile) { 'BLOCKED' } else { 'NOT_TESTED' }
+            ProlongedStability       = if ($runStabilityProfile) { 'BLOCKED' } else { 'NOT_TESTED' }
             ProlongedStabilityProven = if ($runStabilityProfile) { 'BLOCKED' } else { 'NOT_TESTED' }
-            GpuShared            = if ($RequireGpuShared) { 'BLOCKED' } else { 'NOT_APPLICABLE' }
+            StimulusBackend          = if ($runPerfProfile -or $runBenchmark30sProfile -or $runStabilityProfile) { 'BLOCKED' } else { 'NOT_APPLICABLE' }
+            GpuShared                = if ($RequireGpuShared) { 'BLOCKED' } else { 'NOT_APPLICABLE' }
             Nvenc                = if ($EnableNvenc -or $RequireNvenc) { 'BLOCKED' } else { 'NOT_APPLICABLE' }
             H264StructuralDecode = if ($VerifyH264Decode) { 'BLOCKED' } else { 'NOT_APPLICABLE' }
             H264FidelityPsnr     = 'NOT_TESTED'
@@ -2539,6 +2706,7 @@ finally {
         CompletedAtUtc                = (Get-Date).ToUniversalTime().ToString('o')
         Configuration                 = $Configuration
         TestProfile                   = $TestProfile
+        StimulusBackend               = $StimulusBackend
         StagingMode                   = $stagingMode
         ReusedStagingVerification     = $reusedStagingVerification
         Branch                        = $currentBranch
@@ -2612,7 +2780,7 @@ finally {
         $mdLines.Add('# LumaBridge M4.2.1 Functional Validation Report')
         $mdLines.Add('')
         $mdLines.Add(("- RunId: ``{0}`` | Completed UTC: ``{1}``" -f $runId, $reportPayload.CompletedAtUtc))
-        $mdLines.Add(("- Branch: ``{0}`` | Configuration: ``{1}`` | Profile: ``{2}`` | StagingMode: ``{3}``" -f $currentBranch, $Configuration, $TestProfile, $stagingMode))
+        $mdLines.Add(("- Branch: ``{0}`` | Configuration: ``{1}`` | Profile: ``{2}`` | StimulusBackend: ``{3}`` | StagingMode: ``{4}``" -f $currentBranch, $Configuration, $TestProfile, $StimulusBackend, $stagingMode))
         $mdLines.Add(("- Staged Package (``StagingDir``): ``{0}``" -f $signedStagingDir))
         if ($null -ne $subprofileStatuses) {
             $mdLines.Add(("- SubprofileStatuses: Smoke=``{0}``, Performance=``{1}``, Benchmark30s=``{2}``, ProlongedStability=``{3}``" -f `
@@ -2626,8 +2794,8 @@ finally {
         }
         foreach ($seKey in $subprofileEvaluations.Keys) {
             $seVal = $subprofileEvaluations[$seKey]
-            $mdLines.Add(("- Subprofile ``{0}``: Passed=``{1}``, SummaryStatus=``{2}``, Res=``{3}``, Dur=``{4}s``, Valid=``{5}``/``{6}``, Enc=``{7}``, Dec=``{8}``, DropGpu=``{9}``, DropNv=``{10}``, Fps=``{11}``, TsErr=``{12}``" -f `
-                $seKey, $seVal.Passed, $seVal.SummaryStatus, $seVal.MeasuredResolution, $seVal.MeasuredDurationSec, `
+            $mdLines.Add(("- Subprofile ``{0}``: Passed=``{1}``, SummaryStatus=``{2}``, StimReq=``{3}``, StimAct=``{4}``, StimOk=``{5}``, Res=``{6}``, Dur=``{7}s``, Valid=``{8}``/``{9}``, Enc=``{10}``, Dec=``{11}``, DropGpu=``{12}``, DropNv=``{13}``, Fps=``{14}``, TsErr=``{15}``" -f `
+                $seKey, $seVal.Passed, $seVal.SummaryStatus, $seVal.StimulusBackendRequested, $seVal.StimulusBackendActive, $seVal.StimulusBackendPassed, $seVal.MeasuredResolution, $seVal.MeasuredDurationSec, `
                 $seVal.FramesValid, $seVal.ExpectedMinFrames, $seVal.FramesEncoded, $seVal.FramesDecoded, `
                 $seVal.FramesDropped.GpuFramesDropped, $seVal.FramesDropped.TotalNvencDrops, $seVal.MeasuredSustainedFps, `
                 $seVal.TemporalEval.TimestampMeasurementErrors))
@@ -2706,6 +2874,7 @@ return [pscustomobject]@{
     RollbackScopeNote             = $rollbackScopeNote
     Configuration                 = $Configuration
     TestProfile                   = $TestProfile
+    StimulusBackend               = $StimulusBackend
     StagingMode                   = $stagingMode
     ReusedStagingVerification     = $reusedStagingVerification
     Branch                        = $currentBranch

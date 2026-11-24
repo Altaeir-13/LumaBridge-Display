@@ -23,6 +23,7 @@ struct HostGateConfig
     bool VerifyH264Decode{false};
     bool VerifyH264Psnr{false};
     bool RequireVirtualStimulus{false};
+    StimulusBackend RequestedStimulusBackend{StimulusBackend::Auto};
     bool RequireValidTimestamps{false};
     uint32_t RequireWidth{0U};
     uint32_t RequireHeight{0U};
@@ -69,7 +70,50 @@ EvaluateHostGates(
         (metrics.ProtocolErrors == 0ULL);
     eval.MinFramesOk = (metrics.FramesValid >= config.MinFrames);
     eval.MaxTargetOk = (!config.RequireFrameTarget) || metrics.FrameTargetReached;
-    eval.StimulusOk = (!gateCfg.RequireVirtualStimulus) || (stimSnap.VirtualDisplayIdentified && stimSnap.Started);
+
+    const bool enforceStimulus =
+        gateCfg.RequireVirtualStimulus ||
+        (stimSnap.Requested && gateCfg.RequestedStimulusBackend != StimulusBackend::Auto);
+    bool stimulusOk = !enforceStimulus;
+    if (enforceStimulus)
+    {
+        const bool baseStimOk =
+            stimSnap.VirtualDisplayIdentified &&
+            stimSnap.Started &&
+            stimSnap.CompletedCleanly &&
+            !stimSnap.TerminalFailure &&
+            SUCCEEDED(stimSnap.LastHResult) &&
+            stimSnap.ErrorMessage.empty() &&
+            !stimSnap.DisplayDeviceName.empty() &&
+            !stimSnap.IdentificationSource.empty() &&
+            (stimSnap.IdentificationSource != "None");
+
+        if (gateCfg.RequestedStimulusBackend == StimulusBackend::D3d11DxgiVSync)
+        {
+            stimulusOk =
+                baseStimOk &&
+                (stimSnap.BackendRequested == "D3d11DxgiVSync") &&
+                (stimSnap.BackendActive == "D3d11DxgiVSync") &&
+                !stimSnap.FallbackFromDxgiOccurred &&
+                (stimSnap.PresentSucceeded > 0ULL) &&
+                (stimSnap.LastHResult == S_OK);
+        }
+        else if (gateCfg.RequestedStimulusBackend == StimulusBackend::GdiLegacy)
+        {
+            stimulusOk =
+                baseStimOk &&
+                (stimSnap.BackendRequested == "GdiLegacy") &&
+                (stimSnap.BackendActive == "GdiLegacy") &&
+                !stimSnap.FallbackFromDxgiOccurred &&
+                (stimSnap.PresentSucceeded > 0ULL) &&
+                (stimSnap.LastHResult == S_OK);
+        }
+        else
+        {
+            stimulusOk = baseStimOk;
+        }
+    }
+    eval.StimulusOk = stimulusOk;
     eval.TransportContractOk =
         (metrics.TransportContractViolations == 0ULL) &&
         (metrics.UnexpectedCpuFramesInGpuSession == 0ULL) &&

@@ -637,6 +637,14 @@ WriteJsonSummary(
         "0x%08lX",
         static_cast<unsigned long>(h264Worker.LastHResult));
 
+    char stimHrBuf[16]{};
+    _snprintf_s(
+        stimHrBuf,
+        sizeof(stimHrBuf),
+        _TRUNCATE,
+        "0x%08lX",
+        static_cast<unsigned long>(stimulus.LastHResult));
+
     char utcNowBuf[40]{};
     FormatUtcIso8601Now(utcNowBuf, sizeof(utcNowBuf));
 
@@ -877,6 +885,8 @@ WriteJsonSummary(
         << "    \"Started\": " << (stimulus.Started ? "true" : "false") << ",\n"
         << "    \"Active\": " << (stimulus.Active ? "true" : "false") << ",\n"
         << "    \"CompletedCleanly\": " << (stimulus.CompletedCleanly ? "true" : "false") << ",\n"
+        << "    \"TerminalFailure\": " << (stimulus.TerminalFailure ? "true" : "false") << ",\n"
+        << "    \"StopRequested\": " << (stimulus.StopRequested ? "true" : "false") << ",\n"
         << "    \"HighResolutionTimerUsed\": " << (stimulus.HighResolutionTimerUsed ? "true" : "false") << ",\n"
         << "    \"TargetFps\": " << stimulus.TargetFps << ",\n"
         << "    \"BackendRequested\": \"" << EscapeJsonString(stimulus.BackendRequested) << "\",\n"
@@ -914,6 +924,7 @@ WriteJsonSummary(
         << "    \"BoundsWidth\": " << stimulus.BoundsWidth << ",\n"
         << "    \"BoundsHeight\": " << stimulus.BoundsHeight << ",\n"
         << "    \"IdentificationSource\": \"" << EscapeJsonString(stimulus.IdentificationSource) << "\",\n"
+        << "    \"LastHResult\": \"" << stimHrBuf << "\",\n"
         << "    \"ErrorMessage\": \"" << EscapeJsonString(stimulus.ErrorMessage) << "\"\n"
         << "  },\n"
         << "  \"PacingCorrelation\": {\n"
@@ -952,6 +963,8 @@ WriteJsonSummary(
         << "    \"RequireGpuShared\": " << (gateConfig.RequireGpuShared ? "true" : "false") << ",\n"
         << "    \"RequireNvenc\": " << (gateConfig.RequireNvenc ? "true" : "false") << ",\n"
         << "    \"VerifyH264Decode\": " << (gateConfig.VerifyH264Decode ? "true" : "false") << ",\n"
+        << "    \"RequireVirtualStimulus\": " << (gateConfig.RequireVirtualStimulus ? "true" : "false") << ",\n"
+        << "    \"RequestedStimulusBackend\": \"" << EscapeJsonString(lumabridge::host::StimulusBackendToString(gateConfig.RequestedStimulusBackend)) << "\",\n"
         << "    \"RequireValidTimestamps\": " << (gateConfig.RequireValidTimestamps ? "true" : "false") << ",\n"
         << "    \"RequireWidth\": " << gateConfig.RequireWidth << ",\n"
         << "    \"RequireHeight\": " << gateConfig.RequireHeight << ",\n"
@@ -1340,6 +1353,7 @@ wmain(
     gateConfig.VerifyH264Decode = verifyH264Decode;
     gateConfig.VerifyH264Psnr = verifyH264Psnr;
     gateConfig.RequireVirtualStimulus = requireVirtualStimulus;
+    gateConfig.RequestedStimulusBackend = stimulusBackend;
 
     SYSTEM_INFO sysInfo{};
     GetSystemInfo(&sysInfo);
@@ -1902,9 +1916,12 @@ wmain(
     if (stimSnap.Requested)
     {
         std::printf(
-            "[LB-HOST] Stimulus: identified=%u started=%u hiRes=%u req=%s active=%s fallback=%u src=%s ticks=%llu paints=%llu presentOk=%llu occluded=%llu miss=%llu driftUs=%lld maxGapUs=%llu achievedFps=%.2f tickAvgUs=%llu\n",
+            "[LB-HOST] Stimulus: identified=%u started=%u clean=%u termFail=%u hr=0x%08lX hiRes=%u req=%s active=%s fallback=%u src=%s ticks=%llu paints=%llu presentOk=%llu occluded=%llu presentFail=%llu miss=%llu driftUs=%lld maxGapUs=%llu durUs=%llu achievedFps=%.2f tickAvgUs=%llu err=\"%s\"\n",
             stimSnap.VirtualDisplayIdentified ? 1U : 0U,
             stimSnap.Started ? 1U : 0U,
+            stimSnap.CompletedCleanly ? 1U : 0U,
+            stimSnap.TerminalFailure ? 1U : 0U,
+            static_cast<unsigned long>(stimSnap.LastHResult),
             stimSnap.HighResolutionTimerUsed ? 1U : 0U,
             stimSnap.BackendRequested.c_str(),
             stimSnap.BackendActive.c_str(),
@@ -1914,11 +1931,14 @@ wmain(
             static_cast<unsigned long long>(stimSnap.PaintCount),
             static_cast<unsigned long long>(stimSnap.PresentSucceeded),
             static_cast<unsigned long long>(stimSnap.PresentOccluded),
+            static_cast<unsigned long long>(stimSnap.PresentFailures),
             static_cast<unsigned long long>(stimSnap.DeadlineMissCount),
             static_cast<long long>(stimSnap.CumulativeDriftUs),
             static_cast<unsigned long long>(stimSnap.MaxInterPresentGapUs),
+            static_cast<unsigned long long>(stimSnap.DurationUs),
             stimSnap.AchievedFps,
-            static_cast<unsigned long long>(stimSnap.TickIntervalAvgUs));
+            static_cast<unsigned long long>(stimSnap.TickIntervalAvgUs),
+            stimSnap.ErrorMessage.c_str());
     }
 
     std::fflush(stdout);
