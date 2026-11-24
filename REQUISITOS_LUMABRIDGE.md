@@ -1,5 +1,14 @@
 # LumaBridge Display - Documento de Requisitos e Plano de Desenvolvimento
 
+> **Aviso de atualização arquitetural (2026-11-23):** Este documento registra os requisitos iniciais que orientaram a primeira etapa do projeto (`Windows 11 → Arch Linux/Hyprland`). Em 2026-11-23, o projeto formalizou sua visão definitiva como **plataforma open source, multiplataforma, bidirecional e independente de fabricantes** em [ADR-0003 - Visão oficial da plataforma universal](./docs/architecture/ADR-0003-universal-platform-vision.md). Para a arquitetura, compatibilidade e roadmap vigentes, consulte:
+> - [ADR-0003 — Visão da Plataforma Universal](./docs/architecture/ADR-0003-universal-platform-vision.md)
+> - [Arquitetura Multiplataforma Proposta](./docs/architecture/universal-platform-architecture.md)
+> - [Matriz de Compatibilidade](./docs/architecture/compatibility-matrix.md)
+> - [Roadmap Universal (`M0–M6`)](./docs/planning/UNIVERSAL_ROADMAP.md)
+> - [Plano de Migração Conservador](./docs/planning/MIGRATION_PLAN.md)
+>
+> O conteúdo abaixo é preservado integralmente para rastreabilidade histórica do primeiro recorte MVP.
+
 ## 1. Visão geral
 
 O LumaBridge Display é uma aplicação multiplataforma para transformar um dispositivo secundário, inicialmente um laptop Linux com Arch Linux + Hyprland, em um monitor virtual reconhecido pelo Windows 11 como uma tela real adicional.
