@@ -1,0 +1,26 @@
+[package]
+name = "lumabridge-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Versioned C ABI and UniFFI boundary over lumabridge-core (M1.1 PoC)."
+
+[lib]
+name = "lumabridge_ffi"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi_bindgen.rs"
+required-features = ["uniffi-cli"]
+
+[features]
+default = []
+poc-fault-injection = ["lumabridge-core/poc-fault-injection"]
+uniffi = ["dep:uniffi"]
+uniffi-cli = ["uniffi", "uniffi/cli"]
+
+[dependencies]
+lumabridge-core = { version = "0.1.0", path = "../lumabridge-core" }
+uniffi = { version = "0.32.2", optional = true }
