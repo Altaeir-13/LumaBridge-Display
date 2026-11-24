@@ -362,6 +362,19 @@ enum SubmitFaultMode {
     PostCommitPanic,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkerLifecycle {
+    NotSpawned,
+    Active,
+    Joined,
+}
+
+#[derive(Clone, Copy)]
+enum CallbackSlot {
+    Running,
+    Terminal,
+}
+
 struct SharedQueueState {
     state: CoreState,
     queue: VecDeque<QueuedItem>,
@@ -375,6 +388,10 @@ struct SharedQueueState {
     pending_submit_fault: SubmitFaultMode,
     last_error: String,
     worker_thread_id: Option<ThreadId>,
+    worker_lifecycle: WorkerLifecycle,
+    notified_rank: u8,
+    running_cb_tid: Option<ThreadId>,
+    terminal_cb_tid: Option<ThreadId>,
 }
 
 impl SharedQueueState {
@@ -411,6 +428,10 @@ impl SharedQueueState {
             pending_submit_fault: SubmitFaultMode::None,
             last_error: String::new(),
             worker_thread_id: None,
+            worker_lifecycle: WorkerLifecycle::NotSpawned,
+            notified_rank: 0,
+            running_cb_tid: None,
+            terminal_cb_tid: None,
         }
     }
 }
@@ -430,6 +451,83 @@ impl SharedRuntime {
         self.counters
             .state
             .store(new_state as u32, Ordering::SeqCst);
+    }
+
+    fn wait_callbacks_clear_locked<'a>(
+        &self,
+        mut guard: std::sync::MutexGuard<'a, SharedQueueState>,
+        current_tid: ThreadId,
+        wait_for_running: bool,
+    ) -> std::sync::MutexGuard<'a, SharedQueueState> {
+        loop {
+            let blocked_by_running = wait_for_running
+                && guard
+                    .running_cb_tid
+                    .is_some_and(|owner| owner != current_tid);
+            let blocked_by_terminal = guard
+                .terminal_cb_tid
+                .is_some_and(|owner| owner != current_tid);
+            if !blocked_by_running && !blocked_by_terminal {
+                return guard;
+            }
+            guard = self
+                .cv
+                .wait(guard)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn dispatch_state_notification(
+        &self,
+        new_state: CoreState,
+        status: Result<(), CoreError>,
+        slot: CallbackSlot,
+    ) {
+        let _slot_guard = StateCallbackSlotGuard { shared: self, slot };
+        let _cb_guard = CallbackInProgressGuard::enter(&self.global);
+        if new_state == CoreState::Faulted {
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+                self.observer.on_state_changed(new_state, status);
+            }));
+        } else {
+            self.observer.on_state_changed(new_state, status);
+        }
+    }
+}
+
+struct JoinCompletionGuard<'a> {
+    shared: &'a SharedRuntime,
+}
+
+impl Drop for JoinCompletionGuard<'_> {
+    fn drop(&mut self) {
+        let mut guard = self
+            .shared
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.worker_lifecycle = WorkerLifecycle::Joined;
+        self.shared.cv.notify_all();
+    }
+}
+
+struct StateCallbackSlotGuard<'a> {
+    shared: &'a SharedRuntime,
+    slot: CallbackSlot,
+}
+
+impl Drop for StateCallbackSlotGuard<'_> {
+    fn drop(&mut self) {
+        let mut guard = self
+            .shared
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match self.slot {
+            CallbackSlot::Running => guard.running_cb_tid = None,
+            CallbackSlot::Terminal => guard.terminal_cb_tid = None,
+        }
+        self.shared.cv.notify_all();
     }
 }
 
@@ -481,6 +579,7 @@ impl CoreSession {
 
         self.shared.set_state_locked(&mut guard, CoreState::Running);
         guard.stop_requested = false;
+        guard.worker_lifecycle = WorkerLifecycle::Active;
         drop(guard);
 
         let worker_shared = Arc::clone(&self.shared);
@@ -495,6 +594,7 @@ impl CoreSession {
                     .inner
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                err_guard.worker_lifecycle = WorkerLifecycle::NotSpawned;
                 self.shared
                     .set_state_locked(&mut err_guard, CoreState::Faulted);
                 "Failed to spawn worker thread".clone_into(&mut err_guard.last_error);
@@ -503,9 +603,69 @@ impl CoreSession {
 
         self.shared.has_active_thread.store(true, Ordering::SeqCst);
         *worker_slot = Some(handle);
+
+        let current_tid = thread::current().id();
+        let should_notify_running = {
+            let mut notify_guard = self
+                .shared
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !notify_guard.stop_requested
+                && !notify_guard.fault_triggered
+                && notify_guard.notified_rank < 1
+                && notify_guard.state == CoreState::Running
+            {
+                notify_guard.notified_rank = 1;
+                notify_guard.running_cb_tid = Some(current_tid);
+                true
+            } else {
+                false
+            }
+        };
         drop(worker_slot);
 
-        self.invoke_state_callback(CoreState::Running, Ok(()));
+        if should_notify_running {
+            self.shared.dispatch_state_notification(
+                CoreState::Running,
+                Ok(()),
+                CallbackSlot::Running,
+            );
+            let follow_up = {
+                let guard = self
+                    .shared
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut guard = self
+                    .shared
+                    .wait_callbacks_clear_locked(guard, current_tid, false);
+                if guard.fault_triggered
+                    && guard.notified_rank < 3
+                    && guard.terminal_cb_tid.is_none()
+                {
+                    guard.notified_rank = 3;
+                    guard.terminal_cb_tid = Some(current_tid);
+                    Some((CoreState::Faulted, Err(CoreError::InternalPanic)))
+                } else if guard.stop_requested
+                    && !guard.fault_triggered
+                    && guard.worker_thread_id.is_none()
+                    && guard.notified_rank < 2
+                    && guard.terminal_cb_tid.is_none()
+                {
+                    guard.notified_rank = 2;
+                    guard.terminal_cb_tid = Some(current_tid);
+                    self.shared.set_state_locked(&mut guard, CoreState::Stopped);
+                    Some((CoreState::Stopped, Ok(())))
+                } else {
+                    None
+                }
+            };
+            if let Some((state, status)) = follow_up {
+                self.shared
+                    .dispatch_state_notification(state, status, CallbackSlot::Terminal);
+            }
+        }
         Ok(())
     }
 
@@ -697,26 +857,43 @@ impl CoreSession {
             return Ok(());
         }
 
-        self.join_worker_if_external()?;
+        self.wait_and_join_worker_external()?;
 
-        let mut final_guard = self
-            .shared
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let drained_tail = drain_queue_locked(&mut final_guard, &self.shared);
-        let notify_stopped = if matches!(final_guard.state, CoreState::Faulted) {
-            false
-        } else {
-            let changed = final_guard.state != CoreState::Stopped;
-            self.shared
-                .set_state_locked(&mut final_guard, CoreState::Stopped);
-            changed
+        let (drained_tail, pending_notify) = {
+            let guard = self
+                .shared
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut guard = self
+                .shared
+                .wait_callbacks_clear_locked(guard, current_tid, true);
+            let drained_tail = drain_queue_locked(&mut guard, &self.shared);
+            let pending_notify = if guard.fault_triggered {
+                if guard.notified_rank < 3 && guard.terminal_cb_tid.is_none() {
+                    guard.notified_rank = 3;
+                    guard.terminal_cb_tid = Some(current_tid);
+                    Some((CoreState::Faulted, Err(CoreError::InternalPanic)))
+                } else {
+                    None
+                }
+            } else {
+                self.shared.set_state_locked(&mut guard, CoreState::Stopped);
+                if guard.notified_rank < 2 && guard.terminal_cb_tid.is_none() {
+                    guard.notified_rank = 2;
+                    guard.terminal_cb_tid = Some(current_tid);
+                    Some((CoreState::Stopped, Ok(())))
+                } else {
+                    None
+                }
+            };
+            (drained_tail, pending_notify)
         };
-        drop(final_guard);
+
         drop(drained_tail);
-        if notify_stopped {
-            self.invoke_state_callback(CoreState::Stopped, Ok(()));
+        if let Some((state, status)) = pending_notify {
+            self.shared
+                .dispatch_state_notification(state, status, CallbackSlot::Terminal);
         }
         Ok(())
     }
@@ -742,12 +919,39 @@ impl CoreSession {
             self.shared.cv.notify_all();
             (guard.worker_thread_id == Some(current_tid), drained)
         };
-        let _ = panic::catch_unwind(AssertUnwindSafe(|| {
-            drop(drained);
-            self.invoke_state_callback(CoreState::Faulted, Err(CoreError::InternalPanic));
-        }));
+
+        let _ = panic::catch_unwind(AssertUnwindSafe(|| drop(drained)));
         if !is_worker {
-            let _ = self.join_worker_if_external();
+            let _ = self.wait_and_join_worker_external();
+        }
+
+        let should_notify_fault = {
+            let guard = self
+                .shared
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut guard = self
+                .shared
+                .wait_callbacks_clear_locked(guard, current_tid, !is_worker);
+            let can_emit = (!is_worker || guard.running_cb_tid.is_none())
+                && guard.notified_rank < 3
+                && guard.terminal_cb_tid.is_none();
+            if can_emit {
+                guard.notified_rank = 3;
+                guard.terminal_cb_tid = Some(current_tid);
+                true
+            } else {
+                false
+            }
+        };
+
+        if should_notify_fault {
+            self.shared.dispatch_state_notification(
+                CoreState::Faulted,
+                Err(CoreError::InternalPanic),
+                CallbackSlot::Terminal,
+            );
         }
     }
 
@@ -862,7 +1066,8 @@ impl CoreSession {
         guard.last_error.clone()
     }
 
-    fn join_worker_if_external(&self) -> Result<(), CoreError> {
+    fn wait_and_join_worker_external(&self) -> Result<(), CoreError> {
+        let current_tid = thread::current().id();
         let handle = {
             let mut worker_slot = self
                 .worker
@@ -871,12 +1076,28 @@ impl CoreSession {
             worker_slot.take()
         };
         if let Some(join_handle) = handle {
-            if join_handle.thread().id() == thread::current().id() {
+            if join_handle.thread().id() == current_tid {
                 return Ok(());
             }
+            let _join_guard = JoinCompletionGuard {
+                shared: &self.shared,
+            };
             if join_handle.join().is_err() {
                 return Err(CoreError::InternalPanic);
             }
+            return Ok(());
+        }
+        let mut guard = self
+            .shared
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while guard.worker_lifecycle == WorkerLifecycle::Active {
+            guard = self
+                .shared
+                .cv
+                .wait(guard)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
         Ok(())
     }
@@ -897,11 +1118,6 @@ impl CoreSession {
             .counters
             .queue_peak_depth
             .fetch_max(depth_u32, Ordering::SeqCst);
-    }
-
-    fn invoke_state_callback(&self, new_state: CoreState, status: Result<(), CoreError>) {
-        let _cb_guard = CallbackInProgressGuard::enter(&self.shared.global);
-        self.shared.observer.on_state_changed(new_state, status);
     }
 }
 
@@ -984,19 +1200,20 @@ impl Drop for ThreadBookkeeping {
 
 fn worker_thread_entry(shared: &Arc<SharedRuntime>) {
     let _bookkeeping = ThreadBookkeeping::enter(Arc::clone(shared));
+    let worker_tid = thread::current().id();
     {
         let mut guard = shared
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.worker_thread_id = Some(thread::current().id());
+        guard.worker_thread_id = Some(worker_tid);
     }
 
     let res = panic::catch_unwind(AssertUnwindSafe(|| worker_loop(shared)));
     if res.is_err() {
         let _ = panic::catch_unwind(AssertUnwindSafe(|| {
             shared.counters.panic_faults.fetch_add(1, Ordering::SeqCst);
-            let drained = {
+            let (drained, notify_fault) = {
                 let mut guard = shared
                     .inner
                     .lock()
@@ -1005,14 +1222,53 @@ fn worker_thread_entry(shared: &Arc<SharedRuntime>) {
                 guard.stop_requested = true;
                 "Contained panic in core worker thread".clone_into(&mut guard.last_error);
                 shared.set_state_locked(&mut guard, CoreState::Faulted);
-                drain_queue_locked(&mut guard, shared)
+                let drained = drain_queue_locked(&mut guard, shared);
+                let notify_fault = if guard.running_cb_tid.is_none()
+                    && guard.terminal_cb_tid.is_none()
+                    && guard.notified_rank < 3
+                {
+                    guard.notified_rank = 3;
+                    guard.terminal_cb_tid = Some(worker_tid);
+                    true
+                } else {
+                    false
+                };
+                (drained, notify_fault)
             };
             drop(drained);
-            let _cb_guard = CallbackInProgressGuard::enter(&shared.global);
-            shared
-                .observer
-                .on_state_changed(CoreState::Faulted, Err(CoreError::InternalPanic));
+            if notify_fault {
+                shared.dispatch_state_notification(
+                    CoreState::Faulted,
+                    Err(CoreError::InternalPanic),
+                    CallbackSlot::Terminal,
+                );
+            }
         }));
+    } else {
+        let (drained, notify_stopped) = {
+            let mut guard = shared
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let drained = drain_queue_locked(&mut guard, shared);
+            let notify_stopped = if !guard.fault_triggered
+                && guard.running_cb_tid.is_none()
+                && guard.terminal_cb_tid.is_none()
+                && guard.notified_rank < 2
+            {
+                guard.notified_rank = 2;
+                guard.terminal_cb_tid = Some(worker_tid);
+                shared.set_state_locked(&mut guard, CoreState::Stopped);
+                true
+            } else {
+                false
+            };
+            (drained, notify_stopped)
+        };
+        drop(drained);
+        if notify_stopped {
+            shared.dispatch_state_notification(CoreState::Stopped, Ok(()), CallbackSlot::Terminal);
+        }
     }
 }
 
@@ -1097,6 +1353,10 @@ fn worker_loop(shared: &Arc<SharedRuntime>) {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::RwLock;
+
+    // Serialize only tests asserting process-wide counters against other session-creating tests.
+    static SESSION_TEST_RWLOCK: RwLock<()> = RwLock::new(());
 
     struct NoopObserver;
     impl CoreObserver for NoopObserver {
@@ -1134,6 +1394,10 @@ mod tests {
             }
             fn on_state_changed(&self, _new_state: CoreState, _status: Result<(), CoreError>) {}
         }
+
+        let _exclusive = SESSION_TEST_RWLOCK
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let before = global_resource_snapshot();
         let releases = Arc::new(AtomicUsize::new(0));
@@ -1202,6 +1466,9 @@ mod tests {
 
     #[test]
     fn validation_rejects_invalid_inputs_and_preserves_unaccepted_owned_buffer() {
+        let _shared = SESSION_TEST_RWLOCK
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let releases = Arc::new(AtomicUsize::new(0));
         let session =
             CoreSession::create(CoreConfig::default(), Arc::new(NoopObserver)).expect("create");
@@ -1231,6 +1498,9 @@ mod tests {
 
     #[test]
     fn memory_preallocation_is_bounded_for_max_config() {
+        let _shared = SESSION_TEST_RWLOCK
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let session = CoreSession::create(
             CoreConfig {
                 queue_capacity: MAX_QUEUE_CAPACITY,
@@ -1262,6 +1532,10 @@ mod tests {
             }
         }
 
+        let _shared = SESSION_TEST_RWLOCK
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let releases = Arc::new(AtomicUsize::new(0));
         let session = CoreSession::create(CoreConfig::default(), Arc::new(PanickingFaultObserver))
             .expect("create");
@@ -1290,5 +1564,241 @@ mod tests {
         session.mark_faulted("idempotent second fault");
         drop(session);
         assert_eq!(releases.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn concurrent_external_stops_wait_for_worker_and_emit_single_stopped() {
+        use std::sync::Barrier;
+        use std::time::Duration;
+
+        struct GateObserver {
+            entered: Barrier,
+            release: Barrier,
+            states: Mutex<Vec<CoreState>>,
+        }
+        impl CoreObserver for GateObserver {
+            fn on_output_packet(&self, _meta: &EncodedFrameMeta, _payload: Vec<u8>) {
+                self.entered.wait();
+                self.release.wait();
+            }
+            fn on_state_changed(&self, new_state: CoreState, _status: Result<(), CoreError>) {
+                self.states
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(new_state);
+            }
+        }
+
+        let _shared = SESSION_TEST_RWLOCK
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let observer = Arc::new(GateObserver {
+            entered: Barrier::new(2),
+            release: Barrier::new(2),
+            states: Mutex::new(Vec::new()),
+        });
+        let session =
+            Arc::new(CoreSession::create(CoreConfig::default(), observer.clone()).expect("create"));
+        session.start().expect("start");
+
+        let meta = EncodedFrameMeta {
+            session_id: 101,
+            display_id: 0,
+            codec: EncodedCodec::H264AnnexB,
+            flags: 1,
+            frame_id: 1,
+            gop_id: 1,
+            capture_ts_us: 100,
+            encode_done_ts_us: 120,
+            submit_qpc_ticks: 10,
+        };
+        session
+            .submit_borrowed(&meta, &[1, 2, 3, 4])
+            .expect("submit");
+        observer.entered.wait();
+
+        let stop_start = Arc::new(Barrier::new(3));
+        let completed_stops = Arc::new(AtomicUsize::new(0));
+        let mut stop_threads = Vec::new();
+        for _ in 0..2 {
+            let s = Arc::clone(&session);
+            let b = Arc::clone(&stop_start);
+            let done = Arc::clone(&completed_stops);
+            stop_threads.push(thread::spawn(move || {
+                b.wait();
+                s.stop().expect("stop");
+                done.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+
+        stop_start.wait();
+        thread::sleep(Duration::from_millis(25));
+        assert_eq!(
+            completed_stops.load(Ordering::SeqCst),
+            0,
+            "neither concurrent stop may return while worker callback is still active"
+        );
+
+        observer.release.wait();
+        for t in stop_threads {
+            t.join().expect("join stop thread");
+        }
+        assert_eq!(completed_stops.load(Ordering::SeqCst), 2);
+        let recorded = observer
+            .states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(recorded, vec![CoreState::Running, CoreState::Stopped]);
+    }
+
+    #[test]
+    fn start_racing_stop_maintains_monotonic_state_order() {
+        use std::sync::Barrier;
+        use std::time::Duration;
+
+        struct RunningGateObserver {
+            running_entered: Barrier,
+            running_release: Barrier,
+            states: Mutex<Vec<CoreState>>,
+        }
+        impl CoreObserver for RunningGateObserver {
+            fn on_output_packet(&self, _meta: &EncodedFrameMeta, _payload: Vec<u8>) {}
+            fn on_state_changed(&self, new_state: CoreState, _status: Result<(), CoreError>) {
+                self.states
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(new_state);
+                if new_state == CoreState::Running {
+                    self.running_entered.wait();
+                    self.running_release.wait();
+                }
+            }
+        }
+
+        let _shared = SESSION_TEST_RWLOCK
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let observer = Arc::new(RunningGateObserver {
+            running_entered: Barrier::new(2),
+            running_release: Barrier::new(2),
+            states: Mutex::new(Vec::new()),
+        });
+        let session =
+            Arc::new(CoreSession::create(CoreConfig::default(), observer.clone()).expect("create"));
+
+        let s_start = Arc::clone(&session);
+        let start_thread = thread::spawn(move || {
+            s_start.start().expect("start");
+        });
+
+        observer.running_entered.wait();
+        let stop_done = Arc::new(AtomicUsize::new(0));
+        let s_stop = Arc::clone(&session);
+        let done_flag = Arc::clone(&stop_done);
+        let stop_thread = thread::spawn(move || {
+            s_stop.stop().expect("stop");
+            done_flag.fetch_add(1, Ordering::SeqCst);
+        });
+
+        thread::sleep(Duration::from_millis(25));
+        assert_eq!(
+            stop_done.load(Ordering::SeqCst),
+            0,
+            "stop must not emit Stopped or return while Running callback is executing"
+        );
+
+        observer.running_release.wait();
+        start_thread.join().expect("start join");
+        stop_thread.join().expect("stop join");
+        assert_eq!(stop_done.load(Ordering::SeqCst), 1);
+
+        let recorded = observer
+            .states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(recorded, vec![CoreState::Running, CoreState::Stopped]);
+    }
+
+    #[test]
+    fn fault_racing_stop_emits_faulted_without_downgrade_to_stopped() {
+        use std::sync::Barrier;
+
+        struct FaultStopObserver {
+            entered: Barrier,
+            release: Barrier,
+            states: Mutex<Vec<CoreState>>,
+        }
+        impl CoreObserver for FaultStopObserver {
+            fn on_output_packet(&self, _meta: &EncodedFrameMeta, _payload: Vec<u8>) {
+                self.entered.wait();
+                self.release.wait();
+            }
+            fn on_state_changed(&self, new_state: CoreState, _status: Result<(), CoreError>) {
+                self.states
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(new_state);
+            }
+        }
+
+        let _shared = SESSION_TEST_RWLOCK
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let observer = Arc::new(FaultStopObserver {
+            entered: Barrier::new(2),
+            release: Barrier::new(2),
+            states: Mutex::new(Vec::new()),
+        });
+        let session =
+            Arc::new(CoreSession::create(CoreConfig::default(), observer.clone()).expect("create"));
+        session.start().expect("start");
+        let meta = EncodedFrameMeta {
+            session_id: 202,
+            display_id: 0,
+            codec: EncodedCodec::H264AnnexB,
+            flags: 1,
+            frame_id: 1,
+            gop_id: 1,
+            capture_ts_us: 100,
+            encode_done_ts_us: 120,
+            submit_qpc_ticks: 10,
+        };
+        session.submit_borrowed(&meta, &[9, 8, 7]).expect("submit");
+        observer.entered.wait();
+
+        let s1 = Arc::clone(&session);
+        let t_fault = thread::spawn(move || {
+            s1.mark_faulted("concurrent fault");
+        });
+        while session.metrics().state != CoreState::Faulted as u32 {
+            thread::yield_now();
+        }
+
+        let stop_gate = Arc::new(Barrier::new(2));
+        let s2 = Arc::clone(&session);
+        let g2 = Arc::clone(&stop_gate);
+        let t_stop = thread::spawn(move || {
+            g2.wait();
+            let _ = s2.stop();
+        });
+
+        stop_gate.wait();
+        thread::sleep(std::time::Duration::from_millis(15));
+        observer.release.wait();
+        t_fault.join().expect("fault join");
+        t_stop.join().expect("stop join");
+
+        assert_eq!(session.metrics().state, CoreState::Faulted as u32);
+        let recorded = observer
+            .states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(recorded, vec![CoreState::Running, CoreState::Faulted]);
     }
 }

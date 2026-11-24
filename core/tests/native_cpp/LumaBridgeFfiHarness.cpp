@@ -756,6 +756,258 @@ bool TestLifecycle100CyclesAndProcessTelemetry() {
     return true;
 }
 
+bool TestConcurrentExternalStopsWaitForWorkerAndSingleStopped() {
+    LbGlobalResourceCounters before{};
+    before.abi = MakeHeader<LbGlobalResourceCounters>();
+    REQUIRE_STATUS(lb_core_get_global_resource_counters(&before), LB_STATUS_OK, "baseline counters");
+
+    struct ConcurrentStopCtx {
+        std::mutex mu;
+        std::condition_variable cv_entered;
+        std::condition_variable cv_release;
+        bool cb_entered{false};
+        bool cb_release{false};
+        std::atomic<uint64_t> stopped_count{0};
+        std::vector<uint32_t> states;
+        std::mutex state_mu;
+    } ctx{};
+
+    const auto on_out = [](void* u, const LbEncodedFrameMeta* /*m*/, LbOwnedBuffer buf) noexcept {
+        auto* c = static_cast<ConcurrentStopCtx*>(u);
+        {
+            std::unique_lock<std::mutex> lock(c->mu);
+            c->cb_entered = true;
+            c->cv_entered.notify_all();
+            c->cv_release.wait(lock, [&]() { return c->cb_release; });
+        }
+        if (buf.release != nullptr) {
+            (void)lb_core_release_buffer(&buf);
+        }
+    };
+    const auto on_state = [](void* u, uint32_t state, uint32_t /*status*/) noexcept {
+        auto* c = static_cast<ConcurrentStopCtx*>(u);
+        {
+            std::lock_guard<std::mutex> lock(c->state_mu);
+            c->states.push_back(state);
+        }
+        if (state == LB_CORE_STATE_STOPPED) {
+            c->stopped_count.fetch_add(1, std::memory_order_seq_cst);
+        }
+    };
+
+    LbCoreConfig cfg{};
+    cfg.abi = MakeHeader<LbCoreConfig>();
+    cfg.queue_capacity = 4;
+    cfg.expected_frame_bytes_hint = 512;
+    cfg.on_output_packet = on_out;
+    cfg.on_state_change = on_state;
+    cfg.callback_user_ctx = &ctx;
+
+    LbCoreHandle* handle = nullptr;
+    REQUIRE_STATUS(lb_core_create(&cfg, &handle), LB_STATUS_OK, "create");
+    REQUIRE_STATUS(lb_core_start(handle), LB_STATUS_OK, "start");
+
+    const uint8_t payload[64]{1, 2, 3, 4};
+    const LbEncodedFrameMeta meta = MakeValidMeta(1);
+    REQUIRE_STATUS(lb_core_submit_encoded_frame(handle, &meta, payload, sizeof(payload)), LB_STATUS_OK, "submit");
+
+    {
+        std::unique_lock<std::mutex> lock(ctx.mu);
+        REQUIRE_TRUE(ctx.cv_entered.wait_for(lock, std::chrono::seconds(5), [&]() { return ctx.cb_entered; }),
+                     "worker entered output callback");
+    }
+
+    std::atomic<int> ready{0};
+    std::atomic<int> finished{0};
+    std::atomic<uint32_t> rc1{999U};
+    std::atomic<uint32_t> rc2{999U};
+    std::thread t1([&]() {
+        ready.fetch_add(1, std::memory_order_seq_cst);
+        while (ready.load(std::memory_order_seq_cst) < 2) {
+            std::this_thread::yield();
+        }
+        rc1.store(static_cast<uint32_t>(lb_core_stop(handle)), std::memory_order_seq_cst);
+        finished.fetch_add(1, std::memory_order_seq_cst);
+    });
+    std::thread t2([&]() {
+        ready.fetch_add(1, std::memory_order_seq_cst);
+        while (ready.load(std::memory_order_seq_cst) < 2) {
+            std::this_thread::yield();
+        }
+        rc2.store(static_cast<uint32_t>(lb_core_stop(handle)), std::memory_order_seq_cst);
+        finished.fetch_add(1, std::memory_order_seq_cst);
+    });
+
+    while (ready.load(std::memory_order_seq_cst) < 2) {
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    REQUIRE_TRUE(finished.load(std::memory_order_seq_cst) == 0,
+                 "neither concurrent lb_core_stop may return before worker callback finishes");
+
+    {
+        std::lock_guard<std::mutex> lock(ctx.mu);
+        ctx.cb_release = true;
+    }
+    ctx.cv_release.notify_all();
+    t1.join();
+    t2.join();
+
+    REQUIRE_TRUE(finished.load(std::memory_order_seq_cst) == 2, "both stops finished");
+    REQUIRE_TRUE(rc1.load(std::memory_order_seq_cst) == static_cast<uint32_t>(LB_STATUS_OK), "stop 1 ok");
+    REQUIRE_TRUE(rc2.load(std::memory_order_seq_cst) == static_cast<uint32_t>(LB_STATUS_OK), "stop 2 ok");
+    REQUIRE_TRUE(ctx.stopped_count.load(std::memory_order_seq_cst) == 1ULL, "single Stopped callback");
+    {
+        std::lock_guard<std::mutex> lock(ctx.state_mu);
+        REQUIRE_TRUE(ctx.states.size() == 2U && ctx.states[0] == LB_CORE_STATE_RUNNING &&
+                         ctx.states[1] == LB_CORE_STATE_STOPPED,
+                     "monotonic [Running, Stopped] transition");
+    }
+
+    REQUIRE_STATUS(lb_core_destroy(handle), LB_STATUS_OK, "destroy");
+    REQUIRE_TRUE(CheckGlobalCountersBalanced(before, "after TestConcurrentExternalStopsWaitForWorkerAndSingleStopped"),
+                 "counters balanced");
+    std::printf("[PASS] TestConcurrentExternalStopsWaitForWorkerAndSingleStopped\n");
+    return true;
+}
+
+bool TestAbruptDisconnectRacingConcurrentSubmitters() {
+    LbGlobalResourceCounters before{};
+    before.abi = MakeHeader<LbGlobalResourceCounters>();
+    REQUIRE_STATUS(lb_core_get_global_resource_counters(&before), LB_STATUS_OK, "baseline counters");
+
+    NativeHeapTracker tracker{};
+    LbCoreConfig cfg{};
+    cfg.abi = MakeHeader<LbCoreConfig>();
+    cfg.queue_capacity = 8;
+    cfg.expected_frame_bytes_hint = 1024;
+    cfg.on_output_packet = [](void* /*u*/, const LbEncodedFrameMeta* /*m*/, LbOwnedBuffer buf) noexcept {
+        if (buf.release != nullptr) {
+            (void)lb_core_release_buffer(&buf);
+        }
+    };
+
+    LbCoreHandle* handle = nullptr;
+    REQUIRE_STATUS(lb_core_create(&cfg, &handle), LB_STATUS_OK, "create");
+    REQUIRE_STATUS(lb_core_start(handle), LB_STATUS_OK, "start");
+
+    std::atomic<bool> stop_flag{false};
+    std::atomic<uint64_t> accepted{0};
+    std::atomic<uint64_t> unexpected_failures{0};
+
+    auto producer = [&](uint32_t base_id) {
+        for (uint32_t i = 0; i < 120 && !stop_flag.load(std::memory_order_relaxed); ++i) {
+            LbOwnedBuffer owned = MakeTrackedNativeBuffer(tracker, 512, static_cast<uint8_t>(i & 0xFFU));
+            const LbEncodedFrameMeta meta = MakeValidMeta(base_id + i + 1U);
+            const LbStatus st = lb_core_submit_owned_encoded_frame(handle, &meta, &owned);
+            if (st == LB_STATUS_OK) {
+                if (owned.data != nullptr || owned.release != nullptr) {
+                    unexpected_failures.fetch_add(1, std::memory_order_seq_cst);
+                }
+                accepted.fetch_add(1, std::memory_order_seq_cst);
+            } else if (st == LB_STATUS_BACKPRESSURE || st == LB_STATUS_INVALID_STATE) {
+                ReleaseTrackedManualFailure(owned);
+            } else {
+                unexpected_failures.fetch_add(1, std::memory_order_seq_cst);
+                ReleaseTrackedManualFailure(owned);
+            }
+        }
+    };
+
+    std::thread p1(producer, 1000U);
+    std::thread p2(producer, 2000U);
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    REQUIRE_STATUS(lb_core_simulate_disconnect(handle), LB_STATUS_OK, "simulate disconnect mid-stream");
+    stop_flag.store(true, std::memory_order_relaxed);
+    p1.join();
+    p2.join();
+
+    REQUIRE_STATUS(lb_core_stop(handle), LB_STATUS_OK, "stop after disconnect");
+    REQUIRE_STATUS(lb_core_destroy(handle), LB_STATUS_OK, "destroy after disconnect");
+
+    REQUIRE_TRUE(unexpected_failures.load(std::memory_order_seq_cst) == 0ULL, "no unexpected submit status/contract violations");
+    REQUIRE_TRUE(tracker.allocated.load(std::memory_order_seq_cst) == tracker.released.load(std::memory_order_seq_cst),
+                 "every tracked native buffer freed once across concurrent disconnect");
+    REQUIRE_TRUE(tracker.invalid_releases.load(std::memory_order_seq_cst) == 0ULL, "no invalid native releases");
+    REQUIRE_TRUE(CheckGlobalCountersBalanced(before, "after TestAbruptDisconnectRacingConcurrentSubmitters"),
+                 "counters balanced");
+    std::printf("[PASS] TestAbruptDisconnectRacingConcurrentSubmitters (accepted=%llu, released=%llu)\n",
+                static_cast<unsigned long long>(accepted.load(std::memory_order_seq_cst)),
+                static_cast<unsigned long long>(tracker.released.load(std::memory_order_seq_cst)));
+    return true;
+}
+
+bool TestDeferredRustBufferReleaseAfterDestroy() {
+    LbGlobalResourceCounters before{};
+    before.abi = MakeHeader<LbGlobalResourceCounters>();
+    REQUIRE_STATUS(lb_core_get_global_resource_counters(&before), LB_STATUS_OK, "baseline counters");
+
+    struct DeferredCtx {
+        std::mutex mu;
+        std::condition_variable cv;
+        bool has_buf{false};
+        LbOwnedBuffer retained{};
+    } ctx{};
+
+    const auto on_out = [](void* u, const LbEncodedFrameMeta* /*m*/, LbOwnedBuffer buf) noexcept {
+        auto* c = static_cast<DeferredCtx*>(u);
+        std::lock_guard<std::mutex> lock(c->mu);
+        c->retained = buf;
+        c->has_buf = true;
+        c->cv.notify_all();
+    };
+
+    LbCoreConfig cfg{};
+    cfg.abi = MakeHeader<LbCoreConfig>();
+    cfg.queue_capacity = 4;
+    cfg.expected_frame_bytes_hint = 1024;
+    cfg.on_output_packet = on_out;
+    cfg.callback_user_ctx = &ctx;
+
+    LbCoreHandle* handle = nullptr;
+    REQUIRE_STATUS(lb_core_create(&cfg, &handle), LB_STATUS_OK, "create");
+    REQUIRE_STATUS(lb_core_start(handle), LB_STATUS_OK, "start");
+
+    std::vector<uint8_t> payload(256, 0x5CU);
+    payload[0] = 0xDE;
+    payload[255] = 0xAD;
+    const LbEncodedFrameMeta meta = MakeValidMeta(1);
+    REQUIRE_STATUS(lb_core_submit_encoded_frame(handle, &meta, payload.data(), payload.size()),
+                   LB_STATUS_OK, "submit for deferred post-destroy release");
+
+    {
+        std::unique_lock<std::mutex> lock(ctx.mu);
+        REQUIRE_TRUE(ctx.cv.wait_for(lock, std::chrono::seconds(5), [&]() { return ctx.has_buf; }),
+                     "received output buffer");
+    }
+
+    REQUIRE_STATUS(lb_core_stop(handle), LB_STATUS_OK, "stop before destroy");
+    REQUIRE_STATUS(lb_core_destroy(handle), LB_STATUS_OK, "destroy while Rust output buffer still retained by caller");
+    handle = nullptr;
+
+    // Verify instance teardown already ran, Rust buffer payload is STILL intact, and DLL release succeeds on another thread!
+    LbGlobalResourceCounters mid{};
+    mid.abi = MakeHeader<LbGlobalResourceCounters>();
+    REQUIRE_STATUS(lb_core_get_global_resource_counters(&mid), LB_STATUS_OK, "mid global counters");
+    REQUIRE_TRUE(mid.active_instances == before.active_instances, "instance destroyed while buffer still held");
+    REQUIRE_TRUE((mid.rust_buffers_allocated - before.rust_buffers_allocated) == 1ULL, "1 Rust buffer allocated");
+    REQUIRE_TRUE((mid.rust_buffers_released - before.rust_buffers_released) == 0ULL, "0 Rust buffers released yet");
+    REQUIRE_TRUE(ctx.retained.data != nullptr && ctx.retained.len == 256 &&
+                     ctx.retained.data[0] == 0xDE && ctx.retained.data[255] == 0xAD,
+                 "deferred Rust buffer remains valid & readable after lb_core_destroy while DLL is loaded");
+
+    LbStatus release_rc = LB_STATUS_INTERNAL_PANIC;
+    std::thread releaser([&]() { release_rc = lb_core_release_buffer(&ctx.retained); });
+    releaser.join();
+    REQUIRE_STATUS(release_rc, LB_STATUS_OK, "cross-thread post-destroy lb_core_release_buffer succeeded");
+    REQUIRE_TRUE(ctx.retained.data == nullptr && ctx.retained.release == nullptr, "released descriptor zeroed");
+    REQUIRE_TRUE(CheckGlobalCountersBalanced(before, "after TestDeferredRustBufferReleaseAfterDestroy"),
+                 "counters balanced after post-destroy release");
+
+    std::printf("[PASS] TestDeferredRustBufferReleaseAfterDestroy\n");
+    return true;
+}
+
 bool TestPanicContainmentAndDefaultDllIsolation(const std::wstring& faultDllPath) {
     // 1. Default production DLL MUST NOT export lb_core_poc_trigger_panic.
     const HMODULE prodMod = GetModuleHandleW(L"lumabridge_ffi.dll");
@@ -1001,6 +1253,9 @@ int wmain(int argc, wchar_t* argv[]) {
     if (!TestBackpressureAndQueueCapacity()) return 1;
     if (!TestConcurrentSubmissionAndReentrantStop()) return 1;
     if (!TestAbruptDisconnectDrainsOwnedBuffers()) return 1;
+    if (!TestConcurrentExternalStopsWaitForWorkerAndSingleStopped()) return 1;
+    if (!TestAbruptDisconnectRacingConcurrentSubmitters()) return 1;
+    if (!TestDeferredRustBufferReleaseAfterDestroy()) return 1;
     if (!TestLifecycle100CyclesAndProcessTelemetry()) return 1;
 
     if (!faultDllPath.empty()) {
