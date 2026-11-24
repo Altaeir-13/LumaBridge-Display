@@ -1,6 +1,6 @@
 # Roadmap Universal Incremental (`M0–M6`) — LumaBridge Display
 
-> **Nota de governança (`M0.6`):** A validação funcional real da `M0` com o driver carregado em `WUDFHost.exe` (`Benchmark30s` 30 s e `ProlongedStability` 180 s no commit funcional `6b297856`) foi **aprovada** e a pilha Windows + documentação universal encontra-se **integrada em `dev` remoto (`origin/dev`) via PR #37 e Merge commit `23a28046`** (árvore `7f1685f7`, preservando `6b297856` e `a9ad7e43` na ancestralidade; `M0_INTEGRATED_IN_DEV = True`). A `M0` permanece formalmente aberta até o cumprimento integral dos critérios objetivos verificáveis: integração por Merge commit do PR de governança `#38` em `dev`, aprovação dos workflows pós-merge em `dev` (`Linux Repository Hygiene & Governance` e `Windows Non-Admin CI`), reconciliação das pendências (`PR #36`, `Issue #33` aberta como dívida técnica e `Issue #34` aberta com escopo residual não bloqueante) e verificação da proteção de `refs/heads/dev`; a `M1` é iniciada apenas após esse encerramento. Este documento não adota estimativas arbitrárias de tempo ou percentuais.
+> **Nota de governança (`M1.1`):** A `Milestone M0` encontra-se **formalmente encerrada** em `origin/dev` (`440ca3ab8889e4985d9a15862301f45a6cea762a`, integrando os PRs `#37` e `#38`, com Apache-2.0 para código próprio, DCO 1.1 prospectivo, CI Windows/Linux verde e proteção ativa de `refs/heads/dev` via Ruleset `28020487`, preservando `6b297856` e `23a28046` na ancestralidade). Com o encerramento formal da `M0`, foi autorizada a abertura da `M1` exclusivamente pela etapa **`M1.1` (PoC FFI Rust ↔ C++ MSVC 14.51, C ABI e portabilidade Android/UniFFI)** registrada em [m1-ffi-poc-report.md](../architecture/m1-ffi-poc-report.md). A **`M1` permanece não concluída (`M1_COMPLETE = False`)** enquanto protocolo `LBWP v1`, segurança (`SPAKE2`/`mTLS`) e transporte (`QUIC`/`TCP`) não forem implementados e qualificados. Este documento não adota estimativas arbitrárias de tempo ou percentuais.
 
 ---
 
@@ -8,8 +8,8 @@
 
 Embora a ordem de integração siga a dependência lógica `M0 → M1 → M2 → M3 → M4 → M5 → M6`, várias frentes podem avançar em **trilhas paralelas** sem bloquear umas às outras:
 
-- **Trilha A (Encerramento `M0`):** integração técnica concluída em `origin/dev` (`23a28046`); governança (`Apache-2.0` para código próprio, `NOTICE`, `THIRD_PARTY_NOTICES.md`, `CONTRIBUTING.md` com `DCO 1.1` declarativo prospectivo) e CI inicial em `.github/workflows/` encaminhados via PR `#38` para cumprimento dos critérios objetivos de encerramento e proteção de `dev`.
-- **Trilha B (Núcleo Multiplataforma & CI):** PoC Rust ↔ C++ Windows (`ADR-0004`), implementação de `lumabridge-protocol`, `lumabridge-security`, `lumabridge-transport` (benchmark QUIC vs TCP/TLS 1.3), `lumabridge-core` e pipelines CI (Windows + Linux). *(Pode iniciar em paralelo à Trilha A sobre frames sintéticos.)*
+- **Trilha A (Encerramento `M0`):** concluída e formalmente encerrada em `origin/dev` (`440ca3ab` via PRs `#37` e `#38`, Ruleset `28020487`).
+- **Trilha B (Núcleo Multiplataforma & CI):** `M1.1` (PoC Rust ↔ C++ MSVC 14.51, C ABI e portabilidade Android ARM64/UniFFI) executada em [m1-ffi-poc-report.md](../architecture/m1-ffi-poc-report.md); módulos restantes da `M1` (`lumabridge-protocol`, `lumabridge-security`, `lumabridge-transport` com benchmark QUIC vs TCP/TLS 1.3 e `lumabridge-core` completo) aguardam revisão e promoção da `ADR-0004`.
 - **Trilha C (Receptor Linux Wayland/X11):** protótipo e construção do receptor Linux consumindo stream sintético do núcleo (`M1`) antes mesmo de receber quadros reais do driver Windows (`M2`).
 - **Trilha D (Expansão Multi-GPU, Android e Emissores):** abstrações `IVideoEncoder`/Multi-GPU Windows e app receptor Android podem ser prototipados assim que `M1` congelar o protocolo v1.
 
@@ -48,9 +48,9 @@ O marco `M2` será avaliado por métricas reproduzíveis coletadas sem registro 
 
 ### `M0` — Preservação, Validação Real Windows e Consolidação de Governança
 
-- **Estado atual (`M0.6`):** **Funcionalmente aprovada** (`6b297856`) e **integrada em `dev` remoto (`M0_INTEGRATED_IN_DEV = True`)** via PR #37 / Merge commit `23a28046` (árvore `7f1685f7`, head da consolidação `a9ad7e43`). A `M0` permanece formalmente aberta até o cumprimento verificável de todos os critérios objetivos vinculados ao PR de governança `#38`: merge em `dev`, aprovação dos checks pós-merge em `dev`, reconciliação de `PR #36` / `Issue #33` / `Issue #34` e proteção de `refs/heads/dev`, precedendo o início da `M1`.
+- **Estado atual (`M0` encerrada):** **Formalmente encerrada** (`440ca3ab8889e4985d9a15862301f45a6cea762a`, integrando PR `#37` em `23a28046` e PR `#38` em `440ca3ab`, preservando o commit funcional `6b297856` e a árvore qualificada `7f1685f7`, com workflows Windows/Linux aprovados, pendências reconciliadas e Ruleset `28020487` ativo em `dev`).
 - **Objetivo:** Formalizar a documentação da visão universal, fechar a validação funcional ao vivo no Windows 11, consolidar para `dev` preservando a ancestralidade dos commits validados e estabelecer a governança open source (`Apache-2.0`, avisos de terceiros, `DCO 1.1` e CI inicial não administrativo).
-- **Dependências:** Merge do PR #37 concluído (`23a28046`); integração e verificação pós-merge do PR `#38` em `dev`, reconciliação das pendências anteriores e proteção de `refs/heads/dev`.
+- **Dependências:** Atendidas (assinatura EV/WHQL de produção permanece em `M6`).
 - **Artefatos produzidos:**
   - Documentação da arquitetura universal, ADRs `0003–0005`, protocolo rascunho `LBWP v1`, roadmap, plano de migração, registro de riscos e revisão de licenças;
   - Relatórios reais ao vivo aprovados (`Benchmark30s` 30 s e `ProlongedStability` 180 s com `D3d11DxgiVSync`, transporte GPU puro e rollback verificado no commit `6b297856`);
@@ -65,12 +65,14 @@ O marco `M2` será avaliado por métricas reproduzíveis coletadas sem registro 
   - Nenhuma regressão no driver `LumaBridgeIddDriver` (`EnableVirtualMonitor=0` por padrão);
   - Governança `Apache-2.0` + `DCO 1.1` + CI inicial convencional vinculados ao PR `#38`, condicionados à aprovação pós-merge em `dev` e proteção configurada.
 - **Testes necessários:** Categorias **1, 2, 3, 4 (obrigatório)** e **7 (local 30 s + estabilidade prolongada 180 s)** na trilha especializada; subconjunto não administrativo documentado em [`ci-and-test-matrix.md`](../setup/ci-and-test-matrix.md) na trilha convencional do CI.
-- **Condições para avançar ao próximo marco (`M1` / `M2`):**
-  - Integração técnica em `dev` concluída (`23a28046`); conclusão verificável do encerramento formal da `M0` via PR `#38` (merge em `dev`, checks pós-merge em `dev` aprovados, pendências reconciliadas e proteção de `dev` confirmada) como pré-requisito para a abertura autorizada da `M1`.
+- **Condições para avançar ao próximo marco (`M1`):**
+  - Requisitos da `M0` e do encerramento formal cumpridos (`440ca3ab`, Ruleset `28020487`); abertura da `M1` autorizada inicialmente pela etapa `M1.1`.
 
 ---
 
 ### `M1` — Contratos Multiplataforma, Núcleo Compartilhado e Transporte Validado
+
+- **Estado atual (`M1` iniciada via `M1.1`):** **Em andamento (`M1_STARTED = True`, `M1_COMPLETE = False`)**. A subetapa **`M1.1`** concluiu os 5 critérios técnicos da PoC FFI (`ADR-0004`) registrados em [m1-ffi-poc-report.md](../architecture/m1-ffi-poc-report.md) (`MSVC 14.51`, `p99 = 51,0 µs` / pareado `35,5 µs`, `120` ciclos sem vazamento, contenção `catch_unwind` e Android ARM64/UniFFI Kotlin); `ADR-0004` e `ADR-0005` permanecem em `Proposed` aguardando revisão. Restam implementação e validação de `LBWP v1`, segurança (`SPAKE2`/`mTLS`) e transporte (`QUIC`/`TCP`) antes de concluir a `M1`.
 
 - **Objetivo:** Provar a fronteira FFI (`ADR-0004`), validar por benchmark comparativo o transporte (`ADR-0005`), implementar os módulos `lumabridge-protocol`, `lumabridge-security`, `lumabridge-transport` e `lumabridge-core` com contratos `display`/`media`/`input`, e estabelecer testes automatizados multiplataforma.
 - **Dependências:** Documentação arquitetural `M0` aprovada; definição da licença oficial do projeto. *(Independe de execução administrativa de driver Windows.)*
