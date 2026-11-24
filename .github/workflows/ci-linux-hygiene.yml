@@ -1,0 +1,55 @@
+name: Linux Repository Hygiene & Governance
+
+on:
+  pull_request:
+    branches: [dev]
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repository-hygiene:
+    name: Repository Hygiene, Licensing & Prospective DCO
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Verify Python and PyYAML availability
+        shell: bash
+        run: |
+          python3 --version
+          python3 -c "import yaml; print('PyYAML:', yaml.__version__)"
+
+      - name: Run hygiene checker positive and negative self-tests
+        shell: bash
+        run: python3 -B scripts/ci/test_repo_hygiene.py
+
+      - name: Run repository hygiene and prospective DCO validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARGS=(--repo-root . --summary-path "$GITHUB_STEP_SUMMARY" --json-path "${RUNNER_TEMP}/ci-linux-hygiene.json")
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            ARGS+=(--dco-base "${{ github.event.pull_request.base.sha }}" --dco-head "${{ github.event.pull_request.head.sha }}" --dco-cutoff "23a2804606b02a85d915a55b75663b67bd5af58b")
+          fi
+          python3 -B scripts/ci/check_repo_hygiene.py "${ARGS[@]}"
+
+      - name: Upload Linux hygiene summary
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-hygiene-summary
+          path: ${{ runner.temp }}/ci-linux-hygiene.json
+          if-no-files-found: ignore
+          retention-days: 14
