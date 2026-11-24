@@ -3,17 +3,191 @@
 #include "NvencH264Encoder.h"
 #include "VirtualDisplayStimulus.h"
 
+#include <objbase.h>
 #include <psapi.h>
 
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cwchar>
+#include <deque>
 #include <fstream>
+#include <mutex>
 #include <string>
+#include <thread>
 
 namespace {
+
+class AsyncH264ValidationWorker final
+{
+public:
+    static constexpr size_t kMaxQueueCapacity = 256U;
+
+    explicit AsyncH264ValidationWorker(
+        lumabridge::host::H264StreamValidationSession& session
+        ) noexcept
+        : m_session(session)
+    {
+    }
+
+    ~AsyncH264ValidationWorker()
+    {
+        StopAndDrain();
+    }
+
+    AsyncH264ValidationWorker(const AsyncH264ValidationWorker&) = delete;
+    AsyncH264ValidationWorker& operator=(const AsyncH264ValidationWorker&) = delete;
+
+    bool Start(
+        uint32_t prewarmWidth,
+        uint32_t prewarmHeight,
+        uint32_t prewarmFps
+        ) noexcept
+    {
+        StopAndDrain();
+        m_stopRequested = false;
+        m_ready = false;
+        m_started = true;
+        try
+        {
+            m_worker = std::thread(
+                &AsyncH264ValidationWorker::WorkerProc,
+                this,
+                prewarmWidth,
+                prewarmHeight,
+                prewarmFps);
+        }
+        catch (...)
+        {
+            m_started = false;
+            return false;
+        }
+
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_readyCv.wait(lock, [this]() { return m_ready; });
+        return true;
+    }
+
+    void Enqueue(lumabridge::host::EncodedFramePacket&& packet) noexcept
+    {
+        if (!m_started)
+        {
+            m_session.SubmitPacket(packet);
+            return;
+        }
+
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_notFullCv.wait(lock, [this]() {
+            return m_stopRequested || m_queue.size() < kMaxQueueCapacity;
+        });
+        if (!m_stopRequested)
+        {
+            try
+            {
+                m_queue.push_back(std::move(packet));
+            }
+            catch (...)
+            {
+            }
+        }
+        lock.unlock();
+        m_notEmptyCv.notify_one();
+    }
+
+    void StopAndDrain() noexcept
+    {
+        if (!m_started)
+        {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_stopRequested = true;
+        }
+        m_notEmptyCv.notify_all();
+        m_notFullCv.notify_all();
+        if (m_worker.joinable())
+        {
+            m_worker.join();
+        }
+        m_started = false;
+    }
+
+private:
+    void WorkerProc(
+        uint32_t prewarmWidth,
+        uint32_t prewarmHeight,
+        uint32_t prewarmFps
+        ) noexcept
+    {
+        const HRESULT comHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        const bool comInitialized = SUCCEEDED(comHr);
+
+        if (prewarmWidth > 0U && prewarmHeight > 0U)
+        {
+            (void)m_session.PrewarmDecoder(prewarmWidth, prewarmHeight, prewarmFps);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_ready = true;
+        }
+        m_readyCv.notify_one();
+
+        for (;;)
+        {
+            lumabridge::host::EncodedFramePacket pkt{};
+            bool hasPacket = false;
+            bool done = false;
+            {
+                std::unique_lock<std::mutex> lock(m_mutex);
+                m_notEmptyCv.wait(lock, [this]() {
+                    return m_stopRequested || !m_queue.empty();
+                });
+                if (!m_queue.empty())
+                {
+                    pkt = std::move(m_queue.front());
+                    m_queue.pop_front();
+                    hasPacket = true;
+                }
+                else if (m_stopRequested)
+                {
+                    done = true;
+                }
+            }
+
+            if (hasPacket)
+            {
+                m_notFullCv.notify_one();
+                m_session.SubmitPacket(pkt);
+                continue;
+            }
+            if (done)
+            {
+                break;
+            }
+        }
+
+        m_session.Finish();
+        if (comInitialized)
+        {
+            CoUninitialize();
+        }
+    }
+
+    lumabridge::host::H264StreamValidationSession& m_session;
+    std::mutex m_mutex{};
+    std::condition_variable m_notEmptyCv{};
+    std::condition_variable m_notFullCv{};
+    std::condition_variable m_readyCv{};
+    std::deque<lumabridge::host::EncodedFramePacket> m_queue{};
+    std::thread m_worker{};
+    bool m_started{false};
+    bool m_stopRequested{false};
+    bool m_ready{false};
+};
 
 HANDLE g_ConsoleStopEvent = nullptr;
 
@@ -1524,6 +1698,8 @@ wmain(
         stimulusFps,
         verifyH264Psnr || config.VerifySyntheticPattern,
         25.0);
+    AsyncH264ValidationWorker asyncH264Worker(h264Validator);
+    bool asyncH264WorkerStarted = false;
 
     bool nvencInitialized = false;
     bool nvencInitFatal = false;
@@ -1575,9 +1751,13 @@ wmain(
             }
         }
 
-        if (verifyH264Decode && prewarmWidth > 0U && prewarmHeight > 0U)
+        if (verifyH264Decode)
         {
-            (void)h264Validator.PrewarmDecoder(prewarmWidth, prewarmHeight, stimulusFps);
+            asyncH264WorkerStarted = asyncH264Worker.Start(prewarmWidth, prewarmHeight, stimulusFps);
+            if (!asyncH264WorkerStarted && prewarmWidth > 0U && prewarmHeight > 0U)
+            {
+                (void)h264Validator.PrewarmDecoder(prewarmWidth, prewarmHeight, stimulusFps);
+            }
         }
     }
 
@@ -1629,7 +1809,7 @@ wmain(
          &serverStartSample,
          &serverBaselineCaptured,
          &nvencEncoder,
-         &h264Validator,
+         &asyncH264Worker,
          &nvencInitialized,
          &nvencInitFatal,
          &nvencLastHr,
@@ -1735,10 +1915,6 @@ wmain(
             lumabridge::host::EncodedFramePacket pkt{};
             while (nvencEncoder.TryPopEncodedFrame(pkt))
             {
-                if (verifyH264Decode)
-                {
-                    h264Validator.SubmitPacket(pkt);
-                }
                 if (!quiet)
                 {
                     std::printf(
@@ -1749,6 +1925,10 @@ wmain(
                         pkt.Bitstream.size(),
                         static_cast<unsigned long long>(pkt.EncodeLatencyUs));
                 }
+                if (verifyH264Decode)
+                {
+                    asyncH264Worker.Enqueue(std::move(pkt));
+                }
             }
         });
 
@@ -1757,10 +1937,17 @@ wmain(
     {
         if (verifyH264Decode)
         {
-            h264Validator.SubmitPacket(remainingPkt);
+            asyncH264Worker.Enqueue(std::move(remainingPkt));
         }
     }
-    h264Validator.Finish();
+    if (asyncH264WorkerStarted)
+    {
+        asyncH264Worker.StopAndDrain();
+    }
+    else
+    {
+        h264Validator.Finish();
+    }
 
     (void)SetConsoleCtrlHandler(ConsoleCtrlHandler, FALSE);
     g_ConsoleStopEvent = nullptr;
@@ -1912,7 +2099,7 @@ wmain(
     {
         std::printf(
             "[LB-HOST] H264Decode: passed=%u mode=%s struct=%u psnrOk=%u matrix=%s packets=%llu decoded=%llu nalErr=%llu decErr=%llu "
-            "sps=%llu pps=%llu idr=%llu minY=%.2fdB minUv=%.2fdB minComb=%.2fdB\n",
+            "decAvgUs=%llu decP95Us=%llu decP99Us=%llu sps=%llu pps=%llu idr=%llu minY=%.2fdB minUv=%.2fdB minComb=%.2fdB\n",
             h264Snap.Passed ? 1U : 0U,
             h264Snap.ValidationMode.c_str(),
             h264Snap.StructuralDecodeValidated ? 1U : 0U,
@@ -1922,6 +2109,9 @@ wmain(
             static_cast<unsigned long long>(h264Snap.FramesDecoded),
             static_cast<unsigned long long>(h264Snap.NalParseFailures),
             static_cast<unsigned long long>(h264Snap.DecodeFailures),
+            static_cast<unsigned long long>(h264Snap.MftDecodeLatencyUs.AvgUs),
+            static_cast<unsigned long long>(h264Snap.MftDecodeLatencyUs.P95Us),
+            static_cast<unsigned long long>(h264Snap.MftDecodeLatencyUs.P99Us),
             static_cast<unsigned long long>(h264Snap.SpsCount),
             static_cast<unsigned long long>(h264Snap.PpsCount),
             static_cast<unsigned long long>(h264Snap.IdrCount),
