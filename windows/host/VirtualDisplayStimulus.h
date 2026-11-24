@@ -1,6 +1,9 @@
 #pragma once
 
 #include <Windows.h>
+#include <d3d11_1.h>
+#include <dxgi1_3.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <atomic>
@@ -12,8 +15,100 @@
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
 
 namespace lumabridge::host {
+
+enum class StimulusBackend : uint32_t
+{
+    Auto = 0U,
+    D3d11DxgiVSync = 1U,
+    GdiLegacy = 2U
+};
+
+inline const char*
+StimulusBackendToString(StimulusBackend backend) noexcept
+{
+    switch (backend)
+    {
+    case StimulusBackend::D3d11DxgiVSync:
+        return "D3d11DxgiVSync";
+    case StimulusBackend::GdiLegacy:
+        return "GdiLegacy";
+    case StimulusBackend::Auto:
+    default:
+        return "Auto";
+    }
+}
+
+inline bool
+ParseStimulusBackend(
+    const std::wstring& value,
+    StimulusBackend& outBackend
+    ) noexcept
+{
+    if (_wcsicmp(value.c_str(), L"auto") == 0)
+    {
+        outBackend = StimulusBackend::Auto;
+        return true;
+    }
+    if (_wcsicmp(value.c_str(), L"dxgi") == 0 ||
+        _wcsicmp(value.c_str(), L"d3d11") == 0 ||
+        _wcsicmp(value.c_str(), L"vsync") == 0 ||
+        _wcsicmp(value.c_str(), L"d3d11dxgivsync") == 0)
+    {
+        outBackend = StimulusBackend::D3d11DxgiVSync;
+        return true;
+    }
+    if (_wcsicmp(value.c_str(), L"gdi") == 0 ||
+        _wcsicmp(value.c_str(), L"gdilegacy") == 0)
+    {
+        outBackend = StimulusBackend::GdiLegacy;
+        return true;
+    }
+    return false;
+}
+
+/// Computes exact rational QPC tick offset for tickIndex at targetFps without cumulative truncation drift.
+inline uint64_t
+ComputeExactRationalOffsetQpc(
+    uint64_t tickIndex,
+    uint64_t qpcFreq,
+    uint32_t targetFps
+    ) noexcept
+{
+    if (targetFps == 0U || qpcFreq == 0ULL)
+    {
+        return 0ULL;
+    }
+    const uint64_t fps = static_cast<uint64_t>(targetFps);
+    const uint64_t wholeSeconds = tickIndex / fps;
+    const uint64_t remTicks = tickIndex % fps;
+    return (wholeSeconds * qpcFreq) + ((remTicks * qpcFreq) / fps);
+}
+
+inline uint64_t
+ComputeExactRationalDeadlineQpc(
+    uint64_t anchorQpc,
+    uint64_t tickIndex,
+    uint64_t qpcFreq,
+    uint32_t targetFps
+    ) noexcept
+{
+    return anchorQpc + ComputeExactRationalOffsetQpc(tickIndex, qpcFreq, targetFps);
+}
+
+struct VirtualDisplayStimulusConfig
+{
+    uint32_t TargetFps{60U};
+    StimulusBackend Backend{StimulusBackend::Auto};
+    std::wstring ExplicitDisplayName{};
+    LUID ExpectedAdapterLuid{0, 0};
+    bool UseExplicitRectForTestOnly{false};
+    RECT ExplicitTestRect{0L, 0L, 0L, 0L};
+    std::wstring TestDisplayName{L"LUMABRIDGE_TEST_SURFACE"};
+};
 
 struct DisplayCandidateInfo
 {
@@ -51,12 +146,34 @@ struct StimulusMetricsSnapshot
     bool CompletedCleanly{false};
     bool HighResolutionTimerUsed{false};
     uint32_t TargetFps{60U};
+    std::string BackendRequested{"Auto"};
+    std::string BackendActive{"None"};
+    bool FallbackFromDxgiOccurred{false};
+    std::string FallbackReason{};
+    uint64_t PlannedTicks{0ULL};
+    uint64_t ExecutedTicks{0ULL};
     uint64_t TicksPresented{0ULL};
     uint64_t PaintCount{0ULL};
+    uint64_t PresentRequests{0ULL};
+    uint64_t PresentSucceeded{0ULL};
+    uint64_t PresentOccluded{0ULL};
+    uint64_t PresentFailures{0ULL};
+    uint64_t SwapChainRecreations{0ULL};
+    uint64_t PresentFastReturnGuardCount{0ULL};
+    uint64_t DeadlineMissCount{0ULL};
     uint64_t DurationUs{0ULL};
     uint64_t TickIntervalAvgUs{0ULL};
     uint64_t TickIntervalP95Us{0ULL};
     uint64_t TickIntervalMaxUs{0ULL};
+    uint64_t WaitLatencyAvgUs{0ULL};
+    uint64_t WaitLatencyP95Us{0ULL};
+    uint64_t WaitLatencyMaxUs{0ULL};
+    uint64_t PresentLatencyAvgUs{0ULL};
+    uint64_t PresentLatencyP95Us{0ULL};
+    uint64_t PresentLatencyMaxUs{0ULL};
+    int64_t CumulativeDriftUs{0LL};
+    uint64_t MaxInterPresentGapUs{0ULL};
+    uint64_t InterPresentGapsOver25ms{0ULL};
     double AchievedFps{0.0};
     std::wstring DisplayDeviceName{};
     int32_t BoundsLeft{0};
@@ -370,44 +487,72 @@ public:
     VirtualDisplayStimulus(const VirtualDisplayStimulus&) = delete;
     VirtualDisplayStimulus& operator=(const VirtualDisplayStimulus&) = delete;
 
-    bool Start(
-        uint32_t targetFps,
-        const std::wstring& explicitDisplayName = {},
-        LUID expectedAdapterLuid = LUID{0, 0}
-        ) noexcept
+    bool Start(const VirtualDisplayStimulusConfig& config) noexcept
     {
         Stop();
 
-        const uint32_t clampedFps = (targetFps == 0U)
+        const uint32_t clampedFps = (config.TargetFps == 0U)
             ? 60U
-            : ((targetFps > 120U) ? 120U : targetFps);
+            : ((config.TargetFps > 120U) ? 120U : config.TargetFps);
 
         m_snapshot = {};
         m_snapshot.Requested = true;
         m_snapshot.TargetFps = clampedFps;
+        m_snapshot.BackendRequested = StimulusBackendToString(config.Backend);
+        m_requestedBackend = config.Backend;
 
-        const auto candidates = EnumerateActiveDisplayCandidates();
-        const VirtualDisplaySelectionResult selection = DiscoverVirtualDisplayFromCandidates(
-            candidates,
-            explicitDisplayName,
-            expectedAdapterLuid);
-
-        if (!selection.Identified)
+        if (config.UseExplicitRectForTestOnly)
         {
-            m_snapshot.VirtualDisplayIdentified = false;
-            m_snapshot.Started = false;
-            m_snapshot.ErrorMessage = selection.FailureReason;
-            return false;
+            const LONG width = config.ExplicitTestRect.right - config.ExplicitTestRect.left;
+            const LONG height = config.ExplicitTestRect.bottom - config.ExplicitTestRect.top;
+            if (width < 64L || height < 64L)
+            {
+                m_snapshot.VirtualDisplayIdentified = false;
+                m_snapshot.Started = false;
+                m_snapshot.ErrorMessage = "Explicit test rect must have width >= 64 and height >= 64.";
+                return false;
+            }
+
+            DisplayCandidateInfo testTarget{};
+            testTarget.DeviceName = config.TestDisplayName.empty()
+                ? std::wstring(L"LUMABRIDGE_TEST_SURFACE")
+                : config.TestDisplayName;
+            testTarget.BoundsLeft = static_cast<int32_t>(config.ExplicitTestRect.left);
+            testTarget.BoundsTop = static_cast<int32_t>(config.ExplicitTestRect.top);
+            testTarget.BoundsWidth = static_cast<uint32_t>(width);
+            testTarget.BoundsHeight = static_cast<uint32_t>(height);
+            testTarget.RefreshRateHz = clampedFps;
+            testTarget.Active = true;
+            m_targetDisplay = std::move(testTarget);
+            m_snapshot.VirtualDisplayIdentified = true;
+            m_snapshot.IdentificationSource = "ExplicitTestRect";
+        }
+        else
+        {
+            const auto candidates = EnumerateActiveDisplayCandidates();
+            const VirtualDisplaySelectionResult selection = DiscoverVirtualDisplayFromCandidates(
+                candidates,
+                config.ExplicitDisplayName,
+                config.ExpectedAdapterLuid);
+
+            if (!selection.Identified)
+            {
+                m_snapshot.VirtualDisplayIdentified = false;
+                m_snapshot.Started = false;
+                m_snapshot.ErrorMessage = selection.FailureReason;
+                return false;
+            }
+
+            m_targetDisplay = selection.Selected;
+            m_snapshot.VirtualDisplayIdentified = true;
+            m_snapshot.IdentificationSource = selection.IdentificationSource;
         }
 
-        m_targetDisplay = selection.Selected;
-        m_snapshot.VirtualDisplayIdentified = true;
         m_snapshot.DisplayDeviceName = m_targetDisplay.DeviceName;
         m_snapshot.BoundsLeft = m_targetDisplay.BoundsLeft;
         m_snapshot.BoundsTop = m_targetDisplay.BoundsTop;
         m_snapshot.BoundsWidth = m_targetDisplay.BoundsWidth;
         m_snapshot.BoundsHeight = m_targetDisplay.BoundsHeight;
-        m_snapshot.IdentificationSource = selection.IdentificationSource;
 
         m_readyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         m_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -418,12 +563,7 @@ public:
             return false;
         }
 
-        m_ticksPresented.store(0ULL, std::memory_order_relaxed);
-        m_paintCount.store(0ULL, std::memory_order_relaxed);
-        m_tickIntervalsUs.clear();
-        m_highResTimerUsed = false;
-        m_threadStartOk = false;
-        m_threadError.clear();
+        ResetRuntimeCounters();
 
         try
         {
@@ -450,7 +590,23 @@ public:
 
         m_snapshot.Started = true;
         m_snapshot.Active = true;
+        m_snapshot.BackendActive = StimulusBackendToString(m_activeBackend);
+        m_snapshot.FallbackFromDxgiOccurred = m_fallbackFromDxgiOccurred;
+        m_snapshot.FallbackReason = m_fallbackReason;
         return true;
+    }
+
+    bool Start(
+        uint32_t targetFps,
+        const std::wstring& explicitDisplayName = {},
+        LUID expectedAdapterLuid = LUID{0, 0}
+        ) noexcept
+    {
+        VirtualDisplayStimulusConfig cfg{};
+        cfg.TargetFps = targetFps;
+        cfg.ExplicitDisplayName = explicitDisplayName;
+        cfg.ExpectedAdapterLuid = expectedAdapterLuid;
+        return Start(cfg);
     }
 
     void Stop() noexcept
@@ -467,23 +623,40 @@ public:
 
         m_snapshot.Active = false;
         m_snapshot.HighResolutionTimerUsed = m_highResTimerUsed;
+        m_snapshot.BackendActive = StimulusBackendToString(m_activeBackend);
+        m_snapshot.FallbackFromDxgiOccurred = m_fallbackFromDxgiOccurred;
+        m_snapshot.FallbackReason = m_fallbackReason;
+        m_snapshot.PlannedTicks = m_plannedTicks.load(std::memory_order_relaxed);
+        m_snapshot.ExecutedTicks = m_executedTicks.load(std::memory_order_relaxed);
         m_snapshot.TicksPresented = m_ticksPresented.load(std::memory_order_relaxed);
         m_snapshot.PaintCount = m_paintCount.load(std::memory_order_relaxed);
-        if (!m_tickIntervalsUs.empty())
-        {
-            std::vector<uint64_t> sorted = m_tickIntervalsUs;
-            std::sort(sorted.begin(), sorted.end());
-            uint64_t sumUs = 0ULL;
-            for (uint64_t v : sorted)
-            {
-                sumUs += v;
-            }
-            m_snapshot.TickIntervalAvgUs = sumUs / sorted.size();
-            m_snapshot.TickIntervalMaxUs = sorted.back();
-            const size_t rank = (95U * sorted.size() + 99U) / 100U;
-            const size_t idx = (rank > 0U && (rank - 1U) < sorted.size()) ? (rank - 1U) : (sorted.size() - 1U);
-            m_snapshot.TickIntervalP95Us = sorted[idx];
-        }
+        m_snapshot.PresentRequests = m_presentRequests.load(std::memory_order_relaxed);
+        m_snapshot.PresentSucceeded = m_presentSucceeded.load(std::memory_order_relaxed);
+        m_snapshot.PresentOccluded = m_presentOccluded.load(std::memory_order_relaxed);
+        m_snapshot.PresentFailures = m_presentFailures.load(std::memory_order_relaxed);
+        m_snapshot.SwapChainRecreations = m_swapChainRecreations.load(std::memory_order_relaxed);
+        m_snapshot.PresentFastReturnGuardCount = m_presentFastReturnGuardCount.load(std::memory_order_relaxed);
+        m_snapshot.DeadlineMissCount = m_deadlineMissCount.load(std::memory_order_relaxed);
+        m_snapshot.CumulativeDriftUs = m_cumulativeDriftUs;
+        m_snapshot.MaxInterPresentGapUs = m_maxInterPresentGapUs;
+        m_snapshot.InterPresentGapsOver25ms = m_interPresentGapsOver25ms;
+
+        ComputeSeriesStats(
+            m_tickIntervalsUs,
+            m_snapshot.TickIntervalAvgUs,
+            m_snapshot.TickIntervalP95Us,
+            m_snapshot.TickIntervalMaxUs);
+        ComputeSeriesStats(
+            m_waitLatenciesUs,
+            m_snapshot.WaitLatencyAvgUs,
+            m_snapshot.WaitLatencyP95Us,
+            m_snapshot.WaitLatencyMaxUs);
+        ComputeSeriesStats(
+            m_presentLatenciesUs,
+            m_snapshot.PresentLatencyAvgUs,
+            m_snapshot.PresentLatencyP95Us,
+            m_snapshot.PresentLatencyMaxUs);
+
         if (m_startQpc > 0ULL && m_endQpc > m_startQpc && m_qpcFreq > 0ULL)
         {
             m_snapshot.DurationUs = ((m_endQpc - m_startQpc) * 1000000ULL) / m_qpcFreq;
@@ -503,8 +676,17 @@ public:
     StimulusMetricsSnapshot GetMetricsSnapshot() const noexcept
     {
         StimulusMetricsSnapshot snap = m_snapshot;
+        snap.PlannedTicks = m_plannedTicks.load(std::memory_order_relaxed);
+        snap.ExecutedTicks = m_executedTicks.load(std::memory_order_relaxed);
         snap.TicksPresented = m_ticksPresented.load(std::memory_order_relaxed);
         snap.PaintCount = m_paintCount.load(std::memory_order_relaxed);
+        snap.PresentRequests = m_presentRequests.load(std::memory_order_relaxed);
+        snap.PresentSucceeded = m_presentSucceeded.load(std::memory_order_relaxed);
+        snap.PresentOccluded = m_presentOccluded.load(std::memory_order_relaxed);
+        snap.PresentFailures = m_presentFailures.load(std::memory_order_relaxed);
+        snap.SwapChainRecreations = m_swapChainRecreations.load(std::memory_order_relaxed);
+        snap.PresentFastReturnGuardCount = m_presentFastReturnGuardCount.load(std::memory_order_relaxed);
+        snap.DeadlineMissCount = m_deadlineMissCount.load(std::memory_order_relaxed);
         LARGE_INTEGER nowQpc{};
         if (snap.Active && m_startQpc > 0ULL && m_qpcFreq > 0ULL && QueryPerformanceCounter(&nowQpc) != FALSE)
         {
@@ -548,6 +730,11 @@ private:
         }
         if (msg == WM_PAINT && self != nullptr)
         {
+            if (self->m_dxgiOwnsPaint.load(std::memory_order_relaxed))
+            {
+                (void)ValidateRect(hwnd, nullptr);
+                return 0;
+            }
             self->HandlePaint(hwnd);
             return 0;
         }
@@ -556,6 +743,374 @@ private:
             return HTTRANSPARENT;
         }
         return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+
+    struct DxgiStimulusResources
+    {
+        Microsoft::WRL::ComPtr<IDXGIFactory2> Factory{};
+        Microsoft::WRL::ComPtr<ID3D11Device> Device{};
+        Microsoft::WRL::ComPtr<ID3D11DeviceContext> Context{};
+        Microsoft::WRL::ComPtr<ID3D11DeviceContext1> Context1{};
+        Microsoft::WRL::ComPtr<IDXGISwapChain1> SwapChain1{};
+        Microsoft::WRL::ComPtr<IDXGISwapChain2> SwapChain2{};
+        Microsoft::WRL::ComPtr<ID3D11RenderTargetView> Rtv{};
+        HANDLE WaitableObject{nullptr};
+        bool ClearViewSupported{false};
+
+        void Reset() noexcept
+        {
+            if (Context != nullptr)
+            {
+                Context->ClearState();
+                Context->Flush();
+            }
+            if (WaitableObject != nullptr)
+            {
+                CloseHandle(WaitableObject);
+                WaitableObject = nullptr;
+            }
+            Rtv.Reset();
+            SwapChain2.Reset();
+            SwapChain1.Reset();
+            Context1.Reset();
+            Context.Reset();
+            Device.Reset();
+            Factory.Reset();
+            ClearViewSupported = false;
+        }
+
+        ~DxgiStimulusResources()
+        {
+            Reset();
+        }
+    };
+
+    static void ComputeSeriesStats(
+        const std::vector<uint64_t>& samples,
+        uint64_t& outAvg,
+        uint64_t& outP95,
+        uint64_t& outMax
+        ) noexcept
+    {
+        outAvg = 0ULL;
+        outP95 = 0ULL;
+        outMax = 0ULL;
+        if (samples.empty())
+        {
+            return;
+        }
+
+        std::vector<uint64_t> sorted = samples;
+        std::sort(sorted.begin(), sorted.end());
+        uint64_t sum = 0ULL;
+        for (uint64_t v : sorted)
+        {
+            sum += v;
+        }
+        outAvg = sum / sorted.size();
+        outMax = sorted.back();
+        const size_t rank = (95U * sorted.size() + 99U) / 100U;
+        const size_t idx = (rank > 0U && (rank - 1U) < sorted.size()) ? (rank - 1U) : (sorted.size() - 1U);
+        outP95 = sorted[idx];
+    }
+
+    void ResetRuntimeCounters() noexcept
+    {
+        m_plannedTicks.store(0ULL, std::memory_order_relaxed);
+        m_executedTicks.store(0ULL, std::memory_order_relaxed);
+        m_ticksPresented.store(0ULL, std::memory_order_relaxed);
+        m_paintCount.store(0ULL, std::memory_order_relaxed);
+        m_presentRequests.store(0ULL, std::memory_order_relaxed);
+        m_presentSucceeded.store(0ULL, std::memory_order_relaxed);
+        m_presentOccluded.store(0ULL, std::memory_order_relaxed);
+        m_presentFailures.store(0ULL, std::memory_order_relaxed);
+        m_swapChainRecreations.store(0ULL, std::memory_order_relaxed);
+        m_presentFastReturnGuardCount.store(0ULL, std::memory_order_relaxed);
+        m_deadlineMissCount.store(0ULL, std::memory_order_relaxed);
+        m_dxgiOwnsPaint.store(false, std::memory_order_relaxed);
+        m_activeBackend = StimulusBackend::Auto;
+        m_fallbackFromDxgiOccurred = false;
+        m_fallbackReason.clear();
+        m_tickIntervalsUs.clear();
+        m_waitLatenciesUs.clear();
+        m_presentLatenciesUs.clear();
+        m_highResTimerUsed = false;
+        m_cumulativeDriftUs = 0LL;
+        m_maxInterPresentGapUs = 0ULL;
+        m_interPresentGapsOver25ms = 0ULL;
+        m_threadStartOk = false;
+        m_threadError.clear();
+    }
+
+    static bool InitializeDxgiResources(
+        HWND hwnd,
+        uint32_t width,
+        uint32_t height,
+        DxgiStimulusResources& outRes,
+        std::string& outError
+        ) noexcept
+    {
+        outRes.Reset();
+        outError.clear();
+
+        HRESULT hr = CreateDXGIFactory1(
+            __uuidof(IDXGIFactory2),
+            reinterpret_cast<void**>(outRes.Factory.GetAddressOf()));
+        if (FAILED(hr) || outRes.Factory == nullptr)
+        {
+            outError = "CreateDXGIFactory1(IDXGIFactory2) failed.";
+            return false;
+        }
+
+        static constexpr D3D_FEATURE_LEVEL kLevels[] = {
+            D3D_FEATURE_LEVEL_11_1,
+            D3D_FEATURE_LEVEL_11_0,
+            D3D_FEATURE_LEVEL_10_1
+        };
+
+        hr = D3D11CreateDevice(
+            nullptr,
+            D3D_DRIVER_TYPE_HARDWARE,
+            nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            kLevels,
+            ARRAYSIZE(kLevels),
+            D3D11_SDK_VERSION,
+            outRes.Device.GetAddressOf(),
+            nullptr,
+            outRes.Context.GetAddressOf());
+        if (FAILED(hr) || outRes.Device == nullptr || outRes.Context == nullptr)
+        {
+            hr = D3D11CreateDevice(
+                nullptr,
+                D3D_DRIVER_TYPE_WARP,
+                nullptr,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                kLevels,
+                ARRAYSIZE(kLevels),
+                D3D11_SDK_VERSION,
+                outRes.Device.GetAddressOf(),
+                nullptr,
+                outRes.Context.GetAddressOf());
+        }
+        if (FAILED(hr) || outRes.Device == nullptr || outRes.Context == nullptr)
+        {
+            outError = "D3D11CreateDevice failed for both hardware and WARP adapters.";
+            outRes.Reset();
+            return false;
+        }
+
+        (void)outRes.Context.As(&outRes.Context1);
+        D3D11_FEATURE_DATA_D3D11_OPTIONS opts{};
+        if (outRes.Context1 != nullptr &&
+            SUCCEEDED(outRes.Device->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &opts, sizeof(opts))) &&
+            opts.ClearView != FALSE)
+        {
+            outRes.ClearViewSupported = true;
+        }
+
+        DXGI_SWAP_CHAIN_DESC1 scDesc{};
+        scDesc.Width = (std::max)(64U, width);
+        scDesc.Height = (std::max)(64U, height);
+        scDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        scDesc.SampleDesc.Count = 1U;
+        scDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        scDesc.BufferCount = 3U;
+        scDesc.Scaling = DXGI_SCALING_STRETCH;
+        scDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        scDesc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+        scDesc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+
+        hr = outRes.Factory->CreateSwapChainForHwnd(
+            outRes.Device.Get(),
+            hwnd,
+            &scDesc,
+            nullptr,
+            nullptr,
+            outRes.SwapChain1.GetAddressOf());
+        if (FAILED(hr) || outRes.SwapChain1 == nullptr)
+        {
+            scDesc.Flags = 0U;
+            hr = outRes.Factory->CreateSwapChainForHwnd(
+                outRes.Device.Get(),
+                hwnd,
+                &scDesc,
+                nullptr,
+                nullptr,
+                outRes.SwapChain1.GetAddressOf());
+        }
+        if (FAILED(hr) || outRes.SwapChain1 == nullptr)
+        {
+            outError = "CreateSwapChainForHwnd(FLIP_DISCARD) failed.";
+            outRes.Reset();
+            return false;
+        }
+
+        (void)outRes.Factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
+
+        if (scDesc.Flags != 0U && SUCCEEDED(outRes.SwapChain1.As(&outRes.SwapChain2)) && outRes.SwapChain2 != nullptr)
+        {
+            (void)outRes.SwapChain2->SetMaximumFrameLatency(1U);
+            outRes.WaitableObject = outRes.SwapChain2->GetFrameLatencyWaitableObject();
+        }
+
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> backBuffer;
+        hr = outRes.SwapChain1->GetBuffer(
+            0U,
+            __uuidof(ID3D11Texture2D),
+            reinterpret_cast<void**>(backBuffer.GetAddressOf()));
+        if (FAILED(hr) || backBuffer == nullptr)
+        {
+            outError = "IDXGISwapChain1::GetBuffer(0) failed.";
+            outRes.Reset();
+            return false;
+        }
+
+        hr = outRes.Device->CreateRenderTargetView(backBuffer.Get(), nullptr, outRes.Rtv.GetAddressOf());
+        if (FAILED(hr) || outRes.Rtv == nullptr)
+        {
+            outError = "CreateRenderTargetView failed on swapchain backbuffer.";
+            outRes.Reset();
+            return false;
+        }
+
+        return true;
+    }
+
+    static void RenderDxgiFrame(
+        DxgiStimulusResources& dxgi,
+        uint64_t tick,
+        uint32_t width,
+        uint32_t height
+        ) noexcept
+    {
+        if (dxgi.Context == nullptr || dxgi.Rtv == nullptr)
+        {
+            return;
+        }
+
+        const FLOAT bgColor[4] = {
+            static_cast<FLOAT>((tick * 5ULL) & 0x3FU) / 255.0f,
+            static_cast<FLOAT>(16ULL + ((tick * 3ULL) & 0x3FU)) / 255.0f,
+            static_cast<FLOAT>(28ULL + ((tick * 7ULL) & 0x3FU)) / 255.0f,
+            1.0f
+        };
+        dxgi.Context->ClearRenderTargetView(dxgi.Rtv.Get(), bgColor);
+
+        if (dxgi.ClearViewSupported && dxgi.Context1 != nullptr && width > 0U && height > 0U)
+        {
+            const LONG w = static_cast<LONG>(width);
+            const LONG h = static_cast<LONG>(height);
+            const LONG barW = (std::max)(32L, w / 8L);
+            const LONG xPos = static_cast<LONG>((tick * 29ULL) % static_cast<uint64_t>(w));
+            const RECT barRc{xPos, 0L, (std::min)(w, xPos + barW), h};
+            const FLOAT barColor[4] = {
+                static_cast<FLOAT>((tick * 13ULL + 80ULL) & 0xFFU) / 255.0f,
+                static_cast<FLOAT>((tick * 17ULL + 120ULL) & 0xFFU) / 255.0f,
+                static_cast<FLOAT>((tick * 23ULL + 40ULL) & 0xFFU) / 255.0f,
+                1.0f
+            };
+            dxgi.Context1->ClearView(dxgi.Rtv.Get(), barColor, &barRc, 1U);
+
+            const LONG stripeH = (std::max)(16L, h / 10L);
+            const LONG yPos = static_cast<LONG>((tick * 19ULL) % static_cast<uint64_t>(h));
+            const RECT stripeRc{0L, yPos, w, (std::min)(h, yPos + stripeH)};
+            const FLOAT stripeColor[4] = {
+                static_cast<FLOAT>((tick * 29ULL + 40ULL) & 0xFFU) / 255.0f,
+                static_cast<FLOAT>((tick * 7ULL + 190ULL) & 0xFFU) / 255.0f,
+                static_cast<FLOAT>((tick * 11ULL + 90ULL) & 0xFFU) / 255.0f,
+                1.0f
+            };
+            dxgi.Context1->ClearView(dxgi.Rtv.Get(), stripeColor, &stripeRc, 1U);
+        }
+    }
+
+    static bool PumpWindowMessages(bool& outQuit) noexcept
+    {
+        outQuit = false;
+        MSG msg{};
+        while (PeekMessageW(&msg, nullptr, 0U, 0U, PM_REMOVE) != FALSE)
+        {
+            if (msg.message == WM_QUIT)
+            {
+                outQuit = true;
+                return false;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        return true;
+    }
+
+    bool WaitUntilQpcDeadline(
+        HANDLE pacingTimer,
+        uint64_t deadlineQpc,
+        uint64_t spinThresholdQpc
+        ) noexcept
+    {
+        for (;;)
+        {
+            if (WaitForSingleObject(m_stopEvent, 0U) == WAIT_OBJECT_0)
+            {
+                return false;
+            }
+
+            bool quit = false;
+            if (!PumpWindowMessages(quit) || quit)
+            {
+                return false;
+            }
+
+            LARGE_INTEGER nowLi{};
+            (void)QueryPerformanceCounter(&nowLi);
+            const uint64_t nowQpc = (nowLi.QuadPart > 0) ? static_cast<uint64_t>(nowLi.QuadPart) : deadlineQpc;
+            if (nowQpc >= deadlineQpc)
+            {
+                return true;
+            }
+
+            const uint64_t remQpc = deadlineQpc - nowQpc;
+            if (pacingTimer != nullptr && remQpc > spinThresholdQpc)
+            {
+                const uint64_t waitQpc = remQpc - spinThresholdQpc;
+                const uint64_t wait100Ns = (std::max)(1ULL, (waitQpc * 10000000ULL) / m_qpcFreq);
+                LARGE_INTEGER dueTime{};
+                dueTime.QuadPart = -static_cast<LONGLONG>(wait100Ns);
+                (void)SetWaitableTimer(pacingTimer, &dueTime, 0L, nullptr, nullptr, FALSE);
+                const HANDLE waitHandles[2] = {m_stopEvent, pacingTimer};
+                const DWORD waitRes = MsgWaitForMultipleObjects(2U, waitHandles, FALSE, INFINITE, QS_ALLINPUT);
+                if (waitRes == WAIT_OBJECT_0)
+                {
+                    return false;
+                }
+                continue;
+            }
+            else if (pacingTimer == nullptr)
+            {
+                const DWORD sleepMs = static_cast<DWORD>((remQpc * 1000ULL) / m_qpcFreq);
+                if (sleepMs > 0U)
+                {
+                    const DWORD waitRes = MsgWaitForMultipleObjects(1U, &m_stopEvent, FALSE, sleepMs, QS_ALLINPUT);
+                    if (waitRes == WAIT_OBJECT_0)
+                    {
+                        return false;
+                    }
+                    continue;
+                }
+            }
+
+            while (WaitForSingleObject(m_stopEvent, 0U) != WAIT_OBJECT_0)
+            {
+                LARGE_INTEGER spinLi{};
+                (void)QueryPerformanceCounter(&spinLi);
+                if (static_cast<uint64_t>(spinLi.QuadPart) >= deadlineQpc)
+                {
+                    return true;
+                }
+                SwitchToThread();
+            }
+            return false;
+        }
     }
 
     void HandlePaint(HWND hwnd) noexcept
@@ -586,9 +1141,9 @@ private:
 
         // Animated sweeping horizontal/vertical color bars ensure DWM sees new non-trivial
         // surface dirties every tick without reading any user window or desktop pixels.
-        const LONG barWidth = std::max<LONG>(32L, w / 8L);
-        const LONG xPos = static_cast<LONG>((tick * 29ULL) % static_cast<uint64_t>(std::max<LONG>(1L, w)));
-        RECT barRc{xPos, 0L, std::min<LONG>(w, xPos + barWidth), h};
+        const LONG barWidth = (std::max)(32L, w / 8L);
+        const LONG xPos = static_cast<LONG>((tick * 29ULL) % static_cast<uint64_t>((std::max)(1L, w)));
+        RECT barRc{xPos, 0L, (std::min)(w, xPos + barWidth), h};
         HBRUSH accentBrush = CreateSolidBrush(RGB(
             static_cast<uint8_t>((tick * 13ULL + 80ULL) & 0xFFU),
             static_cast<uint8_t>((tick * 17ULL + 120ULL) & 0xFFU),
@@ -599,9 +1154,9 @@ private:
             DeleteObject(accentBrush);
         }
 
-        const LONG stripeHeight = std::max<LONG>(16L, h / 10L);
-        const LONG yPos = static_cast<LONG>((tick * 19ULL) % static_cast<uint64_t>(std::max<LONG>(1L, h)));
-        RECT stripeRc{0L, yPos, w, std::min<LONG>(h, yPos + stripeHeight)};
+        const LONG stripeHeight = (std::max)(16L, h / 10L);
+        const LONG yPos = static_cast<LONG>((tick * 19ULL) % static_cast<uint64_t>((std::max)(1L, h)));
+        RECT stripeRc{0L, yPos, w, (std::min)(h, yPos + stripeHeight)};
         HBRUSH stripeBrush = CreateSolidBrush(RGB(
             static_cast<uint8_t>((tick * 29ULL + 40ULL) & 0xFFU),
             static_cast<uint8_t>((tick * 7ULL + 190ULL) & 0xFFU),
@@ -629,7 +1184,7 @@ private:
 
         WNDCLASSEXW wc{};
         wc.cbSize = sizeof(wc);
-        wc.style = CS_OWNDC;
+        wc.style = 0U;
         wc.lpfnWndProc = &VirtualDisplayStimulus::StimulusWndProc;
         wc.hInstance = GetModuleHandleW(nullptr);
         wc.lpszClassName = className;
@@ -642,12 +1197,12 @@ private:
             return;
         }
 
-        const int stimW = static_cast<int>(std::min<uint32_t>(m_targetDisplay.BoundsWidth, 640U));
-        const int stimH = static_cast<int>(std::min<uint32_t>(m_targetDisplay.BoundsHeight, 360U));
+        const uint32_t stimW = (std::min)(m_targetDisplay.BoundsWidth, 640U);
+        const uint32_t stimH = (std::min)(m_targetDisplay.BoundsHeight, 360U);
         const int stimX = static_cast<int>(m_targetDisplay.BoundsLeft) +
-                          static_cast<int>(m_targetDisplay.BoundsWidth - static_cast<uint32_t>(stimW)) / 2;
+                          static_cast<int>(m_targetDisplay.BoundsWidth - stimW) / 2;
         const int stimY = static_cast<int>(m_targetDisplay.BoundsTop) +
-                          static_cast<int>(m_targetDisplay.BoundsHeight - static_cast<uint32_t>(stimH)) / 2;
+                          static_cast<int>(m_targetDisplay.BoundsHeight - stimH) / 2;
 
         HWND hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
@@ -656,8 +1211,8 @@ private:
             WS_POPUP | WS_VISIBLE,
             stimX,
             stimY,
-            stimW,
-            stimH,
+            static_cast<int>(stimW),
+            static_cast<int>(stimH),
             nullptr,
             nullptr,
             wc.hInstance,
@@ -671,7 +1226,41 @@ private:
         }
 
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        UpdateWindow(hwnd);
+
+        DxgiStimulusResources dxgi;
+        bool useDxgi = (m_requestedBackend != StimulusBackend::GdiLegacy);
+        if (useDxgi)
+        {
+            std::string dxgiErr;
+            if (InitializeDxgiResources(hwnd, stimW, stimH, dxgi, dxgiErr))
+            {
+                m_activeBackend = StimulusBackend::D3d11DxgiVSync;
+                m_dxgiOwnsPaint.store(true, std::memory_order_relaxed);
+            }
+            else
+            {
+                if (m_requestedBackend == StimulusBackend::D3d11DxgiVSync)
+                {
+                    m_threadError = dxgiErr.empty()
+                        ? "Requested D3d11DxgiVSync stimulus backend failed initialization."
+                        : dxgiErr;
+                    DestroyWindow(hwnd);
+                    (void)UnregisterClassW(className, wc.hInstance);
+                    (void)SetEvent(m_readyEvent);
+                    return;
+                }
+                m_fallbackFromDxgiOccurred = true;
+                m_fallbackReason = dxgiErr;
+                useDxgi = false;
+                m_activeBackend = StimulusBackend::GdiLegacy;
+                UpdateWindow(hwnd);
+            }
+        }
+        else
+        {
+            m_activeBackend = StimulusBackend::GdiLegacy;
+            UpdateWindow(hwnd);
+        }
 
         LARGE_INTEGER freqLi{};
         (void)QueryPerformanceFrequency(&freqLi);
@@ -683,8 +1272,6 @@ private:
         m_threadStartOk = true;
         (void)SetEvent(m_readyEvent);
 
-        // Use a high-resolution waitable timer + absolute QPC deadline pacing to avoid the
-        // 15.625ms Windows scheduler tick quantization that throttled 16ms relative waits to ~37.3 FPS.
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
         constexpr DWORD kCreateWaitableTimerHighResolution = 0x00000002U;
 #else
@@ -704,10 +1291,17 @@ private:
             pacingTimer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
         }
 
-        const uint64_t intervalQpc = std::max<uint64_t>(1ULL, m_qpcFreq / static_cast<uint64_t>(targetFps));
-        uint64_t nextDeadlineQpc = m_startQpc;
+        const uint64_t approxFrameQpc = (std::max)(1ULL, m_qpcFreq / static_cast<uint64_t>(targetFps));
+        const uint64_t spinThresholdQpc = (std::max)(1ULL, (m_qpcFreq * 250ULL) / 1000000ULL);
+        uint64_t anchorQpc = m_startQpc;
+        uint64_t anchorTick = 0ULL;
+        uint64_t firstTickQpc = 0ULL;
+        uint64_t lastTickQpc = 0ULL;
         uint64_t prevTickQpc = 0ULL;
-        const uint64_t spinThresholdQpc = std::max<uint64_t>(1ULL, (m_qpcFreq * 250ULL) / 1000000ULL);
+        uint64_t executedTicks = 0ULL;
+        uint32_t consecutiveDeviceLosses = 0U;
+        uint32_t consecutiveOccluded = 0U;
+        bool occludedState = false;
 
         for (;;)
         {
@@ -716,93 +1310,201 @@ private:
                 break;
             }
 
-            MSG msg{};
-            while (PeekMessageW(&msg, nullptr, 0U, 0U, PM_REMOVE) != FALSE)
+            const uint64_t deadlineQpc = ComputeExactRationalDeadlineQpc(anchorQpc, anchorTick, m_qpcFreq, targetFps);
+            m_plannedTicks.fetch_add(1ULL, std::memory_order_relaxed);
+
+            LARGE_INTEGER waitStartLi{};
+            (void)QueryPerformanceCounter(&waitStartLi);
+            const uint64_t waitStartQpc = static_cast<uint64_t>((std::max)(0LL, waitStartLi.QuadPart));
+
+            if (useDxgi && dxgi.WaitableObject != nullptr && !occludedState)
             {
-                if (msg.message == WM_QUIT)
+                const HANDLE handles[2] = {m_stopEvent, dxgi.WaitableObject};
+                const DWORD waitRes = WaitForMultipleObjects(2U, handles, FALSE, 100U);
+                if (waitRes == WAIT_OBJECT_0)
                 {
                     break;
                 }
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
             }
 
-            if (WaitForSingleObject(m_stopEvent, 0U) == WAIT_OBJECT_0)
+            if (!WaitUntilQpcDeadline(pacingTimer, deadlineQpc, spinThresholdQpc))
             {
                 break;
             }
 
-            LARGE_INTEGER nowLi{};
-            (void)QueryPerformanceCounter(&nowLi);
-            const uint64_t nowQpc = (nowLi.QuadPart > 0) ? static_cast<uint64_t>(nowLi.QuadPart) : m_startQpc;
-
-            if (nowQpc < nextDeadlineQpc)
+            LARGE_INTEGER presentStartLi{};
+            (void)QueryPerformanceCounter(&presentStartLi);
+            const uint64_t presentStartQpc = static_cast<uint64_t>((std::max)(0LL, presentStartLi.QuadPart));
+            if (presentStartQpc >= waitStartQpc && m_waitLatenciesUs.size() < 65536U)
             {
-                const uint64_t remQpc = nextDeadlineQpc - nowQpc;
-                if (pacingTimer != nullptr && remQpc > spinThresholdQpc)
+                m_waitLatenciesUs.push_back(((presentStartQpc - waitStartQpc) * 1000000ULL) / m_qpcFreq);
+            }
+
+            bool tickCountedAsPresented = false;
+            if (useDxgi)
+            {
+                const uint64_t tickSeq = m_ticksPresented.load(std::memory_order_relaxed);
+                m_presentRequests.fetch_add(1ULL, std::memory_order_relaxed);
+                HRESULT hr = S_OK;
+                if (occludedState)
                 {
-                    const uint64_t waitQpc = remQpc - spinThresholdQpc;
-                    const uint64_t wait100Ns = std::max<uint64_t>(1ULL, (waitQpc * 10000000ULL) / m_qpcFreq);
-                    LARGE_INTEGER dueTime{};
-                    dueTime.QuadPart = -static_cast<LONGLONG>(wait100Ns);
-                    (void)SetWaitableTimer(pacingTimer, &dueTime, 0L, nullptr, nullptr, FALSE);
-                    const HANDLE waitHandles[2] = {m_stopEvent, pacingTimer};
-                    const DWORD waitRes = MsgWaitForMultipleObjects(2U, waitHandles, FALSE, INFINITE, QS_ALLINPUT);
-                    if (waitRes == WAIT_OBJECT_0)
+                    hr = dxgi.SwapChain1->Present(1U, DXGI_PRESENT_TEST);
+                    if (hr == S_OK)
                     {
+                        occludedState = false;
+                        RenderDxgiFrame(dxgi, tickSeq, stimW, stimH);
+                        m_paintCount.fetch_add(1ULL, std::memory_order_relaxed);
+                        hr = dxgi.SwapChain1->Present(1U, 0U);
+                    }
+                }
+                else
+                {
+                    RenderDxgiFrame(dxgi, tickSeq, stimW, stimH);
+                    m_paintCount.fetch_add(1ULL, std::memory_order_relaxed);
+                    hr = dxgi.SwapChain1->Present(1U, 0U);
+                }
+
+                if (hr == DXGI_STATUS_OCCLUDED)
+                {
+                    occludedState = true;
+                    ++consecutiveOccluded;
+                    m_presentOccluded.fetch_add(1ULL, std::memory_order_relaxed);
+                    if (m_requestedBackend == StimulusBackend::Auto && consecutiveOccluded >= 2U)
+                    {
+                        dxgi.Reset();
+                        useDxgi = false;
+                        occludedState = false;
+                        m_dxgiOwnsPaint.store(false, std::memory_order_relaxed);
+                        m_activeBackend = StimulusBackend::GdiLegacy;
+                        m_fallbackFromDxgiOccurred = true;
+                        m_fallbackReason =
+                            "DXGI_STATUS_OCCLUDED persisted on target desktop; switched to GdiLegacy.";
+                        (void)InvalidateRect(hwnd, nullptr, FALSE);
+                        (void)UpdateWindow(hwnd);
+                        m_presentSucceeded.fetch_add(1ULL, std::memory_order_relaxed);
+                        tickCountedAsPresented = true;
+                    }
+                }
+                else if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
+                {
+                    consecutiveOccluded = 0U;
+                    m_presentFailures.fetch_add(1ULL, std::memory_order_relaxed);
+                    ++consecutiveDeviceLosses;
+                    std::string recreateErr;
+                    if (consecutiveDeviceLosses <= 4U &&
+                        InitializeDxgiResources(hwnd, stimW, stimH, dxgi, recreateErr))
+                    {
+                        m_swapChainRecreations.fetch_add(1ULL, std::memory_order_relaxed);
+                    }
+                    else if (m_requestedBackend == StimulusBackend::Auto)
+                    {
+                        dxgi.Reset();
+                        useDxgi = false;
+                        m_dxgiOwnsPaint.store(false, std::memory_order_relaxed);
+                        m_activeBackend = StimulusBackend::GdiLegacy;
+                        m_fallbackFromDxgiOccurred = true;
+                        m_fallbackReason = recreateErr.empty()
+                            ? "DXGI device lost during presentation; switched to GdiLegacy."
+                            : recreateErr;
+                    }
+                    else
+                    {
+                        m_threadError = recreateErr.empty()
+                            ? "DXGI device lost during D3d11DxgiVSync presentation."
+                            : recreateErr;
                         break;
                     }
-                    continue;
                 }
-                else if (pacingTimer == nullptr)
+                else if (FAILED(hr))
                 {
-                    const DWORD sleepMs = static_cast<DWORD>((remQpc * 1000ULL) / m_qpcFreq);
-                    if (sleepMs > 0U)
-                    {
-                        const DWORD waitRes = MsgWaitForMultipleObjects(1U, &m_stopEvent, FALSE, sleepMs, QS_ALLINPUT);
-                        if (waitRes == WAIT_OBJECT_0)
-                        {
-                            break;
-                        }
-                        continue;
-                    }
+                    consecutiveOccluded = 0U;
+                    m_presentFailures.fetch_add(1ULL, std::memory_order_relaxed);
                 }
-
-                while (WaitForSingleObject(m_stopEvent, 0U) != WAIT_OBJECT_0)
+                else
                 {
-                    LARGE_INTEGER spinLi{};
-                    (void)QueryPerformanceCounter(&spinLi);
-                    if (static_cast<uint64_t>(spinLi.QuadPart) >= nextDeadlineQpc)
-                    {
-                        break;
-                    }
-                    SwitchToThread();
-                }
-                if (WaitForSingleObject(m_stopEvent, 0U) == WAIT_OBJECT_0)
-                {
-                    break;
+                    consecutiveOccluded = 0U;
+                    consecutiveDeviceLosses = 0U;
+                    m_presentSucceeded.fetch_add(1ULL, std::memory_order_relaxed);
+                    tickCountedAsPresented = true;
                 }
             }
-
-            LARGE_INTEGER presentLi{};
-            (void)QueryPerformanceCounter(&presentLi);
-            const uint64_t presentQpc = (presentLi.QuadPart > 0) ? static_cast<uint64_t>(presentLi.QuadPart) : nextDeadlineQpc;
-            if (prevTickQpc > 0ULL && presentQpc >= prevTickQpc && m_tickIntervalsUs.size() < 65536U)
+            else
             {
-                m_tickIntervalsUs.push_back(((presentQpc - prevTickQpc) * 1000000ULL) / m_qpcFreq);
+                m_presentRequests.fetch_add(1ULL, std::memory_order_relaxed);
+                (void)InvalidateRect(hwnd, nullptr, FALSE);
+                (void)UpdateWindow(hwnd);
+                m_presentSucceeded.fetch_add(1ULL, std::memory_order_relaxed);
+                tickCountedAsPresented = true;
             }
-            prevTickQpc = presentQpc;
 
-            nextDeadlineQpc += intervalQpc;
-            if (presentQpc > nextDeadlineQpc + (intervalQpc * 2ULL))
+            LARGE_INTEGER presentEndLi{};
+            (void)QueryPerformanceCounter(&presentEndLi);
+            const uint64_t presentEndQpc =
+                (presentEndLi.QuadPart > 0) ? static_cast<uint64_t>(presentEndLi.QuadPart) : deadlineQpc;
+            const uint64_t presentElapsedUs = (presentEndQpc >= presentStartQpc)
+                ? (((presentEndQpc - presentStartQpc) * 1000000ULL) / m_qpcFreq)
+                : 0ULL;
+            if (m_presentLatenciesUs.size() < 65536U)
             {
-                // Resynchronize after an OS stall without burst catch-up.
-                nextDeadlineQpc = presentQpc + intervalQpc;
+                m_presentLatenciesUs.push_back(presentElapsedUs);
             }
 
-            m_ticksPresented.fetch_add(1ULL, std::memory_order_relaxed);
-            (void)InvalidateRect(hwnd, nullptr, FALSE);
-            (void)UpdateWindow(hwnd);
+            if (useDxgi && tickCountedAsPresented && presentElapsedUs < 1000ULL)
+            {
+                m_presentFastReturnGuardCount.fetch_add(1ULL, std::memory_order_relaxed);
+            }
+
+            ++executedTicks;
+            m_executedTicks.fetch_add(1ULL, std::memory_order_relaxed);
+            if (tickCountedAsPresented)
+            {
+                m_ticksPresented.fetch_add(1ULL, std::memory_order_relaxed);
+            }
+
+            if (firstTickQpc == 0ULL)
+            {
+                firstTickQpc = presentEndQpc;
+            }
+            lastTickQpc = presentEndQpc;
+
+            if (prevTickQpc > 0ULL && presentEndQpc >= prevTickQpc)
+            {
+                const uint64_t gapUs = ((presentEndQpc - prevTickQpc) * 1000000ULL) / m_qpcFreq;
+                if (m_tickIntervalsUs.size() < 65536U)
+                {
+                    m_tickIntervalsUs.push_back(gapUs);
+                }
+                if (gapUs > m_maxInterPresentGapUs)
+                {
+                    m_maxInterPresentGapUs = gapUs;
+                }
+                if (gapUs > 25000ULL)
+                {
+                    ++m_interPresentGapsOver25ms;
+                }
+            }
+            prevTickQpc = presentEndQpc;
+
+            ++anchorTick;
+            const uint64_t nextIdealQpc = ComputeExactRationalDeadlineQpc(anchorQpc, anchorTick, m_qpcFreq, targetFps);
+            if (presentEndQpc > nextIdealQpc + approxFrameQpc)
+            {
+                m_deadlineMissCount.fetch_add(1ULL, std::memory_order_relaxed);
+                if (presentEndQpc > nextIdealQpc + (approxFrameQpc * 2ULL))
+                {
+                    // Re-anchor cleanly after a prolonged stall without burst catch-up frames.
+                    anchorQpc = presentEndQpc;
+                    anchorTick = 1ULL;
+                }
+            }
+        }
+
+        if (executedTicks >= 2ULL && firstTickQpc > 0ULL && lastTickQpc >= firstTickQpc)
+        {
+            const uint64_t actualSpanUs = ((lastTickQpc - firstTickQpc) * 1000000ULL) / m_qpcFreq;
+            const uint64_t idealSpanUs =
+                (ComputeExactRationalOffsetQpc(executedTicks - 1ULL, m_qpcFreq, targetFps) * 1000000ULL) / m_qpcFreq;
+            m_cumulativeDriftUs = static_cast<int64_t>(actualSpanUs) - static_cast<int64_t>(idealSpanUs);
         }
 
         if (pacingTimer != nullptr)
@@ -814,6 +1516,8 @@ private:
         (void)QueryPerformanceCounter(&endLi);
         m_endQpc = (endLi.QuadPart > 0) ? static_cast<uint64_t>(endLi.QuadPart) : m_startQpc;
 
+        m_dxgiOwnsPaint.store(false, std::memory_order_relaxed);
+        dxgi.Reset();
         DestroyWindow(hwnd);
         (void)UnregisterClassW(className, wc.hInstance);
     }
@@ -834,16 +1538,35 @@ private:
 
     DisplayCandidateInfo m_targetDisplay{};
     StimulusMetricsSnapshot m_snapshot{};
+    StimulusBackend m_requestedBackend{StimulusBackend::Auto};
+    StimulusBackend m_activeBackend{StimulusBackend::Auto};
+    bool m_fallbackFromDxgiOccurred{false};
+    std::string m_fallbackReason{};
     std::thread m_worker{};
     HANDLE m_readyEvent{nullptr};
     HANDLE m_stopEvent{nullptr};
+    std::atomic<bool> m_dxgiOwnsPaint{false};
+    std::atomic<uint64_t> m_plannedTicks{0ULL};
+    std::atomic<uint64_t> m_executedTicks{0ULL};
     std::atomic<uint64_t> m_ticksPresented{0ULL};
     std::atomic<uint64_t> m_paintCount{0ULL};
+    std::atomic<uint64_t> m_presentRequests{0ULL};
+    std::atomic<uint64_t> m_presentSucceeded{0ULL};
+    std::atomic<uint64_t> m_presentOccluded{0ULL};
+    std::atomic<uint64_t> m_presentFailures{0ULL};
+    std::atomic<uint64_t> m_swapChainRecreations{0ULL};
+    std::atomic<uint64_t> m_presentFastReturnGuardCount{0ULL};
+    std::atomic<uint64_t> m_deadlineMissCount{0ULL};
     uint64_t m_qpcFreq{10000000ULL};
     uint64_t m_startQpc{0ULL};
     uint64_t m_endQpc{0ULL};
     bool m_highResTimerUsed{false};
+    int64_t m_cumulativeDriftUs{0LL};
+    uint64_t m_maxInterPresentGapUs{0ULL};
+    uint64_t m_interPresentGapsOver25ms{0ULL};
     std::vector<uint64_t> m_tickIntervalsUs{};
+    std::vector<uint64_t> m_waitLatenciesUs{};
+    std::vector<uint64_t> m_presentLatenciesUs{};
     bool m_threadStartOk{false};
     std::string m_threadError{};
 };

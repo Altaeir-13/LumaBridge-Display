@@ -199,6 +199,7 @@ PrintUsage()
         "  --require-virtual-stimulus       Fail if --visual-stimulus cannot identify the virtual display\n"
         "  --stimulus-fps <fps>             Stimulus refresh frequency in Hz (default: 60, range 1..120)\n"
         "  --stimulus-display <gdiName>     Optional explicit GDI display device (e.g. \\\\.\\DISPLAY2)\n"
+        "  --stimulus-backend <mode>        Stimulus backend: auto|dxgi|gdi (default: auto)\n"
         "  --run-id <id>                    Associate execution RunId in JSON telemetry summary\n"
         "  --require-valid-timestamps       Fail if TimestampMeasurementErrors > 0 or coverage < 95%%\n"
         "  --require-width <px>             Require exact LastFrameWidth (and NVENC width if active)\n"
@@ -1013,12 +1014,34 @@ WriteJsonSummary(
         << "    \"CompletedCleanly\": " << (stimulus.CompletedCleanly ? "true" : "false") << ",\n"
         << "    \"HighResolutionTimerUsed\": " << (stimulus.HighResolutionTimerUsed ? "true" : "false") << ",\n"
         << "    \"TargetFps\": " << stimulus.TargetFps << ",\n"
+        << "    \"BackendRequested\": \"" << EscapeJsonString(stimulus.BackendRequested) << "\",\n"
+        << "    \"BackendActive\": \"" << EscapeJsonString(stimulus.BackendActive) << "\",\n"
+        << "    \"FallbackFromDxgiOccurred\": " << (stimulus.FallbackFromDxgiOccurred ? "true" : "false") << ",\n"
+        << "    \"FallbackReason\": \"" << EscapeJsonString(stimulus.FallbackReason) << "\",\n"
+        << "    \"PlannedTicks\": " << stimulus.PlannedTicks << ",\n"
+        << "    \"ExecutedTicks\": " << stimulus.ExecutedTicks << ",\n"
         << "    \"TicksPresented\": " << stimulus.TicksPresented << ",\n"
         << "    \"PaintCount\": " << stimulus.PaintCount << ",\n"
+        << "    \"PresentRequests\": " << stimulus.PresentRequests << ",\n"
+        << "    \"PresentSucceeded\": " << stimulus.PresentSucceeded << ",\n"
+        << "    \"PresentOccluded\": " << stimulus.PresentOccluded << ",\n"
+        << "    \"PresentFailures\": " << stimulus.PresentFailures << ",\n"
+        << "    \"SwapChainRecreations\": " << stimulus.SwapChainRecreations << ",\n"
+        << "    \"PresentFastReturnGuardCount\": " << stimulus.PresentFastReturnGuardCount << ",\n"
+        << "    \"DeadlineMissCount\": " << stimulus.DeadlineMissCount << ",\n"
         << "    \"DurationUs\": " << stimulus.DurationUs << ",\n"
         << "    \"TickIntervalAvgUs\": " << stimulus.TickIntervalAvgUs << ",\n"
         << "    \"TickIntervalP95Us\": " << stimulus.TickIntervalP95Us << ",\n"
         << "    \"TickIntervalMaxUs\": " << stimulus.TickIntervalMaxUs << ",\n"
+        << "    \"WaitLatencyAvgUs\": " << stimulus.WaitLatencyAvgUs << ",\n"
+        << "    \"WaitLatencyP95Us\": " << stimulus.WaitLatencyP95Us << ",\n"
+        << "    \"WaitLatencyMaxUs\": " << stimulus.WaitLatencyMaxUs << ",\n"
+        << "    \"PresentLatencyAvgUs\": " << stimulus.PresentLatencyAvgUs << ",\n"
+        << "    \"PresentLatencyP95Us\": " << stimulus.PresentLatencyP95Us << ",\n"
+        << "    \"PresentLatencyMaxUs\": " << stimulus.PresentLatencyMaxUs << ",\n"
+        << "    \"CumulativeDriftUs\": " << stimulus.CumulativeDriftUs << ",\n"
+        << "    \"MaxInterPresentGapUs\": " << stimulus.MaxInterPresentGapUs << ",\n"
+        << "    \"InterPresentGapsOver25ms\": " << stimulus.InterPresentGapsOver25ms << ",\n"
         << "    \"AchievedFps\": " << stimulus.AchievedFps << ",\n"
         << "    \"DisplayDeviceName\": \"" << EscapeJsonString(NarrowAsciiFromWide(stimulus.DisplayDeviceName.c_str())) << "\",\n"
         << "    \"BoundsLeft\": " << stimulus.BoundsLeft << ",\n"
@@ -1069,6 +1092,7 @@ wmain(
     lumabridge::host::HostConsumerConfig config{};
     std::wstring jsonSummaryPath;
     std::wstring stimulusDisplayName;
+    lumabridge::host::StimulusBackend stimulusBackend = lumabridge::host::StimulusBackend::Auto;
     bool hasExplicitMinFrames = false;
     bool enableVisualStimulus = false;
     bool requireVirtualStimulus = false;
@@ -1318,6 +1342,14 @@ wmain(
         {
             stimulusDisplayName = argv[++i];
         }
+        else if (arg == L"--stimulus-backend" && (i + 1) < argc)
+        {
+            if (!lumabridge::host::ParseStimulusBackend(argv[++i], stimulusBackend))
+            {
+                std::fprintf(stderr, "Invalid --stimulus-backend value (must be auto|dxgi|gdi).\n");
+                return EXIT_FAILURE;
+            }
+        }
         else if (arg == L"--run-id" && (i + 1) < argc)
         {
             gateConfig.RunId = argv[++i];
@@ -1419,7 +1451,11 @@ wmain(
     lumabridge::host::VirtualDisplayStimulus stimulus;
     if (enableVisualStimulus)
     {
-        const bool stimStarted = stimulus.Start(stimulusFps, stimulusDisplayName);
+        lumabridge::host::VirtualDisplayStimulusConfig stimCfg{};
+        stimCfg.TargetFps = stimulusFps;
+        stimCfg.Backend = stimulusBackend;
+        stimCfg.ExplicitDisplayName = stimulusDisplayName;
+        const bool stimStarted = stimulus.Start(stimCfg);
         const auto stimPreSnap = stimulus.GetMetricsSnapshot();
         if (!stimStarted && requireVirtualStimulus)
         {
@@ -1910,13 +1946,21 @@ wmain(
     if (stimSnap.Requested)
     {
         std::printf(
-            "[LB-HOST] Stimulus: identified=%u started=%u hiRes=%u src=%s ticks=%llu paints=%llu achievedFps=%.2f tickAvgUs=%llu\n",
+            "[LB-HOST] Stimulus: identified=%u started=%u hiRes=%u req=%s active=%s fallback=%u src=%s ticks=%llu paints=%llu presentOk=%llu occluded=%llu miss=%llu driftUs=%lld maxGapUs=%llu achievedFps=%.2f tickAvgUs=%llu\n",
             stimSnap.VirtualDisplayIdentified ? 1U : 0U,
             stimSnap.Started ? 1U : 0U,
             stimSnap.HighResolutionTimerUsed ? 1U : 0U,
+            stimSnap.BackendRequested.c_str(),
+            stimSnap.BackendActive.c_str(),
+            stimSnap.FallbackFromDxgiOccurred ? 1U : 0U,
             stimSnap.IdentificationSource.c_str(),
             static_cast<unsigned long long>(stimSnap.TicksPresented),
             static_cast<unsigned long long>(stimSnap.PaintCount),
+            static_cast<unsigned long long>(stimSnap.PresentSucceeded),
+            static_cast<unsigned long long>(stimSnap.PresentOccluded),
+            static_cast<unsigned long long>(stimSnap.DeadlineMissCount),
+            static_cast<long long>(stimSnap.CumulativeDriftUs),
+            static_cast<unsigned long long>(stimSnap.MaxInterPresentGapUs),
             stimSnap.AchievedFps,
             static_cast<unsigned long long>(stimSnap.TickIntervalAvgUs));
     }
