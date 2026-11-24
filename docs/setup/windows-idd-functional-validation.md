@@ -154,17 +154,20 @@ Utilize preferencialmente o script automatizado `Invoke-LumaBridgeFunctionalVali
 - **Modo GPU Shared + NVENC (`M4.2` / `M4.2.1`):** utilize `-TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc [-VerifyH264Decode]` para exigir texturas compartilhadas (`D3D11_RESOURCE_MISC_SHARED_NTHANDLE | KEYEDMUTEX`, `CpuStagingReadsPerformed = 0`), codificacao NVENC H.264 e validacao estrutural NAL/MFT (`StructuralDecodeValidated=true`, mantendo `FidelityPsnrValidated=false` sem referencia sintetica). Para comprovar fidelidade PSNR em isolamento sem pixels privados, execute `FrameEndToEndIntegrationTests.exe` (`--verify-h264-psnr`) ou informe `-SyntheticFidelityExecutablePath`.
 
 ```powershell
-# Previa Dry Run sem efeitos colaterais (M0.2.1 Benchmark 30s e Estabilidade Prolongada 180s sem alterar dispositivo/registro):
-.\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 -Configuration Release -TestProfile Benchmark30s -BenchmarkDurationSec 30 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -CertificateThumbprint 1EEFC55BD7EEB2A9115432607B97978736B9DFE0 -DryRun
-.\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 -Configuration Release -TestProfile ProlongedStability -StabilityDurationSec 180 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -CertificateThumbprint 1EEFC55BD7EEB2A9115432607B97978736B9DFE0 -DryRun
+# Previa Dry Run sem efeitos colaterais (M0.2.1+ Benchmark 30s e Estabilidade Prolongada 180s com DXGI explicito):
+.\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 -Configuration Release -TestProfile Benchmark30s -BenchmarkDurationSec 30 -StimulusBackend Dxgi -StimulusFps 60 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -ResourceSampleIntervalSec 5 -GpuSampleIntervalSec 15 -CertificateThumbprint "<THUMBPRINT_SHA1_40_HEX>" -DryRun
+.\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 -Configuration Release -TestProfile ProlongedStability -StabilityDurationSec 180 -MinProlongedStabilitySec 180 -StimulusBackend Dxgi -StimulusFps 60 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -ResourceSampleIntervalSec 5 -GpuSampleIntervalSec 15 -CertificateThumbprint "<THUMBPRINT_SHA1_40_HEX>" -DryRun
 
 # Execucao real como Administrador (Etapa B — SEM -Force para manter a confirmacao interativa [y/N], somente apos autorizacao explicita):
-.\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 -Configuration Release -TestProfile Smoke -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -CertificateThumbprint 1EEFC55BD7EEB2A9115432607B97978736B9DFE0
-.\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 -Configuration Release -TestProfile Benchmark30s -BenchmarkDurationSec 30 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -CertificateThumbprint 1EEFC55BD7EEB2A9115432607B97978736B9DFE0
-.\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 -Configuration Release -TestProfile ProlongedStability -StabilityDurationSec 180 -MinProlongedStabilitySec 180 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -CertificateThumbprint 1EEFC55BD7EEB2A9115432607B97978736B9DFE0
+.\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 -Configuration Release -TestProfile Smoke -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -CertificateThumbprint "<THUMBPRINT_SHA1_40_HEX>"
+.\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 -Configuration Release -TestProfile Benchmark30s -BenchmarkDurationSec 30 -StimulusBackend Dxgi -StimulusFps 60 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -ResourceSampleIntervalSec 5 -GpuSampleIntervalSec 15 -CertificateThumbprint "<THUMBPRINT_SHA1_40_HEX>"
+.\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 -Configuration Release -TestProfile ProlongedStability -StabilityDurationSec 180 -MinProlongedStabilitySec 180 -StimulusBackend Dxgi -StimulusFps 60 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -ResourceSampleIntervalSec 5 -GpuSampleIntervalSec 15 -CertificateThumbprint "<THUMBPRINT_SHA1_40_HEX>"
+
+# Reutilizacao segura de staging assinado ja instalado (sem reassinar nem reinstalar pacote; manter <OutputDir> exclusivo):
+.\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 -Configuration Release -TestProfile ProlongedStability -StabilityDurationSec 180 -MinProlongedStabilitySec 180 -StimulusBackend Dxgi -StimulusFps 60 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -ResourceSampleIntervalSec 5 -GpuSampleIntervalSec 15 -CertificateThumbprint "<THUMBPRINT_SHA1_40_HEX>" -StagingDir "<StagingDir>" -OutputDir "<OutputDir>" -SkipDriverInstall -ReuseSignedStaging
 ```
 
-> **Semantica de Rollback e Codigos de Saida (`S-02`, `S-06`):** O runner registra um snapshot inicial completo (`InitialSystemSnapshot` distinguindo valor de registro ausente vs `0` vs `1`, certificados existentes, sessoes ETW, binding/INF e topologia de telas) e separa explicitamente seis resultados: `FunctionalValidationSucceeded`, `RuntimeCleanupSucceeded`, `SystemStateRestored`, `DriverBindingPersisted`, `RollbackClean` e `OverallSucceeded`. Se o rollback falhar parcialmente, `OverallSucceeded = false` e `ValidationSucceeded = false` com lancamento de excecao (exit code != 0), preservando ambos os erros sem mascaramento e gravando o relatorio JSON/Markdown inclusive em falhas de estagios intermediarios. Certificados pre-existentes (ex.: `1EEFC55BD7EEB2A9115432607B97978736B9DFE0`) e pacotes historicos do Driver Store **nunca** sao removidos automaticamente como efeito colateral; quando uma atualizacao autorizada do driver permanece instalada apos o benchmark, o relatorio registra `DriverBindingPersisted = true` e `SystemStateRestored = false`.
+> **Semantica de Rollback e Codigos de Saida (`S-02`, `S-06`):** O runner registra um snapshot inicial completo (`InitialSystemSnapshot` distinguindo valor de registro ausente vs `0` vs `1`, certificados existentes, sessoes ETW, binding/INF e topologia de telas) e separa explicitamente seis resultados: `FunctionalValidationSucceeded`, `RuntimeCleanupSucceeded`, `SystemStateRestored`, `DriverBindingPersisted`, `RollbackClean` e `OverallSucceeded`. Se o rollback falhar parcialmente, `OverallSucceeded = false` e `ValidationSucceeded = false` com lancamento de excecao (exit code != 0), preservando ambos os erros sem mascaramento e gravando o relatorio JSON/Markdown inclusive em falhas de estagios intermediarios. Certificados pre-existentes (identificados por `<THUMBPRINT_SHA1_40_HEX>`) e pacotes historicos do Driver Store **nunca** sao removidos automaticamente como efeito colateral; quando uma atualizacao autorizada do driver permanece instalada apos o benchmark, o relatorio registra `DriverBindingPersisted = true` e `SystemStateRestored = false`. Em execucoes com `-SkipDriverInstall -ReuseSignedStaging` que nao alteram o vinculo do driver e restauram integralmente os parametros temporarios, o relatorio registra `DriverBindingPersisted = false` e `SystemStateRestored = true`.
 
 ### Procedimento Seguro de Recuperacao Manual (`S-06`)
 
@@ -197,11 +200,91 @@ Se uma execucao interrompida exigir intervencao manual em PowerShell **como Admi
    ```powershell
    logman stop LumaBridgeIddCore -ets 2>$null
    logman stop LumaBridgeIddDxg -ets 2>$null
-   # Nao remover o certificado pre-existente 1EEFC55BD7EEB2A9115432607B97978736B9DFE0
+   # Nao remover o certificado pre-existente <THUMBPRINT_SHA1_40_HEX>
    # nem os pacotes historicos do Driver Store sem autorizacao explicita.
    ```
    Para desinstalacao completa autorizada apenas quando o dispositivo foi criado especificamente pelo teste, utilize `Uninstall-LumaBridgeDriver.ps1`.
 
-4. **Status M4.2 / M0.1 e proximos passos:**
-   - A arquitetura detalhada, modelo de sincronizacao `IDXGIKeyedMutex`, modelo de seguranca `PROCESS_DUP_HANDLE`, benchmark controlado 3-way (CPU vs GPU Shared vs GPU+NVENC) e caminho para transmissao Linux estao documentados em [windows-gpu-shared-textures-nvenc.md](../architecture/windows-gpu-shared-textures-nvenc.md).
-   - Validacao ao vivo dentro de `WUDFHost.exe` com instalacao controlada da versao compilada e benchmarks `Benchmark30s` / `ProlongedStability` depende de autorizacao administrativa explicita do operador no host Windows 11.
+4. **Status da validacao ao vivo (`M0.3`) e referencia arquitetural:**
+   - A arquitetura detalhada do caminho residente em GPU (`SharedTexturePool`, `IDXGIKeyedMutex`, IPC local `LBIF` v1.1 e `NvencH264Encoder`) esta documentada em [windows-gpu-shared-textures-nvenc.md](../architecture/windows-gpu-shared-textures-nvenc.md).
+   - O historico consolidado de encerramento da validacao funcional Windows (`Benchmark30s` e `ProlongedStability` de `180 s` em `WUDFHost.exe`) encontra-se na Secao 7 abaixo.
+
+## 7. Encerramento da Validacao Funcional da M0 (`M0.2.4` - `M0.3`)
+
+Esta secao consolida o fechamento da validacao funcional do emissor Windows (`M0`) de forma reproduzivel e sanitizada, sem dados especificos da estacao do operador (SIDs, caminhos absolutos, identidades de hardware local ou certificados pessoais).
+
+### 7.1 Evolucao do driver e pipeline Windows (`M3` -> `M0.3`)
+
+| Marco | Escopo entregue e validado |
+|---|---|
+| **`M3`** | Driver UMDF/IddCx base (`LumaBridgeIddDriver`), enumeracao opt-in de 1 monitor virtual (`EnableVirtualMonitor`), modos CTA-861 (`1280x720@60`, `1920x1080@60`), pipeline `SwapChainProcessor` D3D11 e validacao de pacote `InfVerif`/`Inf2Cat`. |
+| **`M4.1` / `M4.1.1`** | Extracao D3D11 com liberacao imediata da superficie IddCx, IPC local Named Pipe `LBIF v1.0` autenticado por token/SID/sessao/integridade (`AllowSameUserAccess = false`) e consumidor separado `lumabridge-host.exe`. |
+| **`M4.2` / `M4.2.1`** | Pool limitado de texturas compartilhadas (`D3D11_RESOURCE_MISC_SHARED_NTHANDLE \| SHARED_KEYEDMUTEX`), IPC `LBIF v1.1` (`136 B` por frame, `DuplicateHandle` por PID autenticado, validacao `AdapterLuid`), codificador GPU `NVENC H.264` (preset P1 Ultra-Low-Latency, 0 B-frames), normalizacao causal QPC e pre-aquecimento. |
+| **`M0.1` - `M0.2.2`** | Orquestrador em 11 etapas (`Invoke-LumaBridgeFunctionalValidation.ps1`), contrato explicito de rollback em `finally`, correlacao por modulo carregado de `WUDFHost.exe`, telemetria continua com contrato `NOT_MEASURED`, metodologia explicita de percentis (`ExactPopulation` vs `ReservoirSampledEstimate_AlgorithmR` vs `NotAvailable`) e resolucao estrita de `RuntimeInformation` no PowerShell 5.1. |
+| **`M0.2.4` - `M0.3`** | Dominio unico de sequencia e transicoes de sessao em `FrameIpcServer`, telemetria ETW `SessionSummary`, contrato estrito GPU-only (`--require-gpu-shared`), estimulo `D3d11DxgiVSync` racional sem drift e sem fallback silencioso para GDI (`--stimulus-backend dxgi`), worker assincrono limitado de decode MFT (`AsyncH264ValidationWorker`, capacidade `256`) sem recalculo redundante de percentis por pacote, reutilizacao criptografica de staging assinado (`-SkipDriverInstall -ReuseSignedStaging`) e aprovacoes reais ao vivo de `30 s` e `180 s` em `WUDFHost.exe`. |
+
+### 7.2 Defeitos encontrados, causas comprovadas e correcoes
+
+1. **Erros causais de timestamp e `LiveEndToEndLatency` vazia (`M4.2.1`):** `IDDCX_METADATA::PresentDisplayQPCTime` representa o alvo futuro de VSync do DWM (`PresentDisplayQPCTime > acquireQpc`). A normalizacao causal passou a usar `SwapChainAcquireQpcTime` preservando o valor bruto para diagnostico (`PresentDisplayQpcWasFutureTarget`).
+2. **Latencia fria no Quadro 1 e complexidade quadratica (`M4.2.1` / `M0.2.5.1`):** Inicializacao tardia de D3D11/NVENC/MFT e chamadas redundantes a `Summarize()` em caminho critico (`O(N^2 log N)`). O pre-aquecimento antes da conexao e a consolidacao exclusiva no encerramento (`H264BitstreamValidator::Finish()`) eliminaram o custo por pacote mantendo os mesmos percentis.
+3. **Colisao de `RuntimeInformation` no PowerShell 5.1 (`M0.2.2`):** `PSReadLine 2.0.0` expoe um tipo interno homonimo sem `OSArchitecture`. Corrigido consultando exclusivamente assemblies confiaveis do .NET runtime validados por `PublicKeyToken`.
+4. **Reprovacao do 1o `Benchmark30s` real (`DriverVer 11.48.30.582`):** O estimulo GDI atingiu apenas `1.744/1.764` quadros validos (`58,13 FPS`) e uma janela de corrida entre atribuicao de sequencia e transicao `CPU -> GPU` produziu `OutOfOrderSequenceCount = 1`, `SequenceGapsDetected = 1` e `3` quadros CPU em sessao GPU (`HostLiveEndToEnd p99 = 15.432 us`, `IpcTransit p99 = 11.265 us`, `ExtractToBitstream p99 = 30.144 us`). Corrigido em `M0.2.4` com serializacao de publicacao/sequencia por geracao de sessao (`FrameIpcServer`), contrato estrito GPU-only, backend `D3d11DxgiVSync` e desacoplamento do MFT para thread trabalhadora dedicada.
+5. **Selecao explicita DXGI e protecao do worker MFT (`M0.2.5.1`):** Adicionado encaminhamento de `-StimulusBackend Dxgi` com propagacao obrigatoria de `LastHResult` e `TerminalFailure` pos-inicializacao (proibindo fallback silencioso para GDI) e endurecido o ciclo COM/MF + drenagem com timeout limitado (`wait_until` sem `detach()`) no `AsyncH264ValidationWorker`.
+
+### 7.3 Testes automatizados e benchmarks sinteticos (commit funcional validado)
+
+- **Commit funcional validado:** `6b297856af535a1737658da97d381c19231913e4` (branch `fix/m0-validation-gates-hardening`), distinto do commit documental posterior de encerramento da `M0`.
+- **Cobertura automatizada aprovada no commit funcional:**
+  - **156/156** testes C++ unitarios e de componentes (`AdapterLifecycleTests` = 21, `DriverPackageValidationTests` = 6, `MonitorModesTests` = 12, `SwapChainLifecycleTests` = 15, `VirtualMonitorLifecycleTests` = 15, `FrameExtractionTests` = 12, `GpuSharedTextureTests` = 9, `FrameIpcTests` = 31, `NvencEncoderTests` = 7, `HostValidationWorkerAndStimulusTests` = 28);
+  - **9/9** testes E2E multiprocesso (`FrameEndToEndIntegrationTests`);
+  - **71/71** testes PowerShell (`LumaBridgeFunctionalToolingTests.ps1`);
+  - **`InfVerif`** aprovado em `Release|x64`.
+- **Benchmark sintetico `M0.2.5.1` (3 execucoes de 30 s @ 1080p60 — sem `WUDFHost.exe`/DWM reais):** `1800/1800` quadros validos, codificados e decodificados nas 3 execucoes, `0` erros de timestamps/contrato GPU; medianas de `p99`: `HostLiveEndToEnd = 301 us`, `NVENC Encode = 12.946 us`, `ExtractToBitstream = 13.178 us`, `MftDecode = 3.407 us`. Benchmarks sinteticos medem exclusivamente o subsistema IPC+NVENC+MFT em isolamento e nao equivalem a execucoes reais em `WUDFHost.exe`.
+
+### 7.4 Proveniencia reproduzivel dos artefatos
+
+- **Versao do pacote (`DriverVer` `Release|x64`):** `11/23/2026,23.3.21.222`
+- **Hashes SHA-256 reproduziveis do build (`6b297856af535a1737658da97d381c19231913e4`, `Release|x64`):**
+  - `LumaBridgeIddDriver.dll` (build nao assinado): `3142694CD2EEDA89D4ECD3CB517DBFC1FBCA6C9BB01231ABED0CE5B89AA6247C`
+  - `LumaBridgeIddDriver.inf`: `CC939B59B203C91D5FF3E08FB0192C9C96A7AB17831665BBD564EE7163E12189`
+  - `lumabridgeidddriver.cat` (build nao assinado): `9B3EA0ABD9B3D1AEAC594CF44638E6067E7A0E7ADF4A5DED4E9329D10D1A153E`
+  - `lumabridge-host.exe` (`Release|x64`): `319614683D6BEF5A8B5A9777DA0B72E0581C31A311BA612D694E80D374E54047`
+- **Integridade de assinatura e reuso seguro:** A assinatura de teste ocorreu exclusivamente em `<StagingDir>` isolado fora do repositorio, mantendo inalterados os artefatos de build. Na validacao prolongada de `180 s`, o modo `-SkipDriverInstall -ReuseSignedStaging` verificou assinatura Authenticode, associacao ao catalogo e identidade SHA-256 bit a bit entre a DLL do staging reutilizado e a DLL carregada em runtime pelo `WUDFHost.exe`, sem reassinar arquivos nem modificar o Driver Store.
+
+### 7.5 Resultados quantitativos das validacoes reais em `WUDFHost.exe`
+
+| Metrica / Criterio | 1o `Benchmark30s` Real (Reprovado — `11.48.30.582`) | 2o `Benchmark30s` Real (Aprovado — `23.3.21.222`) | `ProlongedStability` 180s Real (Aprovado — `23.3.21.222`, `ReusedSignedStaging`) |
+|---|---:|---:|---:|
+| Duracao conectada (`TotalConnectedDurationUs`) | `30,005 s` (`30.005.274 us`) | `30,011 s` (`30.011.404 us`) | `180,005 s` (`180.004.956 us`) |
+| Duracao de streaming ativo (`ActiveStreamingDurationUs`) | `29,990 s` (`29.990.267 us`) | `29,990 s` (`29.989.514 us`) | `179,985 s` (`179.984.534 us`) |
+| Quadros validos / Minimo do gate / Meta nominal | `1.744 / 1.764 / 1.800` | `1.800 / 1.764 / 1.800` | `10.670 / 10.584 / 10.800` (`98,80%`) |
+| Codificados NVENC / Decodificados MFT | `1.741 / 1.741` | `1.800 / 1.800` (`100%`) | `10.670 / 10.670` (`100%`) |
+| `SustainedLiveFps` / `EncoderOutputFps` | `58,13 / 58,12 FPS` | `59,99 / 59,98 FPS` | `59,28 / 59,28 FPS` |
+| Backend estimulo efetivo / Fallback GDI | Legado GDI (`Ticks=1.823`, `60,02 FPS`) | `D3d11DxgiVSync` / `false` (`1.810` presents, `60,03 FPS`) | `D3d11DxgiVSync` / `false` (`10.808` presents, `60,00 FPS`) |
+| Oclusoes / Falhas DXGI / Recriacoes swapchain | — | `0 / 0 / 0` (`DeadlineMiss = 0`) | `0 / 0 / 0` (`DeadlineMiss = 0`) |
+| Transporte recebido (`GPU / CPU`) / Violações / Readbacks CPU | `1.741 GPU / 3 CPU` / `0` readbacks | `1.800 GPU / 0 CPU / 0 / 0` | `10.670 GPU / 0 CPU / 0 / 0` |
+| `OutOfOrder` / `SequenceGaps` / `TimestampErrors` / Cobertura | `1 / 1 / 0 / 100%` | `0 / 0 / 0 / 100%` | `0 / 0 / 0 / 100%` |
+| `HostLiveEndToEnd` (`p50 / p95 / p99`, us) | `188 / 315 / 15.432` | `144 / 201 / 257` | `130 / 196 / 239` |
+| `IpcTransit p99` / `QueueWait p99` (us) | `11.265 / 3.076` | `234 / 43` | `209 / 41` |
+| `Nvenc.EncodeLatency` (`p50 / p95 / p99`, us) | `8.770 / 14.051 / 16.517` | `11.533 / 12.385 / 13.673` | `11.706 / 12.717 / 13.726` |
+| `ExtractToBitstream p99` / `PresentToBitstream p99` (us) | `30.144 / 30.193` | `13.837 / 13.889` | `13.878 / 13.923` |
+| `InterFrameInterval` (`p50 / p95 / p99`, us) | `16.690 / 18.898 / 33.502` | `16.656 / 17.144 / 17.307` | `16.654 / 17.181 / 33.056` |
+| `InterFrameJitter` (`p50 / p95 / p99`, us) | `492 / 10.257 / 17.350` | `284 / 920 / 1.205` | `300 / 1.036 / 16.757` |
+| `MftDecodeLatency` (`p50 / p95 / p99`, us) / `QueuePeakDepth` | `NOT_MEASURED` | `1.316 / 1.650 / 2.621` / `1` | `1.204 / 1.554 / 2.457` / `1` |
+| `SessionSummary` (ETW do driver) | `NOT_MEASURED` | `1.801 pub = 1.800 ent + 1 flush` (`0` drops) | `10.671 pub = 10.670 ent + 1 flush` (`0` drops) |
+| Desfecho / Rollback / Estado | **`FAIL`** (`ExitCode = 1`) | **`PASS`** (`RollbackClean=True`, `DriverBindingPersisted=True`) | **`PASS`** (`ProlongedStabilityProven=True`, `RollbackClean=True`, `SystemStateRestored=True`, `DriverBindingPersisted=False`) |
+
+**Contratos, conservacao de quadros, metodologia e escopo das medicoes:**
+- **Duracao conectada vs streaming ativo:** Em `180 s`, `TotalConnectedDurationUs` atingiu `180,005 s` (`>= 180 s`), enquanto `ActiveStreamingDurationUs` foi `179,985 s` devido ao intervalo inicial entre conexao do pipe e chegada do 1o quadro. O minimo nominal do gate (`10.584` quadros = `0,98 * 180 * 60`) foi superado com `10.670` quadros (`98,80%` da meta nominal de `10.800`), sendo esperada a ocorrencia pontual de `134` intervalos de ~2 vblanks (`~33 ms`, `1,26%`) no compositor DWM/IddCx ao longo de 3 minutos sem qualquer queda de quadro no pipeline (`0` descartes de pool, backpressure, NVENC ou MFT).
+- **Conservacao de quadros e encerramento limpo:** Nos testes de `30 s` e `180 s`, o evento `SessionSummary` comprovou `FramesPublished = FramesDelivered + FramesFlushedOnSessionTransition` (`1.801 = 1.800 + 1` e `10.671 = 10.670 + 1`), com `GpuFramesDropped = 0`, `GpuSyncTimeouts = 0`, `FramesDroppedByBackpressure = 0`, `FramesDiscardedStaleSession = 0` e `FramesDiscardedTransportMismatch = 0`. O worker assincrono MFT manteve `QueuePeakDepth = 1` (de `256`), `PacketsRejected = 0`, `QueuePendingAtShutdown = 0`, `ComBalanced = true` e `CompletionState = NormalShutdown`.
+- **Metodologia de percentis:** Todas as `22` metricas auditadas em `30 s` e `180 s` usaram `PercentileMethod = ExactPopulation` (`PercentilesAreEstimated = false`, `SamplesTruncated = false`, `ReservoirSampled = false`), pois todos os contadores permaneceram abaixo do limite de `65.536` amostras.
+- **Saude de recursos (`180 s`):** O processo do driver (`WUDFHost.exe`) permaneceu plano/decrescente em `25` amostras ativas (`WS -0,274 MB`, `Private -0,180 MB`, `VRAM 42,562 MB` constante em `9/9`, `GPU ~4,60%`, `Handles -2`). O consumidor (`lumabridge-host.exe`) manteve `VRAM 102,066 MB` constante, `Handles` com delta liquido `0` em regime ativo, taxa de CPU plana entre inicio/meio/fim (`0,567 / 0,553 / 0,557 core-s/s`) e variacao privada limitada (`+4,313 MB` ao longo de 180 s, classificada `BOUNDED` e consistente com o crescimento dos vetores `ExactPopulation` ate o teto de `65.536` amostras), com `SharedTexturePoolPeakUsage = 1/4`.
+- **Escopo estrito de medicao:** A validacao H.264 ao vivo sobre desktop real confirma **decodificacao estrutural** (`StructuralDecodeValidated = true`, `FidelityPsnrValidated = false`), enquanto fidelidade PSNR permanece validada no suite sintetica C++/E2E. Todas as latencias medidas nesta etapa refletem exclusivamente a **latencia interna do emissor Windows**, nao incluindo transporte em rede nem latencia glass-to-glass em receptor remoto (`FramesPresented = NOT_MEASURED_NO_REMOTE_RECEIVER`).
+
+### 7.6 Limitacoes remanescentes (nao bloqueantes para `M0`)
+
+- **Observabilidade PDH/GPU:** cada consulta de contadores PDH GPU consumiu `~5,6 - 6,4 s` no runner, elevando o intervalo efetivo medio para `~20,7 s` em `180 s` e tornando `DedicatedVram` do servidor indisponivel visto de dentro do host (`NOT_MEASURED`).
+- **Duracao de 180 s:** comprova estabilidade prolongada e rollback limpo para encerramento da `M0`, mas nao substitui ensaios de longa duracao de varias horas (inclusive acima de `65.536` amostras, onde entra `ReservoirSampledEstimate_AlgorithmR`).
+- **Distincao de politica de fallback no servidor:** o driver ainda registra o default estrutural `AllowCpuFallback = 1` em `SessionSummary` mesmo quando o host negocia `--require-gpu-shared` (`0` frames CPU); a explicitao por handshake fica para refinamento incremental sem alterar contratos `M0`.
+- **Fidelidade visual em captura real, otimizacao de NVENC sincrono, wraparound teorico `UINT64_MAX`, assinatura WHQL/EV de producao, protocolo de rede `LBWP v1`, receptor Linux e latencia glass-to-glass** ficam transferidos para `M1` e marcos posteriores conforme a documentacao de roadmap da plataforma universal (`docs/planning/UNIVERSAL_ROADMAP.md` na branch arquitetural dedicada).
+

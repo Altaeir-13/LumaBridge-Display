@@ -160,35 +160,69 @@ Resultados medidos em processo real separado (`FrameEndToEndIntegrationTests.exe
 
 ---
 
-## 10. Procedimento de Validação Windows e Caminho para Linux
+## 10. Procedimento de Validação Windows e Encerramento da M0
 
 ### Validação em Host Windows 11 Real
 ```powershell
-# Previa Dry Run (Benchmark 30s 1080p60 GPU + NVENC + Decode)
+# Prévia Dry Run (Benchmark 30s 1080p60 GPU + NVENC + Decode com DXGI explícito)
 powershell -NoProfile -ExecutionPolicy Bypass -File .\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 `
     -Configuration Release `
     -TestProfile Benchmark30s `
     -BenchmarkDurationSec 30 `
+    -StimulusBackend Dxgi `
+    -StimulusFps 60 `
     -TransportMode Gpu `
     -RequireGpuShared `
     -EnableNvenc `
     -RequireNvenc `
     -VerifyH264Decode `
+    -ResourceSampleIntervalSec 5 `
+    -GpuSampleIntervalSec 15 `
+    -CertificateThumbprint "<THUMBPRINT_SHA1_40_HEX>" `
     -DryRun
 
-# Execucao real como Administrador (solicita confirmacao explicita e garante rollback em finally)
+# Execução real como Administrador (sem -Force, preservando confirmação interativa e rollback em finally)
 powershell -NoProfile -ExecutionPolicy Bypass -File .\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 `
     -Configuration Release `
     -TestProfile Benchmark30s `
     -BenchmarkDurationSec 30 `
+    -StimulusBackend Dxgi `
+    -StimulusFps 60 `
     -TransportMode Gpu `
     -RequireGpuShared `
     -EnableNvenc `
     -RequireNvenc `
     -VerifyH264Decode `
-    -CreateTestCertificateIfMissing -TrustCertificate -AllowUntrustedChain
+    -ResourceSampleIntervalSec 5 `
+    -GpuSampleIntervalSec 15 `
+    -CertificateThumbprint "<THUMBPRINT_SHA1_40_HEX>"
+
+# Execução real ProlongedStability (180s) reutilizando staging assinado já instalado (sem reinstalar ou reassinar)
+powershell -NoProfile -ExecutionPolicy Bypass -File .\windows\driver\scripts\Invoke-LumaBridgeFunctionalValidation.ps1 `
+    -Configuration Release `
+    -TestProfile ProlongedStability `
+    -StabilityDurationSec 180 `
+    -MinProlongedStabilitySec 180 `
+    -StimulusBackend Dxgi `
+    -StimulusFps 60 `
+    -TransportMode Gpu `
+    -RequireGpuShared `
+    -EnableNvenc `
+    -RequireNvenc `
+    -VerifyH264Decode `
+    -ResourceSampleIntervalSec 5 `
+    -GpuSampleIntervalSec 15 `
+    -CertificateThumbprint "<THUMBPRINT_SHA1_40_HEX>" `
+    -StagingDir "<StagingDir>" `
+    -OutputDir "<OutputDir>" `
+    -SkipDriverInstall `
+    -ReuseSignedStaging
 ```
-O script habilita temporariamente `EnableFrameExtraction=1` (e `EnableGpuSharedTransport` se explicitado) e garante o rollback completo no bloco `finally` (`EnableFrameExtraction=0`, remoção/restauração de `AuthorizedHostUserSid` e `EnableGpuSharedTransport`, encerramento de ETW e reinício do adaptador). Para estabilidade prolongada de 2 a 5 minutos, utilize `-TestProfile ProlongedStability -StabilityDurationSec 120` (ou `-TestProfile Full`).
+O script habilita temporariamente `EnableFrameExtraction=1` (e `EnableGpuSharedTransport` se explicitado) e garante o rollback completo no bloco `finally` (`EnableFrameExtraction=0`, remoção/restauração de `AuthorizedHostUserSid` e `EnableGpuSharedTransport`, encerramento de ETW e reinício do adaptador). Em ambientes novos sem certificado preexistente confiável, utilize um passo explícito e autorizado com `Invoke-LumaBridgePackageSigning.ps1` em `<StagingDir>` isolado antes da execução.
+
+### Status de Encerramento Funcional (`M0.3`)
+- A validação real em `WUDFHost.exe` (`DriverVer 11/23/2026,23.3.21.222`) foi **aprovada** nos perfis `Benchmark30s` (`1.800/1.800` quadros em `30,011 s`, `HostLiveE2E p99 = 257 us`, `NVENC p99 = 13.673 us`) e `ProlongedStability` (`10.670/10.584` quadros mínimos em `180,005 s` conectados, `HostLiveE2E p99 = 239 us`, `NVENC p99 = 13.726 us`, `ProlongedStabilityProven = True`, `RollbackClean = True`), utilizando `D3d11DxgiVSync` sem fallback e transporte GPU puro (`CpuStagingReadsPerformed = 0`).
+- A matriz completa de resultados, proveniência sanitizada e limitações remanescentes encontra-se consolidada na Seção 7 de [windows-idd-functional-validation.md](../setup/windows-idd-functional-validation.md).
 
 ### Caminho Posterior para Transmissão Linux (M5+)
 1. **Empacotamento de Rede em `lumabridge-host.exe`:** Consumir pacotes `EncodedFramePacket` de `EncodedFrameQueue` (já entregues em `Annex-B` com SPS/PPS pré-anexados a cada IDR e `PresentDisplayQpcTime` / `FrameSequence`), fragmentando em datagramas UDP/QUIC/RTP com cabeçalho mínimo de sequência, timestamp monotônico e indicador de keyframe.
