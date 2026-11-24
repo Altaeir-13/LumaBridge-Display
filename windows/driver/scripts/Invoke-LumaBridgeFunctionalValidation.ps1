@@ -2671,7 +2671,7 @@ finally {
         'Identify the specific LumaBridge host process PID via Get-CimInstance Win32_Process -Filter "Name=''lumabridge-host.exe''" before stopping anything (never run Stop-Process -Name blindly across unrelated sessions).',
         'Identify the LumaBridge PnP instance dynamically via DEVPKEY_Device_HardwareIds = Root\LumaBridgeIddDriver (never touch third-party displays).',
         'Restore EnableFrameExtraction, EnableGpuSharedTransport, AuthorizedHostUserSid, and EnableVirtualMonitor to InitialSystemSnapshot.RegistryValues (e.g., keep EnableVirtualMonitor=1 if it existed before the run), then run pnputil /restart-device <InstanceId>.',
-        'Preserve pre-existing certificates (e.g., 1EEFC55BD7EEB2A9115432607B97978736B9DFE0) and historical Driver Store packages unless explicitly authorized.'
+        'Preserve pre-existing certificates and historical Driver Store packages unless explicitly authorized.'
     )
 
     if ($null -eq $subprofileStatuses) {
