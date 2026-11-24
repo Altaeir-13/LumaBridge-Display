@@ -32,7 +32,7 @@ Este registro consolida os riscos técnicos, jurídicos, operacionais e de segur
 - **Contingência:** Disponibilizar modo **Espelhamento Windows (`WGC` / `DXGI`)** em `M3` e **Receptor Windows** sem necessidade de instalação do driver IddCx.
 
 ### `R02` — Compatibilidade Windows 10 vs Windows 11 e Regressões `IddCx`
-- **Descrição:** [LumaBridgeIddDriver.inf](../../windows/driver/LumaBridgeIddDriver/LumaBridgeIddDriver.inf) fixa suporte apenas ao Windows 11 x64 (`NT$ARCH$.10.0...22000`, `10_CO_X64;10_NI_X64;10_GE_X64`). Além disso, `IddCx.dll` pode impor validações binárias não triviais (como a descoberta na branch `#34` da rejeição de `IDDCX_TRANSMISSION_TYPE_NETWORK_OTHER` = `9` com `0xC000000D`).
+- **Descrição:** [LumaBridgeIddDriver.inf](../../windows/driver/LumaBridgeIddDriver/LumaBridgeIddDriver.inf) fixa suporte apenas ao Windows 11 x64 (`NT$ARCH$.10.0...22000`, `10_CO_X64;10_NI_X64;10_GE_X64`). Além disso, `IddCx.dll` pode impor validações binárias não triviais (como a descoberta na issue `#34`, branch `fix/windows-idd-device-start` / PR `#35`, da rejeição de `IDDCX_TRANSMISSION_TYPE_NETWORK_OTHER` = `9` com `0xC000000D`).
 - **Mitigação Preventiva:** Nunca declarar suporte a Windows 10 ou builds novas do Windows 11 sem spike específico, ajuste validado de `.inf`/`Inf2Cat` (`19041+`) e execução completa em ambiente real. Preservar todos os testes de validação estática e contrato em `DriverPackageValidationTests.cpp`.
 
 ### `R03` — Fragmentação de Saídas Virtuais no Linux Wayland

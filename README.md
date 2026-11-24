@@ -2,11 +2,11 @@
 
 Plataforma open source em desenvolvimento para espelhamento, extensao real de area de trabalho na sessao grafica ativa e interacao remota entre dispositivos, com emissor virtual Windows 11 x64 (`LumaBridgeIddDriver` + `lumabridge-host`) e arquitetura multiplataforma planejada para Windows, Linux (Wayland/X11) e Android.
 
-## Estado Atual do Projeto (`M0.4`)
+## Estado Atual do Projeto (`M0.4.1`)
 
-- **M0 (Emissor Windows & Validacao Funcional):** **Funcionalmente aprovada** no commit funcional `6b297856` (`Benchmark30s` 30 s e `ProlongedStability` 180 s com `D3d11DxgiVSync`, transporte GPU puro e `NVENC H.264`) e **consolidada localmente** na branch de integracao `integration/m0-windows-closure`.
-- **Integracao em `dev` remoto (`origin/dev`):** **Ainda nao integrada em `dev` remoto** (aguarda revisao e publicacao por merge commit preservando o historico dos commits validados).
-- **M1 (Nucleo multiplataforma, `LBWP v1`, FFI e transporte):** **Ainda nao iniciada** (arquitetura e roadmap formalizados para a proxima etapa apos o fechamento formal da `M0`).
+- **M0 (Emissor Windows & Validacao Funcional):** **Funcionalmente aprovada** no commit funcional `6b297856` (`Benchmark30s` 30 s e `ProlongedStability` 180 s com `D3d11DxgiVSync`, transporte GPU compartilhado sem readback CPU e `NVENC H.264`), **consolidada localmente** na branch de integracao `integration/m0-windows-closure` e **requalificada para PR (`M0.4.1`)** (`157/157` C++, `71/71` PowerShell, `InfVerif 7/7` e `2/2` execucoes controladas `9/9` E2E aprovadas, preservando duas reprovacoes sinteticas `p99` anteriores da `M0.4`).
+- **Integracao em `dev` remoto (`origin/dev`) e fechamento formal:** **Ainda nao integrada em `dev` remoto (`M0_INTEGRATED_IN_DEV = False`)** e **`M0_FORMALLY_CLOSED = False`** (aguarda revisao/publicacao por merge commit e definicao/criacao de `LICENSE`, `NOTICE`/`THIRD_PARTY_NOTICES.md` e CI inicial em `.github/workflows/`).
+- **M1 (Nucleo multiplataforma, `LBWP v1`, FFI e transporte):** **Ainda nao iniciada (`M1_STARTED = False`)** (arquitetura e roadmap formalizados para a proxima etapa apos a integracao/encerramento formal da `M0`).
 
 ## Documentacao Principal
 

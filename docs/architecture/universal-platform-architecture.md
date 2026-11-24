@@ -165,7 +165,9 @@ flowchart LR
 
 | Plataforma | Mecanismo Zero-Copy Primário | Sincronização de Memória | Fallback Explícito quando Zero-Copy Indisponível |
 |---|---|---|---|
-| **Windows (Extensão)** | `D3D11` Shared NT Handle entre `WUDFHost.exe` e backend host (`M4.2`) | `IDXGIKeyedMutex` (chaves `0 ↔ 1`) + `FrameIpcFrameAck` | IPC v1.0 `CpuStagingPipe` (cópia staging controlada apenas quando GPU shared falhar ou for desabilitado) |
+| **Windows (Extensão)** | `D3D11` Shared NT Handle entre `WUDFHost.exe` e backend host (`M4.2`: elimina readback CPU, mantendo cópia GPU-para-GPU `CopyResource` para o pool limitado) | `IDXGIKeyedMutex` (chaves `0 ↔ 1`) + `FrameIpcFrameAck` | IPC v1.0 `CpuStagingPipe` (cópia staging controlada apenas quando GPU shared falhar ou for desabilitado) |
+
+> **Nota técnica de nomenclatura ("Zero-Copy" vs sem readback CPU):** No caminho Windows IddCx (`M4.2`), a textura entregue por `IddCxSwapChainReleaseAndAcquireBuffer` não é exposta diretamente entre processos sem cópia GPU; o driver copia na GPU (`CopyResource`) para um pool compartilhado (`D3D11_RESOURCE_MISC_SHARED_NTHANDLE | SHARED_KEYEDMUTEX`) e evita integralmente transferências GPU → CPU (`CpuStagingReadsPerformed == 0`). Usa-se aqui "transporte GPU compartilhado / zero readback CPU" de forma distinta de ausência absoluta de cópias na GPU.
 | **Windows (Espelhamento / Receptor)** | Textura `ID3D11Texture2D` intra-processo direto para encoder/decoder/swapchain | Contexto imediato D3D11 / `ID3D11Fence` | Staging texture D3D11 apenas para fallback SW diagnóstico |
 | **Linux (Wayland/PipeWire)** | `DMA-BUF` com negociação de `DRM format modifiers` (`SPA_DATA_DmaBuf`) até VA-API/Vulkan/Wayland (`zwp_linux_dmabuf_v1`) | `dma_buf` implicit sync ou `sync_file` explicit fencing (`SPA_META_SyncTimeline`) | `MemFd` / `XShm` + upload linear para GPU quando GPU híbrida não compartilhar modifier |
 | **Android** | `VirtualDisplay` → `Surface` de entrada do `MediaCodec` (emissor); `MediaCodec` → `SurfaceView` (receptor) | `BufferQueue` / fences Gralloc gerenciados pelo Android | `ImageReader` / CPU YUV somente se necessário para diagnóstico |

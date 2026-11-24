@@ -48,22 +48,23 @@ O marco `M2` será avaliado por métricas reproduzíveis coletadas sem registro 
 
 ### `M0` — Preservação, Validação Real Windows e Consolidação de Governança
 
-- **Estado atual (`M0.4`):** **Funcionalmente aprovada** (`6b297856`) e **consolidada localmente** (`integration/m0-windows-closure`); **ainda não integrada em `dev` remoto** (e `LICENSE`/`.github/workflows/` pendentes antes do fechamento formal em `dev`).
+- **Estado atual (`M0.4.1`):** **Funcionalmente aprovada** (`6b297856`), **consolidada localmente** (`integration/m0-windows-closure`) e **requalificada para abertura de PR** (`M0.4.1` com `2/2` execuções E2E aprovadas preservando duas reprovações sintéticas históricas); **ainda não integrada em `dev` remoto (`M0_INTEGRATED_IN_DEV = False`)** e **ainda sem encerramento formal completo da `M0`** (pendente de merge em `dev`, decisão humana e emissão de `LICENSE`, `NOTICE`/`THIRD_PARTY_NOTICES.md` e CI inicial em `.github/workflows/`).
 - **Objetivo:** Formalizar a documentação da visão universal, fechar a validação funcional ao vivo no Windows 11, consolidar para `dev` preservando a ancestralidade dos commits validados e preparar a base open source (`M1` ainda não iniciada).
 - **Dependências:** Branches empilhadas `fix/windows-idd-device-start`, `feature/windows-frame-extraction-ipc`, `feature/windows-gpu-shared-textures-nvenc`, `fix/m0-validation-gates-hardening` e `docs/universal-architecture-redefinition`; autorização explícita para publicar em `dev`.
 - **Artefatos produzidos:**
   - Documentação da arquitetura universal, ADRs `0003–0005`, protocolo rascunho `LBWP v1`, roadmap, plano de migração, registro de riscos e revisão de licenças;
   - Relatórios reais ao vivo aprovados (`Benchmark30s` 30 s e `ProlongedStability` 180 s com `D3d11DxgiVSync`, transporte GPU puro e rollback verificado no commit `6b297856`);
   - Branch local de integração `integration/m0-windows-closure` com `windows/driver/README.md`, `windows/driver/tests/README.md` e documentação `M0` reconciliados;
-  - *(Pendentes de publicação/execução antes de encerrar `M0` formalmente em `dev`)*: merge em `dev`, decisão final e criação de `LICENSE` (`Apache-2.0` candidata), `NOTICE`/`THIRD_PARTY_NOTICES.md` e `.github/workflows/` inicial.
-- **Critérios objetivos de aceitação:**
-  - `157/157` testes C++ unitários/componentes, `9/9` E2E, `71/71` testes PowerShell e `InfVerif` aprovados na árvore integrada;
+  - *(Distinção entre prontidão do PR e encerramento formal completo da `M0`):* a **prontidão técnica para o PR** decorre da integração local verificada, da validação ao vivo em `6b297856` e das suítes automatizadas aprovadas na `M0.4.1`; já o **encerramento formal da `M0` em `dev`** requer o merge efetivo em `dev`, a escolha/emissão de `LICENSE` (`Apache-2.0` recomendada, pendente de aprovação humana), `NOTICE`/`THIRD_PARTY_NOTICES.md` e definição/criação do CI inicial em `.github/workflows/` (enquanto a qualificação EV/WHQL de produção permanece em `M6`).
+- **Critérios objetivos de aceitação e evidências observadas:**
+  - `157/157` testes C++ unitários/componentes *(inventário real verificado nos fontes, superior ao número histórico `156` anteriormente registrado por contar `8` casos em `NvencEncoderTests.cpp`)*, `71/71` testes PowerShell e `InfVerif` (`7/7` modos) aprovados na árvore integrada;
+  - Suíte E2E `FrameEndToEndIntegrationTests` (`9` testes) aprovada em `6b297856` e revalidada em `M0.4.1` com **2 execuções consecutivas `9/9` (`ExitCode = 0`)** após redução de carga gráfica concorrente — **preservando no histórico duas reprovações sintéticas anteriores da `M0.4` (`8/9`, `ExtToBs p99 = 30.424 us` e `33.354 us` vs `< 30.000 us`)**, sem reivindicar estabilidade universal sob toda condição ambiental;
   - Execução real ao vivo em `WUDFHost.exe` com `TimestampMeasurementErrors == 0`, `CpuStagingReadsPerformed == 0`, `ProlongedStabilityProven == true` e `RollbackClean == true` *(atendido em `6b297856`)*;
-  - Histórico em `dev` livre de conflitos preservando ancestralidade de `6b297856` *(aguardando merge autorizado em `dev`)*;
+  - Histórico em `dev` livre de conflitos preservando ancestralidade de `6b297856` *(aguardando push e merge autorizados em `dev`)*;
   - Nenhuma regressão no driver `LumaBridgeIddDriver` (`EnableVirtualMonitor=0` por padrão).
 - **Testes necessários:** Categorias **1, 2, 3, 4 (obrigatório)** e **7 (local 30 s + estabilidade prolongada 180 s)**.
 - **Condições para avançar ao próximo marco (`M1` / `M2`):**
-  - Gate real aprovado e documentado *(cumprido)*; integração definitiva em `dev` autorizada para abertura formal da **`M1` (ainda não iniciada)**.
+  - Gate real em `WUDFHost.exe` e qualificação local para PR atendidos *(cumprido)*; publicação, merge definitivo em `dev` e resolução dos entregáveis formais de encerramento (`LICENSE`, `NOTICE`/`THIRD_PARTY_NOTICES.md` e CI inicial conforme `LICENSE_COMPLIANCE_REVIEW.md` e `M1`) autorizados para fechamento formal da `M0` e abertura da **`M1` (ainda não iniciada)**.
 
 ---
 
@@ -94,7 +95,7 @@ O marco `M2` será avaliado por métricas reproduzíveis coletadas sem registro 
 
 ### `M2` — Primeiro Fluxo Completo: `Windows → Linux` (Extensão Real em LAN)
 
-- **Objetivo:** Entregar a primeira solução utilizável ponta-a-ponta: monitor virtual real no Windows 11 estendido para um receptor nativo Linux (suportando Wayland e X11) em rede local, usando zero-copy GPU + NVENC no emissor e decodificação por hardware (VA-API quando disponível) no receptor.
+- **Objetivo:** Entregar a primeira solução utilizável ponta-a-ponta: monitor virtual real no Windows 11 estendido para um receptor nativo Linux (suportando Wayland e X11) em rede local, usando transporte GPU compartilhado sem readback CPU (cópia GPU-para-GPU no pool compartilhado) + NVENC no emissor e decodificação por hardware (VA-API quando disponível) no receptor.
 - **Dependências:** `M0` (gate real `M4.2.1` aprovado e integrado) e `M1` concluído.
 - **Artefatos produzidos:**
   - Adaptação mínima de `windows/host/` para consumir o núcleo (`lumabridge-core` via FFI) por trás de `IVideoFrameSource` e `IVideoEncoder` (`NvencH264Encoder`), respondendo a `RequestForceIdr` e ajuste dinâmico de bitrate;
