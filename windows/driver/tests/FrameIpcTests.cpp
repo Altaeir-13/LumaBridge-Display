@@ -484,6 +484,8 @@ TestFrameSequenceMonotonicityAndGapDetection()
     serverCfg.SetPipeName(pipeName.c_str());
     serverCfg.MaxQueueDepth = 2U;
     serverCfg.BufferPoolSize = 4U;
+    // Preserve caller-injected synthetic gap (4 -> 10) to test consumer gap accounting directly.
+    serverCfg.AssignSequenceOnEnqueue = false;
 
     FrameIpcServer server;
     EXPECT_EQ(server.Start(serverCfg), S_OK);

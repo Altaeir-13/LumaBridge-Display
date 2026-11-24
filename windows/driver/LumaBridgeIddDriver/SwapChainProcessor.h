@@ -79,6 +79,7 @@ struct SwapChainFrameMetadata
     bool HasValidSurface{false};
     bool ExtractionAttempted{false};
     bool ExtractionAccepted{false};
+    bool AcquiredWithoutConsumer{false};
     bool PixelsCopied{false};
     bool ProtectedContentRejected{false};
     bool EvictedOldestByBackpressure{false};
@@ -86,6 +87,9 @@ struct SwapChainFrameMetadata
     uint32_t ExtractedHeight{0};
     uint32_t ExtractedFormat{0};
     uint64_t FrameSequence{0};
+    uint64_t SwapChainGeneration{0};
+    uint64_t SessionId{0};
+    uint64_t SessionGeneration{0};
     uint64_t CopyLatencyUs{0};
     HRESULT ExtractionHResult{S_OK};
 };
@@ -150,6 +154,17 @@ struct SwapChainMetricsSnapshot
     uint64_t GpuFramesDropped{0};
     uint64_t GpuSyncTimeouts{0};
     uint64_t GpuSyncWaitUs{0};
+    uint64_t SwapChainGeneration{0};
+    uint64_t SessionGeneration{0};
+    uint64_t ActiveSessionId{0};
+    uint64_t FramesAcquiredWithoutConsumer{0};
+    uint64_t FramesPublished{0};
+    uint64_t FramesDiscardedNoConsumer{0};
+    uint64_t FramesDiscardedStaleSession{0};
+    uint64_t FramesDiscardedTransportMismatch{0};
+    uint64_t FramesFlushedOnSessionTransition{0};
+    uint64_t SequenceWrapAroundCount{0};
+    uint64_t PendingAckCount{0};
 };
 
 /// Abstraction over D3D11/DXGI device setup and IddCx swapchain DDIs for testability.

@@ -117,6 +117,11 @@ private:
 struct ExtractedFrameBuffer
 {
     uint64_t FrameSequence{0};
+    uint64_t ExtractorLocalSequence{0};
+    uint64_t TargetSessionId{0};
+    uint64_t TargetSessionGeneration{0};
+    uint64_t SwapChainGeneration{0};
+    bool HasSessionBinding{false};
     uint32_t PresentationFrameNumber{0};
     uint32_t Width{0};
     uint32_t Height{0};
@@ -148,6 +153,11 @@ struct ExtractedFrameBuffer
     void ResetMetadataKeepCapacity() noexcept
     {
         FrameSequence = 0ULL;
+        ExtractorLocalSequence = 0ULL;
+        TargetSessionId = 0ULL;
+        TargetSessionGeneration = 0ULL;
+        SwapChainGeneration = 0ULL;
+        HasSessionBinding = false;
         PresentationFrameNumber = 0U;
         Width = 0U;
         Height = 0U;

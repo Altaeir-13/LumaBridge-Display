@@ -9,6 +9,17 @@
 
 namespace lumabridge::ipc {
 
+// LBIF wire protocol (v1.0 CPU staging / v1.1 GPU shared NT handles).
+// Authoritative FrameSequence contract (M0.2.4):
+//   - Wire FrameSequence is 1-based monotonic uint64_t (0 is invalid per ValidateFrameHeader/GpuFrameHeader).
+//   - When published through FrameIpcServer::EnqueueFrame (AssignSequenceOnEnqueue=true), FrameSequence
+//     is assigned in one single serialized domain under m_queueLock at FIFO queue-insertion time,
+//     covering both CPU and GPU frames without cross-backend regressions or concurrent inversion.
+//   - Server-instance scope: stays strictly monotonic across reconnects, transport transitions, and
+//     swapchain recreations while FrameIpcServer remains running, wrapping UINT64_MAX -> 1 (skipping 0).
+//   - Pre-enqueue rejections (no consumer, stale session, transport mismatch) do not consume sequence IDs;
+//     post-enqueue backpressure queue evictions produce legitimate sequence gaps matching drop counters.
+
 inline constexpr uint32_t kFrameIpcMagic = 0x4649424CU; // 'LBIF'
 inline constexpr uint16_t kFrameIpcProtocolVersionMajor = 1U;
 inline constexpr uint16_t kFrameIpcProtocolVersionMinor = 0U;

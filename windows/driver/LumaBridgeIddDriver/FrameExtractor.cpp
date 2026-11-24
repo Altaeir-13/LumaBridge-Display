@@ -431,6 +431,10 @@ D3d11FrameExtractor::ExtractFrame(
     const uint64_t copyLatencyUs = ipc::ComputeQpcElapsedUs(startQpc, mapCpuEndQpc, qpcFreq);
 
     const uint64_t seq = static_cast<uint64_t>(InterlockedIncrement64(&m_sequenceCounter));
+    outFrame.ExtractorLocalSequence = seq;
+    // Retain local extraction ordinal for standalone callers/unit tests; when enqueued into
+    // FrameIpcServer with AssignSequenceOnEnqueue=true, FrameSequence is overwritten atomically
+    // at serialized publication time under m_queueLock.
     outFrame.FrameSequence = seq;
     outFrame.PresentationFrameNumber = input.PresentationFrameNumber;
     outFrame.Width = desc.Width;

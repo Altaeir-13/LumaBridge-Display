@@ -963,6 +963,10 @@ D3d11SharedTexturePool::ExtractToSharedTexture(
     const uint64_t gpuCopyLatencyUs = ipc::ComputeQpcElapsedUs(gpuCopyStartQpc, gpuCopyEndQpc, qpcFreq);
     const uint64_t seq = static_cast<uint64_t>(InterlockedIncrement64(&m_sequenceCounter));
 
+    outFrameMetadata.ExtractorLocalSequence = seq;
+    // Retain local extraction ordinal for standalone callers/unit tests; when enqueued into
+    // FrameIpcServer with AssignSequenceOnEnqueue=true, FrameSequence is overwritten atomically
+    // at serialized publication time under m_queueLock.
     outFrameMetadata.FrameSequence = seq;
     outFrameMetadata.PresentationFrameNumber = input.PresentationFrameNumber;
     outFrameMetadata.Width = srcDesc.Width;

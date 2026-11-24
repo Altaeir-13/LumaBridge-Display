@@ -223,6 +223,7 @@ public:
         FrameTransportConfig transportConfig{};
         {
             ExclusiveLockGuard deviceGuard(&m_deviceLock);
+            ++m_swapChainGeneration;
             m_boundSwapChainHandle = swapChainHandle;
             m_activeRenderAdapterLuid = renderAdapterLuid;
             m_lastCausalPresentQpc = 0ULL;
@@ -250,6 +251,7 @@ public:
         SwapChainFrameMetadata& outMetadata
         ) noexcept override
     {
+        const uint64_t callerSwapChainGen = outMetadata.SwapChainGeneration;
         outMetadata = {};
         if (swapChainHandle == nullptr)
         {
@@ -318,9 +320,24 @@ public:
         outMetadata.SwapChainAcquireQpcTime = acquireQpc;
         outMetadata.PresentDisplayQpcWasFutureTarget = (rawPresentQpc > acquireQpc);
         outMetadata.HasValidSurface = hasValidSurface;
+        const uint64_t activeSwapChainGen =
+            (callerSwapChainGen > 0ULL) ? callerSwapChainGen : m_swapChainGeneration;
+        outMetadata.SwapChainGeneration = activeSwapChainGen;
 
         if (InterlockedCompareExchange(&m_frameExtractionEnabled, 0, 0) != 0 && hasValidSurface)
         {
+            // Gate extraction on an active authorized consumer session so frames acquired before
+            // handshake completion never waste CPU readbacks or enter an unnegotiated queue, while
+            // still returning S_OK so SwapChainProcessor completes FinishProcessingFrame normally.
+            const TransportSessionSnapshot session = m_ipcServer.GetActiveSessionSnapshot();
+            if (!session.HasActiveConsumer || !session.ClientAuthorized || session.SessionId == 0ULL)
+            {
+                outMetadata.AcquiredWithoutConsumer = true;
+                outMetadata.ExtractionAttempted = false;
+                texture.Reset();
+                return S_OK;
+            }
+
             std::unique_ptr<ExtractedFrameBuffer> slot = m_ipcServer.AcquireBufferSlot();
             if (slot == nullptr)
             {
@@ -330,11 +347,14 @@ public:
                 return S_OK;
             }
 
-            const bool useGpuShared = m_ipcServer.ShouldProduceGpuSharedFrame();
+            const bool useGpuShared =
+                (session.NegotiatedMode == ipc::FrameIpcTransportMode::GpuSharedNtHandle);
             if (useGpuShared)
             {
                 SharedTextureExtractResult gpuResult{};
                 bool extractionPerformed = false;
+                bool fallbackAttempted = false;
+                FrameExtractionResult fallbackExtractResult{};
                 {
                     ExclusiveLockGuard deviceGuard(&m_deviceLock);
                     if (InterlockedCompareExchange(&m_frameExtractionEnabled, 0, 0) != 0 &&
@@ -342,7 +362,14 @@ public:
                     {
                         extractionPerformed = true;
                         FrameExtractionInput input{};
-                        input.AdoptSourceTexture = texture.Detach();
+                        if (session.AllowCpuFallback)
+                        {
+                            input.SourceTexture = texture.Get();
+                        }
+                        else
+                        {
+                            input.AdoptSourceTexture = texture.Detach();
+                        }
                         input.PresentationFrameNumber = outMetadata.PresentationFrameNumber;
                         input.DirtyRectCount = outMetadata.DirtyRectCount;
                         input.MoveRegionCount = outMetadata.MoveRegionCount;
@@ -351,6 +378,25 @@ public:
                         input.Flags = static_cast<uint32_t>(ipc::FrameIpcFlags::None);
 
                         gpuResult = m_sharedTexturePool.ExtractToSharedTexture(input, *slot, true);
+
+                        if (!gpuResult.GpuCopied &&
+                            !gpuResult.DeviceRemovedOrReset &&
+                            !gpuResult.ProtectedContentRejected &&
+                            session.AllowCpuFallback &&
+                            texture != nullptr)
+                        {
+                            fallbackAttempted = true;
+                            slot->ResetMetadataKeepCapacity();
+                            FrameExtractionInput cpuInput{};
+                            cpuInput.AdoptSourceTexture = texture.Detach();
+                            cpuInput.PresentationFrameNumber = outMetadata.PresentationFrameNumber;
+                            cpuInput.DirtyRectCount = outMetadata.DirtyRectCount;
+                            cpuInput.MoveRegionCount = outMetadata.MoveRegionCount;
+                            cpuInput.HwProtectedSurface = outMetadata.HwProtectedSurface;
+                            cpuInput.PresentDisplayQpcTime = outMetadata.PresentDisplayQPCTime;
+                            cpuInput.Flags = static_cast<uint32_t>(ipc::FrameIpcFlags::None);
+                            fallbackExtractResult = m_extractor.ExtractFrame(cpuInput, *slot);
+                        }
                     }
                     texture.Reset();
                 }
@@ -361,6 +407,57 @@ public:
                     return S_OK;
                 }
 
+                if (fallbackAttempted)
+                {
+                    outMetadata.ExtractionAttempted = true;
+                    outMetadata.ExtractionAccepted = fallbackExtractResult.AcceptedForExtraction;
+                    outMetadata.PixelsCopied = fallbackExtractResult.PixelsCopied;
+                    outMetadata.ProtectedContentRejected = fallbackExtractResult.ProtectedContentRejected;
+                    outMetadata.ExtractedWidth = fallbackExtractResult.Width;
+                    outMetadata.ExtractedHeight = fallbackExtractResult.Height;
+                    outMetadata.ExtractedFormat = fallbackExtractResult.Format;
+                    outMetadata.CopyLatencyUs = fallbackExtractResult.CopyLatencyUs;
+                    outMetadata.ExtractionHResult = fallbackExtractResult.HResult;
+
+                    if (fallbackExtractResult.DeviceRemovedOrReset)
+                    {
+                        m_ipcServer.RecycleBufferSlot(std::move(slot));
+                        return fallbackExtractResult.HResult;
+                    }
+
+                    if (fallbackExtractResult.PixelsCopied)
+                    {
+                        slot->TargetSessionId = session.SessionId;
+                        slot->TargetSessionGeneration = session.SessionGeneration;
+                        slot->SwapChainGeneration = activeSwapChainGen;
+                        slot->HasSessionBinding = true;
+
+                        bool evictedOldest = false;
+                        uint64_t assignedSeq = 0ULL;
+                        const HRESULT enqueueHr = m_ipcServer.EnqueueFrame(
+                            std::move(slot),
+                            evictedOldest,
+                            &assignedSeq);
+                        outMetadata.EvictedOldestByBackpressure = evictedOldest;
+                        if (SUCCEEDED(enqueueHr))
+                        {
+                            outMetadata.FrameSequence = assignedSeq;
+                            outMetadata.SessionId = session.SessionId;
+                            outMetadata.SessionGeneration = session.SessionGeneration;
+                        }
+                        else if (enqueueHr != HRESULT_FROM_WIN32(ERROR_CONTEXT_EXPIRED) &&
+                                 enqueueHr != HRESULT_FROM_WIN32(ERROR_NO_DATA))
+                        {
+                            outMetadata.ExtractionHResult = enqueueHr;
+                        }
+                    }
+                    else
+                    {
+                        m_ipcServer.RecycleBufferSlot(std::move(slot));
+                    }
+                    return S_OK;
+                }
+
                 outMetadata.ExtractionAttempted = true;
                 outMetadata.ExtractionAccepted = gpuResult.AcceptedForExtraction;
                 outMetadata.PixelsCopied = gpuResult.GpuCopied;
@@ -368,7 +465,6 @@ public:
                 outMetadata.ExtractedWidth = gpuResult.Width;
                 outMetadata.ExtractedHeight = gpuResult.Height;
                 outMetadata.ExtractedFormat = gpuResult.Format;
-                outMetadata.FrameSequence = gpuResult.FrameSequence;
                 outMetadata.CopyLatencyUs = gpuResult.GpuCopyLatencyUs;
                 outMetadata.ExtractionHResult = gpuResult.HResult;
 
@@ -380,10 +476,26 @@ public:
 
                 if (gpuResult.GpuCopied)
                 {
+                    slot->TargetSessionId = session.SessionId;
+                    slot->TargetSessionGeneration = session.SessionGeneration;
+                    slot->SwapChainGeneration = activeSwapChainGen;
+                    slot->HasSessionBinding = true;
+
                     bool evictedOldest = false;
-                    const HRESULT enqueueHr = m_ipcServer.EnqueueFrame(std::move(slot), evictedOldest);
+                    uint64_t assignedSeq = 0ULL;
+                    const HRESULT enqueueHr = m_ipcServer.EnqueueFrame(
+                        std::move(slot),
+                        evictedOldest,
+                        &assignedSeq);
                     outMetadata.EvictedOldestByBackpressure = evictedOldest;
-                    if (FAILED(enqueueHr))
+                    if (SUCCEEDED(enqueueHr))
+                    {
+                        outMetadata.FrameSequence = assignedSeq;
+                        outMetadata.SessionId = session.SessionId;
+                        outMetadata.SessionGeneration = session.SessionGeneration;
+                    }
+                    else if (enqueueHr != HRESULT_FROM_WIN32(ERROR_CONTEXT_EXPIRED) &&
+                             enqueueHr != HRESULT_FROM_WIN32(ERROR_NO_DATA))
                     {
                         outMetadata.ExtractionHResult = enqueueHr;
                     }
@@ -430,7 +542,6 @@ public:
             outMetadata.ExtractedWidth = extractResult.Width;
             outMetadata.ExtractedHeight = extractResult.Height;
             outMetadata.ExtractedFormat = extractResult.Format;
-            outMetadata.FrameSequence = extractResult.FrameSequence;
             outMetadata.CopyLatencyUs = extractResult.CopyLatencyUs;
             outMetadata.ExtractionHResult = extractResult.HResult;
 
@@ -442,10 +553,26 @@ public:
 
             if (extractResult.PixelsCopied)
             {
+                slot->TargetSessionId = session.SessionId;
+                slot->TargetSessionGeneration = session.SessionGeneration;
+                slot->SwapChainGeneration = activeSwapChainGen;
+                slot->HasSessionBinding = true;
+
                 bool evictedOldest = false;
-                const HRESULT enqueueHr = m_ipcServer.EnqueueFrame(std::move(slot), evictedOldest);
+                uint64_t assignedSeq = 0ULL;
+                const HRESULT enqueueHr = m_ipcServer.EnqueueFrame(
+                    std::move(slot),
+                    evictedOldest,
+                    &assignedSeq);
                 outMetadata.EvictedOldestByBackpressure = evictedOldest;
-                if (FAILED(enqueueHr))
+                if (SUCCEEDED(enqueueHr))
+                {
+                    outMetadata.FrameSequence = assignedSeq;
+                    outMetadata.SessionId = session.SessionId;
+                    outMetadata.SessionGeneration = session.SessionGeneration;
+                }
+                else if (enqueueHr != HRESULT_FROM_WIN32(ERROR_CONTEXT_EXPIRED) &&
+                         enqueueHr != HRESULT_FROM_WIN32(ERROR_NO_DATA))
                 {
                     outMetadata.ExtractionHResult = enqueueHr;
                 }
@@ -523,6 +650,19 @@ public:
         inoutSnapshot.GpuFramesDropped = ipcSnap.GpuFramesDropped;
         inoutSnapshot.GpuSyncTimeouts = ipcSnap.GpuSyncTimeouts;
         inoutSnapshot.GpuSyncWaitUs = ipcSnap.LastGpuSyncWaitUs;
+        inoutSnapshot.SessionGeneration = ipcSnap.SessionGeneration;
+        inoutSnapshot.ActiveSessionId = ipcSnap.ActiveSessionId;
+        inoutSnapshot.FramesPublished = ipcSnap.FramesPublished;
+        inoutSnapshot.FramesDiscardedNoConsumer = ipcSnap.FramesDiscardedNoConsumer;
+        inoutSnapshot.FramesDiscardedStaleSession = ipcSnap.FramesDiscardedStaleSession;
+        inoutSnapshot.FramesDiscardedTransportMismatch = ipcSnap.FramesDiscardedTransportMismatch;
+        inoutSnapshot.FramesFlushedOnSessionTransition = ipcSnap.FramesFlushedOnSessionTransition;
+        inoutSnapshot.SequenceWrapAroundCount = ipcSnap.SequenceWrapAroundCount;
+        inoutSnapshot.PendingAckCount = ipcSnap.PendingAckCount;
+        if (ipcSnap.LastFrameSequence > inoutSnapshot.LastFrameSequence)
+        {
+            inoutSnapshot.LastFrameSequence = ipcSnap.LastFrameSequence;
+        }
     }
 
 private:
@@ -560,6 +700,10 @@ private:
         // WUDFHost.exe executes under LOCAL SERVICE; peer LOCAL SERVICE processes must not
         // implicitly consume virtual monitor frames.
         transportConfig.AllowSameUserAccess = false;
+        transportConfig.AssignSequenceOnEnqueue = true;
+        transportConfig.RequireActiveSessionForEnqueue = true;
+        transportConfig.FlushQueueOnSessionStart = true;
+        transportConfig.ResetSequenceOnSessionStart = false;
         transportConfig.EnableGpuSharedTransport =
             (InterlockedCompareExchange(const_cast<volatile LONG*>(&m_gpuSharedTransportEnabled), 0, 0) != 0);
         transportConfig.SharedTexturePool = const_cast<D3d11SharedTexturePool*>(&m_sharedTexturePool);
@@ -588,6 +732,7 @@ private:
     volatile LONG m_gpuSharedTransportEnabled{1};
     void* m_boundSwapChainHandle{nullptr};
     LUID m_activeRenderAdapterLuid{0, 0};
+    uint64_t m_swapChainGeneration{0ULL};
     uint64_t m_lastCausalPresentQpc{0ULL};
     wchar_t m_authorizedHostUserSid[128]{};
     ComPtr<ID3D11Device> m_d3dDevice;
@@ -948,7 +1093,14 @@ EmitHostMetricsSnapshot(
             sc.GpuFramesDropped,
             sc.GpuSyncWaitUs,
             sc.SharedTexturePoolSize,
-            sc.SharedTexturePoolPeakUsage);
+            sc.SharedTexturePoolPeakUsage,
+            sc.FramesAcquiredWithoutConsumer,
+            sc.FramesPublished,
+            sc.FramesDiscardedStaleSession,
+            sc.FramesDiscardedTransportMismatch,
+            sc.FramesFlushedOnSessionTransition,
+            sc.SessionGeneration,
+            sc.SwapChainGeneration);
     }
 }
 

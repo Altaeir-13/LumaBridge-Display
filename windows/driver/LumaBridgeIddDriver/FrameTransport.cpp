@@ -1021,6 +1021,18 @@ FrameIpcServer::Start(
 
         m_effectiveMaxQueueDepth = clampedQueueDepth;
         m_effectiveMaxPoolSize = clampedPoolSize;
+        m_nextPublishSequence = 1ULL;
+        m_sessionGeneration = 0ULL;
+        m_activeSessionId = 0ULL;
+        m_activeSessionAuthorized = false;
+        m_activeSessionMode = ipc::FrameIpcTransportMode::CpuStagingPipe;
+        m_activeSessionAllowCpuFallback = false;
+        m_currentSessionSummary = {};
+        m_lastCompletedSessionSummary = {};
+        m_sessionStartGpuSharedBaseline = 0ULL;
+        m_sessionStartGpuDroppedBaseline = 0ULL;
+        m_sessionStartGpuSyncTimeoutsBaseline = 0ULL;
+        InterlockedExchange64(&m_pendingAckCount, 0);
         m_queueMetrics = {};
         m_queueMetrics.Running = true;
 
@@ -1198,6 +1210,43 @@ FrameIpcServer::SetSimulateSlotAllocationFailureForTesting(
     InterlockedExchange(&m_simulateSlotAllocationFailure, simulateFailure ? 1 : 0);
 }
 
+void
+FrameIpcServer::SetNextPublishSequenceForTesting(
+    uint64_t nextSequence
+    ) noexcept
+{
+    ExclusiveLock queueGuard(&m_queueLock);
+    m_nextPublishSequence = (nextSequence == 0ULL) ? 1ULL : nextSequence;
+}
+
+TransportSessionSnapshot
+FrameIpcServer::GetActiveSessionSnapshot() const noexcept
+{
+    SharedLock queueGuard(&m_queueLock);
+    TransportSessionSnapshot snap{};
+    snap.SessionId = m_activeSessionId;
+    snap.SessionGeneration = m_sessionGeneration;
+    snap.ClientAuthorized = m_activeSessionAuthorized;
+    snap.HasActiveConsumer = IsRunning() && m_activeSessionAuthorized && (m_activeSessionId != 0ULL);
+    snap.NegotiatedMode = m_activeSessionMode;
+    snap.AllowCpuFallback = m_activeSessionAllowCpuFallback;
+    snap.RequireGpuOnly =
+        snap.HasActiveConsumer &&
+        (m_activeSessionMode == ipc::FrameIpcTransportMode::GpuSharedNtHandle) &&
+        !m_activeSessionAllowCpuFallback;
+    return snap;
+}
+
+bool
+FrameIpcServer::GetLastCompletedSessionSummary(
+    DriverSessionSummarySnapshot& outSummary
+    ) const noexcept
+{
+    SharedLock queueGuard(&m_queueLock);
+    outSummary = m_lastCompletedSessionSummary;
+    return outSummary.Valid;
+}
+
 bool
 FrameIpcServer::ShouldProduceGpuSharedFrame() const noexcept
 {
@@ -1205,6 +1254,40 @@ FrameIpcServer::ShouldProduceGpuSharedFrame() const noexcept
            (m_config.SharedTexturePool != nullptr) &&
            m_config.EnableGpuSharedTransport &&
            (InterlockedCompareExchange(const_cast<volatile LONG*>(&m_activeSessionNegotiatedGpu), 0, 0) != 0);
+}
+
+void
+FrameIpcServer::ReturnBufferToFreePoolLocked(
+    std::unique_ptr<ExtractedFrameBuffer> buffer,
+    bool freePixelStorage
+    ) noexcept
+{
+    if (buffer == nullptr)
+    {
+        return;
+    }
+
+    if (freePixelStorage)
+    {
+        buffer->ResetMetadataAndFreePixels();
+    }
+    else
+    {
+        buffer->ResetMetadataKeepCapacity();
+    }
+
+    if (buffer->PooledSlot && buffer->PoolEpoch == m_poolEpoch)
+    {
+        buffer->InFlightFromPool = false;
+        if (m_freePool.Size() >= m_effectiveMaxPoolSize ||
+            !m_freePool.PushBack(std::move(buffer)))
+        {
+            if (m_totalPoolSlots > 0U)
+            {
+                --m_totalPoolSlots;
+            }
+        }
+    }
 }
 
 void
@@ -1222,11 +1305,36 @@ FrameIpcServer::ReleaseFrameResources(
     }
 }
 
+void
+FrameIpcServer::ReleasePendingGpuSlots(
+    const PendingGpuSlotRelease* pending,
+    size_t count
+    ) noexcept
+{
+    if (pending == nullptr || m_config.SharedTexturePool == nullptr)
+    {
+        return;
+    }
+    for (size_t i = 0U; i < count; ++i)
+    {
+        if (pending[i].Valid)
+        {
+            m_config.SharedTexturePool->ReleaseQueuedSlot(
+                pending[i].SlotIndex,
+                pending[i].SlotGeneration,
+                pending[i].CountAsDrop);
+        }
+    }
+}
+
 std::unique_ptr<ExtractedFrameBuffer>
 FrameIpcServer::AcquireBufferSlot() noexcept
 {
     bool needDynamicAlloc = false;
     uint64_t acquiredEpoch = 0ULL;
+    PendingGpuSlotRelease pendingReleases[kMaxSupportedQueueDepth]{};
+    size_t pendingReleaseCount = 0U;
+    std::unique_ptr<ExtractedFrameBuffer> acquiredEvictedSlot{};
 
     {
         ExclusiveLock queueGuard(&m_queueLock);
@@ -1265,11 +1373,22 @@ FrameIpcServer::AcquireBufferSlot() noexcept
                 auto evicted = m_queue.PopFront();
                 ++m_queueMetrics.FramesDroppedByBackpressure;
                 ++m_queueMetrics.QueueEvictionsByBackpressure;
+                if (m_activeSessionAuthorized)
+                {
+                    ++m_currentSessionSummary.FramesDroppedByBackpressure;
+                }
                 if (evicted == nullptr)
                 {
                     continue;
                 }
-                ReleaseFrameResources(evicted.get(), true);
+                if (evicted->IsGpuSharedFrame && pendingReleaseCount < ARRAYSIZE(pendingReleases))
+                {
+                    pendingReleases[pendingReleaseCount++] = PendingGpuSlotRelease{
+                        true,
+                        evicted->GpuSlotIndex,
+                        evicted->GpuSlotGeneration,
+                        true};
+                }
                 if (evicted->PooledSlot)
                 {
                     evicted->InFlightFromPool = true;
@@ -1277,7 +1396,8 @@ FrameIpcServer::AcquireBufferSlot() noexcept
                     ++m_inFlightSlots;
                     UpdatePoolMetricsLocked();
                     evicted->ResetMetadataKeepCapacity();
-                    return evicted;
+                    acquiredEvictedSlot = std::move(evicted);
+                    break;
                 }
                 if (m_totalPoolSlots < m_effectiveMaxPoolSize &&
                     m_inFlightSlots < m_effectiveMaxPoolSize)
@@ -1289,13 +1409,16 @@ FrameIpcServer::AcquireBufferSlot() noexcept
                     ++m_inFlightSlots;
                     UpdatePoolMetricsLocked();
                     evicted->ResetMetadataKeepCapacity();
-                    return evicted;
+                    acquiredEvictedSlot = std::move(evicted);
+                    break;
                 }
             }
 
-            ++m_queueMetrics.PoolExhaustionDrops;
-            UpdatePoolMetricsLocked();
-            return nullptr;
+            if (acquiredEvictedSlot == nullptr)
+            {
+                ++m_queueMetrics.PoolExhaustionDrops;
+                UpdatePoolMetricsLocked();
+            }
         }
         else
         {
@@ -1304,6 +1427,15 @@ FrameIpcServer::AcquireBufferSlot() noexcept
             UpdatePoolMetricsLocked();
             return nullptr;
         }
+    }
+
+    if (pendingReleaseCount > 0U)
+    {
+        ReleasePendingGpuSlots(pendingReleases, pendingReleaseCount);
+    }
+    if (acquiredEvictedSlot != nullptr)
+    {
+        return acquiredEvictedSlot;
     }
 
     if (needDynamicAlloc)
@@ -1425,10 +1557,15 @@ FrameIpcServer::RecycleBufferSlot(
 HRESULT
 FrameIpcServer::EnqueueFrame(
     std::unique_ptr<ExtractedFrameBuffer> frame,
-    bool& outEvictedOldest
+    bool& outEvictedOldest,
+    uint64_t* outAssignedSequence
     ) noexcept
 {
     outEvictedOldest = false;
+    if (outAssignedSequence != nullptr)
+    {
+        *outAssignedSequence = 0ULL;
+    }
     if (frame == nullptr)
     {
         return E_INVALIDARG;
@@ -1438,12 +1575,16 @@ FrameIpcServer::EnqueueFrame(
 
     if (!IsRunning())
     {
-        ReleaseFrameResources(frame.get(), true);
+        ReleaseFrameResources(frame.get(), false);
         RecycleBufferSlot(std::move(frame));
         return E_ABORT;
     }
 
     HANDLE eventToSignal = nullptr;
+    HRESULT resultHr = S_OK;
+    PendingGpuSlotRelease pendingReleases[kMaxSupportedQueueDepth + 1U]{};
+    size_t pendingReleaseCount = 0U;
+
     {
         ExclusiveLock queueGuard(&m_queueLock);
         if (!IsRunning() || (frame->PooledSlot && frame->PoolEpoch != m_poolEpoch))
@@ -1460,94 +1601,254 @@ FrameIpcServer::EnqueueFrame(
                 }
                 UpdatePoolMetricsLocked();
             }
-            ReleaseFrameResources(frame.get(), true);
-            return E_ABORT;
-        }
-
-        const bool wasInFlightFromPool = (frame->PooledSlot && frame->InFlightFromPool);
-        if (wasInFlightFromPool && m_inFlightSlots > 0U)
-        {
-            --m_inFlightSlots;
-        }
-        frame->InFlightFromPool = false;
-
-        while (m_queue.Size() >= m_effectiveMaxQueueDepth)
-        {
-            auto evicted = m_queue.PopFront();
-            ++m_queueMetrics.FramesDroppedByBackpressure;
-            ++m_queueMetrics.QueueEvictionsByBackpressure;
-            outEvictedOldest = true;
-
-            if (evicted != nullptr)
+            if (frame->IsGpuSharedFrame)
             {
-                ReleaseFrameResources(evicted.get(), true);
-                if (evicted->PooledSlot && evicted->PoolEpoch == m_poolEpoch)
+                pendingReleases[pendingReleaseCount++] = PendingGpuSlotRelease{
+                    true,
+                    frame->GpuSlotIndex,
+                    frame->GpuSlotGeneration,
+                    false};
+            }
+            resultHr = E_ABORT;
+        }
+        else
+        {
+            const bool wasInFlightFromPool = (frame->PooledSlot && frame->InFlightFromPool);
+            if (wasInFlightFromPool && m_inFlightSlots > 0U)
+            {
+                --m_inFlightSlots;
+            }
+            frame->InFlightFromPool = false;
+
+            const auto recordRejectionLocked = [&](bool isGpu, uint32_t slotIdx, uint32_t slotGen, HRESULT hr) noexcept {
+                if (isGpu && pendingReleaseCount < ARRAYSIZE(pendingReleases))
                 {
-                    evicted->InFlightFromPool = false;
-                    evicted->ResetMetadataKeepCapacity();
-                    if (m_freePool.Size() >= m_effectiveMaxPoolSize ||
-                        !m_freePool.PushBack(std::move(evicted)))
+                    pendingReleases[pendingReleaseCount++] = PendingGpuSlotRelease{
+                        true,
+                        slotIdx,
+                        slotGen,
+                        false};
+                }
+                ReturnBufferToFreePoolLocked(std::move(frame), false);
+                UpdatePoolMetricsLocked();
+                resultHr = hr;
+            };
+
+            // 1. Validate session affinity and active consumer policy under m_queueLock.
+            if (frame->HasSessionBinding)
+            {
+                if (!m_activeSessionAuthorized ||
+                    m_activeSessionId == 0ULL ||
+                    frame->TargetSessionId != m_activeSessionId ||
+                    frame->TargetSessionGeneration != m_sessionGeneration)
+                {
+                    ++m_queueMetrics.FramesDiscardedStaleSession;
+                    if (m_activeSessionAuthorized)
                     {
-                        if (m_totalPoolSlots > 0U)
-                        {
-                            --m_totalPoolSlots;
-                        }
+                        ++m_currentSessionSummary.FramesDiscardedStaleSession;
                     }
+                    recordRejectionLocked(
+                        frame->IsGpuSharedFrame,
+                        frame->GpuSlotIndex,
+                        frame->GpuSlotGeneration,
+                        HRESULT_FROM_WIN32(ERROR_CONTEXT_EXPIRED));
+                }
+            }
+            else if (m_config.RequireActiveSessionForEnqueue &&
+                     (!m_activeSessionAuthorized || m_activeSessionId == 0ULL))
+            {
+                ++m_queueMetrics.FramesDiscardedNoConsumer;
+                recordRejectionLocked(
+                    frame->IsGpuSharedFrame,
+                    frame->GpuSlotIndex,
+                    frame->GpuSlotGeneration,
+                    HRESULT_FROM_WIN32(ERROR_NO_DATA));
+            }
+
+            // 2. Validate transport contract compatibility with active session before publishing.
+            if (SUCCEEDED(resultHr) && m_activeSessionAuthorized)
+            {
+                if (m_activeSessionMode == ipc::FrameIpcTransportMode::GpuSharedNtHandle &&
+                    !frame->IsGpuSharedFrame &&
+                    !m_activeSessionAllowCpuFallback)
+                {
+                    ++m_queueMetrics.FramesDiscardedTransportMismatch;
+                    ++m_currentSessionSummary.FramesDiscardedTransportMismatch;
+                    recordRejectionLocked(
+                        false,
+                        0U,
+                        0U,
+                        DXGI_ERROR_INVALID_CALL);
+                }
+                else if (m_activeSessionMode == ipc::FrameIpcTransportMode::CpuStagingPipe &&
+                         frame->IsGpuSharedFrame)
+                {
+                    ++m_queueMetrics.FramesDiscardedTransportMismatch;
+                    ++m_currentSessionSummary.FramesDiscardedTransportMismatch;
+                    recordRejectionLocked(
+                        true,
+                        frame->GpuSlotIndex,
+                        frame->GpuSlotGeneration,
+                        DXGI_ERROR_INVALID_CALL);
+                }
+            }
+
+            // 3. Validate structural dimensions/payload before consuming a wire FrameSequence.
+            if (SUCCEEDED(resultHr))
+            {
+                const bool dimsInvalid = (frame->Width == 0U || frame->Height == 0U);
+                const bool cpuPayloadInvalid =
+                    (!frame->IsGpuSharedFrame &&
+                     (frame->Pixels.empty() || frame->Pixels.size() > ipc::kMaxFramePayloadBytes));
+                const bool seqMissingWhenExternal =
+                    (!m_config.AssignSequenceOnEnqueue && frame->FrameSequence == 0ULL);
+                if (dimsInvalid || cpuPayloadInvalid || seqMissingWhenExternal)
+                {
+                    recordRejectionLocked(
+                        frame->IsGpuSharedFrame,
+                        frame->GpuSlotIndex,
+                        frame->GpuSlotGeneration,
+                        E_INVALIDARG);
+                }
+            }
+
+            // 4. Enforce bounded drop-oldest queue capacity and assign authoritative sequence atomically.
+            if (SUCCEEDED(resultHr))
+            {
+                while (m_queue.Size() >= m_effectiveMaxQueueDepth)
+                {
+                    auto evicted = m_queue.PopFront();
+                    ++m_queueMetrics.FramesDroppedByBackpressure;
+                    ++m_queueMetrics.QueueEvictionsByBackpressure;
+                    if (m_activeSessionAuthorized)
+                    {
+                        ++m_currentSessionSummary.FramesDroppedByBackpressure;
+                    }
+                    outEvictedOldest = true;
+
+                    if (evicted != nullptr)
+                    {
+                        if (evicted->IsGpuSharedFrame && pendingReleaseCount < ARRAYSIZE(pendingReleases))
+                        {
+                            pendingReleases[pendingReleaseCount++] = PendingGpuSlotRelease{
+                                true,
+                                evicted->GpuSlotIndex,
+                                evicted->GpuSlotGeneration,
+                                true};
+                        }
+                        ReturnBufferToFreePoolLocked(std::move(evicted), false);
+                    }
+                }
+
+                if (m_config.AssignSequenceOnEnqueue)
+                {
+                    if (m_nextPublishSequence == 0ULL)
+                    {
+                        m_nextPublishSequence = 1ULL;
+                    }
+                    const uint64_t assigned = m_nextPublishSequence;
+                    frame->FrameSequence = assigned;
+                    if (assigned == UINT64_MAX)
+                    {
+                        m_nextPublishSequence = 1ULL;
+                        ++m_queueMetrics.SequenceWrapAroundCount;
+                    }
+                    else
+                    {
+                        m_nextPublishSequence = assigned + 1ULL;
+                    }
+                }
+                else if (frame->FrameSequence >= m_nextPublishSequence)
+                {
+                    m_nextPublishSequence =
+                        (frame->FrameSequence == UINT64_MAX) ? 1ULL : (frame->FrameSequence + 1ULL);
+                }
+
+                const uint64_t publishedSeq = frame->FrameSequence;
+                if (!m_queue.PushBack(std::move(frame)))
+                {
+                    if (frame != nullptr && frame->IsGpuSharedFrame && pendingReleaseCount < ARRAYSIZE(pendingReleases))
+                    {
+                        pendingReleases[pendingReleaseCount++] = PendingGpuSlotRelease{
+                            true,
+                            frame->GpuSlotIndex,
+                            frame->GpuSlotGeneration,
+                            true};
+                    }
+                    ReturnBufferToFreePoolLocked(std::move(frame), false);
+                    UpdatePoolMetricsLocked();
+                    resultHr = E_OUTOFMEMORY;
+                }
+                else
+                {
+                    if (outAssignedSequence != nullptr)
+                    {
+                        *outAssignedSequence = publishedSeq;
+                    }
+                    UpdatePoolMetricsLocked();
+                    if (m_queueMetrics.QueueDepth > m_queueMetrics.PeakQueueDepth)
+                    {
+                        m_queueMetrics.PeakQueueDepth = m_queueMetrics.QueueDepth;
+                    }
+                    ++m_queueMetrics.FramesEnqueued;
+                    ++m_queueMetrics.FramesPublished;
+                    m_queueMetrics.LastFrameSequence = publishedSeq;
+                    if (m_activeSessionAuthorized)
+                    {
+                        ++m_currentSessionSummary.FramesPublished;
+                        m_currentSessionSummary.LastFrameSequence = publishedSeq;
+                    }
+                    eventToSignal = m_frameAvailableEvent.Get();
                 }
             }
         }
-
-        if (!m_queue.PushBack(std::move(frame)))
-        {
-            ReleaseFrameResources(frame.get(), true);
-            UpdatePoolMetricsLocked();
-            return E_OUTOFMEMORY;
-        }
-
-        UpdatePoolMetricsLocked();
-        if (m_queueMetrics.QueueDepth > m_queueMetrics.PeakQueueDepth)
-        {
-            m_queueMetrics.PeakQueueDepth = m_queueMetrics.QueueDepth;
-        }
-        ++m_queueMetrics.FramesEnqueued;
-        eventToSignal = m_frameAvailableEvent.Get();
     }
 
-    if (eventToSignal != nullptr)
+    if (pendingReleaseCount > 0U)
+    {
+        ReleasePendingGpuSlots(pendingReleases, pendingReleaseCount);
+    }
+
+    if (SUCCEEDED(resultHr) && eventToSignal != nullptr)
     {
         (void)SetEvent(eventToSignal);
     }
 
-    return S_OK;
+    return resultHr;
 }
 
 void
 FrameIpcServer::FlushQueue() noexcept
 {
-    ExclusiveLock queueGuard(&m_queueLock);
-    while (!m_queue.Empty())
+    PendingGpuSlotRelease pendingReleases[kMaxSupportedQueueDepth]{};
+    size_t pendingReleaseCount = 0U;
+
     {
-        auto item = m_queue.PopFront();
-        if (item != nullptr)
+        ExclusiveLock queueGuard(&m_queueLock);
+        while (!m_queue.Empty())
         {
-            ReleaseFrameResources(item.get(), false);
-            item->ResetMetadataAndFreePixels();
-            if (item->PooledSlot && item->PoolEpoch == m_poolEpoch)
+            auto item = m_queue.PopFront();
+            if (item != nullptr)
             {
-                item->InFlightFromPool = false;
-                if (m_freePool.Size() >= m_effectiveMaxPoolSize ||
-                    !m_freePool.PushBack(std::move(item)))
+                if (item->IsGpuSharedFrame && pendingReleaseCount < ARRAYSIZE(pendingReleases))
                 {
-                    if (m_totalPoolSlots > 0U)
-                    {
-                        --m_totalPoolSlots;
-                    }
+                    pendingReleases[pendingReleaseCount++] = PendingGpuSlotRelease{
+                        true,
+                        item->GpuSlotIndex,
+                        item->GpuSlotGeneration,
+                        false};
                 }
+                ReturnBufferToFreePoolLocked(std::move(item), true);
             }
         }
+        m_freePool.FreeAllPixelStorage();
+        UpdatePoolMetricsLocked();
     }
-    m_freePool.FreeAllPixelStorage();
-    UpdatePoolMetricsLocked();
+
+    if (pendingReleaseCount > 0U)
+    {
+        ReleasePendingGpuSlots(pendingReleases, pendingReleaseCount);
+    }
 }
 
 FrameTransportMetricsSnapshot
@@ -1572,11 +1873,25 @@ FrameIpcServer::GetMetricsSnapshot() const noexcept
     combined.FreePoolSlots = queueSnap.FreePoolSlots;
     combined.InFlightSlots = queueSnap.InFlightSlots;
     combined.PeakInFlightSlots = queueSnap.PeakInFlightSlots;
+    combined.SessionGeneration = queueSnap.SessionGeneration;
+    if (queueSnap.ActiveSessionId != 0ULL)
+    {
+        combined.ActiveSessionId = queueSnap.ActiveSessionId;
+    }
+    combined.LastFrameSequence = queueSnap.LastFrameSequence;
     combined.FramesEnqueued = queueSnap.FramesEnqueued;
+    combined.FramesPublished = queueSnap.FramesPublished;
     combined.FramesDroppedByBackpressure = queueSnap.FramesDroppedByBackpressure;
     combined.QueueEvictionsByBackpressure = queueSnap.QueueEvictionsByBackpressure;
     combined.PoolExhaustionDrops = queueSnap.PoolExhaustionDrops;
     combined.PoolAllocationFailures = queueSnap.PoolAllocationFailures;
+    combined.FramesDiscardedNoConsumer = queueSnap.FramesDiscardedNoConsumer;
+    combined.FramesDiscardedStaleSession = queueSnap.FramesDiscardedStaleSession;
+    combined.FramesDiscardedTransportMismatch = queueSnap.FramesDiscardedTransportMismatch;
+    combined.FramesFlushedOnSessionTransition = queueSnap.FramesFlushedOnSessionTransition;
+    combined.SequenceWrapAroundCount = queueSnap.SequenceWrapAroundCount;
+    combined.PendingAckCount =
+        static_cast<uint64_t>(InterlockedCompareExchange64(const_cast<volatile LONG64*>(&m_pendingAckCount), 0, 0));
     combined.GpuSharedTransportConfigured =
         (m_config.SharedTexturePool != nullptr && m_config.EnableGpuSharedTransport);
     if (m_config.SharedTexturePool != nullptr)
@@ -1809,6 +2124,112 @@ FrameIpcServer::WorkerLoop() noexcept
         }
 
         const uint64_t sessionId = static_cast<uint64_t>(InterlockedIncrement64(&m_nextSessionId));
+        const ipc::FrameIpcTransportMode negotiatedMode = gpuSessionNegotiated
+            ? ipc::FrameIpcTransportMode::GpuSharedNtHandle
+            : ipc::FrameIpcTransportMode::CpuStagingPipe;
+        const bool effectiveAllowCpuFallback =
+            gpuSessionNegotiated ? m_config.AllowCpuFallbackWhenGpuNegotiated : true;
+        uint64_t activeSessionGen = 0ULL;
+
+        {
+            SharedTexturePoolMetricsSnapshot gpuBaseline{};
+            if (m_config.SharedTexturePool != nullptr)
+            {
+                gpuBaseline = m_config.SharedTexturePool->GetMetricsSnapshot();
+            }
+
+            PendingGpuSlotRelease transitionReleases[kMaxSupportedQueueDepth]{};
+            size_t transitionReleaseCount = 0U;
+            {
+                ExclusiveLock queueGuard(&m_queueLock);
+                ++m_sessionGeneration;
+                if (m_sessionGeneration == 0ULL)
+                {
+                    m_sessionGeneration = 1ULL;
+                }
+                activeSessionGen = m_sessionGeneration;
+                m_activeSessionId = sessionId;
+                m_activeSessionMode = negotiatedMode;
+                m_activeSessionAllowCpuFallback = effectiveAllowCpuFallback;
+                m_activeSessionAuthorized = true;
+
+                m_sessionStartGpuSharedBaseline = gpuBaseline.GpuFramesShared;
+                m_sessionStartGpuDroppedBaseline = gpuBaseline.GpuFramesDropped;
+                m_sessionStartGpuSyncTimeoutsBaseline = gpuBaseline.GpuSyncTimeouts;
+
+                m_currentSessionSummary = {};
+                m_currentSessionSummary.Valid = true;
+                m_currentSessionSummary.SessionId = sessionId;
+                m_currentSessionSummary.SessionGeneration = activeSessionGen;
+                m_currentSessionSummary.NegotiatedMode = negotiatedMode;
+                m_currentSessionSummary.AllowCpuFallback = effectiveAllowCpuFallback;
+
+                std::unique_ptr<ExtractedFrameBuffer> kept[kMaxSupportedQueueDepth]{};
+                size_t keptCount = 0U;
+                while (!m_queue.Empty())
+                {
+                    auto item = m_queue.PopFront();
+                    if (item == nullptr)
+                    {
+                        continue;
+                    }
+                    const bool transportMismatch =
+                        (!gpuSessionNegotiated && item->IsGpuSharedFrame) ||
+                        (gpuSessionNegotiated && !effectiveAllowCpuFallback && !item->IsGpuSharedFrame);
+                    const bool mustFlush =
+                        m_config.FlushQueueOnSessionStart ||
+                        gpuSessionNegotiated ||
+                        item->HasSessionBinding ||
+                        transportMismatch;
+                    if (!mustFlush && keptCount < ARRAYSIZE(kept))
+                    {
+                        kept[keptCount++] = std::move(item);
+                    }
+                    else
+                    {
+                        if (item->IsGpuSharedFrame && transitionReleaseCount < ARRAYSIZE(transitionReleases))
+                        {
+                            transitionReleases[transitionReleaseCount++] = PendingGpuSlotRelease{
+                                true,
+                                item->GpuSlotIndex,
+                                item->GpuSlotGeneration,
+                                false};
+                        }
+                        if (item->HasSessionBinding)
+                        {
+                            ++m_queueMetrics.FramesDiscardedStaleSession;
+                            ++m_currentSessionSummary.FramesDiscardedStaleSession;
+                        }
+                        if (transportMismatch)
+                        {
+                            ++m_queueMetrics.FramesDiscardedTransportMismatch;
+                            ++m_currentSessionSummary.FramesDiscardedTransportMismatch;
+                        }
+                        ++m_queueMetrics.FramesFlushedOnSessionTransition;
+                        ++m_currentSessionSummary.FramesFlushedOnSessionTransition;
+                        ReturnBufferToFreePoolLocked(std::move(item), true);
+                    }
+                }
+                for (size_t k = 0U; k < keptCount; ++k)
+                {
+                    (void)m_queue.PushBack(std::move(kept[k]));
+                }
+                if (m_config.ResetSequenceOnSessionStart && m_queue.Empty())
+                {
+                    m_nextPublishSequence = 1ULL;
+                }
+                m_queueMetrics.SessionGeneration = activeSessionGen;
+                m_queueMetrics.ActiveSessionId = sessionId;
+                UpdatePoolMetricsLocked();
+            }
+
+            if (transitionReleaseCount > 0U)
+            {
+                ReleasePendingGpuSlots(transitionReleases, transitionReleaseCount);
+            }
+        }
+
+        InterlockedExchange(&m_activeSessionNegotiatedGpu, gpuSessionNegotiated ? 1 : 0);
         serverHello.SessionId = sessionId;
 
         const DWORD helloWriteErr = WriteExactOverlapped(
@@ -1820,20 +2241,30 @@ FrameIpcServer::WorkerLoop() noexcept
             m_config.IoTimeoutMs);
         if (helloWriteErr != ERROR_SUCCESS)
         {
+            const HRESULT writeHr = HRESULT_FROM_WIN32(helloWriteErr);
             if (helloWriteErr != ERROR_OPERATION_ABORTED)
             {
                 ExclusiveLock metricsGuard(&m_metricsLock);
                 ++m_transportMetrics.FrameTransportFailures;
-                m_transportMetrics.LastTransportError = HRESULT_FROM_WIN32(helloWriteErr);
+                m_transportMetrics.LastTransportError = writeHr;
             }
             InterlockedExchange(&m_activeSessionNegotiatedGpu, 0);
+            {
+                ExclusiveLock queueGuard(&m_queueLock);
+                m_activeSessionAuthorized = false;
+                m_activeSessionId = 0ULL;
+                m_activeSessionMode = ipc::FrameIpcTransportMode::CpuStagingPipe;
+                m_activeSessionAllowCpuFallback = false;
+                m_queueMetrics.ActiveSessionId = 0ULL;
+                m_currentSessionSummary.DisconnectReason = writeHr;
+                m_lastCompletedSessionSummary = m_currentSessionSummary;
+            }
             authenticatedClientProcess.Reset();
             (void)DisconnectNamedPipe(pipeHandle);
             continue;
         }
 
         const uint64_t sessionConnectQpc = QueryCurrentQpc();
-        InterlockedExchange(&m_activeSessionNegotiatedGpu, gpuSessionNegotiated ? 1 : 0);
 
         uint32_t sessionDuplicatedGen[ipc::kMaxSharedTexturePoolSize]{};
         uint64_t sessionDuplicatedHandles[ipc::kMaxSharedTexturePoolSize]{};
@@ -1846,6 +2277,8 @@ FrameIpcServer::WorkerLoop() noexcept
         }
 
         bool disconnectedByPeer = false;
+        HRESULT sessionDisconnectReason = S_OK;
+        uint64_t sessionFramesDelivered = 0ULL;
         while (InterlockedCompareExchange(&m_stopRequested, 0, 0) == 0)
         {
             std::unique_ptr<ExtractedFrameBuffer> frame;
@@ -1855,6 +2288,7 @@ FrameIpcServer::WorkerLoop() noexcept
                 const DWORD waitRes = WaitForMultipleObjects(2U, waitHandles, FALSE, 250U);
                 if (waitRes == WAIT_OBJECT_0 + 1)
                 {
+                    sessionDisconnectReason = HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED);
                     break;
                 }
                 if (waitRes == WAIT_TIMEOUT || waitRes == WAIT_OBJECT_0)
@@ -1882,6 +2316,28 @@ FrameIpcServer::WorkerLoop() noexcept
                         }
                     }
                 }
+                continue;
+            }
+
+            // Defense-in-depth guard: never emit a stale-session or transport-mismatched frame on the wire.
+            if (frame->HasSessionBinding &&
+                (frame->TargetSessionId != sessionId || frame->TargetSessionGeneration != activeSessionGen))
+            {
+                ReleaseFrameResources(frame.get(), false);
+                RecycleBufferSlot(std::move(frame));
+                ExclusiveLock queueGuard(&m_queueLock);
+                ++m_queueMetrics.FramesDiscardedStaleSession;
+                ++m_currentSessionSummary.FramesDiscardedStaleSession;
+                continue;
+            }
+            if ((frame->IsGpuSharedFrame && !gpuSessionNegotiated) ||
+                (!frame->IsGpuSharedFrame && gpuSessionNegotiated && !effectiveAllowCpuFallback))
+            {
+                ReleaseFrameResources(frame.get(), false);
+                RecycleBufferSlot(std::move(frame));
+                ExclusiveLock queueGuard(&m_queueLock);
+                ++m_queueMetrics.FramesDiscardedTransportMismatch;
+                ++m_currentSessionSummary.FramesDiscardedTransportMismatch;
                 continue;
             }
 
@@ -2022,6 +2478,7 @@ FrameIpcServer::WorkerLoop() noexcept
 
                 // GPU shared frames ALWAYS require ACK (or fail/disconnect) before releasing slot back to producer.
                 ipc::FrameIpcFrameAck ack{};
+                InterlockedIncrement64(&m_pendingAckCount);
                 const DWORD ackErr = ReadExactOverlapped(
                     pipeHandle,
                     ioEvent.Get(),
@@ -2029,6 +2486,7 @@ FrameIpcServer::WorkerLoop() noexcept
                     &ack,
                     sizeof(ack),
                     m_config.IoTimeoutMs);
+                InterlockedDecrement64(&m_pendingAckCount);
                 if (ackErr != ERROR_SUCCESS)
                 {
                     m_config.SharedTexturePool->CompleteHostUseForSlot(slotIdx, slotGen, false, 0U);
@@ -2036,6 +2494,7 @@ FrameIpcServer::WorkerLoop() noexcept
                     sessionDuplicatedHandles[slotIdx] = 0ULL;
                     if (ackErr == ERROR_OPERATION_ABORTED)
                     {
+                        sessionDisconnectReason = HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED);
                         break;
                     }
                     {
@@ -2043,6 +2502,7 @@ FrameIpcServer::WorkerLoop() noexcept
                         ++m_transportMetrics.FrameTransportFailures;
                         m_transportMetrics.LastTransportError = HRESULT_FROM_WIN32(ackErr);
                     }
+                    sessionDisconnectReason = HRESULT_FROM_WIN32(ackErr);
                     disconnectedByPeer = true;
                     break;
                 }
@@ -2058,6 +2518,7 @@ FrameIpcServer::WorkerLoop() noexcept
                         ++m_transportMetrics.FrameTransportFailures;
                         m_transportMetrics.LastTransportError = E_FAIL;
                     }
+                    sessionDisconnectReason = E_FAIL;
                     disconnectedByPeer = true;
                     break;
                 }
@@ -2067,6 +2528,7 @@ FrameIpcServer::WorkerLoop() noexcept
 
                 const uint64_t deliveredQpc = QueryCurrentQpc();
                 const uint64_t deliveryLatencyUs = ipc::ComputeQpcElapsedUs(extractQpc, deliveredQpc, frameQpcFreq);
+                ++sessionFramesDelivered;
 
                 {
                     ExclusiveLock metricsGuard(&m_metricsLock);
@@ -2178,6 +2640,7 @@ FrameIpcServer::WorkerLoop() noexcept
             if (m_config.RequireClientAck)
             {
                 ipc::FrameIpcFrameAck ack{};
+                InterlockedIncrement64(&m_pendingAckCount);
                 const DWORD ackErr = ReadExactOverlapped(
                     pipeHandle,
                     ioEvent.Get(),
@@ -2185,10 +2648,12 @@ FrameIpcServer::WorkerLoop() noexcept
                     &ack,
                     sizeof(ack),
                     m_config.IoTimeoutMs);
+                InterlockedDecrement64(&m_pendingAckCount);
                 if (ackErr != ERROR_SUCCESS)
                 {
                     if (ackErr == ERROR_OPERATION_ABORTED)
                     {
+                        sessionDisconnectReason = HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED);
                         break;
                     }
                     {
@@ -2196,6 +2661,7 @@ FrameIpcServer::WorkerLoop() noexcept
                         ++m_transportMetrics.FrameTransportFailures;
                         m_transportMetrics.LastTransportError = HRESULT_FROM_WIN32(ackErr);
                     }
+                    sessionDisconnectReason = HRESULT_FROM_WIN32(ackErr);
                     disconnectedByPeer = true;
                     break;
                 }
@@ -2208,6 +2674,7 @@ FrameIpcServer::WorkerLoop() noexcept
                         ++m_transportMetrics.FrameTransportFailures;
                         m_transportMetrics.LastTransportError = E_FAIL;
                     }
+                    sessionDisconnectReason = E_FAIL;
                     disconnectedByPeer = true;
                     break;
                 }
@@ -2215,6 +2682,7 @@ FrameIpcServer::WorkerLoop() noexcept
 
             const uint64_t deliveredQpc = QueryCurrentQpc();
             const uint64_t deliveryLatencyUs = ipc::ComputeQpcElapsedUs(extractQpc, deliveredQpc, frameQpcFreq);
+            ++sessionFramesDelivered;
 
             {
                 ExclusiveLock metricsGuard(&m_metricsLock);
@@ -2266,10 +2734,88 @@ FrameIpcServer::WorkerLoop() noexcept
         }
 
         InterlockedExchange(&m_activeSessionNegotiatedGpu, 0);
-        if (gpuSessionNegotiated)
+        PendingGpuSlotRelease teardownReleases[kMaxSupportedQueueDepth]{};
+        size_t teardownReleaseCount = 0U;
         {
-            FlushQueue();
+            ExclusiveLock queueGuard(&m_queueLock);
+            m_activeSessionAuthorized = false;
+            m_activeSessionId = 0ULL;
+            m_activeSessionMode = ipc::FrameIpcTransportMode::CpuStagingPipe;
+            m_activeSessionAllowCpuFallback = false;
+            m_queueMetrics.ActiveSessionId = 0ULL;
+
+            std::unique_ptr<ExtractedFrameBuffer> kept[kMaxSupportedQueueDepth]{};
+            size_t keptCount = 0U;
+            while (!m_queue.Empty())
+            {
+                auto item = m_queue.PopFront();
+                if (item == nullptr)
+                {
+                    continue;
+                }
+                const bool shouldFlushOnDisconnect =
+                    gpuSessionNegotiated ||
+                    m_config.FlushQueueOnSessionStart ||
+                    item->HasSessionBinding ||
+                    item->IsGpuSharedFrame;
+                if (!shouldFlushOnDisconnect && keptCount < ARRAYSIZE(kept))
+                {
+                    kept[keptCount++] = std::move(item);
+                }
+                else
+                {
+                    if (item->IsGpuSharedFrame && teardownReleaseCount < ARRAYSIZE(teardownReleases))
+                    {
+                        teardownReleases[teardownReleaseCount++] = PendingGpuSlotRelease{
+                            true,
+                            item->GpuSlotIndex,
+                            item->GpuSlotGeneration,
+                            false};
+                    }
+                    ++m_queueMetrics.FramesFlushedOnSessionTransition;
+                    ++m_currentSessionSummary.FramesFlushedOnSessionTransition;
+                    ReturnBufferToFreePoolLocked(std::move(item), true);
+                }
+            }
+            for (size_t k = 0U; k < keptCount; ++k)
+            {
+                (void)m_queue.PushBack(std::move(kept[k]));
+            }
+            if (m_queue.Empty())
+            {
+                m_freePool.FreeAllPixelStorage();
+            }
+            UpdatePoolMetricsLocked();
         }
+        if (teardownReleaseCount > 0U)
+        {
+            ReleasePendingGpuSlots(teardownReleases, teardownReleaseCount);
+        }
+
+        SharedTexturePoolMetricsSnapshot gpuEndSnap{};
+        if (m_config.SharedTexturePool != nullptr)
+        {
+            gpuEndSnap = m_config.SharedTexturePool->GetMetricsSnapshot();
+        }
+        {
+            ExclusiveLock queueGuard(&m_queueLock);
+            m_currentSessionSummary.FramesDelivered = sessionFramesDelivered;
+            m_currentSessionSummary.DisconnectReason = sessionDisconnectReason;
+            if (gpuEndSnap.GpuFramesShared >= m_sessionStartGpuSharedBaseline)
+            {
+                m_currentSessionSummary.GpuFramesShared = gpuEndSnap.GpuFramesShared - m_sessionStartGpuSharedBaseline;
+            }
+            if (gpuEndSnap.GpuFramesDropped >= m_sessionStartGpuDroppedBaseline)
+            {
+                m_currentSessionSummary.GpuFramesDropped = gpuEndSnap.GpuFramesDropped - m_sessionStartGpuDroppedBaseline;
+            }
+            if (gpuEndSnap.GpuSyncTimeouts >= m_sessionStartGpuSyncTimeoutsBaseline)
+            {
+                m_currentSessionSummary.GpuSyncTimeouts = gpuEndSnap.GpuSyncTimeouts - m_sessionStartGpuSyncTimeoutsBaseline;
+            }
+            m_lastCompletedSessionSummary = m_currentSessionSummary;
+        }
+
         authenticatedClientProcess.Reset();
         (void)DisconnectNamedPipe(pipeHandle);
 

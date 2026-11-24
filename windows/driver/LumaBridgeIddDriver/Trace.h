@@ -294,7 +294,14 @@ LumaBridgeTraceMetrics(
     unsigned long long gpuFramesDropped = 0ULL,
     unsigned long long gpuSyncWaitUs = 0ULL,
     unsigned long sharedPoolSize = 0UL,
-    unsigned long sharedPoolPeakUsage = 0UL
+    unsigned long sharedPoolPeakUsage = 0UL,
+    unsigned long long framesAcquiredWithoutConsumer = 0ULL,
+    unsigned long long framesPublished = 0ULL,
+    unsigned long long framesDiscardedStaleSession = 0ULL,
+    unsigned long long framesDiscardedTransportMismatch = 0ULL,
+    unsigned long long framesFlushedOnSessionTransition = 0ULL,
+    unsigned long long sessionGeneration = 0ULL,
+    unsigned long long swapChainGeneration = 0ULL
     ) noexcept
 {
     if constexpr (!GetDiagnosticStageCapabilities(kActiveDiagnosticStage).EnableTraceLoggingAndRegistryBreadcrumbs)
@@ -345,6 +352,13 @@ LumaBridgeTraceMetrics(
         UNREFERENCED_PARAMETER(gpuSyncWaitUs);
         UNREFERENCED_PARAMETER(sharedPoolSize);
         UNREFERENCED_PARAMETER(sharedPoolPeakUsage);
+        UNREFERENCED_PARAMETER(framesAcquiredWithoutConsumer);
+        UNREFERENCED_PARAMETER(framesPublished);
+        UNREFERENCED_PARAMETER(framesDiscardedStaleSession);
+        UNREFERENCED_PARAMETER(framesDiscardedTransportMismatch);
+        UNREFERENCED_PARAMETER(framesFlushedOnSessionTransition);
+        UNREFERENCED_PARAMETER(sessionGeneration);
+        UNREFERENCED_PARAMETER(swapChainGeneration);
     }
     else
     {
@@ -353,12 +367,12 @@ LumaBridgeTraceMetrics(
         const char* safeMonitorState = (monitorStateName != nullptr) ? monitorStateName : "Unknown";
         const char* safeSwapChainState = (swapChainStateName != nullptr) ? swapChainStateName : "Unknown";
 
-        char buffer[1024]{};
+        char buffer[1280]{};
         _snprintf_s(
             buffer,
             sizeof(buffer),
             _TRUNCATE,
-            "[LB-DRIVER] [METRICS] stage=%s adapterState=%s monitorState=%s monCreate=%llu monArrive=%llu monDepart=%llu monDepartFail=%llu scState=%s scActive=%u scAssigned=%llu scDeleted=%llu framesAcq=%llu framesProc=%llu framesDrop=%llu acqFps=%.2f procFps=%.2f lastUs=%llu avgUs=%llu maxUs=%llu dxgiDevRem=%llu transientErr=%llu fatalErr=%llu extractEn=%u framesExtAcc=%llu framesCopy=%llu framesDeliv=%llu backpressDrop=%llu protRej=%llu copyFail=%llu ipcFail=%llu hostConn=%lu lastSeq=%llu copyUs=%llu delivUs=%llu qDepth=%lu peakQ=%lu extErr=0x%08lX ipcErr=0x%08lX gpuShr=%llu gpuDrop=%llu gpuSyncUs=%llu gpuPool=%lu/%lu wsKB=%llu privKB=%llu handles=%lu\n",
+            "[LB-DRIVER] [METRICS] stage=%s adapterState=%s monitorState=%s monCreate=%llu monArrive=%llu monDepart=%llu monDepartFail=%llu scState=%s scActive=%u scAssigned=%llu scDeleted=%llu scGen=%llu sessGen=%llu framesAcq=%llu framesAcqNoCons=%llu framesProc=%llu framesDrop=%llu acqFps=%.2f procFps=%.2f lastUs=%llu avgUs=%llu maxUs=%llu dxgiDevRem=%llu transientErr=%llu fatalErr=%llu extractEn=%u framesExtAcc=%llu framesCopy=%llu framesPub=%llu framesDeliv=%llu backpressDrop=%llu staleDrop=%llu mismatchDrop=%llu transFlush=%llu protRej=%llu copyFail=%llu ipcFail=%llu hostConn=%lu lastSeq=%llu copyUs=%llu delivUs=%llu qDepth=%lu peakQ=%lu extErr=0x%08lX ipcErr=0x%08lX gpuShr=%llu gpuDrop=%llu gpuSyncUs=%llu gpuPool=%lu/%lu wsKB=%llu privKB=%llu handles=%lu\n",
             safeStage,
             safeAdapterState,
             safeMonitorState,
@@ -370,7 +384,10 @@ LumaBridgeTraceMetrics(
             swapChainActive ? 1U : 0U,
             swapChainsAssigned,
             swapChainsDeleted,
+            swapChainGeneration,
+            sessionGeneration,
             framesAcquired,
+            framesAcquiredWithoutConsumer,
             framesProcessed,
             framesDropped,
             acquireFps,
@@ -384,8 +401,12 @@ LumaBridgeTraceMetrics(
             frameExtractionEnabled ? 1U : 0U,
             framesExtractionAccepted,
             framesCopied,
+            framesPublished,
             framesDelivered,
             framesDroppedByBackpressure,
+            framesDiscardedStaleSession,
+            framesDiscardedTransportMismatch,
+            framesFlushedOnSessionTransition,
             protectedFramesRejected,
             frameCopyFailures,
             frameTransportFailures,
@@ -417,7 +438,10 @@ LumaBridgeTraceMetrics(
             TraceLoggingString(safeMonitorState, "MonitorState"),
             TraceLoggingString(safeSwapChainState, "SwapChainState"),
             TraceLoggingBoolean(static_cast<BOOLEAN>(swapChainActive ? TRUE : FALSE), "SwapChainActive"),
+            TraceLoggingUInt64(swapChainGeneration, "SwapChainGeneration"),
+            TraceLoggingUInt64(sessionGeneration, "SessionGeneration"),
             TraceLoggingUInt64(framesAcquired, "FramesAcquired"),
+            TraceLoggingUInt64(framesAcquiredWithoutConsumer, "FramesAcquiredWithoutConsumer"),
             TraceLoggingUInt64(framesProcessed, "FramesProcessed"),
             TraceLoggingUInt64(framesDropped, "FramesDropped"),
             TraceLoggingFloat64(acquireFps, "AcquireFps"),
@@ -425,8 +449,12 @@ LumaBridgeTraceMetrics(
             TraceLoggingBoolean(static_cast<BOOLEAN>(frameExtractionEnabled ? TRUE : FALSE), "FrameExtractionEnabled"),
             TraceLoggingUInt64(framesExtractionAccepted, "FramesExtractionAccepted"),
             TraceLoggingUInt64(framesCopied, "FramesCopied"),
+            TraceLoggingUInt64(framesPublished, "FramesPublished"),
             TraceLoggingUInt64(framesDelivered, "FramesDelivered"),
             TraceLoggingUInt64(framesDroppedByBackpressure, "FramesDroppedByBackpressure"),
+            TraceLoggingUInt64(framesDiscardedStaleSession, "FramesDiscardedStaleSession"),
+            TraceLoggingUInt64(framesDiscardedTransportMismatch, "FramesDiscardedTransportMismatch"),
+            TraceLoggingUInt64(framesFlushedOnSessionTransition, "FramesFlushedOnSessionTransition"),
             TraceLoggingUInt64(protectedFramesRejected, "ProtectedFramesRejected"),
             TraceLoggingUInt64(frameCopyFailures, "FrameCopyFailures"),
             TraceLoggingUInt64(frameTransportFailures, "FrameTransportFailures"),

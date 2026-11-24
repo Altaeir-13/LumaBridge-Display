@@ -124,6 +124,10 @@ AccumulateExtractionMetricsLocked(
     const SwapChainFrameMetadata& frameMeta
     ) noexcept
 {
+    if (frameMeta.AcquiredWithoutConsumer)
+    {
+        ++metrics.FramesAcquiredWithoutConsumer;
+    }
     if (!frameMeta.ExtractionAttempted)
     {
         return;
@@ -302,6 +306,7 @@ SwapChainProcessor::AssignSwapChain(
         InterlockedExchange(&m_workerThreadId, static_cast<LONG>(createdThreadId));
 
         ++m_metrics.AssignCount;
+        ++m_metrics.SwapChainGeneration;
         m_metrics.ActiveRenderAdapterLuid = renderAdapterLuid;
         m_metrics.IsActive = true;
         m_metrics.State = SwapChainProcessorState::Active;
@@ -616,6 +621,10 @@ SwapChainProcessor::WorkerLoop(
         (void)QueryPerformanceCounter(&frameStartQpcLi);
 
         SwapChainFrameMetadata frameMeta{};
+        {
+            SharedSrwLock metricsGuard(&m_metricsLock);
+            frameMeta.SwapChainGeneration = m_metrics.SwapChainGeneration;
+        }
         const HRESULT acquireHr = m_backend->ReleaseAndAcquireBuffer(swapChainHandle, frameMeta);
 
         if (acquireHr == E_PENDING)
