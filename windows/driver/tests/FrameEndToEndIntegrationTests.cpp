@@ -1565,21 +1565,92 @@ TestVirtualDisplayStimulusHighResTimer60FpsVerification()
     const auto snap = stimulus.GetMetricsSnapshot();
 
     std::printf(
-        "[INFO] VirtualDisplayStimulus 60Hz pacing: display=\"%ls\" hiResTimer=%u ticks=%llu paints=%llu "
-        "achievedFps=%.2f tickAvgUs=%llu tickP95Us=%llu tickMaxUs=%llu\n",
+        "[INFO] VirtualDisplayStimulus 60Hz (Auto) pacing: display=\"%ls\" src=%s hiResTimer=%u "
+        "BackendRequested=%s BackendActive=%s PresentSucceeded=%llu PresentOccluded=%llu PresentFailures=%llu "
+        "FallbackFromDxgiOccurred=%s CompletedCleanly=%s DurationUs=%llu LastHResult=0x%08lX ErrorMessage=\"%s\" "
+        "ticks=%llu paints=%llu achievedFps=%.2f tickAvgUs=%llu tickP95Us=%llu tickMaxUs=%llu\n",
         snap.DisplayDeviceName.c_str(),
+        snap.IdentificationSource.c_str(),
         snap.HighResolutionTimerUsed ? 1U : 0U,
+        snap.BackendRequested.c_str(),
+        snap.BackendActive.c_str(),
+        static_cast<unsigned long long>(snap.PresentSucceeded),
+        static_cast<unsigned long long>(snap.PresentOccluded),
+        static_cast<unsigned long long>(snap.PresentFailures),
+        snap.FallbackFromDxgiOccurred ? "true" : "false",
+        snap.CompletedCleanly ? "true" : "false",
+        static_cast<unsigned long long>(snap.DurationUs),
+        static_cast<unsigned long>(snap.LastHResult),
+        snap.ErrorMessage.c_str(),
         static_cast<unsigned long long>(snap.TicksPresented),
         static_cast<unsigned long long>(snap.PaintCount),
         snap.AchievedFps,
         static_cast<unsigned long long>(snap.TickIntervalAvgUs),
         static_cast<unsigned long long>(snap.TickIntervalP95Us),
         static_cast<unsigned long long>(snap.TickIntervalMaxUs));
+    if (snap.FallbackFromDxgiOccurred || snap.BackendActive != "D3d11DxgiVSync")
+    {
+        std::printf(
+            "[BLOCKED_BY_ENVIRONMENT] Auto stimulus ran on BackendActive=%s (Fallback=%s, Reason=\"%s\"); "
+            "this validates high-res 60Hz pacing on GDI fallback, NOT DXGI D3d11DxgiVSync pacing.\n",
+            snap.BackendActive.c_str(),
+            snap.FallbackFromDxgiOccurred ? "true" : "false",
+            snap.FallbackReason.c_str());
+    }
 
     EXPECT_TRUE(snap.CompletedCleanly);
     EXPECT_TRUE(snap.HighResolutionTimerUsed);
     EXPECT_TRUE(snap.TicksPresented >= 80ULL);
     EXPECT_TRUE(snap.AchievedFps >= 57.0 && snap.AchievedFps <= 63.0);
+
+    // Explicit D3d11DxgiVSync probe: never fall back to GDI; on isolated headless desktop classify occlusion honestly.
+    lumabridge::host::VirtualDisplayStimulus dxgiStimulus;
+    lumabridge::host::VirtualDisplayStimulusConfig dxgiCfg{};
+    dxgiCfg.TargetFps = 60U;
+    dxgiCfg.Backend = lumabridge::host::StimulusBackend::D3d11DxgiVSync;
+    dxgiCfg.ExplicitDisplayName = targetDisplay;
+    const bool dxgiStarted = dxgiStimulus.Start(dxgiCfg);
+    if (dxgiStarted)
+    {
+        Sleep(250U);
+        dxgiStimulus.Stop();
+    }
+    const auto dxgiSnap = dxgiStimulus.GetMetricsSnapshot();
+    std::printf(
+        "[INFO] VirtualDisplayStimulus explicit DXGI probe: display=\"%ls\" "
+        "BackendRequested=%s BackendActive=%s PresentSucceeded=%llu PresentOccluded=%llu PresentFailures=%llu "
+        "FallbackFromDxgiOccurred=%s CompletedCleanly=%s TerminalFailure=%u DurationUs=%llu LastHResult=0x%08lX ErrorMessage=\"%s\"\n",
+        dxgiSnap.DisplayDeviceName.c_str(),
+        dxgiSnap.BackendRequested.c_str(),
+        dxgiSnap.BackendActive.c_str(),
+        static_cast<unsigned long long>(dxgiSnap.PresentSucceeded),
+        static_cast<unsigned long long>(dxgiSnap.PresentOccluded),
+        static_cast<unsigned long long>(dxgiSnap.PresentFailures),
+        dxgiSnap.FallbackFromDxgiOccurred ? "true" : "false",
+        dxgiSnap.CompletedCleanly ? "true" : "false",
+        dxgiSnap.TerminalFailure ? 1U : 0U,
+        static_cast<unsigned long long>(dxgiSnap.DurationUs),
+        static_cast<unsigned long>(dxgiSnap.LastHResult),
+        dxgiSnap.ErrorMessage.c_str());
+    EXPECT_TRUE(!dxgiSnap.FallbackFromDxgiOccurred);
+    EXPECT_EQ(dxgiSnap.BackendRequested, std::string("D3d11DxgiVSync"));
+    EXPECT_EQ(dxgiSnap.BackendActive, std::string("D3d11DxgiVSync"));
+    if (dxgiSnap.LastHResult == DXGI_STATUS_OCCLUDED || (!dxgiStarted && dxgiSnap.TerminalFailure))
+    {
+        std::printf(
+            "[BLOCKED_BY_ENVIRONMENT] Explicit D3d11DxgiVSync stimulus cannot present on isolated desktop "
+            "(LastHResult=0x%08lX, PresentOccluded=%llu, TerminalFailure=%u); no GDI fallback permitted.\n",
+            static_cast<unsigned long>(dxgiSnap.LastHResult),
+            static_cast<unsigned long long>(dxgiSnap.PresentOccluded),
+            dxgiSnap.TerminalFailure ? 1U : 0U);
+        EXPECT_TRUE(dxgiSnap.TerminalFailure);
+        EXPECT_TRUE(!dxgiSnap.CompletedCleanly);
+    }
+    else
+    {
+        EXPECT_TRUE(dxgiSnap.PresentSucceeded > 0ULL);
+        EXPECT_TRUE(dxgiSnap.CompletedCleanly);
+    }
 }
 
 void
@@ -2093,8 +2164,14 @@ TestEndToEndProlonged1080p60GpuNvenc30SecondBenchmark()
     uint64_t framesValid = 0ULL;
     uint64_t tsErrors = 99ULL;
     uint64_t cpuReads = 99ULL;
+    uint64_t gpuFramesRx = 0ULL;
+    uint64_t cpuFramesRx = 99ULL;
+    uint64_t unexpectedCpuInGpu = 99ULL;
+    uint64_t contractViolations = 99ULL;
+    uint64_t gpuFramesOpened = 0ULL;
     uint64_t liveSampleCount = 0ULL;
     uint64_t liveE2EAvgUs = 0ULL;
+    uint64_t liveE2EP50Us = 0ULL;
     uint64_t liveE2EP95Us = 0ULL;
     uint64_t liveE2EP99Us = 0ULL;
     uint64_t jitterAvgUs = 0ULL;
@@ -2102,15 +2179,33 @@ TestEndToEndProlonged1080p60GpuNvenc30SecondBenchmark()
     uint64_t nvEncoded = 0ULL;
     uint64_t nvInitUs = 0ULL;
     uint64_t nvEncAvgUs = 0ULL;
+    uint64_t nvEncP50Us = 0ULL;
     uint64_t nvEncP95Us = 0ULL;
     uint64_t nvEncP99Us = 0ULL;
     uint64_t nvPrepAvgUs = 0ULL;
     uint64_t nvPicAvgUs = 0ULL;
     uint64_t nvLockAvgUs = 0ULL;
+    uint64_t extToBsAvgUs = 0ULL;
+    uint64_t extToBsP50Us = 0ULL;
+    uint64_t extToBsP95Us = 0ULL;
     uint64_t extToBsP99Us = 0ULL;
     uint64_t framesDecoded = 0ULL;
     uint64_t nalFail = 99ULL;
     uint64_t decFail = 99ULL;
+    uint64_t mftDecAvgUs = 0ULL;
+    uint64_t mftDecP50Us = 0ULL;
+    uint64_t mftDecP95Us = 0ULL;
+    uint64_t mftDecP99Us = 0ULL;
+    uint64_t mftDecMaxUs = 0ULL;
+    uint64_t wEnqueued = 0ULL;
+    uint64_t wDequeued = 0ULL;
+    uint64_t wProcessed = 0ULL;
+    uint64_t wRejected = 99ULL;
+    uint64_t wPeakDepth = 0ULL;
+    uint64_t wPendingShutdown = 0ULL;
+    uint64_t wFullWaits = 0ULL;
+    uint64_t wWaitTimeouts = 99ULL;
+    uint64_t wFailures = 99ULL;
     uint64_t hostWsBytes = 0ULL;
     uint64_t hostPeakWsBytes = 0ULL;
     double coreCov = 0.0;
@@ -2124,6 +2219,11 @@ TestEndToEndProlonged1080p60GpuNvenc30SecondBenchmark()
     EXPECT_TRUE(ExtractJsonNumber(jsonText, "FramesValid", framesValid));
     EXPECT_TRUE(ExtractJsonNumber(jsonText, "TimestampMeasurementErrors", tsErrors));
     EXPECT_TRUE(ExtractJsonNumber(jsonText, "CpuStagingReadsPerformed", cpuReads));
+    EXPECT_TRUE(ExtractJsonNumber(jsonText, "GpuFramesReceived", gpuFramesRx));
+    EXPECT_TRUE(ExtractJsonNumber(jsonText, "CpuFramesReceived", cpuFramesRx));
+    EXPECT_TRUE(ExtractJsonNumber(jsonText, "UnexpectedCpuFramesInGpuSession", unexpectedCpuInGpu));
+    EXPECT_TRUE(ExtractJsonNumber(jsonText, "TransportContractViolations", contractViolations));
+    EXPECT_TRUE(ExtractJsonNumber(jsonText, "GpuFramesOpened", gpuFramesOpened));
     EXPECT_TRUE(ExtractJsonNumber(jsonText, "SharedTexturePoolPeakUsage", poolPeak));
     EXPECT_TRUE(ExtractJsonDouble(jsonText, "CoreTimestampCoveragePercent", coreCov));
     EXPECT_TRUE(ExtractJsonDouble(jsonText, "LiveTimestampCoveragePercent", liveCov));
@@ -2132,6 +2232,7 @@ TestEndToEndProlonged1080p60GpuNvenc30SecondBenchmark()
 
     EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "LiveEndToEndLatency", nullptr, "SampleCount", liveSampleCount));
     EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "LiveEndToEndLatency", nullptr, "AvgUs", liveE2EAvgUs));
+    EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "LiveEndToEndLatency", nullptr, "P50Us", liveE2EP50Us));
     EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "LiveEndToEndLatency", nullptr, "P95Us", liveE2EP95Us));
     EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "LiveEndToEndLatency", nullptr, "P99Us", liveE2EP99Us));
     EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "InterFrameJitter", nullptr, "AvgUs", jitterAvgUs));
@@ -2141,16 +2242,40 @@ TestEndToEndProlonged1080p60GpuNvenc30SecondBenchmark()
     EXPECT_TRUE(ExtractJsonDoubleInScope(jsonText, "Nvenc", nullptr, "EncoderOutputFps", encOutputFps));
     EXPECT_TRUE(ExtractJsonDoubleInScope(jsonText, "Nvenc", nullptr, "ExtractToBitstreamCoveragePercent", extToBsCov));
     EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "Nvenc", "EncodeLatencyUs", "AvgUs", nvEncAvgUs));
+    EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "Nvenc", "EncodeLatencyUs", "P50Us", nvEncP50Us));
     EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "Nvenc", "EncodeLatencyUs", "P95Us", nvEncP95Us));
     EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "Nvenc", "EncodeLatencyUs", "P99Us", nvEncP99Us));
     EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "Nvenc", "FormatPrepareLatencyUs", "AvgUs", nvPrepAvgUs));
     EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "Nvenc", "EncodePictureLatencyUs", "AvgUs", nvPicAvgUs));
     EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "Nvenc", "BitstreamLockCopyLatencyUs", "AvgUs", nvLockAvgUs));
+    EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "Nvenc", "ExtractToBitstreamLatencyUs", "AvgUs", extToBsAvgUs));
+    EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "Nvenc", "ExtractToBitstreamLatencyUs", "P50Us", extToBsP50Us));
+    EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "Nvenc", "ExtractToBitstreamLatencyUs", "P95Us", extToBsP95Us));
     EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "Nvenc", "ExtractToBitstreamLatencyUs", "P99Us", extToBsP99Us));
 
     EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "H264DecodeValidation", nullptr, "FramesDecoded", framesDecoded));
     EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "H264DecodeValidation", nullptr, "NalParseFailures", nalFail));
     EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "H264DecodeValidation", nullptr, "DecodeFailures", decFail));
+    EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "H264DecodeValidation", "MftDecodeLatencyUs", "AvgUs", mftDecAvgUs));
+    EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "H264DecodeValidation", "MftDecodeLatencyUs", "P50Us", mftDecP50Us));
+    EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "H264DecodeValidation", "MftDecodeLatencyUs", "P95Us", mftDecP95Us));
+    EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "H264DecodeValidation", "MftDecodeLatencyUs", "P99Us", mftDecP99Us));
+    EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "H264DecodeValidation", "MftDecodeLatencyUs", "MaxUs", mftDecMaxUs));
+
+    EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "H264DecodeValidation", "Worker", "PacketsEnqueued", wEnqueued));
+    EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "H264DecodeValidation", "Worker", "PacketsDequeued", wDequeued));
+    EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "H264DecodeValidation", "Worker", "PacketsProcessed", wProcessed));
+    EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "H264DecodeValidation", "Worker", "PacketsRejected", wRejected));
+    EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "H264DecodeValidation", "Worker", "QueuePeakDepth", wPeakDepth));
+    EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "H264DecodeValidation", "Worker", "QueuePendingAtShutdown", wPendingShutdown));
+    EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "H264DecodeValidation", "Worker", "QueueFullWaitCount", wFullWaits));
+    EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "H264DecodeValidation", "Worker", "QueueWaitTimeoutCount", wWaitTimeouts));
+    EXPECT_TRUE(ExtractJsonNumberInScope(jsonText, "H264DecodeValidation", "Worker", "WorkerFailureCount", wFailures));
+    const bool workerSectionPresent = (jsonText.find("\"Worker\": {") != std::string::npos);
+    EXPECT_TRUE(workerSectionPresent);
+    EXPECT_TRUE(jsonText.find("\"CompletionState\": \"NormalShutdown\"") != std::string::npos);
+    EXPECT_TRUE(jsonText.find("\"ComBalanced\": true") != std::string::npos);
+
     (void)ExtractJsonNumberInScope(jsonText, "ResourceUsage", "Host", "WorkingSetBytes", hostWsBytes);
     (void)ExtractJsonNumberInScope(jsonText, "ResourceUsage", "Host", "PeakWorkingSetBytes", hostPeakWsBytes);
     (void)ExtractJsonDoubleInScope(jsonText, "ResourceUsage", "Host", "CpuUsagePercent", hostCpuPct);
@@ -2160,6 +2285,10 @@ TestEndToEndProlonged1080p60GpuNvenc30SecondBenchmark()
     EXPECT_EQ(framesValid, static_cast<uint64_t>(kTotalFrames));
     EXPECT_EQ(tsErrors, 0ULL);
     EXPECT_EQ(cpuReads, 0ULL);
+    EXPECT_EQ(gpuFramesRx, static_cast<uint64_t>(kTotalFrames));
+    EXPECT_EQ(cpuFramesRx, 0ULL);
+    EXPECT_EQ(unexpectedCpuInGpu, 0ULL);
+    EXPECT_EQ(contractViolations, 0ULL);
     EXPECT_EQ(liveSampleCount, static_cast<uint64_t>(kTotalFrames));
     EXPECT_TRUE(coreCov >= 99.9);
     EXPECT_TRUE(liveCov >= 99.9);
@@ -2172,6 +2301,12 @@ TestEndToEndProlonged1080p60GpuNvenc30SecondBenchmark()
     EXPECT_TRUE(framesDecoded >= 1790ULL);
     EXPECT_EQ(nalFail, 0ULL);
     EXPECT_EQ(decFail, 0ULL);
+    EXPECT_EQ(wEnqueued, static_cast<uint64_t>(kTotalFrames));
+    EXPECT_EQ(wDequeued, static_cast<uint64_t>(kTotalFrames));
+    EXPECT_EQ(wProcessed, static_cast<uint64_t>(kTotalFrames));
+    EXPECT_EQ(wRejected, 0ULL);
+    EXPECT_EQ(wWaitTimeouts, 0ULL);
+    EXPECT_EQ(wFailures, 0ULL);
     EXPECT_TRUE(nvEncP99Us < 25000ULL);
     EXPECT_TRUE(liveE2EP99Us < 30000ULL);
     EXPECT_TRUE(extToBsP99Us < 30000ULL);
@@ -2179,9 +2314,10 @@ TestEndToEndProlonged1080p60GpuNvenc30SecondBenchmark()
     std::printf(
         "\n=== PROLONGED 30s 1080p60 GPU+NVENC BENCHMARK (%s, %u frames) ===\n"
         "  StimulusFPS=%.3f | HostLiveFPS=%.3f | NvencOutFPS=%.3f | Coverage(core=%.1f%%, live=%.1f%%, bs=%.1f%%)\n"
-        "  HostLiveE2E(avg=%lluus, p95=%lluus, p99=%lluus) | JitterAvg=%lluus | PoolSlotWait(avg=%lluus, max=%lluus, peak=%llu/%u)\n"
-        "  NVENC(init=%lluus, avg=%lluus, p95=%lluus, p99=%lluus | prep=%lluus, pic=%lluus, lock=%lluus) | ExtToBsP99=%lluus\n"
-        "  HostMem(ws=%.2fMB, peak=%.2fMB, cpu=%.2f%%) | Decoded=%llu | CpuReads=%llu | TsErrors=%llu\n",
+        "  HostLiveE2E(avg=%lluus, p50=%lluus, p95=%lluus, p99=%lluus) | JitterAvg=%lluus | PoolSlotWait(avg=%lluus, max=%lluus, peak=%llu/%u)\n"
+        "  NVENC(init=%lluus, avg=%lluus, p50=%lluus, p95=%lluus, p99=%lluus | prep=%lluus, pic=%lluus, lock=%lluus) | ExtToBs(avg=%lluus, p50=%lluus, p95=%lluus, p99=%lluus)\n"
+        "  MftDecode(avg=%lluus, p50=%lluus, p95=%lluus, p99=%lluus, max=%lluus) | MftWorker(enq=%llu, deq=%llu, proc=%llu, rej=%llu, peak=%llu, shutPend=%llu, wait=%llu, to=%llu, fail=%llu)\n"
+        "  GpuPurity(gpuRx=%llu, cpuRx=%llu, gpuOpened=%llu, unexpCpu=%llu, viol=%llu, cpuReads=%llu) | HostMem(ws=%.2fMB, peak=%.2fMB, cpu=%.2f%%) | Decoded=%llu | TsErrors=%llu\n",
         driverKind,
         kTotalFrames,
         stimulusAchievedFps.load(),
@@ -2191,6 +2327,7 @@ TestEndToEndProlonged1080p60GpuNvenc30SecondBenchmark()
         liveCov,
         extToBsCov,
         static_cast<unsigned long long>(liveE2EAvgUs),
+        static_cast<unsigned long long>(liveE2EP50Us),
         static_cast<unsigned long long>(liveE2EP95Us),
         static_cast<unsigned long long>(liveE2EP99Us),
         static_cast<unsigned long long>(jitterAvgUs),
@@ -2200,18 +2337,58 @@ TestEndToEndProlonged1080p60GpuNvenc30SecondBenchmark()
         poolSnap.PoolSize,
         static_cast<unsigned long long>(nvInitUs),
         static_cast<unsigned long long>(nvEncAvgUs),
+        static_cast<unsigned long long>(nvEncP50Us),
         static_cast<unsigned long long>(nvEncP95Us),
         static_cast<unsigned long long>(nvEncP99Us),
         static_cast<unsigned long long>(nvPrepAvgUs),
         static_cast<unsigned long long>(nvPicAvgUs),
         static_cast<unsigned long long>(nvLockAvgUs),
+        static_cast<unsigned long long>(extToBsAvgUs),
+        static_cast<unsigned long long>(extToBsP50Us),
+        static_cast<unsigned long long>(extToBsP95Us),
         static_cast<unsigned long long>(extToBsP99Us),
+        static_cast<unsigned long long>(mftDecAvgUs),
+        static_cast<unsigned long long>(mftDecP50Us),
+        static_cast<unsigned long long>(mftDecP95Us),
+        static_cast<unsigned long long>(mftDecP99Us),
+        static_cast<unsigned long long>(mftDecMaxUs),
+        static_cast<unsigned long long>(wEnqueued),
+        static_cast<unsigned long long>(wDequeued),
+        static_cast<unsigned long long>(wProcessed),
+        static_cast<unsigned long long>(wRejected),
+        static_cast<unsigned long long>(wPeakDepth),
+        static_cast<unsigned long long>(wPendingShutdown),
+        static_cast<unsigned long long>(wFullWaits),
+        static_cast<unsigned long long>(wWaitTimeouts),
+        static_cast<unsigned long long>(wFailures),
+        static_cast<unsigned long long>(gpuFramesRx),
+        static_cast<unsigned long long>(cpuFramesRx),
+        static_cast<unsigned long long>(gpuFramesOpened),
+        static_cast<unsigned long long>(unexpectedCpuInGpu),
+        static_cast<unsigned long long>(contractViolations),
+        static_cast<unsigned long long>(cpuReads),
         static_cast<double>(hostWsBytes) / (1024.0 * 1024.0),
         static_cast<double>(hostPeakWsBytes) / (1024.0 * 1024.0),
         hostCpuPct,
         static_cast<unsigned long long>(framesDecoded),
-        static_cast<unsigned long long>(cpuReads),
         static_cast<unsigned long long>(tsErrors));
+
+    wchar_t evidencePathBuf[1024]{};
+    const DWORD evLen = GetEnvironmentVariableW(
+        L"LUMABRIDGE_BENCH30S_EVIDENCE_PATH",
+        evidencePathBuf,
+        ARRAYSIZE(evidencePathBuf));
+    if (evLen > 0U && evLen < ARRAYSIZE(evidencePathBuf))
+    {
+        const std::filesystem::path evPath(evidencePathBuf);
+        std::error_code ec;
+        if (evPath.has_parent_path())
+        {
+            std::filesystem::create_directories(evPath.parent_path(), ec);
+        }
+        std::filesystem::copy_file(jsonPath, evPath, std::filesystem::copy_options::overwrite_existing, ec);
+        EXPECT_TRUE(!ec);
+    }
 
     server.Stop();
     EXPECT_EQ(poolSnap.QueuedSlots, 0U);
@@ -2243,8 +2420,27 @@ RunTest(
 } // namespace
 
 int
-main()
+main(
+    int argc,
+    char* argv[]
+    )
 {
+    bool onlyBench30s = false;
+    for (int i = 1; i < argc; ++i)
+    {
+        if (std::string(argv[i]) == "--only-bench30s")
+        {
+            onlyBench30s = true;
+        }
+    }
+
+    if (onlyBench30s)
+    {
+        RunTest("EndToEndProlonged1080p60GpuNvenc30SecondBenchmark", TestEndToEndProlonged1080p60GpuNvenc30SecondBenchmark);
+        std::printf("Summary: %d tests run, %d assertion failures.\n", g_TestsRun, g_TestsFailed);
+        return (g_TestsFailed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+
     RunTest("EndToEndRealD3d11ExtractionToSeparateHostProcess720pAnd1080p", TestEndToEndRealD3d11ExtractionToSeparateHostProcess720pAnd1080p);
     RunTest("EndToEndHostDisconnectAndReconnectDuringActiveSwapChainLoop", TestEndToEndHostDisconnectAndReconnectDuringActiveSwapChainLoop);
     RunTest("EndToEndSmokeDurationExitAndMinFramesVsTargetCli", TestEndToEndSmokeDurationExitAndMinFramesVsTargetCli);

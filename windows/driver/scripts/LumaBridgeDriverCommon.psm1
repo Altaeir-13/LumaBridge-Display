@@ -865,6 +865,8 @@ function Invoke-LumaBridgeHostProcess {
             ResourceTelemetry         = $null
             Output                    = @()
             StdErr                    = @()
+            Arguments                 = @($Arguments)
+            CommandLine               = $escapedArgs
             DryRun                    = $true
         }
     }

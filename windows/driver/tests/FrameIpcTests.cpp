@@ -3299,6 +3299,28 @@ TestDxgiStimulusExplicitTestSurfaceLifecycle()
     stim.Stop();
 
     const auto snap = stim.GetMetricsSnapshot();
+    std::printf(
+        "[INFO] DxgiStimulusExplicitTestSurface: BackendRequested=%s BackendActive=%s "
+        "PresentSucceeded=%llu PresentOccluded=%llu PresentFailures=%llu "
+        "FallbackFromDxgiOccurred=%s CompletedCleanly=%s DurationUs=%llu LastHResult=0x%08lX ErrorMessage=\"%s\"\n",
+        snap.BackendRequested.c_str(),
+        snap.BackendActive.c_str(),
+        static_cast<unsigned long long>(snap.PresentSucceeded),
+        static_cast<unsigned long long>(snap.PresentOccluded),
+        static_cast<unsigned long long>(snap.PresentFailures),
+        snap.FallbackFromDxgiOccurred ? "true" : "false",
+        snap.CompletedCleanly ? "true" : "false",
+        static_cast<unsigned long long>(snap.DurationUs),
+        static_cast<unsigned long>(snap.LastHResult),
+        snap.ErrorMessage.c_str());
+    if (snap.FallbackFromDxgiOccurred && snap.PresentOccluded > 0ULL)
+    {
+        std::printf(
+            "[BLOCKED_BY_ENVIRONMENT] Explicit test surface hit DXGI_STATUS_OCCLUDED (%llu) on isolated desktop; "
+            "Auto mode fell back to GdiLegacy (DXGI pacing NOT validated by GDI fallback).\n",
+            static_cast<unsigned long long>(snap.PresentOccluded));
+    }
+
     EXPECT_TRUE(snap.VirtualDisplayIdentified);
     EXPECT_TRUE(snap.IdentificationSource == "ExplicitTestRect");
     EXPECT_TRUE(snap.Started);

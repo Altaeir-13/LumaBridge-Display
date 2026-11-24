@@ -3375,7 +3375,16 @@ function New-M01ValidationMockHarness {
             $st.Stage9Reached = $true
             $st.InRollback = $true
             if ($DryRun) {
-                return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; ProcessId = 0; Output = @('[DRY-RUN]'); StdErr = @(); DryRun = $true }
+                return [pscustomobject]@{
+                    ExitCode    = 0
+                    TimedOut    = $false
+                    ProcessId   = 0
+                    Output      = @('[DRY-RUN]')
+                    StdErr      = @()
+                    Arguments   = @($Arguments)
+                    CommandLine = ($Arguments -join ' ')
+                    DryRun      = $true
+                }
             }
             $jsonIdx = [Array]::IndexOf($Arguments, '--json-summary')
             $jsonPath = $Arguments[$jsonIdx + 1]
@@ -4880,6 +4889,373 @@ Write-Output ("DRY_PROFILE=" + `$dryRes.TestProfile)
     $joined = ($rawOut | ForEach-Object { [string]$_ }) -join "`n"
     Assert-Equal $childExit 0 ("Validation DryRun with PSReadLine + StrictMode failed (exit={0}): {1}" -f $childExit, $joined)
     Assert-True ($joined -match 'DRY_PROFILE=Benchmark30s') 'Benchmark30s DryRun completed cleanly under colliding RuntimeInformation'
+}
+
+# 66. M0.2.5.1 P0-B: -StimulusBackend Dxgi/Gdi/Auto forwards --stimulus-backend cleanly in DryRun without creating dirs
+Invoke-UnitTest -Name 'M025_1_StimulusBackendDryRunForwardingAndRetrocompat' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+    $h = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'M025_DryStim'
+    $dryOutBase = Join-Path $caseDir 'dry_stim_out'
+
+    Invoke-WithModuleMocks -GlobalMocks $h.Mocks -ModuleMocks $h.Mocks -Body {
+        $dryDxgi = & $valScript -Configuration Release -TestProfile Benchmark30s -StimulusBackend Dxgi -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir (Join-Path $caseDir 'dry_stg_dxgi') -OutputDir (Join-Path $dryOutBase 'dxgi') -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -DryRun
+        Assert-Equal $dryDxgi.StimulusBackend 'Dxgi' 'DryRun reports StimulusBackend=Dxgi'
+        $dxArgs = @($dryDxgi.Benchmark30sHostPreview.Arguments)
+        $dxIdx = [Array]::IndexOf($dxArgs, '--stimulus-backend')
+        Assert-True ($dxIdx -ge 0 -and $dxArgs[$dxIdx + 1] -eq 'dxgi') 'Benchmark30s DryRun forwards --stimulus-backend dxgi'
+
+        $dryStab = & $valScript -Configuration Release -TestProfile ProlongedStability -StimulusBackend Dxgi -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir (Join-Path $caseDir 'dry_stg_stab') -OutputDir (Join-Path $dryOutBase 'stab') -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -DryRun
+        $stArgs = @($dryStab.StabilityHostPreview.Arguments)
+        $stIdx = [Array]::IndexOf($stArgs, '--stimulus-backend')
+        Assert-True ($stIdx -ge 0 -and $stArgs[$stIdx + 1] -eq 'dxgi') 'ProlongedStability DryRun forwards --stimulus-backend dxgi'
+
+        $dryAuto = & $valScript -Configuration Release -TestProfile Benchmark30s -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir (Join-Path $caseDir 'dry_stg_auto') -OutputDir (Join-Path $dryOutBase 'auto') -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -DryRun
+        Assert-Equal $dryAuto.StimulusBackend 'Auto' 'Default StimulusBackend remains Auto for backward compatibility'
+        $auArgs = @($dryAuto.Benchmark30sHostPreview.Arguments)
+        $auIdx = [Array]::IndexOf($auArgs, '--stimulus-backend')
+        Assert-True ($auIdx -ge 0 -and $auArgs[$auIdx + 1] -eq 'auto') 'Default Benchmark30s DryRun forwards --stimulus-backend auto'
+
+        $dryGdi = & $valScript -Configuration Release -TestProfile Benchmark30s -StimulusBackend Gdi -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir (Join-Path $caseDir 'dry_stg_gdi') -OutputDir (Join-Path $dryOutBase 'gdi') -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -DryRun
+        Assert-Equal $dryGdi.StimulusBackend 'Gdi' 'DryRun reports StimulusBackend=Gdi'
+        $gdArgs = @($dryGdi.Benchmark30sHostPreview.Arguments)
+        $gdIdx = [Array]::IndexOf($gdArgs, '--stimulus-backend')
+        Assert-True ($gdIdx -ge 0 -and $gdArgs[$gdIdx + 1] -eq 'gdi') 'Benchmark30s DryRun forwards --stimulus-backend gdi'
+    }
+    Assert-True (-not (Test-Path -LiteralPath $dryOutBase)) 'DryRun creates zero OutputDir folders'
+}
+
+# 67. M0.2.5.1 P0-B: Explicit -StimulusBackend Dxgi positive Benchmark30s gate pass
+Invoke-UnitTest -Name 'M025_1_ExplicitDxgiGatePositivePass' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+    $h = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'M025_DxgiPass'
+    $h.State.HostHandler = {
+        param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+        $payload = New-M01MockHostPayload -RunId $runIdVal -Frames 1800 -DurationSec 30 -DurationMsOverride 30000 -ActiveStreamingDurationMsOverride 30000 -NvencSubmitted 1800 -NvencEncoded 1800 -H264Decoded 1800
+        $payload | Add-Member -NotePropertyName 'CpuFramesReceived' -NotePropertyValue 0 -Force
+        $payload | Add-Member -NotePropertyName 'GpuFramesReceived' -NotePropertyValue 1800 -Force
+        $payload | Add-Member -NotePropertyName 'UnexpectedCpuFramesInGpuSession' -NotePropertyValue 0 -Force
+        $payload | Add-Member -NotePropertyName 'TransportContractViolations' -NotePropertyValue 0 -Force
+        $payload.H264DecodeValidation | Add-Member -NotePropertyName 'Worker' -NotePropertyValue ([pscustomobject]@{
+            Enabled = $true; Healthy = $true; SynchronousFallbackActive = $false; QueueCapacity = 256;
+            PacketsEnqueued = 1800; PacketsDequeued = 1800; PacketsProcessed = 1800; PacketsRejected = 0;
+            QueuePeakDepth = 4; QueuePendingAtShutdown = 0; QueueRemainingAtExit = 0;
+            QueueFullWaitCount = 0; QueueWaitTimeoutCount = 0; WorkerFailureCount = 0;
+            DrainDeadlineExceeded = $false; ComBalanced = $true; CompletionState = 'NormalShutdown';
+            LastHResult = '0x00000000'; LastErrorMessage = ''
+        }) -Force
+        $payload.VisualStimulus = [pscustomobject]@{
+            Requested = $true; VirtualDisplayIdentified = $true; Started = $true; Active = $false;
+            CompletedCleanly = $true; TerminalFailure = $false; StopRequested = $true;
+            HighResolutionTimerUsed = $true; TargetFps = 60;
+            BackendRequested = 'D3d11DxgiVSync'; BackendActive = 'D3d11DxgiVSync';
+            FallbackFromDxgiOccurred = $false; FallbackReason = '';
+            PresentRequests = 1802; PresentSucceeded = 1802; PresentOccluded = 0; PresentFailures = 0;
+            DurationUs = 30033000; DisplayDeviceName = '\\.\DISPLAY10'; IdentificationSource = 'IndirectWiredMatch';
+            LastHResult = '0x00000000'; ErrorMessage = ''
+        }
+        $payload | ConvertTo-Json -Depth 7 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+        return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] ok'); StdErr = @(); DryRun = $false }
+    }.GetNewClosure()
+
+    $outPass = Join-Path $caseDir 'out_dxgi_pass'
+    Invoke-WithModuleMocks -GlobalMocks $h.Mocks -ModuleMocks $h.Mocks -Body {
+        $res = & $valScript -Configuration Release -TestProfile Benchmark30s -BenchmarkDurationSec 30 -StimulusBackend Dxgi -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $h.State.StagingDir -OutputDir $outPass -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        Assert-Equal $res.FunctionalValidationSucceeded $true 'FunctionalValidationSucceeded=true for valid explicit DXGI'
+        Assert-Equal $res.OverallSucceeded $true 'OverallSucceeded=true for valid explicit DXGI'
+        Assert-Equal $res.GateStatuses.StimulusBackend 'PASS' 'GateStatuses.StimulusBackend=PASS'
+        Assert-Equal $res.AcceptanceCriteria.StimulusBackendPassed $true 'AcceptanceCriteria.StimulusBackendPassed=true'
+        Assert-Equal $res.SubprofileEvaluations.Benchmark30s.StimulusBackendActive 'D3d11DxgiVSync' 'Subprofile records D3d11DxgiVSync'
+    }
+    $md = Get-Content -LiteralPath (Join-Path $outPass 'functional-validation-report.md') -Raw
+    Assert-True ($md -match 'StimulusBackend:\s*`Dxgi`') 'Markdown report records StimulusBackend Dxgi'
+    Assert-True ($md -match 'StimAct=`D3d11DxgiVSync`') 'Markdown subprofile records StimAct=D3d11DxgiVSync'
+}
+
+# 68. M0.2.5.1 P0-B: Explicit DXGI rejects GDI fallback, PresentSucceeded=0, incomplete/terminal error, missing fields, and weak cadence/duration
+Invoke-UnitTest -Name 'M025_1_ExplicitDxgiGateRejectsFallbackZeroPresentIncompleteTerminalAndMissingFields' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+
+    $scenarios = @(
+        @{
+            Name = 'GdiFallback'
+            Modify = {
+                param($p)
+                $p.VisualStimulus.BackendActive = 'GdiLegacy'
+                $p.VisualStimulus.FallbackFromDxgiOccurred = $true
+            }
+        },
+        @{
+            Name = 'ZeroPresent'
+            Modify = {
+                param($p)
+                $p.VisualStimulus.PresentSucceeded = 0
+                $p.VisualStimulus.PresentOccluded = 180
+            }
+        },
+        @{
+            Name = 'NotCompletedCleanly'
+            Modify = {
+                param($p)
+                $p.VisualStimulus.CompletedCleanly = $false
+            }
+        },
+        @{
+            Name = 'TerminalFailureAndHr'
+            Modify = {
+                param($p)
+                $p.VisualStimulus.TerminalFailure = $true
+                $p.VisualStimulus.LastHResult = '0x887A0005'
+                $p.VisualStimulus.ErrorMessage = 'DXGI device lost unrecovered'
+            }
+        },
+        @{
+            Name = 'MissingPresentSucceededField'
+            Modify = {
+                param($p)
+                $p.VisualStimulus.PSObject.Properties.Remove('PresentSucceeded')
+            }
+        },
+        @{
+            Name = 'MissingFallbackField'
+            Modify = {
+                param($p)
+                $p.VisualStimulus.PSObject.Properties.Remove('FallbackFromDxgiOccurred')
+            }
+        },
+        @{
+            Name = 'ExplicitTestRectRejectedAsRealMonitor'
+            Modify = {
+                param($p)
+                $p.VisualStimulus.IdentificationSource = 'ExplicitTestRect'
+            }
+        },
+        @{
+            Name = 'InsufficientFramesEvenWithDxgiPresents'
+            Modify = {
+                param($p)
+                $p.FramesReceived = 1500
+                $p.FramesValid = 1500
+                $p.LiveFramesReceived = 1500
+                $p.Nvenc.NvencFramesSubmitted = 1500
+                $p.Nvenc.NvencFramesEncoded = 1500
+                $p.H264DecodeValidation.PacketsInspected = 1500
+                $p.H264DecodeValidation.FramesDecoded = 1500
+                $p.H264DecodeValidation.Worker.PacketsEnqueued = 1500
+                $p.H264DecodeValidation.Worker.PacketsDequeued = 1500
+                $p.H264DecodeValidation.Worker.PacketsProcessed = 1500
+                $p.SustainedLiveFps = 50.0
+                $p.ObservedActiveFps = 50.0
+                $p.ReceiveFps = 50.0
+            }
+        }
+    )
+
+    $scIdx = 0
+    foreach ($sc in $scenarios) {
+        $scIdx++
+        $key = "n{0}" -f $scIdx
+        $h = New-M01ValidationMockHarness -CaseDir (Join-Path $caseDir ("c{0}" -f $scIdx)) -StateKey $key
+        $modifier = $sc.Modify
+        $h.State.HostHandler = {
+            param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+            $payload = New-M01MockHostPayload -RunId $runIdVal -Frames 1800 -DurationSec 30 -DurationMsOverride 30000 -ActiveStreamingDurationMsOverride 30000 -NvencSubmitted 1800 -NvencEncoded 1800 -H264Decoded 1800
+            $payload | Add-Member -NotePropertyName 'CpuFramesReceived' -NotePropertyValue 0 -Force
+            $payload | Add-Member -NotePropertyName 'GpuFramesReceived' -NotePropertyValue 1800 -Force
+            $payload | Add-Member -NotePropertyName 'UnexpectedCpuFramesInGpuSession' -NotePropertyValue 0 -Force
+            $payload | Add-Member -NotePropertyName 'TransportContractViolations' -NotePropertyValue 0 -Force
+            $payload.H264DecodeValidation | Add-Member -NotePropertyName 'Worker' -NotePropertyValue ([pscustomobject]@{
+                Enabled = $true; Healthy = $true; SynchronousFallbackActive = $false; QueueCapacity = 256;
+                PacketsEnqueued = 1800; PacketsDequeued = 1800; PacketsProcessed = 1800; PacketsRejected = 0;
+                QueuePeakDepth = 4; QueuePendingAtShutdown = 0; QueueRemainingAtExit = 0;
+                QueueFullWaitCount = 0; QueueWaitTimeoutCount = 0; WorkerFailureCount = 0;
+                DrainDeadlineExceeded = $false; ComBalanced = $true; CompletionState = 'NormalShutdown';
+                LastHResult = '0x00000000'; LastErrorMessage = ''
+            }) -Force
+            $payload.VisualStimulus = [pscustomobject]@{
+                Requested = $true; VirtualDisplayIdentified = $true; Started = $true; Active = $false;
+                CompletedCleanly = $true; TerminalFailure = $false; StopRequested = $true;
+                HighResolutionTimerUsed = $true; TargetFps = 60;
+                BackendRequested = 'D3d11DxgiVSync'; BackendActive = 'D3d11DxgiVSync';
+                FallbackFromDxgiOccurred = $false; FallbackReason = '';
+                PresentRequests = 1800; PresentSucceeded = 1800; PresentOccluded = 0; PresentFailures = 0;
+                DurationUs = 30000000; DisplayDeviceName = '\\.\DISPLAY10'; IdentificationSource = 'IndirectWiredMatch';
+                LastHResult = '0x00000000'; ErrorMessage = ''
+            }
+            & $modifier $payload
+            $payload | ConvertTo-Json -Depth 7 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+            return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] neg'); StdErr = @(); DryRun = $false }
+        }.GetNewClosure()
+
+        $outDir = Join-Path $caseDir ("o{0}" -f $scIdx)
+        Invoke-WithModuleMocks -GlobalMocks $h.Mocks -ModuleMocks $h.Mocks -Body {
+            Assert-Throws {
+                & $valScript -Configuration Release -TestProfile Benchmark30s -BenchmarkDurationSec 30 -StimulusBackend Dxgi -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $h.State.StagingDir -OutputDir $outDir -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+            } -ExpectedPattern 'acceptance criteria|RollbackClean=True' -Message ("Scenario {0} must fail validation" -f $sc.Name)
+        }
+        $rep = Get-Content -LiteralPath (Join-Path $outDir 'functional-validation-report.json') -Raw | ConvertFrom-Json
+        Assert-Equal $rep.FunctionalValidationSucceeded $false ("{0}: FunctionalValidationSucceeded=false" -f $sc.Name)
+        Assert-Equal $rep.OverallSucceeded $false ("{0}: OverallSucceeded=false" -f $sc.Name)
+        Assert-Equal $rep.RollbackClean $true ("{0}: RollbackClean=true" -f $sc.Name)
+        if ($sc.Name -ne 'InsufficientFramesEvenWithDxgiPresents') {
+            Assert-Equal $rep.GateStatuses.StimulusBackend 'FAIL' ("{0}: GateStatuses.StimulusBackend=FAIL" -f $sc.Name)
+            Assert-Equal $rep.AcceptanceCriteria.StimulusBackendPassed $false ("{0}: StimulusBackendPassed=false" -f $sc.Name)
+        }
+        else {
+            Assert-Equal $rep.GateStatuses.Benchmark30s 'FAIL' ("{0}: GateStatuses.Benchmark30s=FAIL even when PresentSucceeded>0" -f $sc.Name)
+        }
+    }
+}
+
+# 69. M0.2.5.1 P0-D: H.264 Worker unhealthy / rejected / timeout / unbalanced COM / missing field fails H264 gate even when Passed=true
+Invoke-UnitTest -Name 'M025_1_H264WorkerFailureAndMissingFieldsFailGate' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+
+    foreach ($mode in @('WorkerTimeout', 'MissingWorkerField')) {
+        $h = New-M01ValidationMockHarness -CaseDir (Join-Path $caseDir $mode) -StateKey ('M025_' + $mode)
+        $mCap = $mode
+        $h.State.HostHandler = {
+            param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+            $payload = New-M01MockHostPayload -RunId $runIdVal -Frames 1800 -DurationSec 30 -DurationMsOverride 30000 -ActiveStreamingDurationMsOverride 30000 -NvencSubmitted 1800 -NvencEncoded 1800 -H264Decoded 1800
+            $payload | Add-Member -NotePropertyName 'CpuFramesReceived' -NotePropertyValue 0 -Force
+            $payload | Add-Member -NotePropertyName 'GpuFramesReceived' -NotePropertyValue 1800 -Force
+            $payload | Add-Member -NotePropertyName 'UnexpectedCpuFramesInGpuSession' -NotePropertyValue 0 -Force
+            $payload | Add-Member -NotePropertyName 'TransportContractViolations' -NotePropertyValue 0 -Force
+            $workerObj = [pscustomobject]@{
+                Enabled = $true; Healthy = $true; SynchronousFallbackActive = $false; QueueCapacity = 256;
+                PacketsEnqueued = 1800; PacketsDequeued = 1800; PacketsProcessed = 1800; PacketsRejected = 0;
+                QueuePeakDepth = 8; QueuePendingAtShutdown = 0; QueueRemainingAtExit = 0;
+                QueueFullWaitCount = 0; QueueWaitTimeoutCount = 0; WorkerFailureCount = 0;
+                DrainDeadlineExceeded = $false; ComBalanced = $true; CompletionState = 'NormalShutdown';
+                LastHResult = '0x00000000'; LastErrorMessage = ''
+            }
+            if ($mCap -eq 'WorkerTimeout') {
+                $workerObj.Healthy = $false
+                $workerObj.PacketsRejected = 1
+                $workerObj.QueueWaitTimeoutCount = 1
+                $workerObj.WorkerFailureCount = 1
+                $workerObj.CompletionState = 'EnqueueTimeout'
+            }
+            else {
+                $workerObj.PSObject.Properties.Remove('ComBalanced')
+            }
+            $payload.H264DecodeValidation | Add-Member -NotePropertyName 'Worker' -NotePropertyValue $workerObj -Force
+            $payload.VisualStimulus = [pscustomobject]@{
+                Requested = $true; VirtualDisplayIdentified = $true; Started = $true; Active = $false;
+                CompletedCleanly = $true; TerminalFailure = $false; StopRequested = $true;
+                HighResolutionTimerUsed = $true; TargetFps = 60;
+                BackendRequested = 'D3d11DxgiVSync'; BackendActive = 'D3d11DxgiVSync';
+                FallbackFromDxgiOccurred = $false; FallbackReason = '';
+                PresentRequests = 1800; PresentSucceeded = 1800; PresentOccluded = 0; PresentFailures = 0;
+                DurationUs = 30000000; DisplayDeviceName = '\\.\DISPLAY10'; IdentificationSource = 'IndirectWiredMatch';
+                LastHResult = '0x00000000'; ErrorMessage = ''
+            }
+            $payload | ConvertTo-Json -Depth 7 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+            return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] worker fail'); StdErr = @(); DryRun = $false }
+        }.GetNewClosure()
+
+        $outW = Join-Path $caseDir ('out_' + $mode)
+        Invoke-WithModuleMocks -GlobalMocks $h.Mocks -ModuleMocks $h.Mocks -Body {
+            Assert-Throws {
+                & $valScript -Configuration Release -TestProfile Benchmark30s -BenchmarkDurationSec 30 -StimulusBackend Dxgi -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $h.State.StagingDir -OutputDir $outW -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+            } -ExpectedPattern 'H264DecodePassed|Benchmark30sPassed' -Message ("Worker failure mode {0} must fail validation" -f $mode)
+        }
+        $repW = Get-Content -LiteralPath (Join-Path $outW 'functional-validation-report.json') -Raw | ConvertFrom-Json
+        Assert-Equal $repW.AcceptanceCriteria.H264DecodePassed $false ("{0}: H264DecodePassed=false" -f $mode)
+        Assert-Equal $repW.GateStatuses.H264StructuralDecode 'FAIL' ("{0}: GateStatuses.H264StructuralDecode=FAIL" -f $mode)
+        Assert-Equal $repW.FunctionalValidationSucceeded $false ("{0}: FunctionalValidationSucceeded=false" -f $mode)
+        Assert-Equal $repW.OverallSucceeded $false ("{0}: OverallSucceeded=false" -f $mode)
+    }
+}
+
+# 70. M0.2.5.1 P0-B/C: Auto backward compat vs terminal error rejection, plus Gdi selection enforcement
+Invoke-UnitTest -Name 'M025_1_AutoModeBackwardCompatAndGdiSelection' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+
+    # Case A: Auto fails if TerminalFailure=true is present
+    $hAutoFail = New-M01ValidationMockHarness -CaseDir (Join-Path $caseDir 'autofail') -StateKey 'M025_AutoFail'
+    $hAutoFail.State.HostHandler = {
+        param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+        $payload = New-M01MockHostPayload -RunId $runIdVal -Frames 1800 -DurationSec 30 -DurationMsOverride 30000 -ActiveStreamingDurationMsOverride 30000 -NvencSubmitted 1800 -NvencEncoded 1800 -H264Decoded 1800
+        $payload | Add-Member -NotePropertyName 'CpuFramesReceived' -NotePropertyValue 0 -Force
+        $payload | Add-Member -NotePropertyName 'GpuFramesReceived' -NotePropertyValue 1800 -Force
+        $payload | Add-Member -NotePropertyName 'UnexpectedCpuFramesInGpuSession' -NotePropertyValue 0 -Force
+        $payload | Add-Member -NotePropertyName 'TransportContractViolations' -NotePropertyValue 0 -Force
+        $payload.VisualStimulus = [pscustomobject]@{
+            VirtualDisplayIdentified = $true; Started = $true; TargetFps = 60;
+            CompletedCleanly = $false; TerminalFailure = $true; LastHResult = '0x80004005'; ErrorMessage = 'Post-start runtime failure'
+        }
+        $payload | ConvertTo-Json -Depth 7 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+        return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] auto fail'); StdErr = @(); DryRun = $false }
+    }.GetNewClosure()
+    $outAutoFail = Join-Path $caseDir 'out_autofail'
+    Invoke-WithModuleMocks -GlobalMocks $hAutoFail.Mocks -ModuleMocks $hAutoFail.Mocks -Body {
+        Assert-Throws {
+            & $valScript -Configuration Release -TestProfile Benchmark30s -BenchmarkDurationSec 30 -StimulusBackend Auto -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $hAutoFail.State.StagingDir -OutputDir $outAutoFail -HostExecutablePath $hAutoFail.State.FakeHostExe -CertificateThumbprint $hAutoFail.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        } -ExpectedPattern 'StimulusBackendPassed|Benchmark30sPassed' -Message 'Auto mode must still reject TerminalFailure=true'
+    }
+
+    # Case B: Gdi passes when GdiLegacy completed cleanly
+    $hGdi = New-M01ValidationMockHarness -CaseDir (Join-Path $caseDir 'gdiok') -StateKey 'M025_GdiOk'
+    $hGdi.State.HostHandler = {
+        param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+        $payload = New-M01MockHostPayload -RunId $runIdVal -Frames 1800 -DurationSec 30 -DurationMsOverride 30000 -ActiveStreamingDurationMsOverride 30000 -NvencSubmitted 1800 -NvencEncoded 1800 -H264Decoded 1800
+        $payload | Add-Member -NotePropertyName 'CpuFramesReceived' -NotePropertyValue 0 -Force
+        $payload | Add-Member -NotePropertyName 'GpuFramesReceived' -NotePropertyValue 1800 -Force
+        $payload | Add-Member -NotePropertyName 'UnexpectedCpuFramesInGpuSession' -NotePropertyValue 0 -Force
+        $payload | Add-Member -NotePropertyName 'TransportContractViolations' -NotePropertyValue 0 -Force
+        $payload.VisualStimulus = [pscustomobject]@{
+            VirtualDisplayIdentified = $true; Started = $true; TargetFps = 60;
+            BackendRequested = 'GdiLegacy'; BackendActive = 'GdiLegacy';
+            CompletedCleanly = $true; TerminalFailure = $false;
+            DisplayDeviceName = '\\.\DISPLAY10'; IdentificationSource = 'IndirectWiredMatch';
+            LastHResult = '0x00000000'; ErrorMessage = ''
+        }
+        $payload | ConvertTo-Json -Depth 7 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+        return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] gdi ok'); StdErr = @(); DryRun = $false }
+    }.GetNewClosure()
+    $outGdi = Join-Path $caseDir 'out_gdiok'
+    Invoke-WithModuleMocks -GlobalMocks $hGdi.Mocks -ModuleMocks $hGdi.Mocks -Body {
+        $resGdi = & $valScript -Configuration Release -TestProfile Benchmark30s -BenchmarkDurationSec 30 -StimulusBackend Gdi -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $hGdi.State.StagingDir -OutputDir $outGdi -HostExecutablePath $hGdi.State.FakeHostExe -CertificateThumbprint $hGdi.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        Assert-Equal $resGdi.FunctionalValidationSucceeded $true 'Gdi passes when GdiLegacy telemetry is clean'
+        Assert-Equal $resGdi.GateStatuses.StimulusBackend 'PASS' 'GateStatuses.StimulusBackend=PASS for clean Gdi'
+    }
+}
+
+# 71. M0.2.5.1 P0-B: Isolated Windows PowerShell 5.1 + PSReadLine + StrictMode Latest passes Benchmark30s -StimulusBackend Dxgi -DryRun
+Invoke-UnitTest -Name 'M025_1_PsReadLineStrictModeDxgiDryRun' -TestBody {
+    param($caseDir)
+    $valScriptPath = (Resolve-Path -LiteralPath (Join-Path -Path $scriptsDir -ChildPath 'Invoke-LumaBridgeFunctionalValidation.ps1')).Path
+    $psrlMod = Get-Module -ListAvailable -Name 'PSReadLine' | Sort-Object Version | Select-Object -First 1
+    Assert-True ($null -ne $psrlMod) 'PSReadLine available'
+    $psrlDll = Join-Path -Path $psrlMod.ModuleBase -ChildPath 'Microsoft.PowerShell.PSReadLine.dll'
+    $tmpDryStg = Join-Path $caseDir 'psrl_dxgi_stg'
+    $tmpDryOut = Join-Path $caseDir 'psrl_dxgi_out'
+
+    $childScript = @"
+Set-StrictMode -Version Latest
+`$ErrorActionPreference = 'Stop'
+Import-Module PSReadLine -ErrorAction Stop
+Add-Type -Path '$($psrlDll -replace "'", "''")'
+`$dryRes = & '$($valScriptPath -replace "'", "''")' -Configuration Release -TestProfile Benchmark30s -StimulusBackend Dxgi -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir '$($tmpDryStg -replace "'", "''")' -OutputDir '$($tmpDryOut -replace "'", "''")' -AllowAnyBranch -SkipDriverInstall -DryRun
+if (-not `$dryRes.DryRun) { throw 'Expected DryRun=true' }
+if (`$dryRes.StimulusBackend -ne 'Dxgi') { throw "Expected StimulusBackend=Dxgi, got `$(`$dryRes.StimulusBackend)" }
+`$bArgs = @(`$dryRes.Benchmark30sHostPreview.Arguments)
+`$idx = [Array]::IndexOf(`$bArgs, '--stimulus-backend')
+if (`$idx -lt 0 -or `$bArgs[`$idx + 1] -ne 'dxgi') { throw 'Missing --stimulus-backend dxgi in DryRun' }
+if (Test-Path -LiteralPath '$($tmpDryOut -replace "'", "''")') { throw 'DryRun must not create OutputDir' }
+Write-Output 'DRY_DXGI_STRICT_OK'
+"@
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($childScript))
+    $rawOut = & powershell.exe -NoProfile -NonInteractive -EncodedCommand $encoded 2>&1
+    $childExit = $LASTEXITCODE
+    $joined = ($rawOut | ForEach-Object { [string]$_ }) -join "`n"
+    Assert-Equal $childExit 0 ("Dxgi DryRun with PSReadLine + StrictMode failed (exit={0}): {1}" -f $childExit, $joined)
+    Assert-True ($joined -match 'DRY_DXGI_STRICT_OK') 'Benchmark30s -StimulusBackend Dxgi DryRun passed under colliding RuntimeInformation'
 }
 
 try {
