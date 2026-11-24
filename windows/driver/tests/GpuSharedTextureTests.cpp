@@ -1,6 +1,7 @@
 #include "../LumaBridgeIddDriver/SharedTexturePool.h"
 #include "../LumaBridgeIddDriver/FrameIpcProtocol.h"
 #include "../LumaBridgeIddDriver/FrameTransport.h"
+#include "../LumaBridgeIddDriver/SwapChainProcessor.h"
 #include "../../host/FrameConsumer.h"
 
 #include <d3d11_1.h>
@@ -810,6 +811,126 @@ TestInvalidHandleAndAdapterLuidMismatchRejected()
     pool.Shutdown();
 }
 
+void
+TestGpuPoolFlushSwapChainRecreationAndSeparationMetrics()
+{
+    ComPtr<ID3D11Device> prodDev;
+    ComPtr<ID3D11Device1> prodDev1;
+    ComPtr<ID3D11DeviceContext> prodCtx;
+    LUID adapterLuid{0, 0};
+    const char* kind = nullptr;
+    EXPECT_TRUE(CreateRealD3d11Device1(prodDev, prodDev1, prodCtx, adapterLuid, kind));
+
+    D3d11SharedTexturePool pool;
+    EXPECT_EQ(pool.Configure(3U), S_OK);
+    pool.SetDevice(prodDev.Get(), prodCtx.Get(), adapterLuid);
+
+    wchar_t pipeBuf[128]{};
+    _snwprintf_s(
+        pipeBuf,
+        ARRAYSIZE(pipeBuf),
+        _TRUNCATE,
+        L"\\\\.\\pipe\\LumaBridgeGpuM024_%lu",
+        GetCurrentProcessId());
+    const std::wstring pipeName(pipeBuf);
+
+    FrameTransportConfig srvCfg;
+    srvCfg.SetPipeName(pipeName.c_str());
+    srvCfg.MaxQueueDepth = 3U;
+    srvCfg.BufferPoolSize = 5U;
+    srvCfg.AdapterLuid = adapterLuid;
+    srvCfg.EnableGpuSharedTransport = true;
+    srvCfg.AllowCpuFallbackWhenGpuNegotiated = false;
+    srvCfg.SharedTexturePoolSize = 3U;
+    srvCfg.SharedTexturePool = &pool;
+    srvCfg.RequireActiveSessionForEnqueue = true;
+    srvCfg.FlushQueueOnSessionStart = true;
+
+    FrameIpcServer server;
+    EXPECT_EQ(server.Start(srvCfg), S_OK);
+
+    // 1. Verify SwapChainProcessor SwapChainGeneration increments cleanly across swapchain deletion/recreation.
+    class RecreationMockBackend final : public ISwapChainBackend
+    {
+    public:
+        HRESULT InitializeDeviceAndBindSwapChain(void*, LUID) noexcept override { return S_OK; }
+        HRESULT ReleaseAndAcquireBuffer(void*, SwapChainFrameMetadata&) noexcept override { return E_PENDING; }
+        HRESULT FinishProcessingFrame(void*) noexcept override { return S_OK; }
+        void DeleteSwapChainObject(void*) noexcept override {}
+    };
+
+    RecreationMockBackend swapBackend;
+    HANDLE surfEvt1 = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    HANDLE surfEvt2 = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    EXPECT_TRUE(surfEvt1 != nullptr && surfEvt2 != nullptr);
+
+    SwapChainProcessor swapChain(&swapBackend);
+    EXPECT_EQ(swapChain.AssignSwapChain(reinterpret_cast<void*>(static_cast<uintptr_t>(1U)), surfEvt1, adapterLuid), S_OK);
+    EXPECT_EQ(swapChain.GetMetricsSnapshot().SwapChainGeneration, 1ULL);
+
+    HostConsumerConfig gpuCfg;
+    gpuCfg.PipeName = pipeName;
+    gpuCfg.TransportPreference = HostTransportPreference::GpuSharedOnly;
+    gpuCfg.AllowCpuFallback = false;
+    gpuCfg.VerifySyntheticPattern = false;
+    FrameConsumer consumer(gpuCfg);
+    EXPECT_EQ(consumer.Connect(2000U), S_OK);
+
+    // Enqueue 2 GPU frames across swapchain recreation, consume 1, disconnect with 1 still queued -> FlushQueue frees slots.
+    for (uint32_t i = 1U; i <= 2U; ++i)
+    {
+        if (i == 2U)
+        {
+            EXPECT_EQ(swapChain.UnassignSwapChain(), S_OK);
+            EXPECT_EQ(swapChain.AssignSwapChain(reinterpret_cast<void*>(static_cast<uintptr_t>(2U)), surfEvt2, adapterLuid), S_OK);
+        }
+        ComPtr<ID3D11Texture2D> src;
+        EXPECT_TRUE(CreateSyntheticBgra8SourceTexture(prodDev.Get(), 640U, 360U, i, src));
+        auto slot = server.AcquireBufferSlot();
+        EXPECT_TRUE(slot != nullptr);
+        FrameExtractionInput in{};
+        in.AdoptSourceTexture = src.Detach();
+        in.PresentationFrameNumber = i;
+        in.Flags = static_cast<uint32_t>(FrameIpcFlags::SyntheticTestFrame);
+        EXPECT_EQ(pool.ExtractToSharedTexture(in, *slot, true).HResult, S_OK);
+        uint64_t outSeq = 0ULL;
+        bool evicted = false;
+        EXPECT_EQ(server.EnqueueFrame(std::move(slot), evicted, &outSeq), S_OK);
+        EXPECT_EQ(outSeq, static_cast<uint64_t>(i));
+    }
+
+    bool isGpu = false;
+    FrameIpcGpuFrameHeader gpuHdr{};
+    FrameIpcFrameHeader cpuHdr{};
+    std::vector<uint8_t> cpuPixels;
+    EXPECT_EQ(consumer.ReceiveNextGpuOrCpuFrame(isGpu, gpuHdr, cpuHdr, cpuPixels, 2000U), S_OK);
+    EXPECT_TRUE(isGpu);
+    EXPECT_EQ(gpuHdr.FrameSequence, 1ULL);
+    const auto cSnap = consumer.GetMetricsSnapshot();
+    EXPECT_EQ(cSnap.GpuFramesReceived, 1ULL);
+    EXPECT_EQ(cSnap.CpuFramesReceived, 0ULL);
+    EXPECT_EQ(cSnap.GpuFramesOpened, 1ULL);
+    EXPECT_EQ(cSnap.UnexpectedCpuFramesInGpuSession, 0ULL);
+    EXPECT_EQ(cSnap.TransportContractViolations, 0ULL);
+    EXPECT_EQ(cSnap.CpuStagingReadsPerformed, 0ULL);
+    EXPECT_EQ(swapChain.GetMetricsSnapshot().SwapChainGeneration, 2ULL);
+
+    // Disconnect while frame 2 is still in queue -> server disconnect teardown releases queued GPU slot cleanly.
+    consumer.Disconnect();
+    Sleep(60U);
+    server.FlushQueue();
+    const auto poolAfterFlush = pool.GetMetricsSnapshot();
+    EXPECT_EQ(poolAfterFlush.QueuedSlots, 0U);
+    EXPECT_EQ(poolAfterFlush.InUseByHostSlots, 0U);
+    EXPECT_EQ(poolAfterFlush.FreeSlots, 3U);
+
+    (void)swapChain.Shutdown();
+    CloseHandle(surfEvt1);
+    CloseHandle(surfEvt2);
+    server.Stop();
+    pool.Shutdown();
+}
+
 template <typename Fn>
 void
 RunTest(const char* name, Fn fn)
@@ -840,6 +961,7 @@ main()
     RunTest("SharedTextureDeviceRemovedAndResetRecovery", TestSharedTextureDeviceRemovedAndResetRecovery);
     RunTest("CrossProcessHandleDuplicationAndOpenSharedResource1", TestCrossProcessHandleDuplicationAndOpenSharedResource1);
     RunTest("InvalidHandleAndAdapterLuidMismatchRejected", TestInvalidHandleAndAdapterLuidMismatchRejected);
+    RunTest("GpuPoolFlushSwapChainRecreationAndSeparationMetrics", TestGpuPoolFlushSwapChainRecreationAndSeparationMetrics);
 
     std::printf("Summary: %d tests run, %d assertion failures.\n", g_TestsRun, g_TestsFailed);
     return (g_TestsFailed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;

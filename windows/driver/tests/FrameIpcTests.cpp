@@ -2781,6 +2781,536 @@ TestConnectedDurationClockSafetyAndBoundaries()
     }
 }
 
+void
+TestSessionTransitionsAndStaleFrameGating()
+{
+    Microsoft::WRL::ComPtr<ID3D11Device> dev;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx;
+    LUID adapterLuid{0, 0};
+    EXPECT_TRUE(CreateIpcTestD3d11Device(dev, ctx, adapterLuid));
+
+    D3d11SharedTexturePool pool;
+    EXPECT_EQ(pool.Configure(4U), S_OK);
+    pool.SetDevice(dev.Get(), ctx.Get(), adapterLuid);
+
+    const std::wstring pipeName = MakeUniquePipeName(950U);
+    FrameTransportConfig serverCfg;
+    serverCfg.SetPipeName(pipeName.c_str());
+    serverCfg.MaxQueueDepth = 4U;
+    serverCfg.BufferPoolSize = 6U;
+    serverCfg.AdapterLuid = adapterLuid;
+    serverCfg.EnableGpuSharedTransport = true;
+    serverCfg.AllowCpuFallbackWhenGpuNegotiated = false;
+    serverCfg.SharedTexturePoolSize = 4U;
+    serverCfg.SharedTexturePool = &pool;
+    serverCfg.RequireActiveSessionForEnqueue = false;
+    serverCfg.FlushQueueOnSessionStart = true;
+
+    FrameIpcServer server;
+    EXPECT_EQ(server.Start(serverCfg), S_OK);
+
+    // 1. Pre-existing CPU frames in queue before GPU consumer connects must be flushed cleanly.
+    for (uint32_t i = 1U; i <= 2U; ++i)
+    {
+        bool evicted = false;
+        EXPECT_EQ(server.EnqueueFrame(MakeSyntheticExtractedFrame(i, i, 64U, 64U), evicted), S_OK);
+    }
+
+    // 2. Connect GPU-only consumer -> flushes pre-existing CPU queue and enforces GPU contract.
+    HostConsumerConfig gpuCfg;
+    gpuCfg.PipeName = pipeName;
+    gpuCfg.TransportPreference = HostTransportPreference::GpuSharedOnly;
+    gpuCfg.AllowCpuFallback = false;
+    gpuCfg.VerifySyntheticPattern = false;
+    FrameConsumer gpuConsumer(gpuCfg);
+    EXPECT_EQ(gpuConsumer.Connect(2000U), S_OK);
+
+    const TransportSessionSnapshot sessGpu = server.GetActiveSessionSnapshot();
+    EXPECT_TRUE(sessGpu.HasActiveConsumer && sessGpu.ClientAuthorized);
+    EXPECT_EQ(sessGpu.NegotiatedMode, FrameIpcTransportMode::GpuSharedNtHandle);
+    EXPECT_TRUE(sessGpu.RequireGpuOnly);
+    EXPECT_TRUE(server.GetMetricsSnapshot().FramesFlushedOnSessionTransition >= 2ULL);
+
+    // Late in-flight CPU frame arriving during active GPU session must be rejected cleanly.
+    auto lateCpu = MakeSyntheticExtractedFrame(10U, 10U, 64U, 64U);
+    bool evicted = false;
+    EXPECT_EQ(server.EnqueueFrame(std::move(lateCpu), evicted), DXGI_ERROR_INVALID_CALL);
+    EXPECT_TRUE(server.GetMetricsSnapshot().FramesDiscardedTransportMismatch >= 1ULL);
+
+    // Frame tagged with stale session generation must be rejected without entering queue.
+    auto staleGenFrame = MakeSyntheticExtractedFrame(11U, 11U, 64U, 64U);
+    staleGenFrame->HasSessionBinding = true;
+    staleGenFrame->TargetSessionId = sessGpu.SessionId;
+    staleGenFrame->TargetSessionGeneration = (sessGpu.SessionGeneration > 1ULL) ? (sessGpu.SessionGeneration - 1ULL) : 9999ULL;
+    staleGenFrame->IsGpuSharedFrame = true;
+    EXPECT_EQ(server.EnqueueFrame(std::move(staleGenFrame), evicted), HRESULT_FROM_WIN32(ERROR_CONTEXT_EXPIRED));
+    EXPECT_TRUE(server.GetMetricsSnapshot().FramesDiscardedStaleSession >= 1ULL);
+
+    // Valid GPU frame delivers strictly on GPU path with 0 CPU reads and continuous sequence.
+    {
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> srcGpu;
+        EXPECT_TRUE(CreateSyntheticIpcGpuTexture(dev.Get(), 64U, 64U, 30U, srcGpu));
+        auto slotGpu = server.AcquireBufferSlot();
+        EXPECT_TRUE(slotGpu != nullptr);
+        FrameExtractionInput in{};
+        in.AdoptSourceTexture = srcGpu.Detach();
+        in.PresentationFrameNumber = 30U;
+        in.Flags = static_cast<uint32_t>(FrameIpcFlags::SyntheticTestFrame);
+        EXPECT_EQ(pool.ExtractToSharedTexture(in, *slotGpu, true).HResult, S_OK);
+        uint64_t assignedSeq = 0ULL;
+        EXPECT_EQ(server.EnqueueFrame(std::move(slotGpu), evicted, &assignedSeq), S_OK);
+        EXPECT_TRUE(assignedSeq >= 3ULL);
+
+        bool isGpu = false;
+        FrameIpcGpuFrameHeader gpuHdr{};
+        FrameIpcFrameHeader cpuHdr{};
+        std::vector<uint8_t> cpuPix;
+        EXPECT_EQ(gpuConsumer.ReceiveNextGpuOrCpuFrame(isGpu, gpuHdr, cpuHdr, cpuPix, 2000U), S_OK);
+        EXPECT_TRUE(isGpu);
+        EXPECT_EQ(gpuHdr.FrameSequence, assignedSeq);
+        const auto mGpu = gpuConsumer.GetMetricsSnapshot();
+        EXPECT_EQ(mGpu.GpuFramesReceived, 1ULL);
+        EXPECT_EQ(mGpu.CpuFramesReceived, 0ULL);
+        EXPECT_EQ(mGpu.UnexpectedCpuFramesInGpuSession, 0ULL);
+        EXPECT_EQ(mGpu.CpuStagingReadsPerformed, 0ULL);
+    }
+
+    gpuConsumer.Disconnect();
+    DriverSessionSummarySnapshot summaryGpu{};
+    const ULONGLONG waitDiscStart = GetTickCount64();
+    while (!server.GetLastCompletedSessionSummary(summaryGpu) && (GetTickCount64() - waitDiscStart) < 1500ULL)
+    {
+        Sleep(15U);
+    }
+    EXPECT_TRUE(summaryGpu.Valid);
+    EXPECT_EQ(summaryGpu.SessionId, sessGpu.SessionId);
+    EXPECT_EQ(summaryGpu.NegotiatedMode, FrameIpcTransportMode::GpuSharedNtHandle);
+    EXPECT_EQ(summaryGpu.FramesDelivered, 1ULL);
+
+    // 3. Authorized GPU -> CPU session transition keeps monotonic server sequence without stale leaks.
+    HostConsumerConfig cpuCfg;
+    cpuCfg.PipeName = pipeName;
+    cpuCfg.TransportPreference = HostTransportPreference::CpuStagingOnly;
+    cpuCfg.VerifySyntheticPattern = true;
+    FrameConsumer cpuConsumer(cpuCfg);
+    EXPECT_EQ(cpuConsumer.Connect(2000U), S_OK);
+
+    const TransportSessionSnapshot sessCpu = server.GetActiveSessionSnapshot();
+    EXPECT_EQ(sessCpu.NegotiatedMode, FrameIpcTransportMode::CpuStagingPipe);
+    EXPECT_TRUE(sessCpu.SessionGeneration > sessGpu.SessionGeneration);
+
+    auto validCpu = MakeSyntheticExtractedFrame(1ULL, 31U, 64U, 64U);
+    uint64_t cpuAssignedSeq = 0ULL;
+    EXPECT_EQ(server.EnqueueFrame(std::move(validCpu), evicted, &cpuAssignedSeq), S_OK);
+    EXPECT_TRUE(cpuAssignedSeq > summaryGpu.LastFrameSequence);
+
+    bool isGpu2 = true;
+    FrameIpcGpuFrameHeader gpuHdr2{};
+    FrameIpcFrameHeader cpuHdr2{};
+    std::vector<uint8_t> cpuPix2;
+    EXPECT_EQ(cpuConsumer.ReceiveNextGpuOrCpuFrame(isGpu2, gpuHdr2, cpuHdr2, cpuPix2, 2000U), S_OK);
+    EXPECT_TRUE(!isGpu2);
+    EXPECT_EQ(cpuHdr2.FrameSequence, cpuAssignedSeq);
+    EXPECT_EQ(cpuConsumer.GetMetricsSnapshot().CpuFramesReceived, 1ULL);
+    EXPECT_EQ(cpuConsumer.GetMetricsSnapshot().GpuFramesReceived, 0ULL);
+
+    cpuConsumer.Disconnect();
+    server.Stop();
+    EXPECT_EQ(pool.GetMetricsSnapshot().QueuedSlots, 0U);
+    EXPECT_EQ(pool.GetMetricsSnapshot().InUseByHostSlots, 0U);
+    pool.Shutdown();
+}
+
+void
+TestConcurrentPublishSequenceAndDisconnectRecovery()
+{
+    const std::wstring pipeName = MakeUniquePipeName(951U);
+    FrameTransportConfig serverCfg;
+    serverCfg.SetPipeName(pipeName.c_str());
+    serverCfg.MaxQueueDepth = 4U;
+    serverCfg.BufferPoolSize = 8U;
+    serverCfg.RequireActiveSessionForEnqueue = false;
+
+    FrameIpcServer server;
+    EXPECT_EQ(server.Start(serverCfg), S_OK);
+
+    std::atomic<bool> stopThreads{false};
+    std::atomic<uint64_t> rxCount{0ULL};
+
+    HostConsumerConfig cfg;
+    cfg.PipeName = pipeName;
+    cfg.AutoReconnect = true;
+    cfg.TransportPreference = HostTransportPreference::CpuStagingOnly;
+    cfg.IoTimeoutMs = 50U;
+    cfg.ConnectTimeoutMs = 2000U;
+    cfg.MaxFrames = 80ULL;
+    cfg.RequireFrameTarget = true;
+    FrameConsumer consumer(cfg);
+
+    HANDLE stopEvt = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    EXPECT_TRUE(stopEvt != nullptr);
+    HRESULT consumerHr = E_FAIL;
+    std::thread consumerThread([&]() {
+        consumerHr = consumer.RunLoop(
+            stopEvt,
+            [&rxCount](const FrameIpcFrameHeader&, const std::vector<uint8_t>&) {
+                rxCount.fetch_add(1ULL, std::memory_order_relaxed);
+            });
+    });
+
+    auto spawnWorker = [&](uint32_t threadOffset) {
+        return std::thread([&, threadOffset]() {
+            for (uint32_t k = 0U; !stopThreads.load(std::memory_order_relaxed) && k < 120U; ++k)
+            {
+                if (rxCount.load(std::memory_order_relaxed) >= 80ULL)
+                {
+                    break;
+                }
+                auto slot = server.AcquireBufferSlot();
+                if (slot != nullptr)
+                {
+                    auto synth = MakeSyntheticExtractedFrame(1ULL, threadOffset + k, 64U, 64U);
+                    slot->Width = synth->Width;
+                    slot->Height = synth->Height;
+                    slot->RowPitchBytes = synth->RowPitchBytes;
+                    slot->Format = synth->Format;
+                    slot->PresentationFrameNumber = synth->PresentationFrameNumber;
+                    slot->Flags = 0U;
+                    slot->QpcFrequency = synth->QpcFrequency;
+                    slot->ExtractCompleteQpcTime = synth->ExtractCompleteQpcTime;
+                    slot->Pixels = std::move(synth->Pixels);
+                    slot->PayloadCrc32 = synth->PayloadCrc32;
+                    bool evicted = false;
+                    (void)server.EnqueueFrame(std::move(slot), evicted);
+                }
+                Sleep(4U);
+            }
+        });
+    };
+
+    std::thread p1 = spawnWorker(0U);
+    std::thread p2 = spawnWorker(1000U);
+    consumerThread.join();
+    stopThreads.store(true);
+    p1.join();
+    p2.join();
+    CloseHandle(stopEvt);
+
+    EXPECT_EQ(consumerHr, S_OK);
+    const auto m = consumer.GetMetricsSnapshot();
+    EXPECT_TRUE(m.FramesValid >= 80ULL);
+    EXPECT_EQ(m.OutOfOrderSequenceCount, 0ULL);
+
+    server.Stop();
+}
+
+void
+TestSequenceWraparoundAndNoConsumerNonBlocking()
+{
+    const std::wstring pipeName = MakeUniquePipeName(952U);
+    FrameTransportConfig serverCfg;
+    serverCfg.SetPipeName(pipeName.c_str());
+    serverCfg.RequireActiveSessionForEnqueue = true;
+    serverCfg.FlushQueueOnSessionStart = true;
+
+    FrameIpcServer server;
+    EXPECT_EQ(server.Start(serverCfg), S_OK);
+
+    // 1. RequireActiveSessionForEnqueue rejects without blocking when no consumer is connected.
+    LARGE_INTEGER freqLi{}, startLi{}, endLi{};
+    QueryPerformanceFrequency(&freqLi);
+    QueryPerformanceCounter(&startLi);
+    for (uint32_t i = 0U; i < 100U; ++i)
+    {
+        bool evicted = false;
+        EXPECT_EQ(
+            server.EnqueueFrame(MakeSyntheticExtractedFrame(1ULL, i + 1U, 64U, 64U), evicted),
+            HRESULT_FROM_WIN32(ERROR_NO_DATA));
+    }
+    QueryPerformanceCounter(&endLi);
+    const uint64_t elapsedUs =
+        (static_cast<uint64_t>(endLi.QuadPart - startLi.QuadPart) * 1000000ULL) /
+        static_cast<uint64_t>((freqLi.QuadPart > 0) ? freqLi.QuadPart : 10000000LL);
+    EXPECT_TRUE(elapsedUs < 250000ULL);
+    EXPECT_EQ(server.GetMetricsSnapshot().FramesDiscardedNoConsumer, 100ULL);
+    EXPECT_EQ(server.GetMetricsSnapshot().QueueDepth, 0U);
+
+    // 2. UINT64_MAX -> 1 authoritative publish sequence wraparound.
+    server.Stop();
+    serverCfg.RequireActiveSessionForEnqueue = false;
+    EXPECT_EQ(server.Start(serverCfg), S_OK);
+    server.SetNextPublishSequenceForTesting(UINT64_MAX - 1ULL);
+
+    uint64_t seq1 = 0ULL, seq2 = 0ULL, seq3 = 0ULL;
+    bool evicted = false;
+    EXPECT_EQ(server.EnqueueFrame(MakeSyntheticExtractedFrame(1ULL, 1U, 64U, 64U), evicted, &seq1), S_OK);
+    EXPECT_EQ(server.EnqueueFrame(MakeSyntheticExtractedFrame(1ULL, 2U, 64U, 64U), evicted, &seq2), S_OK);
+    EXPECT_EQ(server.EnqueueFrame(MakeSyntheticExtractedFrame(1ULL, 3U, 64U, 64U), evicted, &seq3), S_OK);
+    EXPECT_EQ(seq1, UINT64_MAX - 1ULL);
+    EXPECT_EQ(seq2, UINT64_MAX);
+    EXPECT_EQ(seq3, 1ULL);
+    EXPECT_EQ(server.GetMetricsSnapshot().SequenceWrapAroundCount, 1ULL);
+
+    // 3. FlushQueue releases queued resources back into free pool cleanly.
+    server.FlushQueue();
+    const auto flushSnap = server.GetMetricsSnapshot();
+    EXPECT_EQ(flushSnap.QueueDepth, 0U);
+    EXPECT_EQ(flushSnap.FreePoolSlots, flushSnap.TotalPoolSlots);
+
+    server.Stop();
+}
+
+void
+TestHostRejectsUnexpectedCpuFrameInGpuOnlySessionAndCountsSeparation()
+{
+    Microsoft::WRL::ComPtr<ID3D11Device> dev;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx;
+    LUID adapterLuid{0, 0};
+    EXPECT_TRUE(CreateIpcTestD3d11Device(dev, ctx, adapterLuid));
+
+    auto runMockMismatchCase = [adapterLuid](bool serverNegotiatesGpu, bool sendGpuPayloadOnWire) -> HostConsumerMetricsSnapshot {
+        wchar_t pipeBuf[128]{};
+        _snwprintf_s(
+            pipeBuf,
+            ARRAYSIZE(pipeBuf),
+            _TRUNCATE,
+            L"\\\\.\\pipe\\LumaBridgeMismatchRaw_%lu_%u_%u",
+            GetCurrentProcessId(),
+            serverNegotiatesGpu ? 1U : 0U,
+            sendGpuPayloadOnWire ? 1U : 0U);
+        const std::wstring pipeName(pipeBuf);
+
+        HANDLE hPipe = CreateNamedPipeW(
+            pipeName.c_str(),
+            PIPE_ACCESS_DUPLEX,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            1U,
+            65536U,
+            65536U,
+            2000U,
+            nullptr);
+        EXPECT_TRUE(hPipe != INVALID_HANDLE_VALUE);
+
+        std::thread mockServer([hPipe, adapterLuid, serverNegotiatesGpu, sendGpuPayloadOnWire]() {
+            if (!ConnectNamedPipe(hPipe, nullptr) && GetLastError() != ERROR_PIPE_CONNECTED)
+            {
+                CloseHandle(hPipe);
+                return;
+            }
+            FrameIpcClientHello hello{};
+            DWORD bytesRead = 0U;
+            if (!ReadFile(hPipe, &hello, sizeof(hello), &bytesRead, nullptr) || bytesRead != sizeof(hello))
+            {
+                CloseHandle(hPipe);
+                return;
+            }
+
+            FrameIpcServerHello sh{};
+            sh.Envelope = InitEnvelope(FrameIpcMessageType::ServerHello, sizeof(sh));
+            sh.Status = static_cast<uint32_t>(FrameIpcStatus::Ok);
+            sh.SessionId = 42ULL;
+            sh.ServerProcessId = GetCurrentProcessId();
+            sh.AdapterLuidLow = static_cast<int32_t>(adapterLuid.LowPart);
+            sh.AdapterLuidHigh = adapterLuid.HighPart;
+            sh.MaxQueueDepth = 3U;
+            const uint32_t caps = serverNegotiatesGpu
+                ? static_cast<uint32_t>(FrameIpcCapabilities::GpuSharedNtHandle)
+                : static_cast<uint32_t>(FrameIpcCapabilities::CpuStagingRawPixels);
+            sh.Reserved1 = PackServerHelloCapabilities(caps, serverNegotiatesGpu ? 3U : 0U);
+
+            DWORD bytesWritten = 0U;
+            (void)WriteFile(hPipe, &sh, sizeof(sh), &bytesWritten, nullptr);
+
+            LARGE_INTEGER freq{}, now{};
+            QueryPerformanceFrequency(&freq);
+            QueryPerformanceCounter(&now);
+            if (!sendGpuPayloadOnWire)
+            {
+                FrameIpcFrameHeader fh{};
+                fh.Envelope = InitEnvelope(FrameIpcMessageType::FrameHeader, sizeof(fh));
+                fh.SessionId = 42ULL;
+                fh.FrameSequence = 1ULL;
+                fh.PresentationFrameNumber = 1U;
+                fh.Width = 4U;
+                fh.Height = 4U;
+                fh.RowPitchBytes = 16U;
+                fh.PixelFormat = static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
+                fh.ExtractCompleteQpcTime = static_cast<uint64_t>(now.QuadPart);
+                fh.ServerSendQpcTime = static_cast<uint64_t>(now.QuadPart);
+                fh.QpcFrequency = static_cast<uint64_t>(freq.QuadPart);
+                fh.PayloadSizeBytes = 64U;
+                std::vector<uint8_t> zeros(64U, 0U);
+                fh.PayloadCrc32 = ComputeFrameCrc32(zeros.data(), zeros.size());
+                (void)WriteFile(hPipe, &fh, sizeof(fh), &bytesWritten, nullptr);
+                (void)WriteFile(hPipe, zeros.data(), static_cast<DWORD>(zeros.size()), &bytesWritten, nullptr);
+            }
+            else
+            {
+                FrameIpcGpuFrameHeader gh{};
+                gh.Envelope = InitEnvelope(FrameIpcMessageType::GpuFrameHeader, sizeof(gh));
+                gh.Envelope.VersionMinor = kFrameIpcProtocolVersionMinorV1_1;
+                gh.SessionId = 42ULL;
+                gh.FrameSequence = 1ULL;
+                gh.PresentationFrameNumber = 1U;
+                gh.Width = 4U;
+                gh.Height = 4U;
+                gh.PixelFormat = static_cast<uint32_t>(DXGI_FORMAT_B8G8R8A8_UNORM);
+                gh.SlotIndex = 0U;
+                gh.SlotGeneration = 1U;
+                gh.DuplicatedNtHandleValue = 0x1234ULL;
+                gh.AdapterLuidLow = static_cast<int32_t>(adapterLuid.LowPart);
+                gh.AdapterLuidHigh = adapterLuid.HighPart;
+                gh.ExtractCompleteQpcTime = static_cast<uint64_t>(now.QuadPart);
+                gh.ServerSendQpcTime = static_cast<uint64_t>(now.QuadPart);
+                gh.QpcFrequency = static_cast<uint64_t>(freq.QuadPart);
+                (void)WriteFile(hPipe, &gh, sizeof(gh), &bytesWritten, nullptr);
+            }
+            FlushFileBuffers(hPipe);
+            Sleep(50U);
+            DisconnectNamedPipe(hPipe);
+            CloseHandle(hPipe);
+        });
+
+        HostConsumerConfig cfg;
+        cfg.PipeName = pipeName;
+        cfg.TransportPreference =
+            serverNegotiatesGpu ? HostTransportPreference::GpuSharedOnly : HostTransportPreference::CpuStagingOnly;
+        cfg.AllowCpuFallback = false;
+        cfg.ConnectTimeoutMs = 2000U;
+        cfg.IoTimeoutMs = 1000U;
+        FrameConsumer consumer(cfg);
+        const HRESULT hr = consumer.RunLoop();
+        mockServer.join();
+        EXPECT_EQ(hr, DXGI_ERROR_INVALID_CALL);
+        return consumer.GetMetricsSnapshot();
+    };
+
+    const auto gpuExpectingReject = runMockMismatchCase(true, false);
+    EXPECT_EQ(gpuExpectingReject.ExitReason, HostExitReason::FatalProtocolError);
+    EXPECT_TRUE(!gpuExpectingReject.TransportHealthy);
+    EXPECT_EQ(gpuExpectingReject.UnexpectedCpuFramesInGpuSession, 1ULL);
+    EXPECT_EQ(gpuExpectingReject.TransportContractViolations, 1ULL);
+    EXPECT_EQ(gpuExpectingReject.CpuFramesReceived, 1ULL);
+    EXPECT_EQ(gpuExpectingReject.GpuFramesReceived, 0ULL);
+
+    const auto cpuExpectingReject = runMockMismatchCase(false, true);
+    EXPECT_EQ(cpuExpectingReject.ExitReason, HostExitReason::FatalProtocolError);
+    EXPECT_TRUE(!cpuExpectingReject.TransportHealthy);
+    EXPECT_EQ(cpuExpectingReject.UnexpectedGpuFramesInCpuSession, 1ULL);
+    EXPECT_EQ(cpuExpectingReject.TransportContractViolations, 1ULL);
+    EXPECT_EQ(cpuExpectingReject.GpuFramesReceived, 0ULL);
+}
+
+void
+TestVirtualDisplayDiscoveryRationalPacingAndCorrelation()
+{
+    // 1. Zero-drift exact rational QPC math across 108,000 ticks (30 min @ 60fps & 59Hz/120Hz).
+    constexpr uint64_t kFreq = 10000000ULL;
+    const uint64_t exact108k = ComputeExactRationalOffsetQpc(108000ULL, kFreq, 60U);
+    EXPECT_EQ(exact108k, 1800ULL * kFreq);
+    const uint64_t exact59Hz = ComputeExactRationalOffsetQpc(59ULL * 1000ULL, kFreq, 59U);
+    EXPECT_EQ(exact59Hz, 1000ULL * kFreq);
+    const uint64_t exact120Hz = ComputeExactRationalOffsetQpc(120ULL * 600ULL, kFreq, 120U);
+    EXPECT_EQ(exact120Hz, 600ULL * kFreq);
+
+    // 2. Virtual display selection strictly refuses falling back to physical primary display.
+    DisplayCandidateInfo physicalPrimary{};
+    physicalPrimary.DeviceName = L"\\\\.\\DISPLAY1";
+    physicalPrimary.AdapterString = L"NVIDIA GeForce RTX";
+    physicalPrimary.BoundsWidth = 1920U;
+    physicalPrimary.BoundsHeight = 1080U;
+    physicalPrimary.Active = true;
+    physicalPrimary.Primary = true;
+    physicalPrimary.IsIndirectWired = false;
+
+    const auto noVirtual = DiscoverVirtualDisplayFromCandidates({physicalPrimary});
+    EXPECT_TRUE(!noVirtual.Identified);
+
+    DisplayCandidateInfo lumaVirtual{};
+    lumaVirtual.DeviceName = L"\\\\.\\DISPLAY10";
+    lumaVirtual.AdapterString = L"LumaBridgeIddDriver";
+    lumaVirtual.BoundsLeft = 1920;
+    lumaVirtual.BoundsWidth = 1920U;
+    lumaVirtual.BoundsHeight = 1080U;
+    lumaVirtual.Active = true;
+    lumaVirtual.Primary = false;
+    lumaVirtual.IsIndirectWired = true;
+
+    const auto foundVirtual = DiscoverVirtualDisplayFromCandidates({physicalPrimary, lumaVirtual});
+    EXPECT_TRUE(foundVirtual.Identified);
+    EXPECT_TRUE(_wcsicmp(foundVirtual.Selected.DeviceName.c_str(), L"\\\\.\\DISPLAY10") == 0);
+
+    // 3. PacingCorrelation accurately detects PresDelta=0/2, SeqGap, and >25ms gaps without per-frame console spam.
+    const std::wstring pipeName = MakeUniquePipeName(953U);
+    FrameTransportConfig srvCfg;
+    srvCfg.SetPipeName(pipeName.c_str());
+    srvCfg.AssignSequenceOnEnqueue = false;
+    srvCfg.RequireActiveSessionForEnqueue = false;
+    FrameIpcServer server;
+    EXPECT_EQ(server.Start(srvCfg), S_OK);
+
+    HostConsumerConfig consCfg;
+    consCfg.PipeName = pipeName;
+    consCfg.TransportPreference = HostTransportPreference::CpuStagingOnly;
+    consCfg.MaxFrames = 5ULL;
+    consCfg.RequireFrameTarget = true;
+    FrameConsumer consumer(consCfg);
+
+    std::thread producer([&server]() {
+        bool ev = false;
+        (void)server.EnqueueFrame(MakeSyntheticExtractedFrame(1ULL, 1U, 64U, 64U), ev);
+        Sleep(10U);
+        (void)server.EnqueueFrame(MakeSyntheticExtractedFrame(2ULL, 1U, 64U, 64U), ev); // PresDelta == 0
+        Sleep(10U);
+        (void)server.EnqueueFrame(MakeSyntheticExtractedFrame(3ULL, 3U, 64U, 64U), ev); // PresDelta == 2
+        Sleep(32U);
+        (void)server.EnqueueFrame(MakeSyntheticExtractedFrame(5ULL, 4U, 64U, 64U), ev); // SeqGap + >25ms gap
+        Sleep(10U);
+        (void)server.EnqueueFrame(MakeSyntheticExtractedFrame(6ULL, 5U, 64U, 64U), ev); // Normal
+    });
+
+    EXPECT_EQ(consumer.RunLoop(), S_OK);
+    producer.join();
+    server.Stop();
+
+    const auto corrSnap = consumer.GetMetricsSnapshot().PacingCorrelation;
+    EXPECT_EQ(corrSnap.PresentationDelta0Count, 1ULL);
+    EXPECT_EQ(corrSnap.PresentationDelta1Count, 2ULL);
+    EXPECT_EQ(corrSnap.PresentationDelta2Count, 1ULL);
+    EXPECT_EQ(corrSnap.SequenceDeltaGapCount, 1ULL);
+    EXPECT_TRUE(corrSnap.InterArrivalGapsOver25ms >= 1ULL);
+    EXPECT_EQ(corrSnap.TotalAnomaliesRecorded, 3ULL);
+    EXPECT_EQ(corrSnap.RecentAnomalies.size(), static_cast<size_t>(3U));
+}
+
+void
+TestDxgiStimulusExplicitTestSurfaceLifecycle()
+{
+    VirtualDisplayStimulus stim;
+    VirtualDisplayStimulusConfig cfg{};
+    cfg.TargetFps = 60U;
+    cfg.Backend = StimulusBackend::Auto;
+    cfg.UseExplicitRectForTestOnly = true;
+    cfg.ExplicitTestRect = RECT{0L, 0L, 320L, 240L};
+    cfg.TestDisplayName = L"LUMABRIDGE_M024_TEST_SURFACE";
+
+    EXPECT_TRUE(stim.Start(cfg));
+    Sleep(350U);
+    stim.Stop();
+
+    const auto snap = stim.GetMetricsSnapshot();
+    EXPECT_TRUE(snap.VirtualDisplayIdentified);
+    EXPECT_TRUE(snap.IdentificationSource == "ExplicitTestRect");
+    EXPECT_TRUE(snap.Started);
+    EXPECT_TRUE(snap.CompletedCleanly);
+    EXPECT_TRUE(snap.HighResolutionTimerUsed);
+    EXPECT_TRUE(snap.ExecutedTicks >= 15ULL);
+    EXPECT_TRUE(snap.TicksPresented >= 15ULL);
+    EXPECT_EQ(snap.PresentFailures, 0ULL);
+    EXPECT_EQ(snap.BoundsWidth, 320U);
+    EXPECT_EQ(snap.BoundsHeight, 240U);
+}
+
 template <typename Fn>
 void
 RunTest(
@@ -2831,6 +3361,12 @@ main()
     RunTest("ReservoirLatencySamplingForLongRuns", TestReservoirLatencySamplingForLongRuns);
     RunTest("PercentileMethodologyBoundariesAndReservoirEstimate", TestPercentileMethodologyBoundariesAndReservoirEstimate);
     RunTest("ConnectedDurationClockSafetyAndBoundaries", TestConnectedDurationClockSafetyAndBoundaries);
+    RunTest("SessionTransitionsAndStaleFrameGating", TestSessionTransitionsAndStaleFrameGating);
+    RunTest("ConcurrentPublishSequenceAndDisconnectRecovery", TestConcurrentPublishSequenceAndDisconnectRecovery);
+    RunTest("SequenceWraparoundAndNoConsumerNonBlocking", TestSequenceWraparoundAndNoConsumerNonBlocking);
+    RunTest("HostRejectsUnexpectedCpuFrameInGpuOnlySessionAndCountsSeparation", TestHostRejectsUnexpectedCpuFrameInGpuOnlySessionAndCountsSeparation);
+    RunTest("VirtualDisplayDiscoveryRationalPacingAndCorrelation", TestVirtualDisplayDiscoveryRationalPacingAndCorrelation);
+    RunTest("DxgiStimulusExplicitTestSurfaceLifecycle", TestDxgiStimulusExplicitTestSurfaceLifecycle);
 
     std::printf("Summary: %d tests run, %d assertion failures.\n", g_TestsRun, g_TestsFailed);
     return (g_TestsFailed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;

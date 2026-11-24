@@ -86,7 +86,7 @@
 14. `ReentrantBackendCallbacksDoNotDeadlockOrLeakReferences` — garante ausencia de deadlock e balanco exato de referencias em callbacks reentrantes;
 15. `DerivedContainerIdsAreUniqueAndRfc4122ValidPerInstance` — confirma `ContainerId` deterministico, unico por instancia/conector e valido segundo RFC 4122.
 
-`LumaBridgeFunctionalToolingTests.ps1` executa **30 verificacoes automatizadas PowerShell** com mocks isolados e assinaturas efemeras em diretorio temporario sobre `windows/driver/scripts/`:
+`LumaBridgeFunctionalToolingTests.ps1` executa **65 verificacoes automatizadas PowerShell** com mocks isolados e assinaturas efemeras em diretorio temporario sobre `windows/driver/scripts/`:
 
 1. `PackageSigningAndCryptographicVerificationPositive` — valida assinatura em staging isolado, hashes SIP de `.dll` e `.inf` no `.cat`, assinatura PKCS#7 e correspondencia de certificados preservando hashes originais de build;
 2. `InfTamperingRejectedEvenWithAllowUntrustedChain` — comprova bloqueio de `.inf` adulterado inclusive com `-AllowUntrustedChain`;
@@ -117,7 +117,9 @@
 27. `PrepareIddSampleReferenceDryRunEnforcesIsolation` — valida bloqueio de diretorios dentro do repositorio e execucao limpa de `Prepare-IddSampleReference.ps1 -DryRun` sem criar arquivos nem instalar drivers;
 28. `DiagnosticStageBuildManifestAndSubkeyBreadcrumbs` — valida leitura automatica de `Diag*` (incluindo `DiagBuildStage`) na subchave `Device Parameters\LumaBridgeIddDriver` e geracao isolada de manifesto/SHA-256 em `Build-LumaBridgeDiagnosticStage.ps1`;
 29. `ObservabilityVerifyProvidersAndUnclampedEtlTraceLoggingRecovery` — valida exposicao de `AllProvidersVerified` no nivel raiz de `VerifyProviders`, nao truncamento de `Collect-LumaBridgeDiagnostics.ps1` por eventos PnP antigos e recuperacao direcionada de eventos TraceLogging sem manifesto (`ProviderId` sem `ProviderName`) apos teto `MaxMatchedEvents`;
-30. `FunctionalValidationScriptDryRunAndFinallyRollbackOnFailure` — valida `Invoke-LumaBridgeFunctionalValidation.ps1 -DryRun`, uso estrito de `$signResult.StagingDir` na documentacao/script e rollback garantido no bloco `finally` (reversao de `EnableFrameExtraction=0`, limpeza de `AuthorizedHostUserSid`, restauracao de `EnableVirtualMonitor`, parada da sessao ETW e restart do dispositivo) mesmo apos falha no host ou erro no meio do fluxo.
+30. `FunctionalValidationScriptDryRunAndFinallyRollbackOnFailure` — valida `Invoke-LumaBridgeFunctionalValidation.ps1 -DryRun`, uso estrito de `$signResult.StagingDir` na documentacao/script e rollback garantido no bloco `finally` (reversao de `EnableFrameExtraction=0`, limpeza de `AuthorizedHostUserSid`, restauracao de `EnableVirtualMonitor`, parada da sessao ETW e restart do dispositivo) mesmo apos falha no host ou erro no meio do fluxo;
+31–57. Cobertura `M4.2.1` / `M0.1` / `M0.2.1` / `M0.2.2` — gates estritos por subperfil (`Benchmark30s` sem desconto de duracao, `ProlongedStability >= 180s`), identidade `WUDFHost`, metodologia de percentis (`ExactPopulation`, `ReservoirSampledEstimate_AlgorithmR`, `NotAvailable`), `RuntimeInformation` isolado contra `PSReadLine` e diagnosticos `M0.2.2`;
+58–65. Cobertura `M0.2.4` — independencia de `FunctionalSmokePassed` no `Benchmark30s`, classificacao `ControlledExitGateFailure` / `TimeoutKilled` / `CrashOrAbnormalExit`, rejeicao de frames CPU em sessao GPU-only, reuso criptograficamente verificado de staging assinado (`-ReuseSignedStaging`) com protecao contra sobrescrita de relatorios historicos e telemetria desacoplada (`-GpuSampleIntervalSec` sem `Get-Counter` na fase `End`).
 
 `FrameExtractionTests.cpp` executa **12 testes deterministicos e D3D11 reais** sobre `FrameExtractor.h` / `FrameExtractor.cpp` (dispositivo D3D11 real hardware/WARP e injecao de falhas via `ID3d11ExtractionHooks`):
 
@@ -134,7 +136,7 @@
 11. `PoolBufferMemoryBoundsAndFlushStorageRelease` — valida retencao de capacidade ate `kMaxRetainedPoolBufferBytes` (`~14.06 MiB` para 720p/1080p/1440p), liberacao automatica de picos de `64 MiB` na reciclagem, rejeicao acima de `kMaxFramePayloadBytes` e zeragem integral da memoria em `FlushQueue()`;
 12. `SwapChainProcessorIntegrationWithExtractionAndIddCxFinish` — integra `SwapChainProcessor`, extrator D3D11 real, fila limitada e `FinishProcessingFrame`.
 
-`FrameIpcTests.cpp` executa **13 testes deterministicos** sobre `FrameIpcProtocol.h`, `FrameTransport.h/.cpp` e `FrameConsumer.h/.cpp`:
+`FrameIpcTests.cpp` executa **31 testes deterministicos** sobre `FrameIpcProtocol.h`, `FrameTransport.h/.cpp` e `FrameConsumer.h/.cpp`:
 
 1. `ValidHandshakeFrameTransferAndAck` — handshake versionado, sessao, transferencia de frames BGRA8 e confirmacao `FrameIpcFrameAck`;
 2. `IncompatibleProtocolVersionRejected` — rejeicao de `VersionMajor` incompativel com `VersionMismatch` e aceitacao subsequente de cliente valido;
@@ -148,7 +150,9 @@
 10. `ConcurrentShutdownSuspendAndResourceCleanup` — encerramento limpo (`Stop()`) sob producao e conexoes concorrentes sem deadlocks;
 11. `CrossUserSidAuthorizationAndRestrictedDaclRejection` — testes negativos de acesso entre usuarios via `AuthorizedUserSid` (rejeicao no handshake e na DACL restrita do kernel quando `RestrictDaclToAuthorizedSid` esta ativo, sem vazamento de pixels) e aceitacao com SID exato autorizado;
 12. `CrossSessionAndSpoofedSessionRejection` — rejeicao de cliente fora da sessao permitida (`AllowedClientSessionId`) e de `ClientSessionId` adulterado no handshake em desacordo com `TokenSessionId` do kernel;
-13. `ProcessIntegrityAndAnonymousSqosRejectionBeforePixels` — rejeicao por `MinimumIntegrityRid` insuficiente, bloqueio de `SECURITY_ANONYMOUS` SQOS e bloqueio real no kernel de thread com token duplicado em `SECURITY_MANDATORY_LOW_RID` (`ERROR_ACCESS_DENIED`), mantendo frame enfileirado intacto para consumidor autorizado.
+13. `ProcessIntegrityAndAnonymousSqosRejectionBeforePixels` — rejeicao por `MinimumIntegrityRid` insuficiente, bloqueio de `SECURITY_ANONYMOUS` SQOS e bloqueio real no kernel de thread com token duplicado em `SECURITY_MANDATORY_LOW_RID` (`ERROR_ACCESS_DENIED`), mantendo frame enfileirado intacto para consumidor autorizado;
+14–25. Cobertura `M4.1.1` / `M4.2` / `M0.2.1` — limites de pool, razoes de saida smoke/idle, sessoes repetidas, negociacao v1.1 GPU Shared Texture, bloqueio de clientes nao autorizados/LUID divergente, reservoir sampling e duracao conectada QPC;
+26–31. Cobertura `M0.2.4` — transicoes `CPU->GPU` e `GPU->CPU` com descarte de frames stale/mismatch, estresse concorrente de publicacao e desconexao mid-stream, wraparound `UINT64_MAX -> 1` + descarte nao bloqueante sem consumidor, rejeicao de `FrameHeader` CPU em sessao GPU-only, pacing racional QPC sem drift (`108k` ticks) + recusa de fallback em monitor fisico + `PacingCorrelation`, e ciclo DXGI stimulus em superficie explicita de teste.
 
 `FrameEndToEndIntegrationTests.cpp` executa **8 testes de integracao multiprocesso reais** com D3D11 real + `D3d11SharedTexturePool` + `FrameIpcServer` + processo filho `lumabridge-host.exe` lancado via `CreateProcessW`:
 
@@ -161,7 +165,7 @@
 7. `EndToEndPhaseBGpuSharedTexturePlusNvencAndIndependentDecode720pAnd1080p` — valida pipeline completo GPU Shared -> NVENC H.264 -> decodificador Media Foundation independente em 720p e 1080p;
 8. `EndToEndControlledThreeWayBenchmark720pAnd1080p` — benchmark controlado comparando M4.1.1 (CPU Staging), M4.2 Fase A (GPU Shared) e M4.2 Fase B (GPU Shared + NVENC H.264) para 120 frames em `1280x720` e `1920x1080`.
 
-`GpuSharedTextureTests.cpp` executa **8 testes deterministas da Fase A** (criacao NT handle/KeyedMutex, sincronizacao GPU sem leitura CPU, backpressure/pool esgotado, LUID incompativel, DACL restrita/SDDL, desconexao durante mutex ativo, timeout e `DXGI_ERROR_DEVICE_REMOVED` / `ReconstructSession`).
+`GpuSharedTextureTests.cpp` executa **9 testes deterministas da Fase A** (criacao NT handle/KeyedMutex, sincronizacao GPU sem leitura CPU, backpressure/pool esgotado, LUID incompativel, DACL restrita/SDDL, desconexao durante mutex ativo, timeout, `DXGI_ERROR_DEVICE_REMOVED` / `ReconstructSession`, recriacao de swapchain + separacao de metricas GPU/CPU e liberacao pos-flush).
 
 `NvencEncoderTests.cpp` executa **7 testes reais de hardware NVIDIA NVENC H.264** (`ProbeAvailability`, sessao 720p/1080p, `DirectArgb` vs `ID3D11VideoProcessor` GPU `NV12`, rejeicao de formato DXGI incompativel, IDR periodico/forcado, injecao de `NV_ENC_ERR_ENCODER_BUSY` / `DEVICE_REMOVED` + `ReconstructSession`, e validacao independente de PSNR com `Microsoft H.264 Video Decoder MFT`).
 

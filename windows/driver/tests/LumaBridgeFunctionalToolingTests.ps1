@@ -4520,6 +4520,368 @@ Invoke-UnitTest -Name 'M022_PreflightFailureEmitsStructuredDiagnosticAndPreserve
     }
 }
 
+# 58. M0.2.4 P1-C: Benchmark30s without Smoke passes without false FunctionalSmokePassed failure and separates NOT_TESTED vs FAIL
+Invoke-UnitTest -Name 'M024_Benchmark30sWithoutSmokePassesAndReportsFunctionalSmokeNotTested' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+
+    # Case A: Benchmark30s passes without running Smoke -> FunctionalSmoke=NOT_TESTED, Benchmark30s=PASS
+    $hOk = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'M024_B30NoSmokeOk'
+    $hOk.State.HostHandler = {
+        param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+        $payload = New-M01MockHostPayload -RunId $runIdVal -Frames 1800 -DurationSec 30 -DurationMsOverride 30000 -ActiveStreamingDurationMsOverride 30000 -NvencSubmitted 1800 -NvencEncoded 1800 -H264Decoded 1800
+        $payload | Add-Member -NotePropertyName 'CpuFramesReceived' -NotePropertyValue 0 -Force
+        $payload | Add-Member -NotePropertyName 'GpuFramesReceived' -NotePropertyValue 1800 -Force
+        $payload | Add-Member -NotePropertyName 'UnexpectedCpuFramesInGpuSession' -NotePropertyValue 0 -Force
+        $payload | Add-Member -NotePropertyName 'TransportContractViolations' -NotePropertyValue 0 -Force
+        $payload | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+        return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] ok'); StdErr = @(); DryRun = $false }
+    }.GetNewClosure()
+
+    $outOk = Join-Path $caseDir 'out_b30_ok'
+    Invoke-WithModuleMocks -GlobalMocks $hOk.Mocks -ModuleMocks $hOk.Mocks -Body {
+        $res = & $valScript -Configuration Release -TestProfile Benchmark30s -BenchmarkDurationSec 30 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $hOk.State.StagingDir -OutputDir $outOk -HostExecutablePath $hOk.State.FakeHostExe -CertificateThumbprint $hOk.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        Assert-Equal $res.ValidationSucceeded $true 'Benchmark30s succeeds cleanly'
+        Assert-Equal $res.AcceptanceCriteria.FunctionalSmokePassed $false 'FunctionalSmokePassed stays false when Smoke did not run'
+        Assert-Equal $res.GateStatuses.FunctionalSmoke 'NOT_TESTED' 'GateStatuses.FunctionalSmoke=NOT_TESTED'
+        Assert-Equal $res.SubprofileStatuses.Smoke 'NOT_TESTED' 'SubprofileStatuses.Smoke=NOT_TESTED'
+        Assert-Equal $res.SubprofileStatuses.Benchmark30s 'PASS' 'SubprofileStatuses.Benchmark30s=PASS'
+    }
+
+    # Case B: Benchmark30s fails on timestamp error -> exception must NOT list FunctionalSmokePassed as failed gate
+    $hFail = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'M024_B30NoSmokeFail'
+    $hFail.State.HostHandler = {
+        param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+        $payload = New-M01MockHostPayload -RunId $runIdVal -Frames 1800 -DurationSec 30 -DurationMsOverride 30000 -ActiveStreamingDurationMsOverride 30000 -NvencSubmitted 1800 -NvencEncoded 1800 -H264Decoded 1800
+        $payload.TimestampMeasurementErrors = 5
+        $payload | Add-Member -NotePropertyName 'CpuFramesReceived' -NotePropertyValue 0 -Force
+        $payload | Add-Member -NotePropertyName 'GpuFramesReceived' -NotePropertyValue 1800 -Force
+        $payload | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+        return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] ts err'); StdErr = @(); DryRun = $false }
+    }.GetNewClosure()
+
+    $outFail = Join-Path $caseDir 'out_b30_fail'
+    Invoke-WithModuleMocks -GlobalMocks $hFail.Mocks -ModuleMocks $hFail.Mocks -Body {
+        $caughtErr = $null
+        try {
+            $null = & $valScript -Configuration Release -TestProfile Benchmark30s -BenchmarkDurationSec 30 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $hFail.State.StagingDir -OutputDir $outFail -HostExecutablePath $hFail.State.FakeHostExe -CertificateThumbprint $hFail.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        }
+        catch { $caughtErr = $_.Exception.Message }
+        Assert-True ($null -ne $caughtErr) 'Benchmark30s failure must throw'
+        Assert-True ($caughtErr -match 'Benchmark30sPassed') 'Failure names Benchmark30sPassed'
+        Assert-True ($caughtErr -notmatch 'FunctionalSmokePassed') 'Failure must NOT falsely report FunctionalSmokePassed when Smoke was not run'
+    }
+    $repFail = Get-Content -LiteralPath (Join-Path $outFail 'functional-validation-report.json') -Raw | ConvertFrom-Json
+    Assert-Equal $repFail.GateStatuses.FunctionalSmoke 'NOT_TESTED' 'Report preserves GateStatuses.FunctionalSmoke=NOT_TESTED on Benchmark30s failure'
+    Assert-Equal $repFail.SubprofileStatuses.Benchmark30s 'FAIL' 'Report marks Benchmark30s=FAIL'
+}
+
+# 59. M0.2.4 P1-C: Smoke profile failure propagates cleanly to FunctionalSmokePassed and GateStatuses.FunctionalSmoke=FAIL
+Invoke-UnitTest -Name 'M024_SmokeFailurePropagatesToAcceptanceCriteriaAndReport' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+    $h = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'M024_SmokeFail'
+    $h.State.HostHandler = {
+        param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+        $payload = New-M01MockHostPayload -RunId $runIdVal -Frames 0 -DurationSec 1 -FrameTargetReached $false -NvencSubmitted 0 -NvencEncoded 0 -H264Decoded 0
+        $payload | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+        return [pscustomobject]@{ ExitCode = 1; TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] smoke zero'); StdErr = @(); DryRun = $false }
+    }.GetNewClosure()
+
+    $outSmoke = Join-Path $caseDir 'out_smoke_fail'
+    Invoke-WithModuleMocks -GlobalMocks $h.Mocks -ModuleMocks $h.Mocks -Body {
+        Assert-Throws {
+            & $valScript -Configuration Release -TestProfile Smoke -StagingDir $h.State.StagingDir -OutputDir $outSmoke -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        } -ExpectedPattern 'FunctionalSmokePassed' -Message 'Smoke failure must propagate FunctionalSmokePassed when Smoke actually ran'
+    }
+    $rep = Get-Content -LiteralPath (Join-Path $outSmoke 'functional-validation-report.json') -Raw | ConvertFrom-Json
+    Assert-Equal $rep.GateStatuses.FunctionalSmoke 'FAIL' 'GateStatuses.FunctionalSmoke=FAIL'
+    Assert-Equal $rep.SubprofileStatuses.Smoke 'FAIL' 'SubprofileStatuses.Smoke=FAIL'
+    Assert-Equal $rep.RollbackClean $true 'RollbackClean=true after Smoke failure'
+}
+
+# 60. M0.2.4 P0-C/P1-C: CPU frames in GPU-only session fail GpuShared gate and ExitCode=1 with valid JSON classifies ControlledExitGateFailure
+Invoke-UnitTest -Name 'M024_CpuFramesInGpuOnlySessionFailsSubprofileAndExitCode1ClassifiedAsControlledExitGateFailure' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+    $h = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'M024_GpuCpuMix'
+    $h.State.HostHandler = {
+        param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+        $payload = New-M01MockHostPayload -RunId $runIdVal -Frames 1800 -DurationSec 30 -DurationMsOverride 30000 -ActiveStreamingDurationMsOverride 30000 -NvencSubmitted 1800 -NvencEncoded 1800 -H264Decoded 1800
+        $payload | Add-Member -NotePropertyName 'CpuFramesReceived' -NotePropertyValue 3 -Force
+        $payload | Add-Member -NotePropertyName 'GpuFramesReceived' -NotePropertyValue 1797 -Force
+        $payload | Add-Member -NotePropertyName 'UnexpectedCpuFramesInGpuSession' -NotePropertyValue 3 -Force
+        $payload | Add-Member -NotePropertyName 'TransportContractViolations' -NotePropertyValue 1 -Force
+        $payload | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+        return [pscustomobject]@{ ExitCode = 1; TimedOut = $false; ProcessId = 4401; Output = @('[LB-HOST] gate failed cleanly'); StdErr = @(); DryRun = $false }
+    }.GetNewClosure()
+
+    $outMix = Join-Path $caseDir 'out_gpucpu_mix'
+    $outTimeout = Join-Path $caseDir 'out_timeout_class'
+    $outCrash = Join-Path $caseDir 'out_crash_class'
+    Invoke-WithModuleMocks -GlobalMocks $h.Mocks -ModuleMocks $h.Mocks -Body {
+        Assert-Throws {
+            & $valScript -Configuration Release -TestProfile Benchmark30s -BenchmarkDurationSec 30 -TransportMode Gpu -RequireGpuShared -EnableNvenc -RequireNvenc -VerifyH264Decode -StagingDir $h.State.StagingDir -OutputDir $outMix -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        } -ExpectedPattern 'GpuSharedPassed' -Message 'CPU frames inside GPU session must fail GpuShared gate'
+
+        $h.State.HostHandler = {
+            param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+            return [pscustomobject]@{ ExitCode = -1; TimedOut = $true; ProcessId = 4402; Output = @('timeout'); StdErr = @(); DryRun = $false }
+        }.GetNewClosure()
+        Assert-Throws {
+            & $valScript -Configuration Release -TestProfile Smoke -StagingDir $h.State.StagingDir -OutputDir $outTimeout -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        } -ExpectedPattern 'RollbackClean=True' -Message 'Timed out host fails Smoke safely with rollback'
+
+        $h.State.HostHandler = {
+            param($Arguments, $jsonPath, $runIdVal, $durMs, $maxF, $wudfPid)
+            return [pscustomobject]@{ ExitCode = -1073741819; TimedOut = $false; ProcessId = 4403; Output = @(); StdErr = @('access violation'); DryRun = $false }
+        }.GetNewClosure()
+        Assert-Throws {
+            & $valScript -Configuration Release -TestProfile Smoke -StagingDir $h.State.StagingDir -OutputDir $outCrash -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -Force
+        } -ExpectedPattern 'RollbackClean=True' -Message 'Crash exit code without JSON fails Smoke safely with rollback'
+    }
+    $rep = Get-Content -LiteralPath (Join-Path $outMix 'functional-validation-report.json') -Raw | ConvertFrom-Json
+    Assert-Equal $rep.SubprofileEvaluations.Benchmark30s.GpuSharedPassed $false 'GpuSharedPassed=false on CPU leakage'
+    Assert-Equal $rep.SubprofileEvaluations.Benchmark30s.ProcessTerminationClass 'ControlledExitGateFailure' 'ExitCode=1 with valid JSON classifies ControlledExitGateFailure'
+    Assert-Equal $rep.SubprofileEvaluations.Benchmark30s.CpuFramesReceived 3 'CpuFramesReceived preserved in subprofile evaluation'
+    Assert-Equal $rep.SubprofileEvaluations.Benchmark30s.UnexpectedCpuFramesInGpuSession 3 'UnexpectedCpuFramesInGpuSession preserved'
+
+    $repTo = Get-Content -LiteralPath (Join-Path $outTimeout 'functional-validation-report.json') -Raw | ConvertFrom-Json
+    Assert-Equal $repTo.SubprofileEvaluations.Smoke.ProcessTerminationClass 'TimeoutKilled' 'TimedOut classifies TimeoutKilled'
+    $repCr = Get-Content -LiteralPath (Join-Path $outCrash 'functional-validation-report.json') -Raw | ConvertFrom-Json
+    Assert-Equal $repCr.SubprofileEvaluations.Smoke.ProcessTerminationClass 'CrashOrAbnormalExit' 'Access violation exit code without JSON classifies CrashOrAbnormalExit'
+}
+
+# 61. M0.2.4 P0-D: Test-LumaBridgeReusedSignedStaging preserves signed files byte-for-byte and rejects tampering / invalid trust
+Invoke-UnitTest -Name 'M024_ReuseSignedStagingPreservesArtifactsByteForByteAndRejectsTamperingAndInvalidSig' -TestBody {
+    param($caseDir)
+    $cert = New-EphemeralTestCertificate -OutDirectory (Join-Path $caseDir 'cert')
+    $stgValid = Join-Path $caseDir 'reused_valid'
+    New-SignedTestPackage -TargetDir $stgValid -CertInfo $cert -ExportCerAsPackageFile
+
+    $preInf = (Get-FileHash -LiteralPath (Join-Path $stgValid 'LumaBridgeIddDriver.inf') -Algorithm SHA256).Hash
+    $preDll = (Get-FileHash -LiteralPath (Join-Path $stgValid 'LumaBridgeIddDriver.dll') -Algorithm SHA256).Hash
+    $preCat = (Get-FileHash -LiteralPath (Join-Path $stgValid 'lumabridgeidddriver.cat') -Algorithm SHA256).Hash
+
+    $resOk = Test-LumaBridgeReusedSignedStaging -StagingDir $stgValid -ExpectedSignerThumbprint $cert.Thumbprint -AllowUntrustedChain
+    Assert-Equal $resOk.Valid $true 'Valid signed staging accepted with -AllowUntrustedChain'
+    Assert-Equal $resOk.StagingMode 'ReusedSignedStaging' 'StagingMode=ReusedSignedStaging'
+    Assert-Equal (Get-FileHash -LiteralPath (Join-Path $stgValid 'LumaBridgeIddDriver.inf') -Algorithm SHA256).Hash $preInf 'INF preserved byte-for-byte'
+    Assert-Equal (Get-FileHash -LiteralPath (Join-Path $stgValid 'LumaBridgeIddDriver.dll') -Algorithm SHA256).Hash $preDll 'DLL preserved byte-for-byte'
+    Assert-Equal (Get-FileHash -LiteralPath (Join-Path $stgValid 'lumabridgeidddriver.cat') -Algorithm SHA256).Hash $preCat 'CAT preserved byte-for-byte'
+
+    # Rejects untrusted cert when -AllowUntrustedChain is omitted
+    Assert-Throws {
+        $null = Test-LumaBridgeReusedSignedStaging -StagingDir $stgValid -ExpectedSignerThumbprint $cert.Thumbprint
+    } -ExpectedPattern 'Cryptographic verification failed' -Message 'Untrusted cert rejected without -AllowUntrustedChain'
+
+    # Rejects 1-byte tampered DLL
+    $stgBadDll = Join-Path $caseDir 'reused_bad_dll'
+    Copy-Item -LiteralPath $stgValid -Destination $stgBadDll -Recurse -Force
+    $dllBytes = [System.IO.File]::ReadAllBytes((Join-Path $stgBadDll 'LumaBridgeIddDriver.dll'))
+    $dllBytes[$dllBytes.Length - 8] = $dllBytes[$dllBytes.Length - 8] -bxor 0x01
+    [System.IO.File]::WriteAllBytes((Join-Path $stgBadDll 'LumaBridgeIddDriver.dll'), $dllBytes)
+    Assert-Throws {
+        $null = Test-LumaBridgeReusedSignedStaging -StagingDir $stgBadDll -AllowUntrustedChain
+    } -ExpectedPattern 'Cryptographic verification failed' -Message 'Tampered DLL rejected'
+
+    # Rejects 1-byte tampered INF
+    $stgBadInf = Join-Path $caseDir 'reused_bad_inf'
+    Copy-Item -LiteralPath $stgValid -Destination $stgBadInf -Recurse -Force
+    Add-Content -LiteralPath (Join-Path $stgBadInf 'LumaBridgeIddDriver.inf') -Value '; tampered'
+    Assert-Throws {
+        $null = Test-LumaBridgeReusedSignedStaging -StagingDir $stgBadInf -AllowUntrustedChain
+    } -ExpectedPattern 'Cryptographic verification failed' -Message 'Tampered INF rejected'
+
+    # Rejects missing CAT
+    $stgNoCat = Join-Path $caseDir 'reused_no_cat'
+    Copy-Item -LiteralPath $stgValid -Destination $stgNoCat -Recurse -Force
+    Remove-Item -LiteralPath (Join-Path $stgNoCat 'lumabridgeidddriver.cat') -Force
+    Assert-Throws {
+        $null = Test-LumaBridgeReusedSignedStaging -StagingDir $stgNoCat -AllowUntrustedChain
+    } -ExpectedPattern 'Cryptographic verification failed' -Message 'Missing CAT rejected'
+}
+
+# 62. M0.2.4 P0-D: Rejects mismatched binding, overlapping paths, repo paths, and overwriting historical report directories
+Invoke-UnitTest -Name 'M024_ReuseSignedStagingRejectsMismatchedBindingOverlappingPathsAndHistoricalReportDir' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+    $cert = New-EphemeralTestCertificate -OutDirectory (Join-Path $caseDir 'cert')
+    $stgValid = Join-Path $caseDir 'reused_stg'
+    New-SignedTestPackage -TargetDir $stgValid -CertInfo $cert -ExportCerAsPackageFile
+
+    # 1. Version mismatch against installed instance
+    $wrongInst = [pscustomobject]@{
+        InstanceId     = 'ROOT\DISPLAY\0000'
+        DriverInfPath  = 'oem76.inf'
+        DriverProvider = 'LumaBridge'
+        DriverVersion  = '1.50.4.765'
+        HardwareIds    = @('Root\LumaBridgeIddDriver')
+        Present        = $true
+        Status         = 'OK'
+        ProblemCode    = 0
+    }
+    Assert-Throws {
+        $null = Test-LumaBridgeReusedSignedStaging -StagingDir $stgValid -AllowUntrustedChain -VerifyInstalledBinding -InstalledInstance $wrongInst
+    } -ExpectedPattern 'does not match installed device' -Message 'Mismatched installed DriverVersion rejected'
+
+    # 1b. Matching DriverVersion but mismatched binary hash rejected
+    $sameVerMeta = Get-LumaBridgeInfDriverVerMetadata -InfPath (Join-Path $stgValid 'LumaBridgeIddDriver.inf')
+    $sameVerInst = [pscustomobject]@{
+        InstanceId     = 'ROOT\DISPLAY\0000'
+        DriverInfPath  = 'oem76.inf'
+        DriverProvider = 'LumaBridge'
+        DriverVersion  = $sameVerMeta.Version
+        HardwareIds    = @('Root\LumaBridgeIddDriver')
+        Present        = $true
+        Status         = 'OK'
+        ProblemCode    = 0
+    }
+    $fakeMismatchLoaded = Join-Path $caseDir 'mismatched_loaded.dll'
+    [System.IO.File]::WriteAllBytes($fakeMismatchLoaded, [byte[]](1, 2, 3, 4))
+    Assert-Throws {
+        $null = Test-LumaBridgeReusedSignedStaging -StagingDir $stgValid -AllowUntrustedChain -VerifyInstalledBinding -InstalledInstance $sameVerInst -LoadedModulePath $fakeMismatchLoaded
+    } -ExpectedPattern 'does not match' -Message 'Mismatched binary SHA-256 rejected'
+
+    # 2. Overlapping OutputDir rejected
+    Assert-Throws {
+        $null = Test-LumaBridgeReusedSignedStaging -StagingDir $stgValid -OutputDir (Join-Path $stgValid 'sub_out') -AllowUntrustedChain
+    } -ExpectedPattern 'must not overlap OutputDir' -Message 'Overlapping OutputDir rejected'
+
+    # 3. Historical validation report sentinel inside StagingDir rejected
+    $histAsStg = Join-Path $caseDir 'hist_report_dir'
+    New-Item -Path $histAsStg -ItemType Directory -Force | Out-Null
+    '{}' | Set-Content -LiteralPath (Join-Path $histAsStg 'functional-validation-report.json') -Encoding UTF8
+    Assert-Throws {
+        $null = Test-LumaBridgeReusedSignedStaging -StagingDir $histAsStg -AllowUntrustedChain
+    } -ExpectedPattern 'historical|validation report directory' -Message 'Validation report dir rejected as staging'
+
+    # 4. Repo / build directory rejected as reused staging
+    $repoPkg = Get-LumaBridgePackageDirectory -Configuration Release
+    Assert-Throws {
+        $null = Test-LumaBridgeReusedSignedStaging -StagingDir $repoPkg -AllowUntrustedChain
+    } -ExpectedPattern 'strictly isolated outside repository' -Message 'Repository build directory rejected as staging'
+
+    # 5. Invoke-LumaBridgeFunctionalValidation refuses overwriting existing historical report OutputDir
+    $histOut = Join-Path $caseDir 'existing_out'
+    New-Item -Path $histOut -ItemType Directory -Force | Out-Null
+    '{}' | Set-Content -LiteralPath (Join-Path $histOut 'functional-validation-report.json') -Encoding UTF8
+    Assert-Throws {
+        $null = & $valScript -Configuration Release -TestProfile Benchmark30s -ReuseSignedStaging -StagingDir $stgValid -OutputDir $histOut -DryRun
+    } -ExpectedPattern 'already contains historical validation report' -Message 'Historical report OutputDir overwrite rejected'
+}
+
+# 63. M0.2.4 P0-D: Invoke-LumaBridgeFunctionalValidation -ReuseSignedStaging -DryRun mutates zero files and does not invoke signing script
+Invoke-UnitTest -Name 'M024_ReuseSignedStagingDryRunMutatesZeroFiles' -TestBody {
+    param($caseDir)
+    $valScript = Join-Path $scriptsDir 'Invoke-LumaBridgeFunctionalValidation.ps1'
+    $h = New-M01ValidationMockHarness -CaseDir $caseDir -StateKey 'M024_ReuseDry'
+    $stgReuse = Join-Path $caseDir 'reused_dry_stg'
+    New-SignedTestPackage -TargetDir $stgReuse -CertInfo $h.State.CertInfo -ExportCerAsPackageFile
+
+    $preInf = (Get-FileHash -LiteralPath (Join-Path $stgReuse 'LumaBridgeIddDriver.inf') -Algorithm SHA256).Hash
+    $preDll = (Get-FileHash -LiteralPath (Join-Path $stgReuse 'LumaBridgeIddDriver.dll') -Algorithm SHA256).Hash
+    $preCat = (Get-FileHash -LiteralPath (Join-Path $stgReuse 'lumabridgeidddriver.cat') -Algorithm SHA256).Hash
+    $dryOut = Join-Path $caseDir 'dry_reuse_out'
+
+    Invoke-WithModuleMocks -GlobalMocks $h.Mocks -ModuleMocks $h.Mocks -Body {
+        $dryRes = & $valScript -Configuration Release -TestProfile Benchmark30s -ReuseSignedStaging -StagingDir $stgReuse -OutputDir $dryOut -HostExecutablePath $h.State.FakeHostExe -CertificateThumbprint $h.State.CertInfo.Thumbprint -AllowUntrustedChain -SkipDriverInstall -DryRun
+        Assert-Equal $dryRes.DryRun $true 'DryRun=true returned'
+        Assert-Equal $dryRes.StagingMode 'ReusedSignedStaging' 'StagingMode=ReusedSignedStaging'
+        Assert-True ($null -eq $dryRes.SigningPreview) 'SigningPreview is null in ReuseSignedStaging mode'
+        Assert-Equal $dryRes.ReusedStagingVerification.Valid $true 'ReusedStagingVerification.Valid=true'
+    }
+    Assert-Equal (Get-FileHash -LiteralPath (Join-Path $stgReuse 'LumaBridgeIddDriver.inf') -Algorithm SHA256).Hash $preInf 'Reused INF untouched after DryRun'
+    Assert-Equal (Get-FileHash -LiteralPath (Join-Path $stgReuse 'LumaBridgeIddDriver.dll') -Algorithm SHA256).Hash $preDll 'Reused DLL untouched after DryRun'
+    Assert-Equal (Get-FileHash -LiteralPath (Join-Path $stgReuse 'lumabridgeidddriver.cat') -Algorithm SHA256).Hash $preCat 'Reused CAT untouched after DryRun'
+    Assert-True (-not (Test-Path -LiteralPath $dryOut)) 'DryRun creates zero OutputDir files'
+}
+
+# 64. M0.2.4 P2-A: Decoupled lightweight vs GPU resource sampling skips End GPU counters and reports effective intervals + leak assessment
+Invoke-UnitTest -Name 'M024_DecoupledLightweightAndGpuTelemetrySkipsEndGpuCounterAndReportsIntervalsAndLeakAssessment' -TestBody {
+    param($caseDir)
+    $phaseLog = New-Object System.Collections.Generic.List[object]
+    $wsStep = [ref]40.0
+    $mocks = @{
+        'Get-LumaBridgeProcessResourceSnapshot' = {
+            param([Nullable[int]]$HostPid = $null, [Nullable[int]]$WudfPid = $null, [string]$Phase = 'Active', [switch]$SkipGpuCounters)
+            $phaseLog.Add([pscustomobject]@{ Phase = $Phase; SkipGpu = $SkipGpuCounters.IsPresent })
+            $wsVal = $wsStep.Value
+            $wsStep.Value = $wsVal + 0.5
+            $gpuStatus = if ($SkipGpuCounters) { 'NOT_MEASURED' } else { 'MEASURED' }
+            $gpuVal = if ($SkipGpuCounters) { $null } else { 4.2 }
+            $roleHost = [pscustomobject]@{
+                Role = 'Host'; Available = $true; ProcessId = $HostPid; Status = 'MEASURED'; Reason = $null
+                CpuTimeSec = 0.25; WorkingSetMB = $wsVal; PrivateMemoryMB = 20.0; HandleCount = 120; ThreadCount = 6
+                DedicatedVramStatus = $gpuStatus; DedicatedVramMB = $(if ($SkipGpuCounters) { $null } else { 32.0 }); DedicatedVramReason = $null
+                GpuEngineStatus = $gpuStatus; GpuEngineTotalPercent = $gpuVal; GpuEngineByType = $null; GpuEngineReason = $null
+            }
+            return [pscustomobject]@{
+                CapturedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+                Phase         = $Phase
+                Host          = $roleHost
+                WudfHost      = [pscustomobject]@{
+                    Role = 'WudfHost'; Available = $true; ProcessId = $WudfPid; Status = 'MEASURED'; Reason = $null
+                    CpuTimeSec = 0.10; WorkingSetMB = 65.0; PrivateMemoryMB = 22.0; HandleCount = 300; ThreadCount = 12
+                    DedicatedVramStatus = 'NOT_MEASURED'; DedicatedVramMB = $null; DedicatedVramReason = 'Skipped'
+                    GpuEngineStatus = 'NOT_MEASURED'; GpuEngineTotalPercent = $null; GpuEngineByType = $null; GpuEngineReason = 'Skipped'
+                }
+            }
+        }.GetNewClosure()
+    }
+
+    Invoke-WithModuleMocks -ModuleMocks $mocks -Body {
+        $psExe = (Get-Command powershell.exe -ErrorAction Stop).Source
+        $res = Invoke-LumaBridgeHostProcess `
+            -ExecutablePath $psExe `
+            -Arguments @('-NoProfile', '-Command', 'Start-Sleep -Milliseconds 3400') `
+            -HardTimeoutMs 15000 `
+            -ResourceSampleIntervalSec 1 `
+            -GpuSampleIntervalSec 3 `
+            -WudfProcessId 9999
+
+        Assert-Equal $res.ExitCode 0 'Short child process exited 0'
+        Assert-True ($null -ne $res.ResourceTelemetry) 'ResourceTelemetry present'
+        Assert-True ($res.ResourceTelemetry.LightweightSampleCount -ge 4) 'Lightweight samples captured every ~1s'
+        Assert-True ($res.ResourceTelemetry.GpuSampleCount -ge 1 -and $res.ResourceTelemetry.GpuSampleCount -le 2) 'GPU counters sampled less frequently than lightweight loop'
+        Assert-True ($res.ResourceTelemetry.EffectiveLightweightIntervalSec -le 2.0) 'EffectiveLightweightIntervalSec stays near 1s'
+        Assert-Equal $res.ResourceTelemetry.MemoryLeakAssessment.Status 'BOUNDED' 'Small bounded WS growth classified BOUNDED'
+
+        $endEntries = @($phaseLog | Where-Object { $_.Phase -eq 'End' })
+        Assert-Equal $endEntries.Count 1 'Exactly one End snapshot captured'
+        Assert-Equal $endEntries[0].SkipGpu $true 'End snapshot strictly skips expensive Get-Counter GPU queries'
+        $startEntries = @($phaseLog | Where-Object { $_.Phase -eq 'Start' })
+        Assert-Equal $startEntries[0].SkipGpu $false 'Start snapshot captures initial GPU baseline'
+    }
+}
+
+# 65. M0.2.4: Isolated Windows PowerShell 5.1 + PSReadLine + StrictMode Latest passes Benchmark30s DryRun
+Invoke-UnitTest -Name 'M024_RuntimeInformationWithPsReadLineAndStrictModePassesForValidationScripts' -TestBody {
+    param($caseDir)
+    $valScriptPath = (Resolve-Path -LiteralPath (Join-Path -Path $scriptsDir -ChildPath 'Invoke-LumaBridgeFunctionalValidation.ps1')).Path
+    $psrlMod = Get-Module -ListAvailable -Name 'PSReadLine' | Sort-Object Version | Select-Object -First 1
+    Assert-True ($null -ne $psrlMod) 'PSReadLine available'
+    $psrlDll = Join-Path -Path $psrlMod.ModuleBase -ChildPath 'Microsoft.PowerShell.PSReadLine.dll'
+    $tmpDryStg = Join-Path $caseDir 'psrl_dry_stg'
+    $tmpDryOut = Join-Path $caseDir 'psrl_dry_out'
+
+    $childScript = @"
+Set-StrictMode -Version Latest
+`$ErrorActionPreference = 'Stop'
+Import-Module PSReadLine -ErrorAction Stop
+Add-Type -Path '$($psrlDll -replace "'", "''")'
+`$dryRes = & '$($valScriptPath -replace "'", "''")' -Configuration Release -TestProfile Benchmark30s -StagingDir '$($tmpDryStg -replace "'", "''")' -OutputDir '$($tmpDryOut -replace "'", "''")' -AllowAnyBranch -SkipDriverInstall -DryRun
+if (-not `$dryRes.DryRun) { throw 'Expected DryRun=true' }
+Write-Output ("DRY_PROFILE=" + `$dryRes.TestProfile)
+"@
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($childScript))
+    $rawOut = & powershell.exe -NoProfile -NonInteractive -EncodedCommand $encoded 2>&1
+    $childExit = $LASTEXITCODE
+    $joined = ($rawOut | ForEach-Object { [string]$_ }) -join "`n"
+    Assert-Equal $childExit 0 ("Validation DryRun with PSReadLine + StrictMode failed (exit={0}): {1}" -f $childExit, $joined)
+    Assert-True ($joined -match 'DRY_PROFILE=Benchmark30s') 'Benchmark30s DryRun completed cleanly under colliding RuntimeInformation'
+}
+
 try {
     Write-Host ("Summary: {0} tests run, {1} assertion failures." -f $script:TestsRun, $script:TestsFailed)
 }
