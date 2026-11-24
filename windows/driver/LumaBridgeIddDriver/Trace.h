@@ -1,7 +1,6 @@
 #pragma once
 
 #include <stdio.h>
-#include "AdapterStateMachine.h"
 #include "DiagnosticStageConfig.h"
 
 #if defined(LUMABRIDGE_ENABLE_TRACELOGGING)
@@ -12,6 +11,9 @@
 
 TRACELOGGING_DECLARE_PROVIDER(g_LumaBridgeTraceProvider);
 #endif
+
+#if defined(NT_SUCCESS)
+#include "AdapterStateMachine.h"
 
 namespace lumabridge::driver {
 
@@ -474,6 +476,102 @@ LumaBridgeTraceMetrics(
             TraceLoggingUInt64(static_cast<unsigned long long>(workingSetKb), "WorkingSetKb"),
             TraceLoggingUInt64(static_cast<unsigned long long>(privateUsageKb), "PrivateUsageKb"),
             TraceLoggingUInt32(handleCount, "HandleCount"));
+#endif
+    }
+}
+
+} // namespace lumabridge::driver
+
+#endif // defined(NT_SUCCESS)
+
+namespace lumabridge::driver {
+
+/// Emits a structured per-session transport summary once per client disconnect.
+inline void
+LumaBridgeTraceSessionSummary(
+    unsigned long long sessionId,
+    unsigned long long sessionGeneration,
+    const char* negotiatedMode,
+    bool allowCpuFallback,
+    unsigned long long framesPublished,
+    unsigned long long framesDelivered,
+    unsigned long long framesDroppedByBackpressure,
+    unsigned long long gpuFramesShared,
+    unsigned long long gpuFramesDropped,
+    unsigned long long gpuSyncTimeouts,
+    unsigned long long framesDiscardedStaleSession,
+    unsigned long long framesDiscardedTransportMismatch,
+    unsigned long long framesFlushedOnSessionTransition,
+    unsigned long long lastFrameSequence,
+    HRESULT disconnectReason
+    ) noexcept
+{
+    if constexpr (!GetDiagnosticStageCapabilities(kActiveDiagnosticStage).EnableTraceLoggingAndRegistryBreadcrumbs)
+    {
+        UNREFERENCED_PARAMETER(sessionId);
+        UNREFERENCED_PARAMETER(sessionGeneration);
+        UNREFERENCED_PARAMETER(negotiatedMode);
+        UNREFERENCED_PARAMETER(allowCpuFallback);
+        UNREFERENCED_PARAMETER(framesPublished);
+        UNREFERENCED_PARAMETER(framesDelivered);
+        UNREFERENCED_PARAMETER(framesDroppedByBackpressure);
+        UNREFERENCED_PARAMETER(gpuFramesShared);
+        UNREFERENCED_PARAMETER(gpuFramesDropped);
+        UNREFERENCED_PARAMETER(gpuSyncTimeouts);
+        UNREFERENCED_PARAMETER(framesDiscardedStaleSession);
+        UNREFERENCED_PARAMETER(framesDiscardedTransportMismatch);
+        UNREFERENCED_PARAMETER(framesFlushedOnSessionTransition);
+        UNREFERENCED_PARAMETER(lastFrameSequence);
+        UNREFERENCED_PARAMETER(disconnectReason);
+    }
+    else
+    {
+        const char* safeMode = (negotiatedMode != nullptr) ? negotiatedMode : "Unknown";
+        char buffer[768]{};
+        _snprintf_s(
+            buffer,
+            sizeof(buffer),
+            _TRUNCATE,
+            "[LB-DRIVER] [SESSION-SUMMARY] sessionId=%llu sessionGen=%llu mode=%s cpuFallback=%u "
+            "published=%llu delivered=%llu dropBp=%llu gpuShared=%llu gpuDropped=%llu gpuSyncTo=%llu "
+            "staleDiscarded=%llu mismatchDiscarded=%llu flushed=%llu lastSeq=%llu reason=0x%08lX\n",
+            sessionId,
+            sessionGeneration,
+            safeMode,
+            allowCpuFallback ? 1U : 0U,
+            framesPublished,
+            framesDelivered,
+            framesDroppedByBackpressure,
+            gpuFramesShared,
+            gpuFramesDropped,
+            gpuSyncTimeouts,
+            framesDiscardedStaleSession,
+            framesDiscardedTransportMismatch,
+            framesFlushedOnSessionTransition,
+            lastFrameSequence,
+            static_cast<unsigned long>(disconnectReason));
+        OutputDebugStringA(buffer);
+
+#if defined(LUMABRIDGE_ENABLE_TRACELOGGING)
+        TraceLoggingWrite(
+            g_LumaBridgeTraceProvider,
+            "SessionSummary",
+            TraceLoggingLevel(4U),
+            TraceLoggingUInt64(sessionId, "SessionId"),
+            TraceLoggingUInt64(sessionGeneration, "SessionGeneration"),
+            TraceLoggingString(safeMode, "NegotiatedMode"),
+            TraceLoggingBoolean(static_cast<BOOLEAN>(allowCpuFallback ? TRUE : FALSE), "AllowCpuFallback"),
+            TraceLoggingUInt64(framesPublished, "FramesPublished"),
+            TraceLoggingUInt64(framesDelivered, "FramesDelivered"),
+            TraceLoggingUInt64(framesDroppedByBackpressure, "FramesDroppedByBackpressure"),
+            TraceLoggingUInt64(gpuFramesShared, "GpuFramesShared"),
+            TraceLoggingUInt64(gpuFramesDropped, "GpuFramesDropped"),
+            TraceLoggingUInt64(gpuSyncTimeouts, "GpuSyncTimeouts"),
+            TraceLoggingUInt64(framesDiscardedStaleSession, "FramesDiscardedStaleSession"),
+            TraceLoggingUInt64(framesDiscardedTransportMismatch, "FramesDiscardedTransportMismatch"),
+            TraceLoggingUInt64(framesFlushedOnSessionTransition, "FramesFlushedOnSessionTransition"),
+            TraceLoggingUInt64(lastFrameSequence, "LastFrameSequence"),
+            TraceLoggingHResult(disconnectReason, "DisconnectReason"));
 #endif
     }
 }

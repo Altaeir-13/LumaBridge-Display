@@ -1225,6 +1225,38 @@ WriteJsonSummary(
         << "    \"IdentificationSource\": \"" << EscapeJsonString(stimulus.IdentificationSource) << "\",\n"
         << "    \"ErrorMessage\": \"" << EscapeJsonString(stimulus.ErrorMessage) << "\"\n"
         << "  },\n"
+        << "  \"PacingCorrelation\": {\n"
+        << "    \"InterArrivalGapMaxUs\": " << metrics.PacingCorrelation.InterArrivalGapMaxUs << ",\n"
+        << "    \"InterArrivalGapsOver25ms\": " << metrics.PacingCorrelation.InterArrivalGapsOver25ms << ",\n"
+        << "    \"InterArrivalGapsOver33ms\": " << metrics.PacingCorrelation.InterArrivalGapsOver33ms << ",\n"
+        << "    \"PresentationDeltaDistribution\": {\n"
+        << "      \"Delta0\": " << metrics.PacingCorrelation.PresentationDelta0Count << ",\n"
+        << "      \"Delta1\": " << metrics.PacingCorrelation.PresentationDelta1Count << ",\n"
+        << "      \"Delta2\": " << metrics.PacingCorrelation.PresentationDelta2Count << ",\n"
+        << "      \"Delta3Plus\": " << metrics.PacingCorrelation.PresentationDelta3PlusCount << ",\n"
+        << "      \"Regression\": " << metrics.PacingCorrelation.PresentationDeltaRegressionCount << "\n"
+        << "    },\n"
+        << "    \"SequenceDeltaDistribution\": {\n"
+        << "      \"Delta1\": " << metrics.PacingCorrelation.SequenceDelta1Count << ",\n"
+        << "      \"Gap\": " << metrics.PacingCorrelation.SequenceDeltaGapCount << ",\n"
+        << "      \"NonPositive\": " << metrics.PacingCorrelation.SequenceDeltaNonPositiveCount << "\n"
+        << "    },\n"
+        << "    \"TotalAnomaliesRecorded\": " << metrics.PacingCorrelation.TotalAnomaliesRecorded << ",\n"
+        << "    \"RecentAnomalies\": [\n";
+    for (size_t idx = 0U; idx < metrics.PacingCorrelation.RecentAnomalies.size(); ++idx)
+    {
+        const auto& a = metrics.PacingCorrelation.RecentAnomalies[idx];
+        out << "      {"
+            << "\"FrameSequence\": " << a.FrameSequence << ", "
+            << "\"PresentationFrameNumber\": " << a.PresentationFrameNumber << ", "
+            << "\"InterArrivalGapUs\": " << a.InterArrivalGapUs << ", "
+            << "\"PresentationDelta\": " << a.PresentationDelta << ", "
+            << "\"SequenceDelta\": " << a.SequenceDelta << ", "
+            << "\"TransportMode\": " << a.TransportMode
+            << "}" << ((idx + 1U < metrics.PacingCorrelation.RecentAnomalies.size()) ? "," : "") << "\n";
+    }
+    out << "    ]\n"
+        << "  },\n"
         << "  \"GateEvaluation\": {\n"
         << "    \"RequireGpuShared\": " << (gateConfig.RequireGpuShared ? "true" : "false") << ",\n"
         << "    \"RequireNvenc\": " << (gateConfig.RequireNvenc ? "true" : "false") << ",\n"

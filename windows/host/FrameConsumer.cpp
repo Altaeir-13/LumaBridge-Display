@@ -1373,6 +1373,98 @@ FrameConsumer::RecordFrameMetricsAndTimestampsLocked(
     m_metrics.LastFrameChecksumCrc32 = payloadCrc32;
     m_lastFrameRecvQpc = recvCompleteQpc;
 
+    if (!m_hasPrevFrameCorrelation)
+    {
+        m_hasPrevFrameCorrelation = true;
+    }
+    else
+    {
+        const uint64_t gapUs = (recvCompleteQpc >= m_prevCorrelationRecvQpc)
+            ? ipc::ComputeQpcElapsedUs(m_prevCorrelationRecvQpc, recvCompleteQpc, m_qpcFreq)
+            : 0ULL;
+        if (gapUs > m_metrics.PacingCorrelation.InterArrivalGapMaxUs)
+        {
+            m_metrics.PacingCorrelation.InterArrivalGapMaxUs = gapUs;
+        }
+        if (gapUs > 25000ULL)
+        {
+            ++m_metrics.PacingCorrelation.InterArrivalGapsOver25ms;
+        }
+        if (gapUs > 33000ULL)
+        {
+            ++m_metrics.PacingCorrelation.InterArrivalGapsOver33ms;
+        }
+
+        const int64_t presDelta =
+            static_cast<int64_t>(presentationFrameNumber) - static_cast<int64_t>(m_prevCorrelationPres);
+        if (presDelta < 0LL)
+        {
+            ++m_metrics.PacingCorrelation.PresentationDeltaRegressionCount;
+        }
+        else if (presDelta == 0LL)
+        {
+            ++m_metrics.PacingCorrelation.PresentationDelta0Count;
+        }
+        else if (presDelta == 1LL)
+        {
+            ++m_metrics.PacingCorrelation.PresentationDelta1Count;
+        }
+        else if (presDelta == 2LL)
+        {
+            ++m_metrics.PacingCorrelation.PresentationDelta2Count;
+        }
+        else
+        {
+            ++m_metrics.PacingCorrelation.PresentationDelta3PlusCount;
+        }
+
+        const int64_t seqDelta = (frameSequence >= m_prevCorrelationSeq)
+            ? ((frameSequence - m_prevCorrelationSeq) <= static_cast<uint64_t>(INT64_MAX)
+                ? static_cast<int64_t>(frameSequence - m_prevCorrelationSeq)
+                : INT64_MAX)
+            : -((m_prevCorrelationSeq - frameSequence) <= static_cast<uint64_t>(INT64_MAX)
+                ? static_cast<int64_t>(m_prevCorrelationSeq - frameSequence)
+                : INT64_MAX);
+        if (seqDelta <= 0LL)
+        {
+            ++m_metrics.PacingCorrelation.SequenceDeltaNonPositiveCount;
+        }
+        else if (seqDelta == 1LL)
+        {
+            ++m_metrics.PacingCorrelation.SequenceDelta1Count;
+        }
+        else
+        {
+            ++m_metrics.PacingCorrelation.SequenceDeltaGapCount;
+        }
+
+        if (gapUs > 25000ULL || presDelta != 1LL || seqDelta != 1LL)
+        {
+            ++m_metrics.PacingCorrelation.TotalAnomaliesRecorded;
+            try
+            {
+                auto& anomalies = m_metrics.PacingCorrelation.RecentAnomalies;
+                if (anomalies.size() >= lumabridge::host::PacingCorrelationSnapshot::kMaxRecentAnomalies)
+                {
+                    anomalies.erase(anomalies.begin());
+                }
+                anomalies.push_back(lumabridge::host::PacingCorrelationAnomaly{
+                    frameSequence,
+                    presentationFrameNumber,
+                    gapUs,
+                    presDelta,
+                    seqDelta,
+                    static_cast<uint32_t>(m_metrics.NegotiatedTransportMode)});
+            }
+            catch (...)
+            {
+            }
+        }
+    }
+    m_prevCorrelationRecvQpc = recvCompleteQpc;
+    m_prevCorrelationSeq = frameSequence;
+    m_prevCorrelationPres = presentationFrameNumber;
+
     if (hasGpuSyncSample)
     {
         m_gpuSyncWaitLat.Record(gpuSyncWaitUs);

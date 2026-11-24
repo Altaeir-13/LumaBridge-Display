@@ -1,4 +1,5 @@
 #include "FrameTransport.h"
+#include "Trace.h"
 
 #include <sddl.h>
 #include <stdio.h>
@@ -2797,6 +2798,7 @@ FrameIpcServer::WorkerLoop() noexcept
         {
             gpuEndSnap = m_config.SharedTexturePool->GetMetricsSnapshot();
         }
+        DriverSessionSummarySnapshot completedSummary{};
         {
             ExclusiveLock queueGuard(&m_queueLock);
             m_currentSessionSummary.FramesDelivered = sessionFramesDelivered;
@@ -2814,7 +2816,29 @@ FrameIpcServer::WorkerLoop() noexcept
                 m_currentSessionSummary.GpuSyncTimeouts = gpuEndSnap.GpuSyncTimeouts - m_sessionStartGpuSyncTimeoutsBaseline;
             }
             m_lastCompletedSessionSummary = m_currentSessionSummary;
+            completedSummary = m_lastCompletedSessionSummary;
         }
+
+        const char* modeLabel =
+            (completedSummary.NegotiatedMode == ipc::FrameIpcTransportMode::GpuSharedNtHandle)
+                ? "GpuSharedNtHandle"
+                : "CpuStagingPipe";
+        LumaBridgeTraceSessionSummary(
+            completedSummary.SessionId,
+            completedSummary.SessionGeneration,
+            modeLabel,
+            completedSummary.AllowCpuFallback,
+            completedSummary.FramesPublished,
+            completedSummary.FramesDelivered,
+            completedSummary.FramesDroppedByBackpressure,
+            completedSummary.GpuFramesShared,
+            completedSummary.GpuFramesDropped,
+            completedSummary.GpuSyncTimeouts,
+            completedSummary.FramesDiscardedStaleSession,
+            completedSummary.FramesDiscardedTransportMismatch,
+            completedSummary.FramesFlushedOnSessionTransition,
+            completedSummary.LastFrameSequence,
+            completedSummary.DisconnectReason);
 
         authenticatedClientProcess.Reset();
         (void)DisconnectNamedPipe(pipeHandle);

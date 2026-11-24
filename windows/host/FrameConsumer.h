@@ -308,6 +308,35 @@ struct HostConsumerConfig
     uint64_t ForcedQpcFrequencyForTesting{0ULL};
 };
 
+struct PacingCorrelationAnomaly
+{
+    uint64_t FrameSequence{0ULL};
+    uint32_t PresentationFrameNumber{0U};
+    uint64_t InterArrivalGapUs{0ULL};
+    int64_t PresentationDelta{0LL};
+    int64_t SequenceDelta{0LL};
+    uint32_t TransportMode{0U};
+};
+
+struct PacingCorrelationSnapshot
+{
+    static constexpr size_t kMaxRecentAnomalies = 64U;
+
+    uint64_t InterArrivalGapMaxUs{0ULL};
+    uint64_t InterArrivalGapsOver25ms{0ULL};
+    uint64_t InterArrivalGapsOver33ms{0ULL};
+    uint64_t PresentationDelta0Count{0ULL};
+    uint64_t PresentationDelta1Count{0ULL};
+    uint64_t PresentationDelta2Count{0ULL};
+    uint64_t PresentationDelta3PlusCount{0ULL};
+    uint64_t PresentationDeltaRegressionCount{0ULL};
+    uint64_t SequenceDelta1Count{0ULL};
+    uint64_t SequenceDeltaGapCount{0ULL};
+    uint64_t SequenceDeltaNonPositiveCount{0ULL};
+    uint64_t TotalAnomaliesRecorded{0ULL};
+    std::vector<PacingCorrelationAnomaly> RecentAnomalies{};
+};
+
 /// Synchronized runtime statistics observed by lumabridge-host.
 struct HostConsumerMetricsSnapshot
 {
@@ -416,6 +445,7 @@ struct HostConsumerMetricsSnapshot
     uint64_t GpuSyncTimeouts{0ULL};
     uint64_t AdapterMismatchErrors{0ULL};
     uint64_t CpuStagingReadsPerformed{0ULL};
+    PacingCorrelationSnapshot PacingCorrelation{};
 };
 
 /// Overlapped local Named Pipe client that authenticates to LumaBridgeIddDriver,
@@ -569,6 +599,10 @@ private:
     uint64_t m_prevSessionServerSendQpc{0ULL};
     uint64_t m_prevSessionPresentQpc{0ULL};
     uint64_t m_lastFrameRecvQpc{0ULL};
+    bool m_hasPrevFrameCorrelation{false};
+    uint64_t m_prevCorrelationRecvQpc{0ULL};
+    uint64_t m_prevCorrelationSeq{0ULL};
+    uint32_t m_prevCorrelationPres{0U};
 
     LatencyAccumulator m_copyLat{};
     LatencyAccumulator m_presentToExtractLat{};
