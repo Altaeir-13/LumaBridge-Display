@@ -265,17 +265,25 @@ LbStatus lb_core_submit_encoded_frame(struct LbCoreHandle *handle,
                                       size_t data_len);
 
 /**
- * Asynchronously transfer ownership of a native-allocated `LbOwnedBuffer` into the core.
- * - On `LB_STATUS_OK`, Rust owns the buffer and guarantees `buffer->release` is called exactly once.
- * - On ANY error status, ownership remains with the caller and `buffer->release` is NOT called.
+ * Asynchronously transfer ownership of a native-allocated `LbOwnedBuffer` into the core
+ * using two-phase transactional commit.
+ * - On `LB_STATUS_OK`, Rust owns the buffer, zeroes `*buffer` (`release == NULL`), and
+ *   guarantees `release` is called **noexcept** exactly once outside internal mutexes.
+ * - On any non-panic error status (`InvalidArgument`, `InvalidState`, `Backpressure`,
+ *   `Faulted`, etc.), ownership remains with the caller, `*buffer` is untouched, and
+ *   `release` is NOT called.
+ * - On `LB_STATUS_INTERNAL_PANIC`, if a pre-commit panic occurred, `*buffer` remains intact
+ *   (`buffer->release != NULL`) and caller retains ownership; if a post-commit panic occurred,
+ *   `*buffer` is already zeroed (`buffer->release == NULL`) and Rust drains/releases it once.
+ *   Calling `lb_core_release_buffer(buffer)` on cleanup safely handles both outcomes without double-free.
  *
  * # Safety
- * - `handle`, `meta`, and `buffer` must be valid non-null pointers.
+ * - `handle`, `meta`, and `buffer` must be valid aligned non-null pointers.
  * - `buffer->data` must be valid and immutable for `buffer->len` bytes until `buffer->release` runs.
  */
 LbStatus lb_core_submit_owned_encoded_frame(struct LbCoreHandle *handle,
                                             const struct LbEncodedFrameMeta *meta,
-                                            const struct LbOwnedBuffer *buffer);
+                                            struct LbOwnedBuffer *buffer);
 
 /**
  * Release a buffer via its embedded `release` callback and zero out the descriptor fields.
@@ -357,6 +365,8 @@ LbStatus lb_core_layout_signature(struct LbAbiLayoutSignature *out_sig);
  * Controlled fault-injection entry point compiled ONLY when `poc-fault-injection` feature is active.
  * - `mode = 1`: triggers an intentional panic directly inside the FFI call (`catch_unwind` -> `InternalPanic`, instance -> `Faulted`).
  * - `mode = 2`: arms an intentional panic on the core worker thread to verify worker panic containment & buffer drain.
+ * - `mode = 3`: arms an intentional panic inside `submit_owned_boxed` BEFORE ownership commit.
+ * - `mode = 4`: arms an intentional panic inside `submit_owned_boxed` AFTER ownership commit.
  *
  * # Panics
  * When `mode == 1`, intentionally triggers a test panic inside the `catch_unwind` FFI boundary

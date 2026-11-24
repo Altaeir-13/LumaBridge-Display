@@ -18,6 +18,11 @@ pub const MIN_QUEUE_CAPACITY: usize = 1;
 pub const MAX_QUEUE_CAPACITY: usize = 256;
 pub const DEFAULT_QUEUE_CAPACITY: usize = 64;
 pub const MAX_VALID_DISPLAY_ID: u16 = 0xFFFE;
+/// Hard cap on eager startup pre-allocation per session so `MAX_QUEUE_CAPACITY` x `MAX_ENCODED_FRAME_BYTES`
+/// never allocates ~2 GiB eagerly on creation; per-session/display byte budgets will accompany M1 protocols.
+pub const MAX_EAGER_PREALLOC_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_EAGER_PREALLOC_SLOTS: usize = 8;
+pub const MIN_RETAINED_POOL_SLAB_BYTES: usize = 256 * 1024;
 
 /// Explicit lifecycle state of a core session instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +139,58 @@ pub trait OwnedByteSlice: Send {
     fn as_slice(&self) -> &[u8];
 }
 
+/// Extension of `OwnedByteSlice` supporting two-phase transactional ownership transfer.
+/// Implementations keep caller ownership disarmed until `commit_ownership()` runs at
+/// the infallible enqueue point, preventing pre-commit panics from invoking native `release`.
+pub trait TransactionalOwnedSlice: OwnedByteSlice {
+    fn commit_ownership(&mut self);
+}
+
+struct PlainOwnedSliceAdapter<T: OwnedByteSlice>(T);
+
+impl<T: OwnedByteSlice> OwnedByteSlice for PlainOwnedSliceAdapter<T> {
+    fn as_slice(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+impl<T: OwnedByteSlice> TransactionalOwnedSlice for PlainOwnedSliceAdapter<T> {
+    fn commit_ownership(&mut self) {}
+}
+
+struct InFlightToken(Arc<GlobalCounters>);
+
+impl InFlightToken {
+    fn new(global: Arc<GlobalCounters>) -> Self {
+        global.in_flight_buffers.fetch_add(1, Ordering::SeqCst);
+        Self(global)
+    }
+}
+
+impl Drop for InFlightToken {
+    fn drop(&mut self) {
+        self.0.in_flight_buffers.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+struct CallbackInProgressGuard<'a>(&'a GlobalCounters);
+
+impl<'a> CallbackInProgressGuard<'a> {
+    fn enter(global: &'a GlobalCounters) -> Self {
+        global.callbacks_in_progress.fetch_add(1, Ordering::SeqCst);
+        global
+            .callbacks_invoked_total
+            .fetch_add(1, Ordering::SeqCst);
+        Self(global)
+    }
+}
+
+impl Drop for CallbackInProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.0.callbacks_in_progress.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Payload held inside the bounded queue between submission and worker dispatch.
 pub enum QueuedPayload {
     /// Synchronous borrowed submission copied into a bounded Rust-owned `Vec<u8>`.
@@ -155,6 +212,7 @@ impl QueuedPayload {
 struct QueuedItem {
     meta: EncodedFrameMeta,
     payload: QueuedPayload,
+    _in_flight: InFlightToken,
 }
 
 /// Snapshot of per-instance counters and queue occupancy.
@@ -296,14 +354,25 @@ impl InstanceCounters {
     }
 }
 
+#[cfg(feature = "poc-fault-injection")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SubmitFaultMode {
+    None,
+    PreCommitPanic,
+    PostCommitPanic,
+}
+
 struct SharedQueueState {
     state: CoreState,
     queue: VecDeque<QueuedItem>,
     recycle_pool: Vec<Vec<u8>>,
     queue_capacity: usize,
+    retained_slab_cap_limit: usize,
     stop_requested: bool,
     fault_triggered: bool,
     pending_worker_panic: bool,
+    #[cfg(feature = "poc-fault-injection")]
+    pending_submit_fault: SubmitFaultMode,
     last_error: String,
     worker_thread_id: Option<ThreadId>,
 }
@@ -311,20 +380,35 @@ struct SharedQueueState {
 impl SharedQueueState {
     fn new(config: CoreConfig) -> Self {
         let mut recycle_pool = Vec::with_capacity(config.queue_capacity);
-        let prealloc_cap = config.expected_frame_bytes_hint;
-        if prealloc_cap > 0 {
-            for _ in 0..config.queue_capacity {
-                recycle_pool.push(Vec::with_capacity(prealloc_cap));
+        if config.expected_frame_bytes_hint > 0 {
+            let slot_cap = config
+                .expected_frame_bytes_hint
+                .min(MAX_EAGER_PREALLOC_TOTAL_BYTES);
+            let max_slots_by_bytes = MAX_EAGER_PREALLOC_TOTAL_BYTES / slot_cap;
+            let eager_slots = config
+                .queue_capacity
+                .min(MAX_EAGER_PREALLOC_SLOTS)
+                .min(max_slots_by_bytes);
+            for _ in 0..eager_slots {
+                recycle_pool.push(Vec::with_capacity(slot_cap));
             }
         }
+        let retained_slab_cap_limit = config
+            .expected_frame_bytes_hint
+            .max(MIN_RETAINED_POOL_SLAB_BYTES)
+            .saturating_mul(2)
+            .min(MAX_ENCODED_FRAME_BYTES);
         Self {
             state: CoreState::Created,
             queue: VecDeque::with_capacity(config.queue_capacity),
             recycle_pool,
             queue_capacity: config.queue_capacity,
+            retained_slab_cap_limit,
             stop_requested: false,
             fault_triggered: false,
             pending_worker_panic: false,
+            #[cfg(feature = "poc-fault-injection")]
+            pending_submit_fault: SubmitFaultMode::None,
             last_error: String::new(),
             worker_thread_id: None,
         }
@@ -360,21 +444,21 @@ impl CoreSession {
     pub fn create(config: CoreConfig, observer: Arc<dyn CoreObserver>) -> Result<Self, CoreError> {
         config.validate()?;
         let global = global_counters();
-        global.active_instances.fetch_add(1, Ordering::SeqCst);
-
+        let queue_state = SharedQueueState::new(config);
         let shared = Arc::new(SharedRuntime {
-            inner: Mutex::new(SharedQueueState::new(config)),
+            inner: Mutex::new(queue_state),
             cv: Condvar::new(),
             counters: InstanceCounters::new(CoreState::Created),
-            global,
+            global: Arc::clone(&global),
             observer,
             has_active_thread: AtomicBool::new(false),
         });
+        let worker = Mutex::new(None);
+        // Increment active_instances only after all startup allocations succeed so OOM/panic
+        // during initialization cannot leak the instance counter.
+        global.active_instances.fetch_add(1, Ordering::SeqCst);
 
-        Ok(Self {
-            shared,
-            worker: Mutex::new(None),
-        })
+        Ok(Self { shared, worker })
     }
 
     /// Transition `Created -> Running` and spawn the dedicated worker thread.
@@ -460,9 +544,11 @@ impl CoreSession {
         buf.clear();
         buf.extend_from_slice(data);
 
+        let token = InFlightToken::new(Arc::clone(&self.shared.global));
         guard.queue.push_back(QueuedItem {
             meta: *meta,
             payload: QueuedPayload::Copied(buf),
+            _in_flight: token,
         });
 
         self.record_enqueue_metrics(guard.queue.len(), false);
@@ -478,6 +564,23 @@ impl CoreSession {
         meta: &EncodedFrameMeta,
         payload: T,
     ) -> Result<(), (CoreError, T)> {
+        match self.submit_owned_boxed(meta, Box::new(PlainOwnedSliceAdapter(payload))) {
+            Ok(()) => Ok(()),
+            Err((err, boxed)) => Err((err, boxed.0)),
+        }
+    }
+
+    /// Transactional variant of `submit_owned` keeping `payload` disarmed until the
+    /// infallible enqueue commit point inside the queue lock.
+    ///
+    /// # Panics
+    /// Under the optional `poc-fault-injection` feature, triggers an intentional armed
+    /// test panic before or after ownership commit to verify transactional safety.
+    pub fn submit_owned_boxed<T: TransactionalOwnedSlice + 'static>(
+        &self,
+        meta: &EncodedFrameMeta,
+        mut payload: Box<T>,
+    ) -> Result<(), (CoreError, Box<T>)> {
         if let Err(err) = meta.validate() {
             return Err((err, payload));
         }
@@ -509,13 +612,38 @@ impl CoreSession {
             return Err((CoreError::Backpressure, payload));
         }
 
+        guard.queue.reserve(1);
+
+        #[cfg(feature = "poc-fault-injection")]
+        let submit_fault =
+            std::mem::replace(&mut guard.pending_submit_fault, SubmitFaultMode::None);
+        #[cfg(feature = "poc-fault-injection")]
+        assert!(
+            submit_fault != SubmitFaultMode::PreCommitPanic,
+            "Controlled PoC FFI panic before ownership commit"
+        );
+        #[cfg(feature = "poc-fault-injection")]
+        let trigger_post_commit_panic = submit_fault == SubmitFaultMode::PostCommitPanic;
+
+        let token = InFlightToken::new(Arc::clone(&self.shared.global));
+        // Infallible commit point: all checks & reservations finished; commit ownership atomically.
+        payload.commit_ownership();
         guard.queue.push_back(QueuedItem {
             meta: *meta,
-            payload: QueuedPayload::External(Box::new(payload)),
+            payload: QueuedPayload::External(payload),
+            _in_flight: token,
         });
 
         self.record_enqueue_metrics(guard.queue.len(), true);
         self.shared.cv.notify_one();
+        drop(guard);
+
+        #[cfg(feature = "poc-fault-injection")]
+        assert!(
+            !trigger_post_commit_panic,
+            "Controlled PoC FFI panic after ownership commit"
+        );
+
         Ok(())
     }
 
@@ -614,8 +742,10 @@ impl CoreSession {
             self.shared.cv.notify_all();
             (guard.worker_thread_id == Some(current_tid), drained)
         };
-        drop(drained);
-        self.invoke_state_callback(CoreState::Faulted, Err(CoreError::InternalPanic));
+        let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+            drop(drained);
+            self.invoke_state_callback(CoreState::Faulted, Err(CoreError::InternalPanic));
+        }));
         if !is_worker {
             let _ = self.join_worker_if_external();
         }
@@ -634,6 +764,36 @@ impl CoreSession {
         }
         guard.pending_worker_panic = true;
         self.shared.cv.notify_all();
+        Ok(())
+    }
+
+    #[cfg(feature = "poc-fault-injection")]
+    /// Controlled `PoC` helper to arm a pre-commit panic inside `submit_owned_boxed`.
+    pub fn poc_arm_submit_pre_commit_panic(&self) -> Result<(), CoreError> {
+        let mut guard = self
+            .shared
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.state != CoreState::Running {
+            return Err(CoreError::InvalidState(guard.state));
+        }
+        guard.pending_submit_fault = SubmitFaultMode::PreCommitPanic;
+        Ok(())
+    }
+
+    #[cfg(feature = "poc-fault-injection")]
+    /// Controlled `PoC` helper to arm a post-commit panic inside `submit_owned_boxed`.
+    pub fn poc_arm_submit_post_commit_panic(&self) -> Result<(), CoreError> {
+        let mut guard = self
+            .shared
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.state != CoreState::Running {
+            return Err(CoreError::InvalidState(guard.state));
+        }
+        guard.pending_submit_fault = SubmitFaultMode::PostCommitPanic;
         Ok(())
     }
 
@@ -732,10 +892,6 @@ impl CoreSession {
                 .native_owned_submitted
                 .fetch_add(1, Ordering::SeqCst);
         }
-        self.shared
-            .global
-            .in_flight_buffers
-            .fetch_add(1, Ordering::SeqCst);
         let depth_u32 = u32::try_from(depth).unwrap_or(u32::MAX);
         self.shared
             .counters
@@ -744,19 +900,8 @@ impl CoreSession {
     }
 
     fn invoke_state_callback(&self, new_state: CoreState, status: Result<(), CoreError>) {
-        self.shared
-            .global
-            .callbacks_in_progress
-            .fetch_add(1, Ordering::SeqCst);
-        self.shared
-            .global
-            .callbacks_invoked_total
-            .fetch_add(1, Ordering::SeqCst);
+        let _cb_guard = CallbackInProgressGuard::enter(&self.shared.global);
         self.shared.observer.on_state_changed(new_state, status);
-        self.shared
-            .global
-            .callbacks_in_progress
-            .fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -785,10 +930,6 @@ impl Drop for CoreSession {
 fn drain_queue_locked(guard: &mut SharedQueueState, shared: &SharedRuntime) -> Vec<QueuedItem> {
     let mut drained = Vec::with_capacity(guard.queue.len());
     while let Some(item) = guard.queue.pop_front() {
-        shared
-            .global
-            .in_flight_buffers
-            .fetch_sub(1, Ordering::SeqCst);
         if matches!(item.payload, QueuedPayload::External(_)) {
             shared
                 .counters
@@ -802,6 +943,16 @@ fn drain_queue_locked(guard: &mut SharedQueueState, shared: &SharedRuntime) -> V
 
 struct ThreadBookkeeping {
     shared: Arc<SharedRuntime>,
+}
+
+impl ThreadBookkeeping {
+    fn enter(shared: Arc<SharedRuntime>) -> Self {
+        shared
+            .global
+            .active_worker_threads
+            .fetch_add(1, Ordering::SeqCst);
+        Self { shared }
+    }
 }
 
 impl Drop for ThreadBookkeeping {
@@ -832,10 +983,7 @@ impl Drop for ThreadBookkeeping {
 }
 
 fn worker_thread_entry(shared: &Arc<SharedRuntime>) {
-    shared
-        .global
-        .active_worker_threads
-        .fetch_add(1, Ordering::SeqCst);
+    let _bookkeeping = ThreadBookkeeping::enter(Arc::clone(shared));
     {
         let mut guard = shared
             .inner
@@ -843,40 +991,28 @@ fn worker_thread_entry(shared: &Arc<SharedRuntime>) {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.worker_thread_id = Some(thread::current().id());
     }
-    let _bookkeeping = ThreadBookkeeping {
-        shared: Arc::clone(shared),
-    };
 
     let res = panic::catch_unwind(AssertUnwindSafe(|| worker_loop(shared)));
     if res.is_err() {
-        shared.counters.panic_faults.fetch_add(1, Ordering::SeqCst);
-        let drained = {
-            let mut guard = shared
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard.fault_triggered = true;
-            guard.stop_requested = true;
-            "Contained panic in core worker thread".clone_into(&mut guard.last_error);
-            shared.set_state_locked(&mut guard, CoreState::Faulted);
-            drain_queue_locked(&mut guard, shared)
-        };
-        drop(drained);
-        shared
-            .global
-            .callbacks_in_progress
-            .fetch_add(1, Ordering::SeqCst);
-        shared
-            .global
-            .callbacks_invoked_total
-            .fetch_add(1, Ordering::SeqCst);
-        shared
-            .observer
-            .on_state_changed(CoreState::Faulted, Err(CoreError::InternalPanic));
-        shared
-            .global
-            .callbacks_in_progress
-            .fetch_sub(1, Ordering::SeqCst);
+        let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+            shared.counters.panic_faults.fetch_add(1, Ordering::SeqCst);
+            let drained = {
+                let mut guard = shared
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.fault_triggered = true;
+                guard.stop_requested = true;
+                "Contained panic in core worker thread".clone_into(&mut guard.last_error);
+                shared.set_state_locked(&mut guard, CoreState::Faulted);
+                drain_queue_locked(&mut guard, shared)
+            };
+            drop(drained);
+            let _cb_guard = CallbackInProgressGuard::enter(&shared.global);
+            shared
+                .observer
+                .on_state_changed(CoreState::Faulted, Err(CoreError::InternalPanic));
+        }));
     }
 }
 
@@ -909,7 +1045,11 @@ fn worker_loop(shared: &Arc<SharedRuntime>) {
             continue;
         };
 
-        let QueuedItem { meta, payload } = item;
+        let QueuedItem {
+            meta,
+            payload,
+            _in_flight: in_flight,
+        } = item;
         let out_bytes = payload.as_slice().to_vec();
         let byte_len = out_bytes.len() as u64;
 
@@ -921,7 +1061,9 @@ fn worker_loop(shared: &Arc<SharedRuntime>) {
                     .inner
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if guard.recycle_pool.len() < guard.queue_capacity {
+                if guard.recycle_pool.len() < guard.queue_capacity
+                    && vec_buf.capacity() <= guard.retained_slab_cap_limit
+                {
                     guard.recycle_pool.push(vec_buf);
                 }
             }
@@ -935,11 +1077,8 @@ fn worker_loop(shared: &Arc<SharedRuntime>) {
                     .fetch_add(1, Ordering::SeqCst);
             }
         }
+        drop(in_flight);
 
-        shared
-            .global
-            .in_flight_buffers
-            .fetch_sub(1, Ordering::SeqCst);
         shared
             .counters
             .packets_processed
@@ -949,19 +1088,8 @@ fn worker_loop(shared: &Arc<SharedRuntime>) {
             .bytes_processed
             .fetch_add(byte_len, Ordering::SeqCst);
 
-        shared
-            .global
-            .callbacks_in_progress
-            .fetch_add(1, Ordering::SeqCst);
-        shared
-            .global
-            .callbacks_invoked_total
-            .fetch_add(1, Ordering::SeqCst);
+        let _cb_guard = CallbackInProgressGuard::enter(&shared.global);
         shared.observer.on_output_packet(&meta, out_bytes);
-        shared
-            .global
-            .callbacks_in_progress
-            .fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -1098,6 +1226,69 @@ mod tests {
         // Ownership remained with caller until caller drops `returned_owned`.
         assert_eq!(releases.load(Ordering::SeqCst), 0);
         drop(returned_owned);
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn memory_preallocation_is_bounded_for_max_config() {
+        let session = CoreSession::create(
+            CoreConfig {
+                queue_capacity: MAX_QUEUE_CAPACITY,
+                expected_frame_bytes_hint: MAX_ENCODED_FRAME_BYTES,
+            },
+            Arc::new(NoopObserver),
+        )
+        .expect("max config session must not eagerly allocate 2 GiB");
+        let guard = session
+            .shared
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let eager_total: usize = guard.recycle_pool.iter().map(Vec::capacity).sum();
+        assert!(guard.recycle_pool.len() <= MAX_EAGER_PREALLOC_SLOTS);
+        assert!(eager_total <= MAX_EAGER_PREALLOC_TOTAL_BYTES);
+    }
+
+    #[test]
+    fn observer_panic_during_fault_recovery_is_contained_and_decrements_counters() {
+        struct PanickingFaultObserver;
+        impl CoreObserver for PanickingFaultObserver {
+            fn on_output_packet(&self, _meta: &EncodedFrameMeta, _payload: Vec<u8>) {}
+            fn on_state_changed(&self, new_state: CoreState, _status: Result<(), CoreError>) {
+                assert!(
+                    new_state != CoreState::Faulted,
+                    "Simulated observer panic during fault notification"
+                );
+            }
+        }
+
+        let releases = Arc::new(AtomicUsize::new(0));
+        let session = CoreSession::create(CoreConfig::default(), Arc::new(PanickingFaultObserver))
+            .expect("create");
+        session.start().expect("start");
+        let meta = EncodedFrameMeta {
+            session_id: 77,
+            display_id: 0,
+            codec: EncodedCodec::H264AnnexB,
+            flags: 1,
+            frame_id: 1,
+            gop_id: 1,
+            capture_ts_us: 100,
+            encode_done_ts_us: 120,
+            submit_qpc_ticks: 10,
+        };
+        let owned = TrackingNativeBuf {
+            bytes: vec![0xAA; 64],
+            releases: Arc::clone(&releases),
+        };
+        session.submit_owned(&meta, owned).expect("submit");
+        // mark_faulted triggers PanickingFaultObserver inside worker/caller; panic must not escape.
+        let res = panic::catch_unwind(AssertUnwindSafe(|| {
+            session.mark_faulted("test fault");
+        }));
+        assert!(res.is_ok());
+        session.mark_faulted("idempotent second fault");
+        drop(session);
         assert_eq!(releases.load(Ordering::SeqCst), 1);
     }
 }

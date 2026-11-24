@@ -163,9 +163,14 @@ int RunLumaBridgeFfiPocSelfTest() noexcept {
     owned.user_ctx = holder;
 
     if (lb_core_submit_owned_encoded_frame(handle, &meta, &owned) != LB_STATUS_OK) {
-        delete[] raw_native;
-        delete holder;
+        (void)lb_core_release_buffer(&owned);
         std::fprintf(stderr, "[FFI-POC] lb_core_submit_owned_encoded_frame failed.\n");
+        (void)lb_core_stop(handle);
+        (void)lb_core_destroy(handle);
+        return EXIT_FAILURE;
+    }
+    if (owned.release != nullptr || owned.data != nullptr) {
+        std::fprintf(stderr, "[FFI-POC] Expected accepted LbOwnedBuffer descriptor to be zeroed.\n");
         (void)lb_core_stop(handle);
         (void)lb_core_destroy(handle);
         return EXIT_FAILURE;

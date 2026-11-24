@@ -780,7 +780,8 @@ bool TestPanicContainmentAndDefaultDllIsolation(const std::wstring& faultDllPath
     using FnAbiVer = LbStatus (*)(uint32_t*, uint32_t*);
     using FnCreate = LbStatus (*)(const LbCoreConfig*, LbCoreHandle**);
     using FnStart = LbStatus (*)(LbCoreHandle*);
-    using FnSubmitOwned = LbStatus (*)(LbCoreHandle*, const LbEncodedFrameMeta*, const LbOwnedBuffer*);
+    using FnSubmitOwned = LbStatus (*)(LbCoreHandle*, const LbEncodedFrameMeta*, LbOwnedBuffer*);
+    using FnReleaseBuf = LbStatus (*)(LbOwnedBuffer*);
     using FnTriggerPanic = LbStatus (*)(LbCoreHandle*, uint32_t);
     using FnMetrics = LbStatus (*)(const LbCoreHandle*, LbCoreMetrics*);
     using FnLastError = LbStatus (*)(const LbCoreHandle*, uint8_t*, size_t, size_t*);
@@ -791,14 +792,15 @@ bool TestPanicContainmentAndDefaultDllIsolation(const std::wstring& faultDllPath
     auto fn_create = reinterpret_cast<FnCreate>(GetProcAddress(faultMod, "lb_core_create"));
     auto fn_start = reinterpret_cast<FnStart>(GetProcAddress(faultMod, "lb_core_start"));
     auto fn_submit_owned = reinterpret_cast<FnSubmitOwned>(GetProcAddress(faultMod, "lb_core_submit_owned_encoded_frame"));
+    auto fn_release = reinterpret_cast<FnReleaseBuf>(GetProcAddress(faultMod, "lb_core_release_buffer"));
     auto fn_trigger = reinterpret_cast<FnTriggerPanic>(GetProcAddress(faultMod, "lb_core_poc_trigger_panic"));
     auto fn_metrics = reinterpret_cast<FnMetrics>(GetProcAddress(faultMod, "lb_core_get_metrics"));
     auto fn_last_error = reinterpret_cast<FnLastError>(GetProcAddress(faultMod, "lb_core_get_last_error"));
     auto fn_destroy = reinterpret_cast<FnDestroy>(GetProcAddress(faultMod, "lb_core_destroy"));
     auto fn_global = reinterpret_cast<FnGlobalCounters>(GetProcAddress(faultMod, "lb_core_get_global_resource_counters"));
 
-    REQUIRE_TRUE(fn_abi && fn_create && fn_start && fn_submit_owned && fn_trigger && fn_metrics && fn_last_error &&
-                     fn_destroy && fn_global,
+    REQUIRE_TRUE(fn_abi && fn_create && fn_start && fn_submit_owned && fn_release && fn_trigger && fn_metrics &&
+                     fn_last_error && fn_destroy && fn_global,
                  "resolved all fault-injection exports");
 
     uint32_t fmaj = 0;
@@ -914,6 +916,57 @@ bool TestPanicContainmentAndDefaultDllIsolation(const std::wstring& faultDllPath
                      "mode 2 queued native buffers cleanly released");
     }
 
+    // Mode 3: Transactional pre-commit panic inside submit_owned_boxed (descriptor intact, NOT released by Rust)
+    {
+        NativeHeapTracker tracker{};
+        LbCoreConfig cfg{};
+        cfg.abi = MakeHeader<LbCoreConfig>();
+        cfg.queue_capacity = 4;
+        cfg.expected_frame_bytes_hint = 512;
+
+        LbCoreHandle* h3 = nullptr;
+        REQUIRE_STATUS(fn_create(&cfg, &h3), LB_STATUS_OK, "mode 3 create");
+        REQUIRE_STATUS(fn_start(h3), LB_STATUS_OK, "mode 3 start");
+        REQUIRE_STATUS(fn_trigger(h3, 3U), LB_STATUS_OK, "mode 3 arm pre-commit panic");
+
+        LbOwnedBuffer pre_buf = MakeTrackedNativeBuffer(tracker, 512, 0x33U);
+        const LbEncodedFrameMeta m = MakeValidMeta(1);
+        REQUIRE_STATUS(fn_submit_owned(h3, &m, &pre_buf), LB_STATUS_INTERNAL_PANIC, "mode 3 pre-commit panic trapped");
+        REQUIRE_TRUE(pre_buf.data != nullptr && pre_buf.release != nullptr,
+                     "mode 3 caller retains untouched descriptor on pre-commit panic");
+        REQUIRE_TRUE(tracker.released.load(std::memory_order_seq_cst) == 0ULL,
+                     "mode 3 Rust MUST NOT call release on pre-commit unwind");
+        REQUIRE_STATUS(fn_release(&pre_buf), LB_STATUS_OK, "mode 3 caller frees retained buffer once");
+        REQUIRE_TRUE(tracker.released.load(std::memory_order_seq_cst) == 1ULL, "mode 3 single release verified");
+        REQUIRE_STATUS(fn_destroy(h3), LB_STATUS_OK, "mode 3 destroy cleanly");
+    }
+
+    // Mode 4: Transactional post-commit panic inside submit_owned_boxed (descriptor zeroed, Rust drains once)
+    {
+        NativeHeapTracker tracker{};
+        LbCoreConfig cfg{};
+        cfg.abi = MakeHeader<LbCoreConfig>();
+        cfg.queue_capacity = 4;
+        cfg.expected_frame_bytes_hint = 512;
+
+        LbCoreHandle* h4 = nullptr;
+        REQUIRE_STATUS(fn_create(&cfg, &h4), LB_STATUS_OK, "mode 4 create");
+        REQUIRE_STATUS(fn_start(h4), LB_STATUS_OK, "mode 4 start");
+        REQUIRE_STATUS(fn_trigger(h4, 4U), LB_STATUS_OK, "mode 4 arm post-commit panic");
+
+        LbOwnedBuffer post_buf = MakeTrackedNativeBuffer(tracker, 512, 0x44U);
+        const LbEncodedFrameMeta m = MakeValidMeta(1);
+        REQUIRE_STATUS(fn_submit_owned(h4, &m, &post_buf), LB_STATUS_INTERNAL_PANIC, "mode 4 post-commit panic trapped");
+        REQUIRE_TRUE(post_buf.data == nullptr && post_buf.release == nullptr,
+                     "mode 4 committed descriptor zeroed even on post-commit panic");
+        REQUIRE_TRUE(tracker.released.load(std::memory_order_seq_cst) == 1ULL,
+                     "mode 4 Rust drained & released committed buffer exactly once");
+        REQUIRE_STATUS(fn_release(&post_buf), LB_STATUS_INVALID_ARGUMENT,
+                       "mode 4 defensive caller lb_core_release_buffer is safe no-op without double-free");
+        REQUIRE_TRUE(tracker.released.load(std::memory_order_seq_cst) == 1ULL, "mode 4 still released once");
+        REQUIRE_STATUS(fn_destroy(h4), LB_STATUS_OK, "mode 4 destroy cleanly");
+    }
+
     LbGlobalResourceCounters after{};
     after.abi = MakeHeader<LbGlobalResourceCounters>();
     REQUIRE_STATUS(fn_global(&after), LB_STATUS_OK, "fault dll global counters");
@@ -921,9 +974,9 @@ bool TestPanicContainmentAndDefaultDllIsolation(const std::wstring& faultDllPath
                      after.in_flight_buffers == 0ULL &&
                      after.rust_buffers_allocated == after.rust_buffers_released &&
                      after.native_buffers_received == after.native_buffers_released,
-                 "fault dll zero leaked resources after Mode 1 & Mode 2 panic");
+                 "fault dll zero leaked resources after Mode 1..4 panic checks");
 
-    std::printf("[PASS] TestPanicContainmentAndDefaultDllIsolation (Mode 1 + Mode 2 + prod isolation)\n");
+    std::printf("[PASS] TestPanicContainmentAndDefaultDllIsolation (Mode 1..4 + prod isolation)\n");
     return true;
 }
 

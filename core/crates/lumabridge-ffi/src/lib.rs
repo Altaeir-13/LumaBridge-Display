@@ -32,7 +32,7 @@ use lumabridge_core::{
     global_resource_snapshot, record_native_buffer_received, record_native_buffer_released,
     record_rust_buffer_allocated, record_rust_buffer_released, CoreConfig, CoreError, CoreObserver,
     CoreSession, CoreState, EncodedCodec, EncodedFrameMeta, OwnedByteSlice,
-    MAX_ENCODED_FRAME_BYTES, MAX_QUEUE_CAPACITY, MIN_QUEUE_CAPACITY,
+    TransactionalOwnedSlice, MAX_ENCODED_FRAME_BYTES, MAX_QUEUE_CAPACITY, MIN_QUEUE_CAPACITY,
 };
 
 pub const LB_FFI_ABI_MAJOR: u32 = 1;
@@ -305,11 +305,13 @@ extern "C" fn lb_ffi_release_rust_vec(
     if user_ctx.is_null() {
         return;
     }
-    // SAFETY: `user_ctx` was created exclusively via `Box::into_raw(Box::new(RustOwnedVecPayload { .. }))`
-    // in `alloc_rust_owned_buffer` and transfers ownership cleanly back to Rust on the first call.
-    unsafe {
-        let _reclaimed = Box::from_raw(user_ctx.cast::<RustOwnedVecPayload>());
-    }
+    let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: `user_ctx` was created exclusively via `Box::into_raw(Box::new(RustOwnedVecPayload { .. }))`
+        // in `alloc_rust_owned_buffer` and transfers ownership cleanly back to Rust on the first call.
+        unsafe {
+            let _reclaimed = Box::from_raw(user_ctx.cast::<RustOwnedVecPayload>());
+        }
+    }));
     record_rust_buffer_released();
 }
 
@@ -339,11 +341,15 @@ struct NativeOwnedBufferGuard {
     capacity: usize,
     release: RawReleaseFn,
     user_ctx_addr: usize,
+    caller_desc: *mut LbOwnedBuffer,
+    armed: bool,
 }
 
 // SAFETY: `LbBufferReleaseFn` and `user_ctx` are supplied under the C ABI contract that
 // `release` may execute on the worker thread (strictly outside Rust locks) and `data[0..len]`
-// remains immutable and valid until `release` is invoked.
+// remains immutable and valid until `release` is invoked. `caller_desc` is only accessed
+// synchronously on the submitting thread during `commit_ownership()` inside `submit_owned_boxed`
+// before returning to the FFI caller, then immediately cleared to null.
 unsafe impl Send for NativeOwnedBufferGuard {}
 
 impl OwnedByteSlice for NativeOwnedBufferGuard {
@@ -357,14 +363,45 @@ impl OwnedByteSlice for NativeOwnedBufferGuard {
     }
 }
 
+impl TransactionalOwnedSlice for NativeOwnedBufferGuard {
+    fn commit_ownership(&mut self) {
+        self.armed = true;
+        record_native_buffer_received();
+        let desc = self.caller_desc;
+        self.caller_desc = ptr::null_mut();
+        if !desc.is_null() {
+            // SAFETY: Still synchronously on the FFI caller thread before `submit_owned_boxed`
+            // returns or triggers any post-commit unwind; zeroing `*desc` ensures the caller can
+            // never mistakenly re-release an accepted buffer even after `LB_STATUS_INTERNAL_PANIC`.
+            unsafe {
+                ptr::write(
+                    desc,
+                    LbOwnedBuffer {
+                        data: ptr::null(),
+                        len: 0,
+                        capacity: 0,
+                        release: None,
+                        user_ctx: ptr::null_mut(),
+                    },
+                );
+            }
+        }
+    }
+}
+
 impl Drop for NativeOwnedBufferGuard {
     fn drop(&mut self) {
-        (self.release)(
-            self.user_ctx_addr as *mut c_void,
-            self.data,
-            self.len,
-            self.capacity,
-        );
+        if !self.armed {
+            return;
+        }
+        let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+            (self.release)(
+                self.user_ctx_addr as *mut c_void,
+                self.data,
+                self.len,
+                self.capacity,
+            );
+        }));
         record_native_buffer_released();
     }
 }
@@ -420,12 +457,14 @@ fn run_with_panic_boundary(
     }
     if let Some(raw) = handle_opt {
         if !raw.is_null() {
-            // SAFETY: Called only when the handle pointer passed by caller was non-null.
-            // Marks instance `Faulted` with sanitized reason without re-throwing.
-            let wrapper = unsafe { &*raw };
-            wrapper
-                .session
-                .mark_faulted("Contained Rust panic at FFI boundary");
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+                // SAFETY: Called only when the handle pointer passed by caller was non-null.
+                // Marks instance `Faulted` with sanitized reason without re-throwing across C ABI.
+                let wrapper = unsafe { &*raw };
+                wrapper
+                    .session
+                    .mark_faulted("Contained Rust panic at FFI boundary");
+            }));
         }
     }
     LbStatus::InternalPanic
@@ -556,24 +595,32 @@ pub unsafe extern "C" fn lb_core_submit_encoded_frame(
     })
 }
 
-/// Asynchronously transfer ownership of a native-allocated `LbOwnedBuffer` into the core.
-/// - On `LB_STATUS_OK`, Rust owns the buffer and guarantees `buffer->release` is called exactly once.
-/// - On ANY error status, ownership remains with the caller and `buffer->release` is NOT called.
+/// Asynchronously transfer ownership of a native-allocated `LbOwnedBuffer` into the core
+/// using two-phase transactional commit.
+/// - On `LB_STATUS_OK`, Rust owns the buffer, zeroes `*buffer` (`release == NULL`), and
+///   guarantees `release` is called **noexcept** exactly once outside internal mutexes.
+/// - On any non-panic error status (`InvalidArgument`, `InvalidState`, `Backpressure`,
+///   `Faulted`, etc.), ownership remains with the caller, `*buffer` is untouched, and
+///   `release` is NOT called.
+/// - On `LB_STATUS_INTERNAL_PANIC`, if a pre-commit panic occurred, `*buffer` remains intact
+///   (`buffer->release != NULL`) and caller retains ownership; if a post-commit panic occurred,
+///   `*buffer` is already zeroed (`buffer->release == NULL`) and Rust drains/releases it once.
+///   Calling `lb_core_release_buffer(buffer)` on cleanup safely handles both outcomes without double-free.
 ///
 /// # Safety
-/// - `handle`, `meta`, and `buffer` must be valid non-null pointers.
+/// - `handle`, `meta`, and `buffer` must be valid aligned non-null pointers.
 /// - `buffer->data` must be valid and immutable for `buffer->len` bytes until `buffer->release` runs.
 #[no_mangle]
 pub unsafe extern "C" fn lb_core_submit_owned_encoded_frame(
     handle: *mut LbCoreHandle,
     meta: *const LbEncodedFrameMeta,
-    buffer: *const LbOwnedBuffer,
+    buffer: *mut LbOwnedBuffer,
 ) -> LbStatus {
     run_with_panic_boundary(Some(handle), || {
         if handle.is_null() || meta.is_null() || buffer.is_null() {
             return LbStatus::InvalidArgument;
         }
-        // SAFETY: Caller guarantees readable pointers for `handle`, `meta`, and `buffer`.
+        // SAFETY: Caller guarantees readable pointers for `handle` and `meta`.
         let wrapper = unsafe { &*handle };
         // SAFETY: Caller guarantees readable `LbEncodedFrameMeta`.
         let raw_meta = unsafe { &*meta };
@@ -581,8 +628,8 @@ pub unsafe extern "C" fn lb_core_submit_owned_encoded_frame(
             Ok(m) => m,
             Err(s) => return s,
         };
-        // SAFETY: Caller guarantees readable `LbOwnedBuffer`.
-        let owned = unsafe { &*buffer };
+        // SAFETY: Caller guarantees readable/writable `LbOwnedBuffer`.
+        let owned = unsafe { ptr::read(buffer) };
         if owned.data.is_null()
             || owned.len == 0
             || owned.len > owned.capacity
@@ -594,24 +641,19 @@ pub unsafe extern "C" fn lb_core_submit_owned_encoded_frame(
             return LbStatus::InvalidArgument;
         };
 
-        let guard = NativeOwnedBufferGuard {
+        let guard_box = Box::new(NativeOwnedBufferGuard {
             data: owned.data,
             len: owned.len,
             capacity: owned.capacity,
             release: release_fn,
             user_ctx_addr: owned.user_ctx as usize,
-        };
+            caller_desc: buffer,
+            armed: false,
+        });
 
-        match wrapper.session.submit_owned(&parsed_meta, guard) {
-            Ok(()) => {
-                record_native_buffer_received();
-                LbStatus::Ok
-            }
-            Err((err, unaccepted_guard)) => {
-                // Disarm release callback because rejected transfer leaves ownership with caller.
-                std::mem::forget(unaccepted_guard);
-                map_core_error(err)
-            }
+        match wrapper.session.submit_owned_boxed(&parsed_meta, guard_box) {
+            Ok(()) => LbStatus::Ok,
+            Err((err, _unaccepted_disarmed_guard)) => map_core_error(err),
         }
     })
 }
@@ -874,6 +916,8 @@ pub unsafe extern "C" fn lb_core_layout_signature(out_sig: *mut LbAbiLayoutSigna
 /// Controlled fault-injection entry point compiled ONLY when `poc-fault-injection` feature is active.
 /// - `mode = 1`: triggers an intentional panic directly inside the FFI call (`catch_unwind` -> `InternalPanic`, instance -> `Faulted`).
 /// - `mode = 2`: arms an intentional panic on the core worker thread to verify worker panic containment & buffer drain.
+/// - `mode = 3`: arms an intentional panic inside `submit_owned_boxed` BEFORE ownership commit.
+/// - `mode = 4`: arms an intentional panic inside `submit_owned_boxed` AFTER ownership commit.
 ///
 /// # Panics
 /// When `mode == 1`, intentionally triggers a test panic inside the `catch_unwind` FFI boundary
@@ -897,6 +941,14 @@ pub unsafe extern "C" fn lb_core_poc_trigger_panic(
                 panic!("Controlled PoC FFI boundary panic injection (mode 1)");
             }
             2 => match wrapper.session.poc_arm_worker_panic() {
+                Ok(()) => LbStatus::Ok,
+                Err(e) => map_core_error(e),
+            },
+            3 => match wrapper.session.poc_arm_submit_pre_commit_panic() {
+                Ok(()) => LbStatus::Ok,
+                Err(e) => map_core_error(e),
+            },
+            4 => match wrapper.session.poc_arm_submit_post_commit_panic() {
                 Ok(()) => LbStatus::Ok,
                 Err(e) => map_core_error(e),
             },
@@ -1055,7 +1107,7 @@ mod tests {
         let boxed_slice: Box<[u8]> = vec![0x77u8; 256].into_boxed_slice();
         let cap = boxed_slice.len();
         let raw_data = Box::into_raw(boxed_slice).cast::<u8>();
-        let native_owned = LbOwnedBuffer {
+        let mut native_owned = LbOwnedBuffer {
             data: raw_data,
             len: cap,
             capacity: cap,
@@ -1064,9 +1116,16 @@ mod tests {
         };
         assert_eq!(
             unsafe {
-                lb_core_submit_owned_encoded_frame(handle, &raw const meta, &raw const native_owned)
+                lb_core_submit_owned_encoded_frame(handle, &raw const meta, &raw mut native_owned)
             },
             LbStatus::Ok
+        );
+        // Transactional move semantics: accepted descriptor was zeroed by Rust commit point.
+        assert!(native_owned.data.is_null());
+        assert!(native_owned.release.is_none());
+        assert_eq!(
+            unsafe { lb_core_release_buffer(&raw mut native_owned) },
+            LbStatus::InvalidArgument
         );
 
         for _ in 0..100 {
@@ -1134,6 +1193,125 @@ mod tests {
         assert_eq!(metrics.state, LbCoreState::Faulted as u32);
         assert!(metrics.panic_faults >= 1);
         assert_eq!(unsafe { lb_core_destroy(handle) }, LbStatus::Ok);
+    }
+
+    #[cfg(feature = "poc-fault-injection")]
+    struct ReentrantCtx {
+        handle: *mut LbCoreHandle,
+        freed: AtomicUsize,
+    }
+
+    #[cfg(feature = "poc-fault-injection")]
+    extern "C" fn reentrant_metrics_release(
+        user_ctx: *mut c_void,
+        data: *const u8,
+        _len: usize,
+        capacity: usize,
+    ) {
+        let ctx = unsafe { &*(user_ctx.cast::<ReentrantCtx>()) };
+        let mut m = LbCoreMetrics {
+            abi: LbAbiHeader::new::<LbCoreMetrics>(),
+            state: 0,
+            queue_depth: 0,
+            queue_peak_depth: 0,
+            reserved0: 0,
+            packets_submitted: 0,
+            packets_processed: 0,
+            bytes_processed: 0,
+            backpressure_events: 0,
+            native_owned_submitted: 0,
+            native_owned_dropped: 0,
+            panic_faults: 0,
+        };
+        let st = unsafe { lb_core_get_metrics(ctx.handle, &raw mut m) };
+        assert_eq!(st, LbStatus::Ok);
+        ctx.freed.fetch_add(1, Ordering::SeqCst);
+        let slice_ptr = ptr::slice_from_raw_parts_mut(data.cast_mut(), capacity);
+        unsafe { drop(Box::from_raw(slice_ptr)) };
+    }
+
+    #[cfg(feature = "poc-fault-injection")]
+    fn run_transactional_panic_case(mode: u32, expect_committed: bool) {
+        let cfg = LbCoreConfig {
+            abi: LbAbiHeader::new::<LbCoreConfig>(),
+            queue_capacity: 4,
+            expected_frame_bytes_hint: 512,
+            on_output_packet: None,
+            on_state_change: None,
+            callback_user_ctx: ptr::null_mut(),
+        };
+        let mut handle: *mut LbCoreHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe { lb_core_create(&raw const cfg, &raw mut handle) },
+            LbStatus::Ok
+        );
+        assert_eq!(unsafe { lb_core_start(handle) }, LbStatus::Ok);
+        let rctx = Box::into_raw(Box::new(ReentrantCtx {
+            handle,
+            freed: AtomicUsize::new(0),
+        }));
+
+        let boxed_slice: Box<[u8]> = vec![0x55u8; 64].into_boxed_slice();
+        let cap = boxed_slice.len();
+        let mut native_owned = LbOwnedBuffer {
+            data: Box::into_raw(boxed_slice).cast::<u8>(),
+            len: cap,
+            capacity: cap,
+            release: Some(reentrant_metrics_release),
+            user_ctx: rctx.cast::<c_void>(),
+        };
+        let valid_meta = LbEncodedFrameMeta {
+            abi: LbAbiHeader::new::<LbEncodedFrameMeta>(),
+            session_id: 99,
+            capture_ts_us: 100,
+            encode_done_ts_us: 120,
+            submit_qpc_ticks: 1,
+            codec: LbEncodedCodec::H264AnnexB as u32,
+            flags: 1,
+            frame_id: 1,
+            display_id: 0,
+            gop_id: 1,
+        };
+
+        assert_eq!(
+            unsafe { lb_core_poc_trigger_panic(handle, mode) },
+            LbStatus::Ok
+        );
+        assert_eq!(
+            unsafe {
+                lb_core_submit_owned_encoded_frame(
+                    handle,
+                    &raw const valid_meta,
+                    &raw mut native_owned,
+                )
+            },
+            LbStatus::InternalPanic
+        );
+        if expect_committed {
+            assert!(native_owned.data.is_null() && native_owned.release.is_none());
+            assert_eq!(unsafe { (&*rctx).freed.load(Ordering::SeqCst) }, 1);
+            assert_eq!(
+                unsafe { lb_core_release_buffer(&raw mut native_owned) },
+                LbStatus::InvalidArgument
+            );
+        } else {
+            assert!(!native_owned.data.is_null() && native_owned.release.is_some());
+            assert_eq!(unsafe { (&*rctx).freed.load(Ordering::SeqCst) }, 0);
+            assert_eq!(
+                unsafe { lb_core_release_buffer(&raw mut native_owned) },
+                LbStatus::Ok
+            );
+        }
+        assert_eq!(unsafe { (&*rctx).freed.load(Ordering::SeqCst) }, 1);
+        assert_eq!(unsafe { lb_core_destroy(handle) }, LbStatus::Ok);
+        unsafe { drop(Box::from_raw(rctx)) };
+    }
+
+    #[cfg(feature = "poc-fault-injection")]
+    #[test]
+    fn transactional_ownership_pre_and_post_commit_panics_never_double_free() {
+        run_transactional_panic_case(3, false);
+        run_transactional_panic_case(4, true);
     }
 
     #[test]
