@@ -99,6 +99,9 @@ param(
     [ValidateRange(1, 60)]
     [int]$ResourceSampleIntervalSec = 5,
 
+    [ValidateRange(0, 300)]
+    [int]$GpuSampleIntervalSec = 15,
+
     [ValidateRange(0, 4096)]
     [int]$CoreEtwMaxFileSizeMb = 0,
 
@@ -121,6 +124,8 @@ param(
     [switch]$AllowAnyBranch,
 
     [switch]$SkipDriverInstall,
+
+    [switch]$ReuseSignedStaging,
 
     [switch]$IncludeDxgKrnl,
 
@@ -514,8 +519,23 @@ function Test-LumaBridgeSubprofileGates {
     }
 
     $procExitedOk = ($null -ne $ProcessResult -and (-not [bool]$ProcessResult.TimedOut) -and ([int]$ProcessResult.ExitCode -eq 0))
+    $processTerminationClass = if ($null -eq $ProcessResult) {
+        'NotRun'
+    }
+    elseif ([bool]$ProcessResult.TimedOut) {
+        'TimeoutKilled'
+    }
+    elseif ([int]$ProcessResult.ExitCode -eq 0) {
+        'ControlledExitSuccess'
+    }
+    elseif ([int]$ProcessResult.ExitCode -eq 1 -and $summaryValid) {
+        'ControlledExitGateFailure'
+    }
+    else {
+        'CrashOrAbnormalExit'
+    }
     if (-not $procExitedOk) {
-        $reasons.Add(("Process did not exit cleanly (TimedOut={0}, ExitCode={1})." -f $(if ($null -ne $ProcessResult) { $ProcessResult.TimedOut } else { $null }), $(if ($null -ne $ProcessResult) { $ProcessResult.ExitCode } else { $null })))
+        $reasons.Add(("Process did not exit cleanly (Class={0}, TimedOut={1}, ExitCode={2})." -f $processTerminationClass, $(if ($null -ne $ProcessResult) { $ProcessResult.TimedOut } else { $null }), $(if ($null -ne $ProcessResult) { $ProcessResult.ExitCode } else { $null })))
     }
 
     $hostExitedNormally = if ($summaryValid) { [bool](Get-LumaBridgeValidationOptionalProp $summary 'HostProcessExitedNormally' $false) } else { $false }
@@ -528,15 +548,18 @@ function Test-LumaBridgeSubprofileGates {
     $protocolErrors = if ($summaryValid) { [uint64](Get-LumaBridgeValidationOptionalProp $summary 'ProtocolErrors' 1) } else { [uint64]1 }
     $fatalIoTimeouts = if ($summaryValid) { [uint64](Get-LumaBridgeValidationOptionalProp $summary 'FatalIoTimeouts' 0) } else { [uint64]0 }
     $fatalIpcErrors = if ($summaryValid) { [uint64](Get-LumaBridgeValidationOptionalProp $summary 'FatalIpcErrors' 0) } else { [uint64]0 }
+    $unexpectedCpuInGpu = if ($summaryValid) { [uint64](Get-LumaBridgeValidationOptionalProp $summary 'UnexpectedCpuFramesInGpuSession' 0) } else { [uint64]0 }
+    $contractViolations = if ($summaryValid) { [uint64](Get-LumaBridgeValidationOptionalProp $summary 'TransportContractViolations' 0) } else { [uint64]0 }
     $lastProtocolStatus = if ($summaryValid) { [string](Get-LumaBridgeValidationOptionalProp $summary 'LastProtocolStatus' 'Unknown') } else { 'Missing' }
     $frameTargetReached = if ($summaryValid) { [bool](Get-LumaBridgeValidationOptionalProp $summary 'FrameTargetReached' $false) } else { $false }
 
     $ipcOk = ($connectCount -ge 1) -and $hostExitedNormally -and $hostTransportHealthy -and
         ($checksumMismatches -eq 0) -and ($syntheticMismatches -eq 0) -and
         ($protocolErrors -eq 0) -and ($fatalIoTimeouts -eq 0) -and ($fatalIpcErrors -eq 0) -and
+        ($unexpectedCpuInGpu -eq 0) -and ($contractViolations -eq 0) -and
         ($lastProtocolStatus -ne 'UnauthorizedClient')
     if ($summaryValid -and -not $ipcOk) {
-        $reasons.Add(("IPC/Integrity failure (Connects={0}, Healthy={1}, CRC={2}, ProtoErr={3}, Status={4})." -f $connectCount, $hostTransportHealthy, $checksumMismatches, $protocolErrors, $lastProtocolStatus))
+        $reasons.Add(("IPC/Integrity failure (Connects={0}, Healthy={1}, CRC={2}, ProtoErr={3}, UnexpCpu={4}, ContractViol={5}, Status={6})." -f $connectCount, $hostTransportHealthy, $checksumMismatches, $protocolErrors, $unexpectedCpuInGpu, $contractViolations, $lastProtocolStatus))
     }
 
     $temporalEval = Test-LumaBridgeTemporalTelemetry -Summary $summary
@@ -547,6 +570,10 @@ function Test-LumaBridgeSubprofileGates {
     $gpuMode = if ($summaryValid) { [string](Get-LumaBridgeValidationOptionalProp $summary 'NegotiatedTransportMode' 'CpuStagingPipe') } else { 'CpuStagingPipe' }
     $gpuFallback = if ($summaryValid) { [bool](Get-LumaBridgeValidationOptionalProp $summary 'FallbackToCpuActivated' $false) } else { $false }
     $gpuOpened = if ($summaryValid) { [uint64](Get-LumaBridgeValidationOptionalProp $summary 'GpuFramesOpened' 0) } else { [uint64]0 }
+    $hasCpuFramesProp = ($summaryValid -and ($summary.PSObject.Properties.Name -contains 'CpuFramesReceived'))
+    $hasGpuFramesProp = ($summaryValid -and ($summary.PSObject.Properties.Name -contains 'GpuFramesReceived'))
+    $cpuFramesRx = if ($hasCpuFramesProp) { [uint64]$summary.CpuFramesReceived } else { [uint64]0 }
+    $gpuFramesRx = if ($hasGpuFramesProp) { [uint64]$summary.GpuFramesReceived } else { $gpuOpened }
     $gpuDropped = if ($summaryValid) { [uint64](Get-LumaBridgeValidationOptionalProp $summary 'GpuFramesDropped' 0) } else { [uint64]0 }
     $gpuOpenFail = if ($summaryValid) { [uint64](Get-LumaBridgeValidationOptionalProp $summary 'GpuSharedOpenFailures' 0) } else { [uint64]0 }
     $gpuSyncTo = if ($summaryValid) { [uint64](Get-LumaBridgeValidationOptionalProp $summary 'GpuSyncTimeouts' 0) } else { [uint64]0 }
@@ -560,6 +587,10 @@ function Test-LumaBridgeSubprofileGates {
         ($gpuMode -eq 'GpuSharedNtHandle') -and
         (-not $gpuFallback) -and
         ($gpuOpened -ge 1) -and
+        ($gpuFramesRx -ge 1) -and
+        ($cpuFramesRx -eq 0) -and
+        ($unexpectedCpuInGpu -eq 0) -and
+        ($contractViolations -eq 0) -and
         ($gpuOpenFail -eq 0) -and
         ($gpuSyncTo -eq 0) -and
         ($gpuLuidErr -eq 0) -and
@@ -567,7 +598,7 @@ function Test-LumaBridgeSubprofileGates {
         ($gpuDropRatio -le $MaxDropRatio)
     )
     if ($RequireGpuShared -and $summaryValid -and -not $gpuSharedPassed) {
-        $reasons.Add(("GpuShared gate failed (Mode={0}, Fallback={1}, Opened={2}, GpuDrop={3}, OpenFail={4}, SyncTo={5}, LuidErr={6}, CpuReads={7})." -f $gpuMode, $gpuFallback, $gpuOpened, $gpuDropped, $gpuOpenFail, $gpuSyncTo, $gpuLuidErr, $cpuReads))
+        $reasons.Add(("GpuShared gate failed (Mode={0}, Fallback={1}, Opened={2}, GpuRx={3}, CpuRx={4}, UnexpCpu={5}, ContractViol={6}, GpuDrop={7}, OpenFail={8}, SyncTo={9}, LuidErr={10}, CpuReads={11})." -f $gpuMode, $gpuFallback, $gpuOpened, $gpuFramesRx, $cpuFramesRx, $unexpectedCpuInGpu, $contractViolations, $gpuDropped, $gpuOpenFail, $gpuSyncTo, $gpuLuidErr, $cpuReads))
     }
 
     $qpcClockValid = if ($summaryValid -and ($summary.PSObject.Properties.Name -contains 'QpcClockValid')) {
@@ -748,15 +779,20 @@ function Test-LumaBridgeSubprofileGates {
         SubprofileName            = $SubprofileName
         SummaryValid              = $summaryValid
         SummaryStatus             = if ($null -ne $ValidationResult) { $ValidationResult.Status } else { 'MISSING' }
-        ProcessExitedOk           = $procExitedOk
-        IpcOk                     = $ipcOk
-        QpcClockOk                = $qpcClockOk
-        DurationOk                = $durationOk
-        ActiveStreamingOk         = $activeStreamingOk
-        SafetyExecutionTimeoutHit = $safetyTimeoutHit
-        TemporalEval              = $temporalEval
-        GpuSharedPassed           = $gpuSharedPassed
-        NvencPassed               = $nvencPassed
+        ProcessExitedOk              = $procExitedOk
+        ProcessTerminationClass      = $processTerminationClass
+        IpcOk                        = $ipcOk
+        QpcClockOk                   = $qpcClockOk
+        DurationOk                   = $durationOk
+        ActiveStreamingOk            = $activeStreamingOk
+        SafetyExecutionTimeoutHit    = $safetyTimeoutHit
+        TemporalEval                 = $temporalEval
+        GpuSharedPassed              = $gpuSharedPassed
+        CpuFramesReceived            = $cpuFramesRx
+        GpuFramesReceived            = $gpuFramesRx
+        UnexpectedCpuFramesInGpuSession = $unexpectedCpuInGpu
+        TransportContractViolations  = $contractViolations
+        NvencPassed                  = $nvencPassed
         H264DecodePassed          = $h264Passed
         ResolutionOk              = $resolutionOk
         ProfileSpecificOk         = $profileSpecificOk
@@ -789,10 +825,21 @@ $repoRoot = Get-LumaBridgeRepoRoot
 $sourcePackageDir = Get-LumaBridgePackageDirectory -Configuration $Configuration
 $runId = "{0}-{1}" -f (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ'), ([Guid]::NewGuid().ToString('N').Substring(0, 12))
 
-if ([string]::IsNullOrWhiteSpace($StagingDir)) {
-    $StagingDir = "{0}_{1}" -f (Get-LumaBridgeDefaultStagingDirectory -Configuration $Configuration), $runId
+$stagingMode = if ($ReuseSignedStaging) { 'ReusedSignedStaging' } else { 'FreshStaging' }
+$reusedStagingVerification = $null
+
+if ($ReuseSignedStaging) {
+    if ([string]::IsNullOrWhiteSpace($StagingDir)) {
+        throw 'ReuseSignedStaging requires specifying an explicit -StagingDir path.'
+    }
+    $StagingDir = Assert-LumaBridgeIsolatedStagingDirectory -StagingDir $StagingDir -SourcePackageDir $sourcePackageDir
 }
-$StagingDir = Assert-LumaBridgeIsolatedStagingDirectory -StagingDir $StagingDir -SourcePackageDir $sourcePackageDir
+else {
+    if ([string]::IsNullOrWhiteSpace($StagingDir)) {
+        $StagingDir = "{0}_{1}" -f (Get-LumaBridgeDefaultStagingDirectory -Configuration $Configuration), $runId
+    }
+    $StagingDir = Assert-LumaBridgeIsolatedStagingDirectory -StagingDir $StagingDir -SourcePackageDir $sourcePackageDir
+}
 
 if ([string]::IsNullOrWhiteSpace($OutputDir)) {
     $localAppData = if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
@@ -802,6 +849,25 @@ if ([string]::IsNullOrWhiteSpace($OutputDir)) {
         [Environment]::GetFolderPath('LocalApplicationData')
     }
     $OutputDir = Join-Path -Path $localAppData -ChildPath ("LumaBridgeDisplay\Validation\{0}" -f $runId)
+}
+
+$normOutput = [System.IO.Path]::GetFullPath($OutputDir).TrimEnd('\', '/')
+$normStagingCheck = [System.IO.Path]::GetFullPath($StagingDir).TrimEnd('\', '/')
+$normRepoCheck = [System.IO.Path]::GetFullPath($repoRoot).TrimEnd('\', '/')
+$normSourceCheck = [System.IO.Path]::GetFullPath($sourcePackageDir).TrimEnd('\', '/')
+foreach ($forbiddenOutBase in @($normStagingCheck, $normRepoCheck, $normSourceCheck)) {
+    $outPrefix = $normOutput + '\'
+    $forbPrefix = $forbiddenOutBase + '\'
+    if ($normOutput -ieq $forbiddenOutBase -or
+        $normOutput.StartsWith($forbPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+        $forbiddenOutBase.StartsWith($outPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw ("OutputDir '{0}' must not overlap StagingDir or repository/build path '{1}'." -f $normOutput, $forbiddenOutBase)
+    }
+}
+foreach ($histReportSentinel in @('functional-validation-report.json', 'diagnostics-summary.json')) {
+    if (Test-Path -LiteralPath (Join-Path -Path $normOutput -ChildPath $histReportSentinel)) {
+        throw ("OutputDir '{0}' already contains historical validation report '{1}'; choose a fresh directory to preserve previous evidence." -f $normOutput, $histReportSentinel)
+    }
 }
 
 if ([string]::IsNullOrWhiteSpace($HostExecutablePath)) {
@@ -913,10 +979,10 @@ try {
     if (-not $prereq.HostOs.IsSupportedWindows11) {
         throw ("Unsupported Windows build {0}; Windows 11 x64 >= {1} is required." -f $prereq.HostOs.CurrentBuildNumber, $constants.MinimumWindows11Build)
     }
-    if (-not $prereq.BuildPackage.AllFilesPresent) {
+    if (-not $ReuseSignedStaging -and -not $prereq.BuildPackage.AllFilesPresent) {
         throw ("Missing built package files in '{0}'. Rebuild {1}|x64 first." -f $sourcePackageDir, $Configuration)
     }
-    if (-not $DryRun) {
+    if (-not $DryRun -and -not $ReuseSignedStaging) {
         if ([string]::IsNullOrWhiteSpace($prereq.WdkTools.SignToolPath) -or
             [string]::IsNullOrWhiteSpace($prereq.WdkTools.Inf2CatPath) -or
             [string]::IsNullOrWhiteSpace($prereq.WdkTools.DevconPath)) {
@@ -1176,18 +1242,64 @@ $benchmarkGateCriteria = [pscustomobject]@{
     MinTemporalCoveragePct    = 95.0
     MaxTimestampErrors        = 0
     ResourceSampleIntervalSec = $ResourceSampleIntervalSec
+    GpuSampleIntervalSec      = $GpuSampleIntervalSec
     CoreEtwMaxFileSizeMb      = $effectiveCoreEtwMaxMb
 }
 
+function Invoke-LumaBridgeValidationHostCompat {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ExecutablePath,
+        [string[]]$Arguments = @(),
+        [int]$HardTimeoutMs = 30000,
+        [int]$SampleIntervalSec = 0,
+        [int]$GpuIntervalSec = 15,
+        [Nullable[int]]$WudfProcessId = $null,
+        [switch]$DryRun
+    )
+
+    $invokeParams = @{
+        ExecutablePath            = $ExecutablePath
+        Arguments                 = $Arguments
+        HardTimeoutMs             = $HardTimeoutMs
+        ResourceSampleIntervalSec = $SampleIntervalSec
+    }
+    if ($null -ne $WudfProcessId) {
+        $invokeParams['WudfProcessId'] = $WudfProcessId
+    }
+    if ($DryRun) {
+        $invokeParams['DryRun'] = $true
+    }
+    $hostCmd = Get-Command -Name 'Invoke-LumaBridgeHostProcess' -ErrorAction SilentlyContinue
+    if ($null -ne $hostCmd -and $hostCmd.Parameters.ContainsKey('GpuSampleIntervalSec')) {
+        $invokeParams['GpuSampleIntervalSec'] = $GpuIntervalSec
+    }
+    return Invoke-LumaBridgeHostProcess @invokeParams
+}
+
 if ($DryRun) {
-    $signingDry = & $signingScript `
-        -Configuration $Configuration `
-        -StagingDir $StagingDir `
-        -CertificateThumbprint $CertificateThumbprint `
-        -CertificateSubject $CertificateSubject `
-        -CreateTestCertificateIfMissing:$CreateTestCertificateIfMissing `
-        -TrustCertificate:$TrustCertificate `
-        -DryRun
+    $signingDry = $null
+    if ($ReuseSignedStaging) {
+        $reusedStagingVerification = Test-LumaBridgeReusedSignedStaging `
+            -StagingDir $StagingDir `
+            -OutputDir $OutputDir `
+            -SourcePackageDir $sourcePackageDir `
+            -ExpectedSignerThumbprint $CertificateThumbprint `
+            -AllowUntrustedChain:$effectiveAllowUntrusted `
+            -VerifyInstalledBinding:$SkipDriverInstall `
+            -InstalledInstance $preExistingInstance `
+            -DriverStorePackages $initialDriverStorePackages
+    }
+    else {
+        $signingDry = & $signingScript `
+            -Configuration $Configuration `
+            -StagingDir $StagingDir `
+            -CertificateThumbprint $CertificateThumbprint `
+            -CertificateSubject $CertificateSubject `
+            -CreateTestCertificateIfMissing:$CreateTestCertificateIfMissing `
+            -TrustCertificate:$TrustCertificate `
+            -DryRun
+    }
 
     $etwStartDry = & $etwScript -Action Start -OutputDir $etwDir -CoreMaxFileSizeMb $effectiveCoreEtwMaxMb -IncludeDxgKrnl:$IncludeDxgKrnl -DryRun
     if (-not $SkipDriverInstall) {
@@ -1200,19 +1312,19 @@ if ($DryRun) {
 
     $smokeDry = $null
     if ($runSmokeProfile) {
-        $smokeDry = Invoke-LumaBridgeHostProcess -ExecutablePath $HostExecutablePath -Arguments (Build-SmokeHostArgs -JsonOut $hostSmokeJsonPath) -HardTimeoutMs $timeoutPlan['Smoke'].HardTimeoutMs -ResourceSampleIntervalSec $ResourceSampleIntervalSec -DryRun
+        $smokeDry = Invoke-LumaBridgeValidationHostCompat -ExecutablePath $HostExecutablePath -Arguments (Build-SmokeHostArgs -JsonOut $hostSmokeJsonPath) -HardTimeoutMs $timeoutPlan['Smoke'].HardTimeoutMs -SampleIntervalSec $ResourceSampleIntervalSec -GpuIntervalSec $GpuSampleIntervalSec -DryRun
     }
     $perfDry = $null
     if ($runPerfProfile) {
-        $perfDry = Invoke-LumaBridgeHostProcess -ExecutablePath $HostExecutablePath -Arguments (Build-PerfHostArgs -JsonOut $hostPerfJsonPath) -HardTimeoutMs $timeoutPlan['Performance'].HardTimeoutMs -ResourceSampleIntervalSec $ResourceSampleIntervalSec -DryRun
+        $perfDry = Invoke-LumaBridgeValidationHostCompat -ExecutablePath $HostExecutablePath -Arguments (Build-PerfHostArgs -JsonOut $hostPerfJsonPath) -HardTimeoutMs $timeoutPlan['Performance'].HardTimeoutMs -SampleIntervalSec $ResourceSampleIntervalSec -GpuIntervalSec $GpuSampleIntervalSec -DryRun
     }
     $bench30sDry = $null
     if ($runBenchmark30sProfile) {
-        $bench30sDry = Invoke-LumaBridgeHostProcess -ExecutablePath $HostExecutablePath -Arguments (Build-ProlongedHostArgs -JsonOut $hostBench30sJsonPath -DurationSec $BenchmarkDurationSec) -HardTimeoutMs $timeoutPlan['Benchmark30s'].HardTimeoutMs -ResourceSampleIntervalSec $ResourceSampleIntervalSec -DryRun
+        $bench30sDry = Invoke-LumaBridgeValidationHostCompat -ExecutablePath $HostExecutablePath -Arguments (Build-ProlongedHostArgs -JsonOut $hostBench30sJsonPath -DurationSec $BenchmarkDurationSec) -HardTimeoutMs $timeoutPlan['Benchmark30s'].HardTimeoutMs -SampleIntervalSec $ResourceSampleIntervalSec -GpuIntervalSec $GpuSampleIntervalSec -DryRun
     }
     $stabilityDry = $null
     if ($runStabilityProfile) {
-        $stabilityDry = Invoke-LumaBridgeHostProcess -ExecutablePath $HostExecutablePath -Arguments (Build-ProlongedHostArgs -JsonOut $hostStabilityJsonPath -DurationSec $StabilityDurationSec) -HardTimeoutMs $timeoutPlan['ProlongedStability'].HardTimeoutMs -ResourceSampleIntervalSec $ResourceSampleIntervalSec -DryRun
+        $stabilityDry = Invoke-LumaBridgeValidationHostCompat -ExecutablePath $HostExecutablePath -Arguments (Build-ProlongedHostArgs -JsonOut $hostStabilityJsonPath -DurationSec $StabilityDurationSec) -HardTimeoutMs $timeoutPlan['ProlongedStability'].HardTimeoutMs -SampleIntervalSec $ResourceSampleIntervalSec -GpuIntervalSec $GpuSampleIntervalSec -DryRun
     }
 
     $etwStopDry = & $etwScript -Action Stop -OutputDir $etwDir -IncludeDxgKrnl:$IncludeDxgKrnl -DryRun
@@ -1225,6 +1337,8 @@ if ($DryRun) {
         RunId                      = $runId
         Configuration              = $Configuration
         TestProfile                = $TestProfile
+        StagingMode                = $stagingMode
+        ReusedStagingVerification  = $reusedStagingVerification
         Branch                     = $currentBranch
         PreValidationState         = $preValidationState
         InitialSystemSnapshot      = $initialSnapshot
@@ -1259,46 +1373,84 @@ if (-not (Confirm-LumaBridgeAction -PromptMessage $authPrompt -Force:$Force)) {
 }
 
 # -------------------------------------------------------------------------
-# Stage 3 & Stage 4: Prepare isolated signed staging ($signResult.StagingDir) & verify
+# Stage 3 & Stage 4: Prepare or verify isolated signed staging & verify
 # -------------------------------------------------------------------------
-$signResult = & $signingScript `
-    -Configuration $Configuration `
-    -StagingDir $StagingDir `
-    -CertificateThumbprint $CertificateThumbprint `
-    -CertificateSubject $CertificateSubject `
-    -CreateTestCertificateIfMissing:$CreateTestCertificateIfMissing `
-    -TrustCertificate:$TrustCertificate `
-    -Force
-
-if ($null -eq $signResult -or [string]::IsNullOrWhiteSpace($signResult.StagingDir)) {
-    throw 'Invoke-LumaBridgePackageSigning.ps1 did not return StagingDir.'
+$preReuseLoadedModulePath = $null
+if ($ReuseSignedStaging -and $SkipDriverInstall) {
+    foreach ($wp in @($initialWudfProcs)) {
+        $lmp = Get-LumaBridgeValidationOptionalProp -InputObject $wp -PropertyName 'LoadedDriverModulePath' -DefaultValue $null
+        if ($wp.IsLumaBridgeHost -and -not [string]::IsNullOrWhiteSpace([string]$lmp)) {
+            $preReuseLoadedModulePath = [string]$lmp
+            break
+        }
+    }
 }
-$signedStagingDir = $signResult.StagingDir
-$signedThumbprint = $signResult.CertificateThumbprint
-$didTrustCert = [bool]$signResult.CertificateTrusted
-$certCreatedInRun = [bool](Get-LumaBridgeValidationOptionalProp -InputObject $signResult -PropertyName 'CertificateCreatedInRun' -DefaultValue $false)
-$certTrustedInRun = [bool](Get-LumaBridgeValidationOptionalProp -InputObject $signResult -PropertyName 'CertificateTrustedInRun' -DefaultValue $false)
+
+if ($ReuseSignedStaging) {
+    $reusedStagingVerification = Test-LumaBridgeReusedSignedStaging `
+        -StagingDir $StagingDir `
+        -OutputDir $OutputDir `
+        -SourcePackageDir $sourcePackageDir `
+        -ExpectedSignerThumbprint $CertificateThumbprint `
+        -AllowUntrustedChain:$effectiveAllowUntrusted `
+        -VerifyInstalledBinding:$SkipDriverInstall `
+        -InstalledInstance $preExistingInstance `
+        -DriverStorePackages $initialDriverStorePackages `
+        -LoadedModulePath $preReuseLoadedModulePath
+
+    $signedStagingDir = $reusedStagingVerification.StagingDir
+    $signedThumbprint = $reusedStagingVerification.SignerThumbprint
+    $didTrustCert = $true
+    $certCreatedInRun = $false
+    $certTrustedInRun = $false
+    $packageVerify = $reusedStagingVerification.ArtifactVerify
+}
+else {
+    $signResult = & $signingScript `
+        -Configuration $Configuration `
+        -StagingDir $StagingDir `
+        -CertificateThumbprint $CertificateThumbprint `
+        -CertificateSubject $CertificateSubject `
+        -CreateTestCertificateIfMissing:$CreateTestCertificateIfMissing `
+        -TrustCertificate:$TrustCertificate `
+        -Force
+
+    if ($null -eq $signResult -or [string]::IsNullOrWhiteSpace($signResult.StagingDir)) {
+        throw 'Invoke-LumaBridgePackageSigning.ps1 did not return StagingDir.'
+    }
+    $signedStagingDir = $signResult.StagingDir
+    $signedThumbprint = $signResult.CertificateThumbprint
+    $didTrustCert = [bool]$signResult.CertificateTrusted
+    $certCreatedInRun = [bool](Get-LumaBridgeValidationOptionalProp -InputObject $signResult -PropertyName 'CertificateCreatedInRun' -DefaultValue $false)
+    $certTrustedInRun = [bool](Get-LumaBridgeValidationOptionalProp -InputObject $signResult -PropertyName 'CertificateTrustedInRun' -DefaultValue $false)
+
+    $packageVerify = Test-LumaBridgePackageArtifacts `
+        -PackageDirectory $signedStagingDir `
+        -ExpectedSignerThumbprint $signedThumbprint `
+        -RequireValidSignature `
+        -AllowUntrustedChain:$effectiveAllowUntrusted
+}
+
 $certWasPreExistingInSnapshot = $false
 if (-not [string]::IsNullOrWhiteSpace($signedThumbprint) -and $null -ne $initialSnapshot -and $null -ne $initialSnapshot.CertificateSnapshot) {
     $certWasPreExistingInSnapshot = (@($initialSnapshot.CertificateSnapshot.MatchingThumbprints | Where-Object { $_ -ieq $signedThumbprint }).Count -gt 0)
 }
 
-$packageVerify = Test-LumaBridgePackageArtifacts `
-    -PackageDirectory $signedStagingDir `
-    -ExpectedSignerThumbprint $signedThumbprint `
-    -RequireValidSignature `
-    -AllowUntrustedChain:$effectiveAllowUntrusted
-
-$postSignBuildHashes = [ordered]@{
-    InfSha256  = (Get-FileHash -LiteralPath $sourceInf -Algorithm SHA256).Hash
-    DllSha256  = (Get-FileHash -LiteralPath $sourceDll -Algorithm SHA256).Hash
-    CatSha256  = if (Test-Path -LiteralPath $sourceCat -PathType Leaf) { (Get-FileHash -LiteralPath $sourceCat -Algorithm SHA256).Hash } else { $null }
-    HostSha256 = (Get-FileHash -LiteralPath $HostExecutablePath -Algorithm SHA256).Hash
+if (-not $ReuseSignedStaging) {
+    $postSignBuildHashes = [ordered]@{
+        InfSha256  = (Get-FileHash -LiteralPath $sourceInf -Algorithm SHA256).Hash
+        DllSha256  = (Get-FileHash -LiteralPath $sourceDll -Algorithm SHA256).Hash
+        CatSha256  = if (Test-Path -LiteralPath $sourceCat -PathType Leaf) { (Get-FileHash -LiteralPath $sourceCat -Algorithm SHA256).Hash } else { $null }
+        HostSha256 = (Get-FileHash -LiteralPath $HostExecutablePath -Algorithm SHA256).Hash
+    }
+    if ($preBuildHashes.InfSha256 -ne $postSignBuildHashes.InfSha256 -or
+        $preBuildHashes.DllSha256 -ne $postSignBuildHashes.DllSha256 -or
+        $preBuildHashes.HostSha256 -ne $postSignBuildHashes.HostSha256) {
+        throw 'Repository build artifacts were modified unexpectedly during signed staging.'
+    }
 }
-if ($preBuildHashes.InfSha256 -ne $postSignBuildHashes.InfSha256 -or
-    $preBuildHashes.DllSha256 -ne $postSignBuildHashes.DllSha256 -or
-    $preBuildHashes.HostSha256 -ne $postSignBuildHashes.HostSha256) {
-    throw 'Repository build artifacts were modified unexpectedly during signed staging.'
+else {
+    $postSignBuildHashes = $preBuildHashes
 }
 
 if (-not (Test-Path -LiteralPath $OutputDir)) {
@@ -1352,6 +1504,8 @@ $postRunWudfProcs = @()
 $postRunWudfResolution = $null
 $postRunDumpInventory = $null
 $acceptanceCriteria = $null
+$gateStatuses = $null
+$subprofileStatuses = $null
 $validationError = $null
 $driverBindingVerified = $false
 $latencySamplingAudit = @()
@@ -1551,11 +1705,12 @@ try {
             Remove-Item -LiteralPath $JsonOutPath -Force -ErrorAction SilentlyContinue
         }
         $launchUtc = (Get-Date).ToUniversalTime()
-        $procRes = Invoke-LumaBridgeHostProcess `
+        $procRes = Invoke-LumaBridgeValidationHostCompat `
             -ExecutablePath $HostExecutablePath `
             -Arguments $HostArgs `
             -HardTimeoutMs $HardTimeoutMs `
-            -ResourceSampleIntervalSec $ResourceSampleIntervalSec `
+            -SampleIntervalSec $ResourceSampleIntervalSec `
+            -GpuIntervalSec $GpuSampleIntervalSec `
             -WudfProcessId $verifiedPreWudfPid
 
         $resTel = Get-LumaBridgeValidationOptionalProp -InputObject $procRes -PropertyName 'ResourceTelemetry' -DefaultValue $null
@@ -1918,13 +2073,48 @@ try {
     $wudfProcessSelected = if ($null -ne $postRunWudfResolution.Process) { $postRunWudfResolution.Process } else { $preStage9WudfResolution.Process }
 
     $processResourceSummary = [pscustomobject]@{
-        WudfIdentityStatus         = $wudfIdentityStatus
-        VerifiedWudfPid            = if ($null -ne $wudfProcessSelected) { [int]$wudfProcessSelected.Id } else { $null }
-        WudfAssociationMethod      = if ($null -ne $wudfProcessSelected) { $wudfProcessSelected.AssociationMethod } else { $null }
-        ContinuousSampleIntervalSec = $ResourceSampleIntervalSec
-        ContinuousSubprofiles      = @($continuousTelemetryList.ToArray())
-        PrimaryContinuousTelemetry = $primaryContinuousTelemetry
-        HostProcessResourceUsage   = if ($null -ne $primaryEvalSummary) { Get-LumaBridgeValidationOptionalProp $primaryEvalSummary 'ResourceUsage' $null } else { $null }
+        WudfIdentityStatus              = $wudfIdentityStatus
+        VerifiedWudfPid                 = if ($null -ne $wudfProcessSelected) { [int]$wudfProcessSelected.Id } else { $null }
+        WudfAssociationMethod           = if ($null -ne $wudfProcessSelected) { $wudfProcessSelected.AssociationMethod } else { $null }
+        ContinuousSampleIntervalSec     = $ResourceSampleIntervalSec
+        GpuSampleIntervalSec            = $GpuSampleIntervalSec
+        EffectiveLightweightIntervalSec = if ($null -ne $primaryContinuousTelemetry -and ($primaryContinuousTelemetry.PSObject.Properties.Name -contains 'EffectiveLightweightIntervalSec')) { $primaryContinuousTelemetry.EffectiveLightweightIntervalSec } else { $null }
+        EffectiveGpuSampleIntervalSec   = if ($null -ne $primaryContinuousTelemetry -and ($primaryContinuousTelemetry.PSObject.Properties.Name -contains 'EffectiveGpuSampleIntervalSec')) { $primaryContinuousTelemetry.EffectiveGpuSampleIntervalSec } else { $null }
+        MemoryLeakAssessment            = if ($null -ne $primaryContinuousTelemetry -and ($primaryContinuousTelemetry.PSObject.Properties.Name -contains 'MemoryLeakAssessment')) { $primaryContinuousTelemetry.MemoryLeakAssessment } else { $null }
+        ContinuousSubprofiles           = @($continuousTelemetryList.ToArray())
+        PrimaryContinuousTelemetry      = $primaryContinuousTelemetry
+        HostProcessResourceUsage        = if ($null -ne $primaryEvalSummary) { Get-LumaBridgeValidationOptionalProp $primaryEvalSummary 'ResourceUsage' $null } else { $null }
+    }
+
+    $gateStatuses = [pscustomobject]@{
+        DriverBinding        = if ($driverBindingVerified -and $cmProbNone -and $adapterInitFinishedOk) { 'PASS' } else { 'FAIL' }
+        VirtualMonitor       = if ($virtualMonitorActive) { 'PASS' } else { 'FAIL' }
+        WudfHostIdentity     = if ($wudfProcessHealthy) { 'PASS' } else { 'FAIL' }
+        FunctionalSmoke      = if (-not $runSmokeProfile) { 'NOT_TESTED' } elseif ($null -eq $smokeEvalObj) { 'BLOCKED' } elseif ($functionalSmokePassed) { 'PASS' } else { 'FAIL' }
+        Performance          = if (-not $runPerfProfile) { 'NOT_TESTED' } elseif ($null -eq $perfEvalObj) { 'BLOCKED' } elseif ($perfTargetReached) { 'PASS' } else { 'FAIL' }
+        Benchmark30s         = if (-not $runBenchmark30sProfile) { 'NOT_TESTED' } elseif ($null -eq $bench30sEvalObj) { 'BLOCKED' } elseif ($bench30sPassed) { 'PASS' } else { 'FAIL' }
+        ProlongedStability   = if (-not $runStabilityProfile) { 'NOT_TESTED' } elseif ($null -eq $stabEvalObj) { 'BLOCKED' } elseif ($stabilityPassed) { 'PASS' } else { 'FAIL' }
+        ProlongedStabilityProven = if (-not $runStabilityProfile) { 'NOT_TESTED' } elseif ($prolongedStabilityProven) { 'PASS' } else { 'FAIL' }
+        GpuShared            = if (-not $RequireGpuShared -and $TransportMode -eq 'Cpu') { 'NOT_APPLICABLE' } elseif ($gpuSharedPassed) { 'PASS' } elseif ($RequireGpuShared) { 'FAIL' } else { 'NOT_TESTED' }
+        Nvenc                = if (-not ($EnableNvenc -or $RequireNvenc)) { 'NOT_APPLICABLE' } elseif ($nvencPassed) { 'PASS' } else { 'FAIL' }
+        H264StructuralDecode = if (-not $VerifyH264Decode) { 'NOT_APPLICABLE' } elseif ($structuralDecodeValidated) { 'PASS' } else { 'FAIL' }
+        H264FidelityPsnr     = if ($fidelityPsnrValidated) { 'PASS' } elseif (-not [string]::IsNullOrWhiteSpace($SyntheticFidelityExecutablePath)) { 'FAIL' } else { 'NOT_TESTED' }
+        TemporalConsistency  = if ($sequenceAndTimestampsOk) { 'PASS' } else { 'FAIL' }
+    }
+
+    $resolveSubprofileStatus = {
+        param([bool]$Requested, [string]$SubKey)
+        if (-not $Requested) { return 'NOT_TESTED' }
+        if ($subprofileEvaluations.Contains($SubKey)) {
+            return $(if ([bool]$subprofileEvaluations[$SubKey].Passed) { 'PASS' } else { 'FAIL' })
+        }
+        return 'BLOCKED'
+    }
+    $subprofileStatuses = [pscustomobject]@{
+        Smoke              = (& $resolveSubprofileStatus $runSmokeProfile 'Smoke')
+        Performance        = (& $resolveSubprofileStatus $runPerfProfile 'Performance')
+        Benchmark30s       = (& $resolveSubprofileStatus $runBenchmark30sProfile 'Benchmark30s')
+        ProlongedStability = (& $resolveSubprofileStatus $runStabilityProfile 'ProlongedStability')
     }
 
     $acceptanceCriteria = [pscustomobject]@{
@@ -1989,6 +2179,7 @@ try {
         $skipEvalNames = @(
             'RunId', 'AllPassed', 'RollbackClean', 'RuntimeCleanupSucceeded', 'SystemStateRestored', 'DriverBindingPersisted', 'OverallSucceeded',
             'FramesReceived', 'FramesValid', 'FrameTargetReached', 'WudfIdentityStatus',
+            'FunctionalSmokePassed',
             'PerformanceTestExecuted', 'PerformanceTargetReached',
             'Benchmark30sExecuted', 'Benchmark30sPassed',
             'ProlongedStabilityExecuted', 'ProlongedStabilityPassed', 'ProlongedStabilityProven',
@@ -1999,6 +2190,7 @@ try {
             'HasEstimatedPercentiles'
         )
         $failedFlags = @($acceptanceCriteria.PSObject.Properties | Where-Object { $_.Name -notin $skipEvalNames -and -not [bool]$_.Value } | ForEach-Object { $_.Name })
+        if ($runSmokeProfile -and -not $functionalSmokePassed) { $failedFlags += 'FunctionalSmokePassed' }
         if ($runPerfProfile -and -not $perfTargetReached) { $failedFlags += 'PerformanceTargetReached' }
         if ($runBenchmark30sProfile -and -not $bench30sPassed) { $failedFlags += 'Benchmark30sPassed' }
         if ($runStabilityProfile -and -not $stabilityPassed) { $failedFlags += 'ProlongedStabilityPassed' }
@@ -2316,11 +2508,39 @@ finally {
         'Preserve pre-existing certificates (e.g., 1EEFC55BD7EEB2A9115432607B97978736B9DFE0) and historical Driver Store packages unless explicitly authorized.'
     )
 
+    if ($null -eq $subprofileStatuses) {
+        $subprofileStatuses = [pscustomobject]@{
+            Smoke              = if ($runSmokeProfile) { 'BLOCKED' } else { 'NOT_TESTED' }
+            Performance        = if ($runPerfProfile) { 'BLOCKED' } else { 'NOT_TESTED' }
+            Benchmark30s       = if ($runBenchmark30sProfile) { 'BLOCKED' } else { 'NOT_TESTED' }
+            ProlongedStability = if ($runStabilityProfile) { 'BLOCKED' } else { 'NOT_TESTED' }
+        }
+    }
+    if ($null -eq $gateStatuses) {
+        $gateStatuses = [pscustomobject]@{
+            DriverBinding        = if ($driverBindingVerified) { 'PASS' } else { 'BLOCKED' }
+            VirtualMonitor       = if ($modifiedVirtMon) { 'BLOCKED' } else { 'NOT_TESTED' }
+            WudfHostIdentity     = 'NOT_TESTED'
+            FunctionalSmoke      = if ($runSmokeProfile) { 'BLOCKED' } else { 'NOT_TESTED' }
+            Performance          = if ($runPerfProfile) { 'BLOCKED' } else { 'NOT_TESTED' }
+            Benchmark30s         = if ($runBenchmark30sProfile) { 'BLOCKED' } else { 'NOT_TESTED' }
+            ProlongedStability   = if ($runStabilityProfile) { 'BLOCKED' } else { 'NOT_TESTED' }
+            ProlongedStabilityProven = if ($runStabilityProfile) { 'BLOCKED' } else { 'NOT_TESTED' }
+            GpuShared            = if ($RequireGpuShared) { 'BLOCKED' } else { 'NOT_APPLICABLE' }
+            Nvenc                = if ($EnableNvenc -or $RequireNvenc) { 'BLOCKED' } else { 'NOT_APPLICABLE' }
+            H264StructuralDecode = if ($VerifyH264Decode) { 'BLOCKED' } else { 'NOT_APPLICABLE' }
+            H264FidelityPsnr     = 'NOT_TESTED'
+            TemporalConsistency  = 'NOT_TESTED'
+        }
+    }
+
     $reportPayload = [pscustomobject]@{
         RunId                         = $runId
         CompletedAtUtc                = (Get-Date).ToUniversalTime().ToString('o')
         Configuration                 = $Configuration
         TestProfile                   = $TestProfile
+        StagingMode                   = $stagingMode
+        ReusedStagingVerification     = $reusedStagingVerification
         Branch                        = $currentBranch
         PreValidationState            = $preValidationState
         InitialSystemSnapshot         = $initialSnapshot
@@ -2363,6 +2583,8 @@ finally {
         DiagnosticsResult             = $diagResult
         DiagnosticsCollectionError    = $diagCollectionError
         AcceptanceCriteria            = $acceptanceCriteria
+        GateStatuses                  = $gateStatuses
+        SubprofileStatuses            = $subprofileStatuses
         FunctionalValidationSucceeded = $functionalValidationSucceeded
         RuntimeCleanupSucceeded       = $runtimeCleanupSucceeded
         SystemStateRestored           = $systemStateRestored
@@ -2390,8 +2612,12 @@ finally {
         $mdLines.Add('# LumaBridge M4.2.1 Functional Validation Report')
         $mdLines.Add('')
         $mdLines.Add(("- RunId: ``{0}`` | Completed UTC: ``{1}``" -f $runId, $reportPayload.CompletedAtUtc))
-        $mdLines.Add(("- Branch: ``{0}`` | Configuration: ``{1}`` | Profile: ``{2}``" -f $currentBranch, $Configuration, $TestProfile))
+        $mdLines.Add(("- Branch: ``{0}`` | Configuration: ``{1}`` | Profile: ``{2}`` | StagingMode: ``{3}``" -f $currentBranch, $Configuration, $TestProfile, $stagingMode))
         $mdLines.Add(("- Staged Package (``StagingDir``): ``{0}``" -f $signedStagingDir))
+        if ($null -ne $subprofileStatuses) {
+            $mdLines.Add(("- SubprofileStatuses: Smoke=``{0}``, Performance=``{1}``, Benchmark30s=``{2}``, ProlongedStability=``{3}``" -f `
+                $subprofileStatuses.Smoke, $subprofileStatuses.Performance, $subprofileStatuses.Benchmark30s, $subprofileStatuses.ProlongedStability))
+        }
         $mdLines.Add(("- FunctionalValidationSucceeded: ``{0}`` | RuntimeCleanupSucceeded: ``{1}`` | SystemStateRestored: ``{2}`` | DriverBindingPersisted: ``{3}`` | RollbackClean: ``{4}`` | OverallSucceeded: ``{5}``" -f `
             $functionalValidationSucceeded, $runtimeCleanupSucceeded, $systemStateRestored, $driverBindingPersisted, $rollbackClean, $overallSucceeded))
         $mdLines.Add(("- Rollback Scope: {0}" -f $rollbackScopeNote))
@@ -2480,6 +2706,8 @@ return [pscustomobject]@{
     RollbackScopeNote             = $rollbackScopeNote
     Configuration                 = $Configuration
     TestProfile                   = $TestProfile
+    StagingMode                   = $stagingMode
+    ReusedStagingVerification     = $reusedStagingVerification
     Branch                        = $currentBranch
     StagingDir                    = $signedStagingDir
     OutputDir                     = $OutputDir
@@ -2491,6 +2719,8 @@ return [pscustomobject]@{
     Benchmark30sSummaryPath       = $hostBench30sJsonPath
     StabilitySummaryPath          = $hostStabilityJsonPath
     SubprofileEvaluations         = [pscustomobject]$subprofileEvaluations
+    SubprofileStatuses            = $subprofileStatuses
+    GateStatuses                  = $gateStatuses
     SmokeSummary                  = $smokeSummary
     PerfSummary                   = $perfSummary
     Benchmark30sSummary           = $bench30sSummary

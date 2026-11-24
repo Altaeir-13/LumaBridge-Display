@@ -836,6 +836,9 @@ function Invoke-LumaBridgeHostProcess {
         [ValidateRange(0, 300)]
         [int]$ResourceSampleIntervalSec = 0,
 
+        [ValidateRange(0, 300)]
+        [int]$GpuSampleIntervalSec = 15,
+
         [Nullable[int]]$WudfProcessId = $null,
 
         [switch]$DryRun
@@ -851,13 +854,14 @@ function Invoke-LumaBridgeHostProcess {
     }) -join ' '
 
     if ($DryRun) {
-        Write-Host ("[DRY-RUN] Would run host process (timeout={0}ms, sampleIntervalSec={1}): `"{2}`" {3}" -f $HardTimeoutMs, $ResourceSampleIntervalSec, $ExecutablePath, $escapedArgs) -ForegroundColor Cyan
+        Write-Host ("[DRY-RUN] Would run host process (timeout={0}ms, sampleIntervalSec={1}, gpuSampleIntervalSec={2}): `"{3}`" {4}" -f $HardTimeoutMs, $ResourceSampleIntervalSec, $GpuSampleIntervalSec, $ExecutablePath, $escapedArgs) -ForegroundColor Cyan
         return [pscustomobject]@{
             ExitCode                  = 0
             TimedOut                  = $false
             ProcessId                 = $null
             HardTimeoutMs             = $HardTimeoutMs
             ResourceSampleIntervalSec = $ResourceSampleIntervalSec
+            GpuSampleIntervalSec      = $GpuSampleIntervalSec
             ResourceTelemetry         = $null
             Output                    = @()
             StdErr                    = @()
@@ -881,8 +885,34 @@ function Invoke-LumaBridgeHostProcess {
     $proc.StartInfo = $psi
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $samplesList = New-Object System.Collections.Generic.List[object]
+    $lightweightTimestampsMs = New-Object System.Collections.Generic.List[double]
+    $gpuTimestampsMs = New-Object System.Collections.Generic.List[double]
+    $sampleOverheadsMs = New-Object System.Collections.Generic.List[double]
     $wudfExitedDuringRun = $false
     $startedHostPid = $null
+
+    $collectSample = {
+        param([string]$PhaseName, [bool]$IncludeGpu)
+        $sampleSw = [System.Diagnostics.Stopwatch]::StartNew()
+        $snap = Get-LumaBridgeProcessResourceSnapshot `
+            -HostPid $startedHostPid `
+            -WudfPid $WudfProcessId `
+            -Phase $PhaseName `
+            -SkipGpuCounters:(-not $IncludeGpu)
+        $sampleSw.Stop()
+        $overheadMs = [Math]::Round($sampleSw.Elapsed.TotalMilliseconds, 2)
+        $elapsedMsNow = [Math]::Round($stopwatch.Elapsed.TotalMilliseconds, 2)
+        $snap | Add-Member -NotePropertyName 'SampleCollectionOverheadMs' -NotePropertyValue $overheadMs -Force
+        $snap | Add-Member -NotePropertyName 'IncludedGpuCounters' -NotePropertyValue $IncludeGpu -Force
+        $snap | Add-Member -NotePropertyName 'ElapsedMs' -NotePropertyValue $elapsedMsNow -Force
+        $samplesList.Add($snap)
+        $lightweightTimestampsMs.Add($elapsedMsNow)
+        $sampleOverheadsMs.Add($overheadMs)
+        if ($IncludeGpu) {
+            $gpuTimestampsMs.Add($elapsedMsNow)
+        }
+        return $snap
+    }
 
     try {
         if (-not $proc.Start()) {
@@ -894,10 +924,12 @@ function Invoke-LumaBridgeHostProcess {
         $stderrTask = $proc.StandardError.ReadToEndAsync()
 
         $exited = $false
+        $lastGpuSampleAtMs = [int64]0
         if ($ResourceSampleIntervalSec -gt 0) {
             $sampleIntervalMs = $ResourceSampleIntervalSec * 1000
-            $initSnap = Get-LumaBridgeProcessResourceSnapshot -HostPid $startedHostPid -WudfPid $WudfProcessId -Phase 'Start'
-            $samplesList.Add($initSnap)
+            $gpuIntervalMs = if ($GpuSampleIntervalSec -gt 0) { [int64]$GpuSampleIntervalSec * 1000 } else { [int64]0 }
+            $initSnap = & $collectSample 'Start' ($gpuIntervalMs -gt 0)
+            $lastGpuSampleAtMs = [int64]$stopwatch.ElapsedMilliseconds
             if ($null -ne $WudfProcessId -and $null -ne $initSnap.WudfHost -and -not $initSnap.WudfHost.Available) {
                 $wudfExitedDuringRun = $true
             }
@@ -914,8 +946,12 @@ function Invoke-LumaBridgeHostProcess {
                     $exited = $true
                     break
                 }
-                $activeSnap = Get-LumaBridgeProcessResourceSnapshot -HostPid $startedHostPid -WudfPid $WudfProcessId -Phase 'Active'
-                $samplesList.Add($activeSnap)
+                $nowElapsedMs = [int64]$stopwatch.ElapsedMilliseconds
+                $includeGpuNow = ($gpuIntervalMs -gt 0) -and (($nowElapsedMs - $lastGpuSampleAtMs) -ge $gpuIntervalMs)
+                $activeSnap = & $collectSample 'Active' $includeGpuNow
+                if ($includeGpuNow) {
+                    $lastGpuSampleAtMs = [int64]$stopwatch.ElapsedMilliseconds
+                }
                 if ($null -ne $WudfProcessId -and $null -ne $activeSnap.WudfHost -and -not $activeSnap.WudfHost.Available) {
                     $wudfExitedDuringRun = $true
                 }
@@ -938,8 +974,8 @@ function Invoke-LumaBridgeHostProcess {
         $stopwatch.Stop()
 
         if ($ResourceSampleIntervalSec -gt 0) {
-            $endSnap = Get-LumaBridgeProcessResourceSnapshot -HostPid $startedHostPid -WudfPid $WudfProcessId -Phase 'End'
-            $samplesList.Add($endSnap)
+            # Never run expensive wildcard Get-Counter queries on End phase after host exit.
+            $endSnap = & $collectSample 'End' $false
             if ($null -ne $WudfProcessId -and $null -ne $endSnap.WudfHost -and -not $endSnap.WudfHost.Available) {
                 $wudfExitedDuringRun = $true
             }
@@ -976,15 +1012,95 @@ function Invoke-LumaBridgeHostProcess {
         $resourceTelemetry = $null
         if ($ResourceSampleIntervalSec -gt 0) {
             $sampledArray = @($samplesList.ToArray())
+            $hostSeries = Measure-LumaBridgeResourceSeriesSummary -Samples $sampledArray -Role 'Host'
+            $wudfSeries = Measure-LumaBridgeResourceSeriesSummary -Samples $sampledArray -Role 'WudfHost'
+
+            $effLightSec = [double]$ResourceSampleIntervalSec
+            if ($lightweightTimestampsMs.Count -ge 2) {
+                $spanMs = $lightweightTimestampsMs[$lightweightTimestampsMs.Count - 1] - $lightweightTimestampsMs[0]
+                if ($spanMs -gt 0) {
+                    $effLightSec = [Math]::Round(($spanMs / [double]($lightweightTimestampsMs.Count - 1)) / 1000.0, 3)
+                }
+            }
+            $effGpuSec = $null
+            if ($gpuTimestampsMs.Count -ge 2) {
+                $gpuSpanMs = $gpuTimestampsMs[$gpuTimestampsMs.Count - 1] - $gpuTimestampsMs[0]
+                if ($gpuSpanMs -gt 0) {
+                    $effGpuSec = [Math]::Round(($gpuSpanMs / [double]($gpuTimestampsMs.Count - 1)) / 1000.0, 3)
+                }
+            }
+            elseif ($gpuTimestampsMs.Count -eq 1 -and $GpuSampleIntervalSec -gt 0) {
+                $effGpuSec = [double]$GpuSampleIntervalSec
+            }
+
+            $avgOverheadMs = if ($sampleOverheadsMs.Count -gt 0) {
+                [Math]::Round((($sampleOverheadsMs | Measure-Object -Average).Average), 2)
+            } else { 0.0 }
+            $maxOverheadMs = if ($sampleOverheadsMs.Count -gt 0) {
+                [Math]::Round((($sampleOverheadsMs | Measure-Object -Maximum).Maximum), 2)
+            } else { 0.0 }
+
+            $hostLeakMonotonic = $false
+            if ($null -ne $hostSeries.WorkingSetMB -and $hostSeries.WorkingSetMB.Status -eq 'MEASURED' -and $hostSeries.WorkingSetMB.SampleCount -ge 3) {
+                $wsVals = @($sampledArray | Where-Object { $null -ne $_.Host -and $_.Host.Available -and $null -ne $_.Host.WorkingSetMB } | ForEach-Object { [double]$_.Host.WorkingSetMB })
+                if ($wsVals.Count -ge 3) {
+                    $strictUp = $true
+                    for ($idx = 1; $idx -lt $wsVals.Count; ++$idx) {
+                        if ($wsVals[$idx] -le $wsVals[$idx - 1]) { $strictUp = $false; break }
+                    }
+                    $hostLeakMonotonic = $strictUp -and (($wsVals[$wsVals.Count - 1] - $wsVals[0]) -gt 16.0)
+                }
+            }
+            $wudfLeakMonotonic = $false
+            if ($null -ne $wudfSeries.WorkingSetMB -and $wudfSeries.WorkingSetMB.Status -eq 'MEASURED' -and $wudfSeries.WorkingSetMB.SampleCount -ge 3) {
+                $wsWVals = @($sampledArray | Where-Object { $null -ne $_.WudfHost -and $_.WudfHost.Available -and $null -ne $_.WudfHost.WorkingSetMB } | ForEach-Object { [double]$_.WudfHost.WorkingSetMB })
+                if ($wsWVals.Count -ge 3) {
+                    $strictUpW = $true
+                    for ($idx = 1; $idx -lt $wsWVals.Count; ++$idx) {
+                        if ($wsWVals[$idx] -le $wsWVals[$idx - 1]) { $strictUpW = $false; break }
+                    }
+                    $wudfLeakMonotonic = $strictUpW -and (($wsWVals[$wsWVals.Count - 1] - $wsWVals[0]) -gt 16.0)
+                }
+            }
+
+            $memLeakStatus = if ($lightweightTimestampsMs.Count -lt 2) {
+                'INSUFFICIENT_SAMPLES'
+            }
+            elseif ($hostLeakMonotonic -or $wudfLeakMonotonic) {
+                'GROWTH_OBSERVED'
+            }
+            else {
+                'BOUNDED'
+            }
+            $memoryLeakAssessment = [pscustomobject]@{
+                Status                      = $memLeakStatus
+                HostWorkingSetDeltaMB       = if ($null -ne $hostSeries.WorkingSetMB) { $hostSeries.WorkingSetMB.Delta } else { $null }
+                HostPrivateMemoryDeltaMB    = if ($null -ne $hostSeries.PrivateMemoryMB) { $hostSeries.PrivateMemoryMB.Delta } else { $null }
+                HostHandleDelta             = if ($null -ne $hostSeries.HandleCount) { $hostSeries.HandleCount.Delta } else { $null }
+                WudfWorkingSetDeltaMB       = if ($null -ne $wudfSeries.WorkingSetMB) { $wudfSeries.WorkingSetMB.Delta } else { $null }
+                WudfPrivateMemoryDeltaMB    = if ($null -ne $wudfSeries.PrivateMemoryMB) { $wudfSeries.PrivateMemoryMB.Delta } else { $null }
+                WudfHandleDelta             = if ($null -ne $wudfSeries.HandleCount) { $wudfSeries.HandleCount.Delta } else { $null }
+                HostMonotonicGrowthDetected = $hostLeakMonotonic
+                WudfMonotonicGrowthDetected = $wudfLeakMonotonic
+            }
+
             $resourceTelemetry = [pscustomobject]@{
-                SampleIntervalSec          = $ResourceSampleIntervalSec
-                SampleCount                = $sampledArray.Count
-                HostProcessId              = $startedHostPid
-                WudfProcessId              = $WudfProcessId
-                WudfProcessExitedDuringRun = $wudfExitedDuringRun
-                HostSummary                = Measure-LumaBridgeResourceSeriesSummary -Samples $sampledArray -Role 'Host'
-                WudfSummary                = Measure-LumaBridgeResourceSeriesSummary -Samples $sampledArray -Role 'WudfHost'
-                Samples                    = $sampledArray
+                SampleIntervalSec                = $ResourceSampleIntervalSec
+                EffectiveLightweightIntervalSec  = $effLightSec
+                GpuSampleIntervalSec             = $GpuSampleIntervalSec
+                EffectiveGpuSampleIntervalSec    = $effGpuSec
+                SampleCount                      = $sampledArray.Count
+                LightweightSampleCount           = $lightweightTimestampsMs.Count
+                GpuSampleCount                   = $gpuTimestampsMs.Count
+                AvgSampleCollectionOverheadMs    = $avgOverheadMs
+                MaxSampleCollectionOverheadMs    = $maxOverheadMs
+                HostProcessId                    = $startedHostPid
+                WudfProcessId                    = $WudfProcessId
+                WudfProcessExitedDuringRun       = $wudfExitedDuringRun
+                HostSummary                      = $hostSeries
+                WudfSummary                      = $wudfSeries
+                MemoryLeakAssessment             = $memoryLeakAssessment
+                Samples                          = $sampledArray
             }
         }
 
@@ -996,6 +1112,7 @@ function Invoke-LumaBridgeHostProcess {
             DurationMs                = [Math]::Round($stopwatch.Elapsed.TotalMilliseconds, 2)
             HardTimeoutMs             = $HardTimeoutMs
             ResourceSampleIntervalSec = $ResourceSampleIntervalSec
+            GpuSampleIntervalSec      = $GpuSampleIntervalSec
             ResourceTelemetry         = $resourceTelemetry
             Output                    = $stdoutLines
             StdErr                    = $stderrLines
@@ -2690,6 +2807,142 @@ function Test-LumaBridgePackageArtifacts {
     }
 
     return $result
+}
+
+function Test-LumaBridgePathsOverlap {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PathA,
+        [Parameter(Mandatory = $true)]
+        [string]$PathB
+    )
+
+    $normA = [System.IO.Path]::GetFullPath($PathA).TrimEnd('\', '/')
+    $normB = [System.IO.Path]::GetFullPath($PathB).TrimEnd('\', '/')
+    $prefixA = $normA + '\'
+    $prefixB = $normB + '\'
+    return (
+        ($normA -ieq $normB) -or
+        $normA.StartsWith($prefixB, [StringComparison]::OrdinalIgnoreCase) -or
+        $normB.StartsWith($prefixA, [StringComparison]::OrdinalIgnoreCase)
+    )
+}
+
+function Test-LumaBridgeReusedSignedStaging {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$StagingDir,
+
+        [string]$OutputDir,
+
+        [string]$SourcePackageDir,
+
+        [string]$ExpectedSignerThumbprint,
+
+        [switch]$AllowUntrustedChain,
+
+        [switch]$VerifyInstalledBinding,
+
+        $InstalledInstance = $null,
+
+        [object[]]$DriverStorePackages = @(),
+
+        [string]$LoadedModulePath = $null
+    )
+
+    if ([string]::IsNullOrWhiteSpace($StagingDir)) {
+        throw 'ReuseSignedStaging requires a non-empty -StagingDir path.'
+    }
+    if (-not (Test-Path -LiteralPath $StagingDir -PathType Container)) {
+        throw ("ReuseSignedStaging directory does not exist: '{0}'" -f $StagingDir)
+    }
+
+    $resolvedStaging = [System.IO.Path]::GetFullPath($StagingDir).TrimEnd('\', '/')
+    $effectiveSource = if (-not [string]::IsNullOrWhiteSpace($SourcePackageDir)) {
+        $SourcePackageDir
+    }
+    else {
+        Get-LumaBridgePackageDirectory -Configuration 'Release'
+    }
+    $null = Assert-LumaBridgeIsolatedStagingDirectory -StagingDir $resolvedStaging -SourcePackageDir $effectiveSource
+
+    if (-not [string]::IsNullOrWhiteSpace($OutputDir) -and (Test-LumaBridgePathsOverlap -PathA $resolvedStaging -PathB $OutputDir)) {
+        throw ("ReuseSignedStaging directory '{0}' must not overlap OutputDir '{1}'." -f $resolvedStaging, $OutputDir)
+    }
+
+    foreach ($sentinel in @('functional-validation-report.json', 'diagnostics-summary.json', 'lumabridge-host-summary.json')) {
+        if (Test-Path -LiteralPath (Join-Path -Path $resolvedStaging -ChildPath $sentinel)) {
+            throw ("ReuseSignedStaging directory '{0}' appears to be a validation report directory (contains '{1}') and cannot be used as package staging." -f $resolvedStaging, $sentinel)
+        }
+    }
+
+    $verify = Test-LumaBridgePackageArtifacts `
+        -PackageDirectory $resolvedStaging `
+        -ExpectedSignerThumbprint $ExpectedSignerThumbprint `
+        -RequireValidSignature `
+        -AllowUntrustedChain:$AllowUntrustedChain
+
+    $installedBindingVerified = $false
+    $installedBindingDetail = $null
+    if ($VerifyInstalledBinding) {
+        if ($null -eq $InstalledInstance) {
+            throw 'VerifyInstalledBinding requested with ReuseSignedStaging, but no installed PnP instance was found.'
+        }
+
+        $stagedInfPath = Join-Path -Path $resolvedStaging -ChildPath $script:LumaBridgeDriverConstants.InfFileName
+        $stagedDllPath = Join-Path -Path $resolvedStaging -ChildPath $script:LumaBridgeDriverConstants.DllFileName
+        $bindingCheck = Test-LumaBridgeDeviceDriverBinding `
+            -Instance $InstalledInstance `
+            -DriverStorePackages $DriverStorePackages `
+            -ExpectedInfPath $stagedInfPath `
+            -ExpectedDllPath $stagedDllPath `
+            -LoadedModulePath $LoadedModulePath
+
+        $installedBindingDetail = $bindingCheck
+        if ($null -eq $bindingCheck -or (-not [bool]$bindingCheck.IsBound)) {
+            $reasonMsg = if ($null -ne $bindingCheck -and $null -ne $bindingCheck.Reasons) {
+                @($bindingCheck.Reasons) -join '; '
+            }
+            else {
+                'Installed binding metadata did not match reused signed staging.'
+            }
+            throw ("Reused signed staging '{0}' does not match installed device '{1}': {2}" -f $resolvedStaging, $InstalledInstance.InstanceId, $reasonMsg)
+        }
+        $binIdStatus = if (($null -ne $bindingCheck) -and ($bindingCheck.PSObject.Properties.Name -contains 'BinaryIdentityStatus')) {
+            [string]$bindingCheck.BinaryIdentityStatus
+        }
+        else {
+            ''
+        }
+        if ($binIdStatus -eq 'MISMATCH') {
+            throw ("Reused signed staging DLL SHA-256 '{0}' does not match installed driver binary." -f $verify.DllSha256)
+        }
+        $installedBindingVerified = $true
+    }
+
+    return [pscustomobject]@{
+        Valid                    = $true
+        StagingMode              = 'ReusedSignedStaging'
+        StagingDir               = $resolvedStaging
+        InfPath                  = $verify.InfPath
+        DllPath                  = $verify.DllPath
+        CatPath                  = $verify.CatPath
+        InfDriverVersion         = $verify.InfDriverVersion
+        InfDriverVerRaw          = $verify.InfDriverVerRaw
+        SignerThumbprint         = $verify.DllSignerThumbprint
+        InfSha256                = $verify.InfSha256
+        DllSha256                = $verify.DllSha256
+        CatSha256                = $verify.CatSha256
+        CatalogMemberVerified    = $verify.CatalogMemberVerified
+        CatalogHashesVerified    = $verify.CatalogHashesVerified
+        IsCryptographicallyValid = $verify.IsCryptographicallyValid
+        IsValidWithUntrustedRoot = $verify.IsValidWithUntrustedRoot
+        InstalledBindingVerified = $installedBindingVerified
+        InstalledBindingCheck    = $installedBindingDetail
+        VerifiedAtUtc            = (Get-Date).ToUniversalTime().ToString('o')
+        ArtifactVerify           = $verify
+    }
 }
 
 function Get-LumaBridgeDeviceWudfDiagnosticInfo {
@@ -5627,6 +5880,7 @@ Export-ModuleMember -Function @(
     'Test-LumaBridgeCatalogCmsSignature',
     'Invoke-LumaBridgeSigntoolCatalogVerify',
     'Test-LumaBridgePackageArtifacts',
+    'Test-LumaBridgeReusedSignedStaging',
     'Get-LumaBridgeRawWudfProcesses',
     'Get-LumaBridgeWudfHostProcesses',
     'Resolve-LumaBridgeVerifiedWudfHostProcess',
