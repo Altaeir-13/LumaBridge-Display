@@ -54,8 +54,8 @@ cl /nologo /std:c++17 /W4 /WX /EHsc /O2 /Zi /MD /DNDEBUG /DUNICODE /D_UNICODE /I
 - O `AsyncH264ValidationWorker` executa COM MTA (`CoInitializeEx(COINIT_MULTITHREADED)`), inicializacao Media Foundation (`MFStartup`), criacao/uso/liberacao de `IMFTransform`, `Finish()`, `Shutdown()`, `MFShutdown()` e o `CoUninitialize()` pareado integralmente na mesma thread do worker.
 - Fila FIFO limitada a `256` pacotes com ownership por valor (`std::move`), backpressure com `wait_until` monotônico (`EnqueueTimeoutMs`) e encerramento sem `detach()` nem `TerminateThread()`. Caso uma chamada sincrona externa do MFT bloqueie indefinidamente alem de `DrainWaitTimeoutMs`, o worker marca `DrainDeadlineExceeded` / `DrainFailed` e conclui `join()` de forma segura; o `HardTimeoutMs` externo do runner permanece como ultima fronteira de contencao.
 
-## Limites e privacidade
+## Limites, Licenciamento e CI
 
 - Nenhum frame, screenshot ou buffer de pixels e salvo em disco nem lido da area de trabalho pelo estimulo diagnostico.
 - Payload CPU fallback limitado a `4096 x 4096 x 4` bytes (`64 MiB`). Em transporte GPU (`M4.2`), trafegam pelo Named Pipe apenas `136` bytes por frame (`FrameIpcGpuFrameHeader`) contendo o `HANDLE` NT duplicado para o PID autenticado do host, mantendo `CpuStagingReadsPerformed = 0` durante operacao normal.
-- Consulte [windows-gpu-shared-textures-nvenc.md](../../docs/architecture/windows-gpu-shared-textures-nvenc.md) para detalhes do modelo de sincronizacao, seguranca e licenca MIT do cabeçalho `nvEncodeAPI.h`.
+- Consulte [windows-gpu-shared-textures-nvenc.md](../../docs/architecture/windows-gpu-shared-textures-nvenc.md) para detalhes do modelo de sincronizacao e seguranca, [LICENSE](../../LICENSE) (`Apache-2.0` para codigo proprio), [THIRD_PARTY_NOTICES.md](../../THIRD_PARTY_NOTICES.md) (cabecalho MIT preservado de `third_party/nvenc/nvEncodeAPI.h`, sem redistribuicao de `nvEncodeAPI64.dll`) e [ci-and-test-matrix.md](../../docs/setup/ci-and-test-matrix.md) (no CI Windows hospedado apenas a compilacao de `lumabridge-host.exe` e verificada, sem execucao em GPU/NVENC fisica).

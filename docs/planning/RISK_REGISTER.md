@@ -65,13 +65,13 @@ Este registro consolida os riscos técnicos, jurídicos, operacionais e de segur
 - **Mitigação Preventiva:** Pareamento em duas fases com isolamento de ALPN, SPAKE2/QR vinculado a `tls-exporter` (`RFC 9266`), mTLS estrito pós-pareamento, permissões ortogonais *deny-by-default*, rate-limiting contra brute-force e auditoria rigorosa garantindo zero pixels/teclas/segredos em logs.
 
 ### `R10` — Incompatibilidade de Licenças e Patentes Multimídia
-- **Descrição:** Vincular estaticamente bibliotecas `GPLv2-only` ou distribuir encoders H.264/HEVC próprios sem observar patentes pode inviabilizar o licenciamento `Apache-2.0` pretendido.
-- **Mitigação Preventiva:** Seguir integralmente a política em 3 faixas detalhada em [LICENSE_COMPLIANCE_REVIEW.md](./LICENSE_COMPLIANCE_REVIEW.md), delegando codecs às APIs do sistema/hardware e reservando fallbacks software apenas a componentes compatíveis (ex.: modelo OpenH264 BSD/Cisco ou `SVT-AV1`/`dav1d` BSD).
+- **Descrição:** Vincular estaticamente bibliotecas `GPLv2-only` ou distribuir encoders H.264/HEVC próprios sem observar patentes pode inviabilizar o licenciamento `Apache-2.0` do LumaBridge.
+- **Mitigação Preventiva:** Adotada `Apache-2.0` para o código próprio em [`LICENSE`](../../LICENSE), com atribuições preservadas em [`NOTICE`](../../NOTICE) e [`THIRD_PARTY_NOTICES.md`](../../THIRD_PARTY_NOTICES.md) (`nvEncodeAPI.h` MIT), política prospectiva `DCO 1.1` em [`CONTRIBUTING.md`](../../CONTRIBUTING.md) e faixas Verde/Amarela/Vermelha em [LICENSE_COMPLIANCE_REVIEW.md](./LICENSE_COMPLIANCE_REVIEW.md); delegação de codecs às APIs do sistema/hardware e previsão de `cargo-deny` na `M1`.
 
 ### `R11` — Fronteira FFI e Complexidade Multi-Toolchain
 - **Descrição:** Introduzir Rust ao lado de MSVC C++17/WDK e Android NDK cria risco de conflito de CRT (`/MD` vs `/MDd`), vazamento de *panics* através da ABI C ou overhead inesperado de memória.
 - **Mitigação Preventiva:** Manter texturas GPU 100% fora da fronteira FFI; executar PoC com critérios numéricos objetivos (`ADR-0004`) no início de `M1`, mantendo C++20/CMake como fallback arquitetural imediato caso a PoC reprove.
 
 ### `R12` — Acúmulo de Branches Empilhadas sem CI
-- **Descrição:** A existência de 3 branches Windows encadeadas à frente de `dev` sem pipelines automatizados de build/teste aumenta o risco de conflitos silenciosos e divergência documental.
-- **Mitigação Preventiva:** Consolidar `M0` com revisão sequencial de PRs após o gate real `M4.2.1` e configurar `.github/workflows/` (build e testes unitários Windows + Linux) logo na entrada de `M1`.
+- **Descrição:** A existência de branches empilhadas à frente de `dev` sem pipelines automatizados de build/teste aumenta o risco de conflitos silenciosos e divergência documental.
+- **Mitigação Preventiva:** A pilha Windows `M0` foi integrada em `dev` via PR #37 (`23a28046`). Na etapa `M0.6`, foram adicionados workflows iniciais não administrativos em `.github/workflows/` (`ci-windows.yml` e `ci-linux-hygiene.yml`) e a matriz [`ci-and-test-matrix.md`](../setup/ci-and-test-matrix.md); a proteção de `refs/heads/dev` vinculada aos checks estáveis Windows e Linux entra em vigor após a aprovação dos workflows pós-merge em `dev`.

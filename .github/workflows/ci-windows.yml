@@ -1,0 +1,48 @@
+name: Windows Non-Admin CI
+
+on:
+  pull_request:
+    branches: [dev]
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-unit-and-tooling:
+    name: Windows Unit & Tooling Tests (Non-Admin)
+    runs-on: windows-2025
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Run non-administrative Windows C++ & PowerShell CI suite
+        shell: powershell
+        run: |
+          powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/ci/Invoke-LumaBridgeCiWindowsTests.ps1 `
+            -RepoRoot $env:GITHUB_WORKSPACE `
+            -SummaryPath $env:GITHUB_STEP_SUMMARY `
+            -JsonReportPath (Join-Path $env:RUNNER_TEMP 'ci-windows-summary.json') `
+            -LogDir (Join-Path $env:RUNNER_TEMP 'ci-windows-logs')
+          exit $LASTEXITCODE
+
+      - name: Upload sanitized Windows CI logs and summary
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-ci-summary-and-logs
+          path: |
+            ${{ runner.temp }}/ci-windows-summary.json
+            ${{ runner.temp }}/ci-windows-logs
+          if-no-files-found: ignore
+          retention-days: 14

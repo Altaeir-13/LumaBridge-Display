@@ -1,6 +1,6 @@
 # Revisão de Licenciamento e Conformidade Legal — LumaBridge Display
 
-> **Status da licença:** **`Apache-2.0` aprovada como licença candidata preferencial.** O arquivo `LICENSE` definitivo **ainda NÃO foi criado** no repositório; sua publicação depende da aprovação desta auditoria técnica/jurídica e da criação concomitante de `NOTICE` / `THIRD_PARTY_NOTICES.md`. Este documento constitui análise de engenharia e conformidade de software livre, devendo receber revisão jurídica formal caso o projeto venha a distribuir binários comerciais ou assinados em larga escala.
+> **Status da licença (`M0.6`):** **`Apache-2.0` aprovada pelo mantenedor para o código próprio do LumaBridge Display e política prospectiva declarativa DCO 1.1 estabelecida.** Após revisão técnica de engenharia sobre histórico Git, cabeçalhos de licença e checksums upstream (confirmando ausência de código copiado do `IddSampleDriver` nos arquivos inspecionados e preservando integralmente o cabeçalho MIT de `windows/host/third_party/nvenc/nvEncodeAPI.h`), foram publicados [`LICENSE`](../../LICENSE) (Apache-2.0 integral), [`NOTICE`](../../NOTICE), [`THIRD_PARTY_NOTICES.md`](../../THIRD_PARTY_NOTICES.md) e [`CONTRIBUTING.md`](../../CONTRIBUTING.md). Nem todos os arquivos do repositório estão sujeitos à Apache-2.0 — componentes incorporados de terceiros mantêm suas licenças originais. **Esta revisão constitui análise técnica de engenharia e conformidade de software livre, não equivalendo à prova jurídica absoluta de titularidade;** deverá receber revisão jurídica formal caso o projeto venha a distribuir binários comerciais ou assinados em larga escala.
 
 ---
 
@@ -12,7 +12,7 @@
 |---|---|---|---|---|
 | **Windows SDK / WDK / UMDF / IddCx** (`wdf.h`, `IddCx.h`, `d3d11.lib`, `dxgi.lib`, `mfplat.lib`) | `origin/dev` (`windows/driver`) e branches M4 | Microsoft Windows SDK / WDK License | Headers em tempo de compilação + vínculo dinâmico com DLLs nativas do Windows do usuário | Padrão para software Windows; **não redistribuir** binários internos do SO/WDK fora do permitido pelo redistributable. |
 | **MSVC C++ Runtime + Spectre libs** | Build Windows local | Microsoft Visual Studio Redistributable | Vínculo estático de runtime no driver UMDF (`/Qspectre`); dinâmico (`/MD`) ou redistribuível no host | Conformidade via uso legítimo de toolchain VS/WDK; em distribuição pública observar termos do MSVC Redistributable. |
-| **`nvEncodeAPI.h`** (`FFmpeg/nv-codec-headers` `sdk/12.1`) | Branch `feature/windows-gpu-shared-textures-nvenc` (`windows/host/third_party/nvenc/`) | **MIT** *(verificado no cabeçalho do arquivo naquela branch)* | Header C puro incluído em compilação; `nvEncodeAPI64.dll` carregada dinamicamente do driver instalado no sistema (`LoadLibraryExW`) | Excelente padrão: **nenhuma DLL ou `.lib` proprietária da NVIDIA** é redistribuída no repositório. |
+| **`nvEncodeAPI.h`** (`FFmpeg/nv-codec-headers` `sdk/12.1`) | Integrado em `dev` (`23a28046`) em [`windows/host/third_party/nvenc/nvEncodeAPI.h`](../../windows/host/third_party/nvenc/nvEncodeAPI.h) *(blob SHA-1 `f91ec9ad3b7303bcbb66f7265ab0c1341971d247`)* | **MIT** *(preservado integralmente no cabeçalho e em `THIRD_PARTY_NOTICES.md`)* | Header C puro incluído em compilação; `nvEncodeAPI64.dll` carregada dinamicamente do driver instalado no sistema (`LoadLibraryExW`) | Excelente padrão: **nenhuma DLL ou `.lib` proprietária da NVIDIA** é redistribuída no repositório. |
 
 ### 1.2 Dependências planejadas (Núcleo Multiplataforma, Vídeo, Transporte e Plataformas)
 
@@ -91,12 +91,13 @@ Em vez de aplicar uma proibição genérica simplista a toda tecnologia associad
    - **Faixa Amarela (Permitida mediante revisão, link dinâmico e documentação em `THIRD_PARTY_NOTICES.md`):** `MPL-2.0`, `LGPL-2.1+` / `LGPL-3.0` (somente desktop via linkagem dinâmica ou carregamento runtime; evitada no núcleo mobile).
    - **Faixa Vermelha (Bloqueada nos binários oficiais distribuídos):** `GPLv2-only`, `GPLv3` (como dependência linkada), `AGPL`, código proprietário sem permissão explícita ou codecs HEVC software proprietários/patent-encumbered.
 
-### Checklist antes do PR que criará `LICENSE`
+### Checklist de Publicação de `LICENSE` (`M0.6`)
 
-- [ ] Aprovação humana da recomendação `Apache-2.0` + DCO neste documento.
-- [ ] Conferência dos cabeçalhos em `windows/` e futuros módulos quanto a avisos de copyright consistentes.
-- [ ] Criação simultânea de:
-  - `LICENSE` (texto integral oficial Apache License 2.0 na raiz)
-  - `NOTICE` (atribuição do projeto LumaBridge Display)
-  - `THIRD_PARTY_NOTICES.md` (registrando `nvEncodeAPI.h` MIT de `FFmpeg/nv-codec-headers` quando `M4.2` for integrada, e futuras dependências)
-  - Configuração de verificação automatizada de licenças (`cargo-deny` quando o workspace `core/` for criado em `M1`).
+- [x] Aprovação humana da recomendação `Apache-2.0` (código próprio) + política declarativa `DCO 1.1` prospectivo.
+- [x] Conferência técnica dos cabeçalhos em `windows/` e revisão de proveniência (`IddSampleDriver` apenas como ferramenta externa isolada em `Prepare-IddSampleReference.ps1`; `nvEncodeAPI.h` MIT verificado contra `FFmpeg/nv-codec-headers` `sdk/12.1`), sem reivindicar prova jurídica absoluta de titularidade.
+- [x] Criação simultânea no PR de governança da `M0` (`#38`) de:
+  - [`LICENSE`](../../LICENSE) (texto integral oficial Apache License 2.0 na raiz)
+  - [`NOTICE`](../../NOTICE) (atribuição do projeto LumaBridge Display e referência a `nvEncodeAPI.h`)
+  - [`THIRD_PARTY_NOTICES.md`](../../THIRD_PARTY_NOTICES.md) (registrando `nvEncodeAPI.h` MIT, revisão `IddSampleDriver` e dependências não redistribuídas de build/runtime/CI)
+  - [`CONTRIBUTING.md`](../../CONTRIBUTING.md) (política prospectiva DCO 1.1 e fluxo de contribuição)
+- [ ] Configuração de verificação automatizada de licenças (`cargo-deny` quando o workspace `core/` for criado em `M1`).

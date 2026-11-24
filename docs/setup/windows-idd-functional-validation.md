@@ -289,11 +289,13 @@ Esta secao consolida o fechamento da validacao funcional do emissor Windows (`M0
 
 ### 7.6 Estado de governanca e limitacoes remanescentes (nao bloqueantes para `M0`)
 
-- **Diferenciacao de marcos e integracao:**
-  - `M0` funcionalmente aprovada no commit `6b297856af535a1737658da97d381c19231913e4` (seguido do commit documental `f1d2565e82b9878f8655aeb8ddb3d4a4ace3ecac`).
-  - `M0` consolidada localmente na branch `integration/m0-windows-closure`.
-  - **`M0` ainda nao integrada em `dev` remoto (`origin/dev`).**
-  - **`M1` ainda nao iniciada.**
+- **Diferenciacao de marcos e integracao (`M0.6`):**
+  - `M0` funcionalmente aprovada no commit `6b297856af535a1737658da97d381c19231913e4` (seguido do commit documental `f1d2565e82b9878f8655aeb8ddb3d4a4ace3ecac` e do PR #37 / `a9ad7e43c06f41b59cbec7906cd6a7ced0f7ac78`).
+  - **`M0` integrada em `dev` remoto (`origin/dev`, `M0_INTEGRATED_IN_DEV = True`)** via Merge commit `23a2804606b02a85d915a55b75663b67bd5af58b` (arvore qualificada `7f1685f7ed1da22baa56f4e41c1dd1b50880c6a0` preservada integralmente).
+  - **Governanca e criterio de encerramento (`M0.6` — PR `#38`):** adota `Apache-2.0` para o codigo proprio do LumaBridge (`LICENSE`), preserva avisos de terceiros (`NOTICE` e `THIRD_PARTY_NOTICES.md` para `nvEncodeAPI.h` MIT, sem constituir prova juridica absoluta de titularidade), estabelece DCO 1.1 prospectivo declarativo (`CONTRIBUTING.md`) e cria workflows iniciais nao administrativos em `.github/workflows/` (`164/237` casos historicos Windows ≈ `69,2%` do inventario de testes executados no CI convencional, sem classificar os `73` casos excluidos como reprovados, conforme [ci-and-test-matrix.md](./ci-and-test-matrix.md)). O encerramento formal da `M0` fica vinculado ao merge do PR `#38` em `dev`, aprovacao dos checks pos-merge em `dev`, reconciliacao das pendencias anteriores e protecao de `refs/heads/dev`.
+  - **Issue `#33` mantida aberta:** ausencia de persistencia de `MonitorContainerId` em `PLUGPLAY_REGKEY_DEVICE` (divida tecnica conhecida a tratar antes de cenarios multi-monitor/multi-instancia, sem alteracao em `Adapter.cpp` ou `VirtualMonitor.cpp` nesta rodada).
+  - **Issue `#34`:** checklist auditado individualmente no PR `#38`, mantida aberta com escopo operacional residual nao bloqueante para a baseline funcional `M0` nem para o inicio futuro da `M1` (ver qualificacao sugerida em ambiente dedicado / VM descartavel).
+  - **Abertura da `M1`:** ocorre somente em etapa posterior autorizada apos cumprimento integral dos criterios formais de encerramento da `M0`.
 - **Observabilidade PDH/GPU:** cada consulta de contadores PDH GPU consumiu `~5,6 - 6,4 s` no runner, elevando o intervalo efetivo medio para `~20,7 s` em `180 s` e mantendo `DedicatedVram` do servidor visto internamente pelo host como `NOT_MEASURED`.
 - **Duracao de 180 s e regime `> 65.536` amostras:** comprova estabilidade para encerramento funcional da `M0`, mas nao substitui ensaios de longa duracao de varias horas (inclusive alem de `65.536` amostras, onde entra `ReservoirSampledEstimate_AlgorithmR`).
 - **Distincao de politica de fallback no servidor:** o driver ainda registra o default estrutural `AllowCpuFallback = 1` em `SessionSummary` mesmo quando o host negocia `--require-gpu-shared` (`0` frames CPU); a explicitao por handshake fica para refinamento incremental sem alterar contratos `M0`.
