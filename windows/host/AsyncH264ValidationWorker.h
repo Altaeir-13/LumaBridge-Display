@@ -211,6 +211,7 @@ public:
             m_workerExited = false;
             m_started = true;
             m_drainFailed = false;
+            m_usedSynchronousFallback = false;
             m_syncFallbackComInit = false;
             m_syncFallbackThreadId = 0U;
             m_finalSummary = {};
@@ -618,6 +619,11 @@ private:
             }
         }
 
+        m_usedSynchronousFallback = true;
+        m_startFailed = false;
+        m_metrics.WorkerFailureCount = 0ULL;
+        m_metrics.LastHResult = S_OK;
+        m_metrics.LastErrorMessage.clear();
         m_metrics.SynchronousFallbackActive = true;
         m_metrics.CompletionState = H264WorkerCompletionState::Running;
         m_stopRequested = false;
@@ -704,7 +710,7 @@ private:
         }
 
         const bool countsConsistent =
-            m_metrics.SynchronousFallbackActive
+            m_usedSynchronousFallback
                 ? (m_metrics.PacketsEnqueued == m_metrics.PacketsProcessed)
                 : ((m_metrics.PacketsEnqueued == m_metrics.PacketsDequeued) &&
                    (m_metrics.PacketsDequeued == m_metrics.PacketsProcessed));
@@ -906,6 +912,7 @@ private:
     bool m_startFailed{false};
     bool m_workerExited{false};
     bool m_drainFailed{false};
+    bool m_usedSynchronousFallback{false};
     bool m_syncFallbackComInit{false};
     DWORD m_syncFallbackThreadId{0U};
     H264ValidationSummary m_finalSummary{};
