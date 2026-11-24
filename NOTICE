@@ -1,0 +1,20 @@
+LumaBridge Display
+Copyright 2026 Altaeir-13 and LumaBridge Display contributors.
+
+This repository licenses LumaBridge Display's own original source code and
+documentation under the Apache License, Version 2.0 (see LICENSE).
+
+Third-Party Notices:
+
+This repository incorporates the following third-party header under its own
+permissive license (which is preserved intact and is not replaced by the
+Apache License, Version 2.0):
+
+- windows/host/third_party/nvenc/nvEncodeAPI.h
+  Copyright (c) 2010-2023 NVIDIA Corporation
+  Licensed under the MIT License (via FFmpeg/nv-codec-headers, branch sdk/12.1).
+  See THIRD_PARTY_NOTICES.md for the complete notice, provenance, and license text.
+
+This NOTICE file is provided solely for informational attribution purposes under
+Section 4(d) of the Apache License, Version 2.0 and does not modify the
+license or introduce any additional restrictions.
