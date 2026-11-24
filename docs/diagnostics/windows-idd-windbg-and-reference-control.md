@@ -10,7 +10,7 @@ Escopo: Milestone M3 — Windows Virtual Display / Issue #34
 
 ## 1. Matriz Comparativa Semantica e Binaria (15 Pontos): `IddSampleDriver` vs. `LumaBridgeIddDriver`
 
-Comparacao verificada entre a compilacao isolada de `microsoft/Windows-driver-samples` (`video/IndirectDisplay` em `C:\Temp\LumaBridgeReference\IndirectDisplay`), os binarios do runtime Windows 11 (`IddCx.dll` e `WUDFx02000.dll` `10.0.26100.9818`) via `cdb.exe`, e `windows/driver/LumaBridgeIddDriver`:
+Comparacao verificada entre a compilacao isolada de `microsoft/Windows-driver-samples` (`video/IndirectDisplay` em `<WorkDir>\IndirectDisplay`, ex.: `%TEMP%\LumaBridgeReference\IndirectDisplay`), os binarios do runtime Windows 11 (`IddCx.dll` e `WUDFx02000.dll` `10.0.26100.9818`) via `cdb.exe`, e `windows/driver/LumaBridgeIddDriver`:
 
 | # | Dimensao comparada | `IddSampleDriver` (Controle Microsoft — PASSOU) | `LumaBridgeIddDriver` (Antes da correcao -> Apos correcao) | Veredito / Prova `cdb.exe` |
 |---|---|---|---|---|
@@ -39,9 +39,9 @@ Executado manualmente pelo operador no mesmo host (`Windows 11 x64 26300.9974`, 
 | Modo do controle | InstanceId | Status PnP / ProblemCode | ProblemStatus | Monitores criados | Limpeza pos-teste |
 |---|---|---|---|---|---|
 | `SwDeviceCreate` (`IddSampleApp.exe`) | `SWD\IDDSAMPLEDRIVER\IDDSAMPLEDRIVER` | `OK` | — | `3` | Encerrado |
-| `ROOT` via `DevCon` (`Root\IddSampleDriver`) | `ROOT\DISPLAY\0000` | `OK` / `0` | `Empty` | `3` | `ROOT\DISPLAY\0000` e `oem68.inf` removidos sem erros |
+| `ROOT` via `DevCon` (`Root\IddSampleDriver`) | `ROOT\DISPLAY\0000` | `OK` / `0` | `Empty` | `3` | `ROOT\DISPLAY\0000` e pacote OEM (`oemXX.inf`) removidos sem erros |
 
-*(O script isolado [Prepare-IddSampleReference.ps1](file:///c:/Users/Altair/Documents/Working/Development/LumaBridge Display/windows/driver/scripts/Prepare-IddSampleReference.ps1) permanece disponivel para eventuais re-validacoes de referencia sem tocar no repositorio.)*
+*(O script isolado [Prepare-IddSampleReference.ps1](../../windows/driver/scripts/Prepare-IddSampleReference.ps1) permanece disponivel para eventuais re-validacoes de referencia sem tocar no repositorio.)*
 
 ---
 
@@ -88,7 +88,7 @@ Como na tentativa #2 `WUDFHost.exe` iniciou e falhou em ~2.1 ms apos o carregame
 Todos os nomes de simbolos abaixo foram verificados diretamente com `cdb.exe` contra `LumaBridgeIddDriver.dll`, `IddCx.dll` e `WUDFx02000.dll` instalados no host. Execute os comandos abaixo na janela de comandos do WinDbg logo apos o carregamento de `LumaBridgeIddDriver.dll` (`ld LumaBridgeIddDriver; ld IddCx; ld WUDFx02000`):
 
 ```dbg
-.sympath C:\Users\Altair\Documents\Working\Development\LumaBridge Display\windows\driver\x64\Release;srv*C:\Temp\LumaBridgeSymCache*https://msdl.microsoft.com/download/symbols
+.sympath <RepoRoot>\windows\driver\x64\Release;srv*%TEMP%\LumaBridgeSymCache*https://msdl.microsoft.com/download/symbols
 .reload /f
 
 * --- 1. Entrada do WDF UMDF Stub ---
@@ -151,7 +151,7 @@ Abra o dump mais recente no WinDbg/CDB elevado com o `_NT_SYMBOL_PATH` configura
 
 ## 4. Plano de Variante Diagnostica em 7 Estagios (`LUMABRIDGE_DIAGNOSTIC_STAGE` `1..6` + Estagio `0`)
 
-Para permitir isolamento incremental sem descartar nem sobrescrever a implementacao completa (padrao `LUMABRIDGE_DIAGNOSTIC_STAGE = 6`), [DiagnosticStageConfig.h](file:///c:/Users/Altair/Documents/Working/Development/LumaBridge Display/windows/driver/LumaBridgeIddDriver/DiagnosticStageConfig.h) e [Build-LumaBridgeDiagnosticStage.ps1](file:///c:/Users/Altair/Documents/Working/Development/LumaBridge Display/windows/driver/scripts/Build-LumaBridgeDiagnosticStage.ps1) isolam os subsistemas mantendo `.inf`, UMDF `2.31` (min `25`), IddCx `1.4` (min `4`) e `/Qspectre`:
+Para permitir isolamento incremental sem descartar nem sobrescrever a implementacao completa (padrao `LUMABRIDGE_DIAGNOSTIC_STAGE = 6`), [DiagnosticStageConfig.h](../../windows/driver/LumaBridgeIddDriver/DiagnosticStageConfig.h) e [Build-LumaBridgeDiagnosticStage.ps1](../../windows/driver/scripts/Build-LumaBridgeDiagnosticStage.ps1) isolam os subsistemas mantendo `.inf`, UMDF `2.31` (min `25`), IddCx `1.4` (min `4`) e `/Qspectre`:
 
 | Estagio | Escopo / Variavel controlada | Macro / Comando de build + manifesto | Criterio de aprovacao & Logs/Hashes esperados | Rollback |
 |---|---|---|---|---|

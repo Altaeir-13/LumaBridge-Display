@@ -13,14 +13,14 @@ Escopo: Milestone M3 — Windows Virtual Display / Issue #34
 Na primeira tentativa controlada de instalacao do pacote `Release|x64` (com `EnableVirtualMonitor=0`):
 
 - **Instance ID:** `ROOT\DISPLAY\0000`
-- **Driver publicado:** `oem68.inf`
+- **Driver publicado:** `oemXX.inf` *(pacote OEM publicado na tentativa)*
 - **Service / UpperFilters:** `WUDFRd` / `IndirectKmd`
 - **ProblemCode:** `10` (`0x0a`, `CM_PROB_FAILED_START`)
 - **ProblemStatus:** `0xC000009E` (`STATUS_DEVICE_POWER_FAILURE`)
 - **Evento Kernel-PnP:** ID `411`
 - **Mensagem SetupAPI observada na desinstalacao/instalacao:**
   `Using WDF schema version 2.23 when section requires version 2.31. Section = [LumaBridge_Install.NT.Wdf]`
-- **Rollback automatico:** removeu `ROOT\DISPLAY\0000` e `oem68.inf` sem deixar residuos.
+- **Rollback automatico:** removeu `ROOT\DISPLAY\0000` e o pacote OEM publicado (`oemXX.inf`) sem deixar residuos.
 
 ### Linha do tempo correlacionada nos logs do host
 
@@ -34,19 +34,19 @@ Na primeira tentativa controlada de instalacao do pacote `Release|x64` (com `Ena
 
 - Os canais `Microsoft-Windows-DriverFrameworks-UserMode/Operational` e `Microsoft-Windows-IndirectDisplays-ClassExtension-Events/Diagnostic` estavam desabilitados (`IsEnabled = false`).
 - Nenhuma sessao ETW (`TraceLogging` / `IddCx WPP`) nem captura `[LB-DRIVER]` (DebugView) estava ativa durante os ~97 ms entre configuracao e falha.
-- O rollback automatico removeu imediatamente `ROOT\DISPLAY\0000` (junto com os logs/subchaves PnP) e `oem68.inf` antes que qualquer coleta post-mortem fosse persistida em disco.
+- O rollback automatico removeu imediatamente `ROOT\DISPLAY\0000` (junto com os logs/subchaves PnP) e o pacote OEM publicado (`oemXX.inf`) antes que qualquer coleta post-mortem fosse persistida em disco.
 
 ---
 
 ## 1.5 Evidencias da Execucao Real #2 (`Attempt2`) e Forense dos ETLs
 
-Na segunda tentativa instrumentada (`EnableVirtualMonitor=0`, pacote assinado em `C:\Temp\LumaBridgeStaging_Attempt2`, artefatos preservados em `C:\Users\Altair\AppData\Local\LumaBridgeDisplay\Diagnostics\Attempt2`):
+Na segunda tentativa instrumentada (`EnableVirtualMonitor=0`, pacote assinado em `<StagingDir>\Attempt2`, artefatos preservados em `%LOCALAPPDATA%\LumaBridgeDisplay\Diagnostics\Attempt2`):
 
 - **Resultado PnP:** `ROOT\DISPLAY\0000`, `ProblemCode = 10` (`CM_PROB_FAILED_START`), `ProblemStatus = 0xC000009E` (`STATUS_DEVICE_POWER_FAILURE`), rollback concluido sem residuos.
-- **Carregamento confirmado no host UMDF (`WUDFHost.exe`, PID `23812`, Host `{fdfb7f82-12cf-4e87-a92b-9a1e9447e6f8}`):**
+- **Carregamento confirmado no host UMDF (`WUDFHost.exe`, PID `<WudfHostPid>`, Host `<HostSessionGuid>`):**
   - `Microsoft-Windows-DriverFrameworks-UserMode/Operational` registrou `54` eventos no intervalo.
   - `00:57:48.012Z`: host solicitado a carregar `LumaBridgeIddDriver` no nivel `0` para `ROOT\DISPLAY\0000`.
-  - `00:57:48.017Z`–`00:57:48.028Z`: DLLs carregadas no processo (`WUDFx02000.dll`, `IddCx.dll`, `lumabridgeidddriver.dll` a partir do Driver Store `lumabridgeidddriver.inf_amd64_c9580eb694d9b571`, `dxgi.dll`, `d3d11.dll`, `WppRecorderUM.dll`, `d2d1.dll`, `DWrite.dll`, `dxcore.dll`, `CRYPT32.dll`).
+  - `00:57:48.017Z`–`00:57:48.028Z`: DLLs carregadas no processo (`WUDFx02000.dll`, `IddCx.dll`, `lumabridgeidddriver.dll` a partir do Driver Store `lumabridgeidddriver.inf_amd64_<hash>`, `dxgi.dll`, `d3d11.dll`, `WppRecorderUM.dll`, `d2d1.dll`, `DWrite.dll`, `dxcore.dll`, `CRYPT32.dll`).
   - `00:57:48.0287643Z` (Event `2006`): `O Host UMDF carregou com exito o driver no nivel 0`.
   - `00:57:48.0291Z`–`00:57:48.0306Z`: operacoes `(27, 9)` (`IRP_MN_QUERY_CAPABILITIES`) e `(27, 0)` (`IRP_MN_START_DEVICE`) encaminhadas ao driver inferior (`0x0` apos forward `0xC00000BB`).
   - `00:57:48.0308806Z` (Event `2103`, **`235 us` apos o envio de `(27, 0)` e ~`2.1 ms` apos Event `2006`**): operacao PnP `(27, 0)` falhou para `ROOT\DISPLAY\0000` com `NTSTATUS 0xC000009E` (`STATUS_DEVICE_POWER_FAILURE`).
@@ -72,7 +72,7 @@ A ausencia de eventos proprios do LumaBridge e de breadcrumbs `Diag*` em `Attemp
 
 Com os `.tmf` oficiais extraidos dos simbolos de `IddCx.dll` (`10.0.26100.9818`) e `WUDFx02000.dll` (`10.0.26100.9818`), sobreviveram os seguintes registros na janela exata `21:57:48` (horario local `UTC-3`, equivalente a `00:57:48Z`):
 
-- **PID `23812` (`5D04`, TID `1F7C`, CPU 9) — inicializacao do `IddCx` em `WUDFHost.exe`:**
+- **Processo `WUDFHost.exe` (PID/TID da sessao de diagnostico) — inicializacao do `IddCx` em `WUDFHost.exe`:**
   - `21:57:48.021`: `[IddCx]?IddCxLibraryInitialize@@YAJXZ: Enter`
   - `21:57:48.021`: `[IddCx]?IddCxLibraryInitialize@@YAJXZ: Exit`
   - `21:57:48.021`: `[IddCx]DriverEntry: Exit, status=STATUS_SUCCESS`
@@ -92,7 +92,7 @@ No mesmo host Windows 11 x64 (`26300.9974`, GPU NVIDIA GeForce RTX 3060 Ti, cert
 
 1. **`SwDeviceCreate` (`IddSampleApp.exe`):** `InstanceId = SWD\IDDSAMPLEDRIVER\IDDSAMPLEDRIVER`, `Status = OK`, `3` monitores virtuais criados.
 2. **Enumeracao `ROOT` via DevCon (`Root\IddSampleDriver`):** `InstanceId = ROOT\DISPLAY\0000`, `Status = OK`, `DEVPKEY_Device_ProblemCode = 0`, `DEVPKEY_Device_ProblemStatus = Empty`, `3` monitores virtuais criados.
-3. Limpeza confirmada sem residuos (`ROOT\DISPLAY\0000` e `oem68.inf` removidos).
+3. Limpeza confirmada sem residuos (`ROOT\DISPLAY\0000` e pacote OEM `oemXX.inf` removidos).
 
 Esse resultado descartou definitivamente hipotese de incompatibilidade ambiental no host Windows 11, GPU RTX 3060 Ti, certificado de teste ou enumeracao `ROOT\DISPLAY` via `DevCon`.
 
@@ -198,7 +198,7 @@ msbuild windows\driver\LumaBridgeIddDriver.sln /t:Rebuild /p:Configuration=Relea
 ### Etapa B — Previa Dry-Run (nao destrutiva) e preparar staging assinado
 
 ```powershell
-$stagingDir = 'C:\Temp\LumaBridgeStaging_Attempt3'
+$stagingDir = "$env:TEMP\LumaBridgeStaging_Attempt3"
 $diagDir    = "$env:LOCALAPPDATA\LumaBridgeDisplay\Diagnostics\Attempt3"
 $etwDir     = "$diagDir\Etw"
 $etlPath    = "$etwDir\LumaBridgeIddCore.etl"
