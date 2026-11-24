@@ -176,17 +176,17 @@ try {
         Write-Host '[PASS] cbindgen C ABI header matches committed header exactly.' -ForegroundColor Green
     }
 
-    Invoke-NativeChecked -Label 'CLIPPY DEFAULT' -Executable 'cargo' -Arguments @('clippy', '--workspace', '--all-targets', '--', '-D', 'warnings') -WorkingDirectory $coreDir | Out-Null
-    Invoke-NativeChecked -Label 'CLIPPY FAULT-INJECTION' -Executable 'cargo' -Arguments @('clippy', '--workspace', '--all-targets', '--features', 'poc-fault-injection', '--', '-D', 'warnings') -WorkingDirectory $coreDir | Out-Null
-    Invoke-NativeChecked -Label 'CLIPPY UNIFFI' -Executable 'cargo' -Arguments @('clippy', '--workspace', '--all-targets', '--features', 'uniffi', '--', '-D', 'warnings') -WorkingDirectory $coreDir | Out-Null
+    Invoke-NativeChecked -Label 'CLIPPY DEFAULT' -Executable 'cargo' -Arguments @('clippy', '--locked', '--workspace', '--all-targets', '--', '-D', 'warnings') -WorkingDirectory $coreDir | Out-Null
+    Invoke-NativeChecked -Label 'CLIPPY FAULT-INJECTION' -Executable 'cargo' -Arguments @('clippy', '--locked', '--workspace', '--all-targets', '--features', 'poc-fault-injection', '--', '-D', 'warnings') -WorkingDirectory $coreDir | Out-Null
+    Invoke-NativeChecked -Label 'CLIPPY UNIFFI' -Executable 'cargo' -Arguments @('clippy', '--locked', '--workspace', '--all-targets', '--features', 'uniffi', '--', '-D', 'warnings') -WorkingDirectory $coreDir | Out-Null
 
-    Invoke-NativeChecked -Label 'RUST TEST DEFAULT' -Executable 'cargo' -Arguments @('test', '--workspace') -WorkingDirectory $coreDir | Out-Null
-    Invoke-NativeChecked -Label 'RUST TEST FAULT-INJECTION' -Executable 'cargo' -Arguments @('test', '--workspace', '--features', 'poc-fault-injection') -WorkingDirectory $coreDir | Out-Null
-    Invoke-NativeChecked -Label 'RUST TEST UNIFFI' -Executable 'cargo' -Arguments @('test', '--workspace', '--features', 'uniffi') -WorkingDirectory $coreDir | Out-Null
+    Invoke-NativeChecked -Label 'RUST TEST DEFAULT' -Executable 'cargo' -Arguments @('test', '--locked', '--workspace') -WorkingDirectory $coreDir | Out-Null
+    Invoke-NativeChecked -Label 'RUST TEST FAULT-INJECTION' -Executable 'cargo' -Arguments @('test', '--locked', '--workspace', '--features', 'poc-fault-injection') -WorkingDirectory $coreDir | Out-Null
+    Invoke-NativeChecked -Label 'RUST TEST UNIFFI' -Executable 'cargo' -Arguments @('test', '--locked', '--workspace', '--features', 'uniffi') -WorkingDirectory $coreDir | Out-Null
     $report.rust_checks_passed = $true
 
     if (Get-Command 'cargo-deny.exe' -ErrorAction SilentlyContinue) {
-        Invoke-NativeChecked -Label 'CARGO DENY CHECK' -Executable 'cargo' -Arguments @('deny', 'check', 'licenses', 'bans', 'sources') -WorkingDirectory $coreDir | Out-Null
+        Invoke-NativeChecked -Label 'CARGO DENY CHECK' -Executable 'cargo' -Arguments @('deny', '--locked', 'check', 'advisories', 'licenses', 'bans', 'sources') -WorkingDirectory $coreDir | Out-Null
         $report.cargo_deny_checked = $true
     }
     elseif ($RequireCargoDeny) {
@@ -199,18 +199,18 @@ try {
     New-Item -Path $dbgDir, $relDir, $stdDir -ItemType Directory -Force | Out-Null
 
     # Build fault-injection DLLs first into dedicated filenames
-    Invoke-NativeChecked -Label 'CARGO BUILD FAULT DEBUG' -Executable 'cargo' -Arguments @('build', '-p', 'lumabridge-ffi', '--features', 'poc-fault-injection') -WorkingDirectory $coreDir | Out-Null
+    Invoke-NativeChecked -Label 'CARGO BUILD FAULT DEBUG' -Executable 'cargo' -Arguments @('build', '--locked', '-p', 'lumabridge-ffi', '--features', 'poc-fault-injection') -WorkingDirectory $coreDir | Out-Null
     Copy-Item -LiteralPath (Join-Path $coreDir 'target\debug\lumabridge_ffi.dll') -Destination (Join-Path $dbgDir 'lumabridge_ffi_poc_fault.dll') -Force
 
-    Invoke-NativeChecked -Label 'CARGO BUILD FAULT RELEASE' -Executable 'cargo' -Arguments @('build', '-p', 'lumabridge-ffi', '--features', 'poc-fault-injection', '--release') -WorkingDirectory $coreDir | Out-Null
+    Invoke-NativeChecked -Label 'CARGO BUILD FAULT RELEASE' -Executable 'cargo' -Arguments @('build', '--locked', '-p', 'lumabridge-ffi', '--features', 'poc-fault-injection', '--release') -WorkingDirectory $coreDir | Out-Null
     Copy-Item -LiteralPath (Join-Path $coreDir 'target\release\lumabridge_ffi.dll') -Destination (Join-Path $relDir 'lumabridge_ffi_poc_fault.dll') -Force
 
     # Build clean default production DLLs
-    Invoke-NativeChecked -Label 'CARGO BUILD PROD DEBUG' -Executable 'cargo' -Arguments @('build', '-p', 'lumabridge-ffi') -WorkingDirectory $coreDir | Out-Null
+    Invoke-NativeChecked -Label 'CARGO BUILD PROD DEBUG' -Executable 'cargo' -Arguments @('build', '--locked', '-p', 'lumabridge-ffi') -WorkingDirectory $coreDir | Out-Null
     Copy-Item -LiteralPath (Join-Path $coreDir 'target\debug\lumabridge_ffi.dll') -Destination (Join-Path $dbgDir 'lumabridge_ffi.dll') -Force
     Copy-Item -LiteralPath (Join-Path $coreDir 'target\debug\lumabridge_ffi.dll.lib') -Destination (Join-Path $dbgDir 'lumabridge_ffi.dll.lib') -Force
 
-    Invoke-NativeChecked -Label 'CARGO BUILD PROD RELEASE' -Executable 'cargo' -Arguments @('build', '-p', 'lumabridge-ffi', '--release') -WorkingDirectory $coreDir | Out-Null
+    Invoke-NativeChecked -Label 'CARGO BUILD PROD RELEASE' -Executable 'cargo' -Arguments @('build', '--locked', '-p', 'lumabridge-ffi', '--release') -WorkingDirectory $coreDir | Out-Null
     Copy-Item -LiteralPath (Join-Path $coreDir 'target\release\lumabridge_ffi.dll') -Destination (Join-Path $relDir 'lumabridge_ffi.dll') -Force
     Copy-Item -LiteralPath (Join-Path $coreDir 'target\release\lumabridge_ffi.dll.lib') -Destination (Join-Path $relDir 'lumabridge_ffi.dll.lib') -Force
 
@@ -325,7 +325,7 @@ try {
             '## M1.1 FFI & MSVC Interoperability CI Summary',
             '',
             "- Toolchain: ``$($report.rustc_version)`` + ``$($report.msvc_toolchain)`` (SDK ``$($report.windows_sdk_version)``)",
-            "- Rust checks (fmt/clippy/test default+fault+uniffi): ``$($report.rust_checks_passed)`` (cbindgen drift check: ``$($report.cbindgen_checked)``, cargo-deny: ``$($report.cargo_deny_checked)``)",
+            "- Rust checks (fmt/clippy/test --locked default+fault+uniffi): ``$($report.rust_checks_passed)`` (cbindgen drift check: ``$($report.cbindgen_checked)``, cargo-deny --locked incl. advisories: ``$($report.cargo_deny_checked)``)",
             "- Debug (/MDd) & Release (/MD) C11/C++20 Harness (120 cycles + panic containment): ``Debug=$($report.debug_harness_passed)``, ``Release=$($report.release_harness_passed)``",
             "- Host ``lumabridge-host.exe --ffi-poc-selftest``: ``Debug=$($report.host_poc_debug_passed)``, ``Release=$($report.host_poc_release_passed)`` | Standard host isolated: ``$($report.std_host_isolated)``",
             "- Benchmark (CI informative non-gating): ``executed=$($report.benchmark_executed)`` (``mode=$($report.benchmark_mode)``, ``ffi_borrowed_p99_us=$($report.benchmark_p99_us)``)"
