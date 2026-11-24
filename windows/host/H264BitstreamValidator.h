@@ -70,6 +70,7 @@ struct H264ValidationSummary
     double AvgUvPsnrDb{0.0};
     double MinCombinedPsnrDb{0.0};
     double AvgCombinedPsnrDb{0.0};
+    LatencySummaryStats MftDecodeLatencyUs{};
     bool Passed{false};
     HRESULT LastHResult{S_OK};
 };
@@ -188,6 +189,8 @@ private:
     double m_sumUvPsnrDb{0.0};
     double m_sumCombinedPsnrDb{0.0};
     uint64_t m_psnrSamples{0ULL};
+    uint64_t m_qpcFrequency{10000000ULL};
+    ReservoirLatencyAccumulator m_mftDecodeLatTracker{};
     H264IndependentDecoder m_decoder{};
     H264ValidationSummary m_summary{};
 };

@@ -583,6 +583,7 @@ struct HostGateEvaluation
     bool MaxTargetOk{false};
     bool DurationOk{false};
     bool StimulusOk{false};
+    bool TransportContractOk{false};
     bool GpuTransportOk{false};
     bool NvencOk{false};
     bool H264DecodeOk{false};
@@ -613,10 +614,20 @@ EvaluateHostGates(
     eval.MinFramesOk = (metrics.FramesValid >= config.MinFrames);
     eval.MaxTargetOk = (!config.RequireFrameTarget) || metrics.FrameTargetReached;
     eval.StimulusOk = (!gateCfg.RequireVirtualStimulus) || (stimSnap.VirtualDisplayIdentified && stimSnap.Started);
+    eval.TransportContractOk =
+        (metrics.TransportContractViolations == 0ULL) &&
+        (metrics.UnexpectedCpuFramesInGpuSession == 0ULL) &&
+        (metrics.UnexpectedGpuFramesInCpuSession == 0ULL) &&
+        (!gateCfg.RequireGpuShared || metrics.CpuFramesReceived == 0ULL);
     eval.GpuTransportOk =
         (!gateCfg.RequireGpuShared) ||
         (metrics.NegotiatedTransportMode == lumabridge::ipc::FrameIpcTransportMode::GpuSharedNtHandle &&
          !metrics.FallbackToCpuActivated &&
+         eval.TransportContractOk &&
+         metrics.GpuFramesReceived > 0ULL &&
+         metrics.CpuFramesReceived == 0ULL &&
+         metrics.UnexpectedCpuFramesInGpuSession == 0ULL &&
+         metrics.TransportContractViolations == 0ULL &&
          metrics.GpuFramesOpened > 0ULL &&
          metrics.GpuSharedOpenFailures == 0ULL &&
          metrics.GpuSyncTimeouts == 0ULL &&
@@ -712,6 +723,7 @@ EvaluateHostGates(
         eval.MaxTargetOk &&
         eval.DurationOk &&
         eval.StimulusOk &&
+        eval.TransportContractOk &&
         eval.GpuTransportOk &&
         eval.NvencOk &&
         eval.H264DecodeOk &&
@@ -801,6 +813,12 @@ WriteJsonSummary(
         << "  \"FallbackToCpuActivated\": " << (metrics.FallbackToCpuActivated ? "true" : "false") << ",\n"
         << "  \"SharedTexturePoolSize\": " << metrics.SharedTexturePoolSize << ",\n"
         << "  \"SharedTexturePoolPeakUsage\": " << metrics.SharedTexturePoolPeakUsage << ",\n"
+        << "  \"CpuFramesReceived\": " << metrics.CpuFramesReceived << ",\n"
+        << "  \"GpuFramesReceived\": " << metrics.GpuFramesReceived << ",\n"
+        << "  \"GpuSharedResourcesOpened\": " << metrics.GpuSharedResourcesOpened << ",\n"
+        << "  \"UnexpectedCpuFramesInGpuSession\": " << metrics.UnexpectedCpuFramesInGpuSession << ",\n"
+        << "  \"UnexpectedGpuFramesInCpuSession\": " << metrics.UnexpectedGpuFramesInCpuSession << ",\n"
+        << "  \"TransportContractViolations\": " << metrics.TransportContractViolations << ",\n"
         << "  \"GpuFramesOpened\": " << metrics.GpuFramesOpened << ",\n"
         << "  \"GpuFramesDropped\": " << metrics.GpuFramesDropped << ",\n"
         << "  \"GpuSharedOpenFailures\": " << metrics.GpuSharedOpenFailures << ",\n"
@@ -977,8 +995,9 @@ WriteJsonSummary(
         << "    \"MinCombinedPsnrDb\": " << h264Validation.MinCombinedPsnrDb << ",\n"
         << "    \"AvgCombinedPsnrDb\": " << h264Validation.AvgCombinedPsnrDb << ",\n"
         << "    \"Passed\": " << (h264Validation.Passed ? "true" : "false") << ",\n"
-        << "    \"LastHResult\": \"" << h264HrBuf << "\"\n"
-        << "  },\n";
+        << "    \"LastHResult\": \"" << h264HrBuf << "\",\n";
+    WriteLatencyStatsJsonWithIndent(out, "    ", "MftDecodeLatencyUs", h264Validation.MftDecodeLatencyUs, false);
+    out << "  },\n";
 
     out << "  \"ResourceUsage\": {\n"
         << "    \"LogicalProcessorCount\": " << logicalProcessorCount << ",\n";
@@ -1024,6 +1043,7 @@ WriteJsonSummary(
         << "    \"MaxTargetOk\": " << (gateEval.MaxTargetOk ? "true" : "false") << ",\n"
         << "    \"DurationOk\": " << (gateEval.DurationOk ? "true" : "false") << ",\n"
         << "    \"StimulusOk\": " << (gateEval.StimulusOk ? "true" : "false") << ",\n"
+        << "    \"TransportContractOk\": " << (gateEval.TransportContractOk ? "true" : "false") << ",\n"
         << "    \"GpuTransportOk\": " << (gateEval.GpuTransportOk ? "true" : "false") << ",\n"
         << "    \"NvencOk\": " << (gateEval.NvencOk ? "true" : "false") << ",\n"
         << "    \"H264DecodeOk\": " << (gateEval.H264DecodeOk ? "true" : "false") << ",\n"
@@ -1807,14 +1827,19 @@ wmain(
         static_cast<unsigned long long>(metrics.InterFrameJitter.AvgUs));
 
     std::printf(
-        "[LB-HOST] Transport: mode=%s fallback=%u pool=%u/%u gpuOpened=%llu gpuDrop=%llu openErr=%llu syncTimeout=%llu "
-        "luidErr=%llu cpuReads=%llu syncWaitAvgUs=%llu syncWaitP95Us=%llu hostCopyAvgUs=%llu\n",
+        "[LB-HOST] Transport: mode=%s fallback=%u pool=%u/%u cpuRx=%llu gpuRx=%llu gpuOpened=%llu gpuDrop=%llu "
+        "unexpCpu=%llu contractViol=%llu openErr=%llu syncTimeout=%llu luidErr=%llu cpuReads=%llu "
+        "syncWaitAvgUs=%llu syncWaitP95Us=%llu hostCopyAvgUs=%llu\n",
         TransportModeToString(metrics.NegotiatedTransportMode),
         metrics.FallbackToCpuActivated ? 1U : 0U,
         metrics.SharedTexturePoolSize,
         metrics.SharedTexturePoolPeakUsage,
+        static_cast<unsigned long long>(metrics.CpuFramesReceived),
+        static_cast<unsigned long long>(metrics.GpuFramesReceived),
         static_cast<unsigned long long>(metrics.GpuFramesOpened),
         static_cast<unsigned long long>(metrics.GpuFramesDropped),
+        static_cast<unsigned long long>(metrics.UnexpectedCpuFramesInGpuSession),
+        static_cast<unsigned long long>(metrics.TransportContractViolations),
         static_cast<unsigned long long>(metrics.GpuSharedOpenFailures),
         static_cast<unsigned long long>(metrics.GpuSyncTimeouts),
         static_cast<unsigned long long>(metrics.AdapterMismatchErrors),

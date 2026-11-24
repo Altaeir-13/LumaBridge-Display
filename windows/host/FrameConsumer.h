@@ -404,6 +404,12 @@ struct HostConsumerMetricsSnapshot
     bool FallbackToCpuActivated{false};
     uint32_t SharedTexturePoolSize{0U};
     uint32_t SharedTexturePoolPeakUsage{0U};
+    uint64_t CpuFramesReceived{0ULL};
+    uint64_t GpuFramesReceived{0ULL};
+    uint64_t GpuSharedResourcesOpened{0ULL};
+    uint64_t UnexpectedCpuFramesInGpuSession{0ULL};
+    uint64_t UnexpectedGpuFramesInCpuSession{0ULL};
+    uint64_t TransportContractViolations{0ULL};
     uint64_t GpuFramesOpened{0ULL};
     uint64_t GpuFramesDropped{0ULL};
     uint64_t GpuSharedOpenFailures{0ULL};

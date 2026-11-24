@@ -1916,6 +1916,28 @@ FrameConsumer::ReceiveNextGpuOrCpuFrame(
         env.MessageType == static_cast<uint16_t>(ipc::FrameIpcMessageType::GpuFrameHeader) &&
         env.HeaderSizeBytes == sizeof(ipc::FrameIpcGpuFrameHeader))
     {
+        bool requireCpuOnly = (m_config.TransportPreference == HostTransportPreference::CpuStagingOnly);
+        {
+            SharedLock lock(&m_metricsLock);
+            if (m_metrics.NegotiatedTransportMode == ipc::FrameIpcTransportMode::CpuStagingPipe)
+            {
+                requireCpuOnly = true;
+            }
+        }
+        if (requireCpuOnly)
+        {
+            ClosePipeAndResetConnectionState(false);
+            ExclusiveLock lock(&m_metricsLock);
+            ++m_metrics.UnexpectedGpuFramesInCpuSession;
+            ++m_metrics.TransportContractViolations;
+            ++m_metrics.ProtocolErrors;
+            ++m_metrics.FatalIpcErrors;
+            m_metrics.TransportHealthy = false;
+            m_metrics.LastProtocolStatus = ipc::FrameIpcStatus::InvalidLength;
+            m_metrics.LastErrorHResult = DXGI_ERROR_INVALID_CALL;
+            return DXGI_ERROR_INVALID_CALL;
+        }
+
         std::memcpy(&outGpuHeader.Envelope, &env, sizeof(env));
         size_t gpuHdrBytesRead = 0U;
         const DWORD hdrErr = ReadExactOverlapped(
@@ -2125,6 +2147,7 @@ FrameConsumer::ReceiveNextGpuOrCpuFrame(
 
             ExclusiveLock lock(&m_metricsLock);
             ++m_metrics.GpuFramesOpened;
+            ++m_metrics.GpuSharedResourcesOpened;
         }
 
         if (!m_slotSeenInSession[slotIdx])
@@ -2303,6 +2326,7 @@ FrameConsumer::ReceiveNextGpuOrCpuFrame(
 
         {
             ExclusiveLock lock(&m_metricsLock);
+            ++m_metrics.GpuFramesReceived;
             RecordFrameMetricsAndTimestampsLocked(
                 outGpuHeader.FrameSequence,
                 outGpuHeader.PresentationFrameNumber,
@@ -2349,6 +2373,30 @@ FrameConsumer::ReceiveNextGpuOrCpuFrame(
         m_metrics.LastProtocolStatus = badStatus;
         m_metrics.LastErrorHResult = E_FAIL;
         return E_FAIL;
+    }
+
+    bool requireGpuOnly = (m_config.TransportPreference == HostTransportPreference::GpuSharedOnly);
+    {
+        SharedLock lock(&m_metricsLock);
+        if (m_metrics.NegotiatedTransportMode == ipc::FrameIpcTransportMode::GpuSharedNtHandle &&
+            !m_config.AllowCpuFallback)
+        {
+            requireGpuOnly = true;
+        }
+    }
+    if (requireGpuOnly)
+    {
+        ClosePipeAndResetConnectionState(false);
+        ExclusiveLock lock(&m_metricsLock);
+        ++m_metrics.CpuFramesReceived;
+        ++m_metrics.UnexpectedCpuFramesInGpuSession;
+        ++m_metrics.TransportContractViolations;
+        ++m_metrics.ProtocolErrors;
+        ++m_metrics.FatalIpcErrors;
+        m_metrics.TransportHealthy = false;
+        m_metrics.LastProtocolStatus = ipc::FrameIpcStatus::InvalidLength;
+        m_metrics.LastErrorHResult = DXGI_ERROR_INVALID_CALL;
+        return DXGI_ERROR_INVALID_CALL;
     }
 
     std::memcpy(&outHeader.Envelope, &env, sizeof(env));
@@ -2503,6 +2551,7 @@ FrameConsumer::ReceiveNextGpuOrCpuFrame(
 
     {
         ExclusiveLock lock(&m_metricsLock);
+        ++m_metrics.CpuFramesReceived;
         RecordFrameMetricsAndTimestampsLocked(
             outHeader.FrameSequence,
             outHeader.PresentationFrameNumber,
@@ -2791,7 +2840,7 @@ FrameConsumer::RunLoop(
             {
                 finalReason = HostExitReason::GpuResourceError;
             }
-            else if (recvHr == E_FAIL || recvHr == E_INVALIDARG || recvHr == E_HANDLE)
+            else if (recvHr == E_FAIL || recvHr == E_INVALIDARG || recvHr == E_HANDLE || recvHr == DXGI_ERROR_INVALID_CALL)
             {
                 finalReason = HostExitReason::FatalProtocolError;
             }
@@ -2870,6 +2919,9 @@ FrameConsumer::RunLoop(
         if (m_metrics.FatalIoTimeouts > 0ULL ||
             m_metrics.FatalIpcErrors > 0ULL ||
             m_metrics.ProtocolErrors > 0ULL ||
+            m_metrics.TransportContractViolations > 0ULL ||
+            m_metrics.UnexpectedCpuFramesInGpuSession > 0ULL ||
+            m_metrics.UnexpectedGpuFramesInCpuSession > 0ULL ||
             m_metrics.ChecksumMismatches > 0ULL ||
             m_metrics.SyntheticPatternMismatches > 0ULL ||
             !m_qpcClockValid)

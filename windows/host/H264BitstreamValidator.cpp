@@ -1075,6 +1075,16 @@ H264StreamValidationSession::Configure(
         : (verifySyntheticPsnr
             ? std::string("StructuralDecode+SyntheticPsnr")
             : std::string("StructuralDecodeOnly"));
+    m_mftDecodeLatTracker.Reset();
+    LARGE_INTEGER freqLi{};
+    if (QueryPerformanceFrequency(&freqLi) != FALSE && freqLi.QuadPart > 0)
+    {
+        m_qpcFrequency = static_cast<uint64_t>(freqLi.QuadPart);
+    }
+    else
+    {
+        m_qpcFrequency = 10000000ULL;
+    }
 }
 
 HRESULT
@@ -1241,12 +1251,24 @@ H264StreamValidationSession::SubmitPacket(
         m_height = packet.Height;
     }
 
+    LARGE_INTEGER decStartLi{};
+    LARGE_INTEGER decEndLi{};
+    (void)QueryPerformanceCounter(&decStartLi);
     std::vector<DecodedNv12Frame> decoded;
     const HRESULT decHr = m_decoder.DecodePacket(
         packet.Bitstream.data(),
         packet.Bitstream.size(),
         packet.PresentationFrameNumber,
         decoded);
+    (void)QueryPerformanceCounter(&decEndLi);
+    if (decStartLi.QuadPart > 0 && decEndLi.QuadPart >= decStartLi.QuadPart && m_qpcFrequency > 0ULL)
+    {
+        const uint64_t decUs = ComputeQpcTicksToUsSafe(
+            static_cast<uint64_t>(decEndLi.QuadPart - decStartLi.QuadPart),
+            m_qpcFrequency);
+        m_mftDecodeLatTracker.Record(decUs);
+        m_summary.MftDecodeLatencyUs = m_mftDecodeLatTracker.Summarize();
+    }
     if (FAILED(decHr))
     {
         m_summary.LastHResult = decHr;
@@ -1267,8 +1289,19 @@ H264StreamValidationSession::Finish() noexcept
 
     if (m_decoder.IsInitialized())
     {
+        LARGE_INTEGER drainStartLi{};
+        LARGE_INTEGER drainEndLi{};
+        (void)QueryPerformanceCounter(&drainStartLi);
         std::vector<DecodedNv12Frame> tail;
         const HRESULT drainHr = m_decoder.Drain(tail);
+        (void)QueryPerformanceCounter(&drainEndLi);
+        if (drainStartLi.QuadPart > 0 && drainEndLi.QuadPart >= drainStartLi.QuadPart && m_qpcFrequency > 0ULL && !tail.empty())
+        {
+            const uint64_t drainUs = ComputeQpcTicksToUsSafe(
+                static_cast<uint64_t>(drainEndLi.QuadPart - drainStartLi.QuadPart),
+                m_qpcFrequency);
+            m_mftDecodeLatTracker.Record(drainUs);
+        }
         if (FAILED(drainHr) && drainHr != E_NOT_VALID_STATE)
         {
             m_summary.LastHResult = drainHr;
@@ -1279,6 +1312,7 @@ H264StreamValidationSession::Finish() noexcept
             ProcessDecodedFrames(tail);
         }
     }
+    m_summary.MftDecodeLatencyUs = m_mftDecodeLatTracker.Summarize();
 
     const bool structuralOk =
         m_summary.Enabled &&
