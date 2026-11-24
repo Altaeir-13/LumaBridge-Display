@@ -58,7 +58,7 @@ Os passos originais de validação funcional e preparação local já foram cump
 1. **Concluído (`M0.2.4`–`M0.3`) — Gate funcional real aprovado em `6b297856`:**
    - Execuções reais `Benchmark30s` (`30,011 s`, `1.800/1.800` quadros) e `ProlongedStability` (`180,005 s` conectados, `10.670/10.584` quadros mínimos) aprovadas em `WUDFHost.exe` com `D3d11DxgiVSync`, transporte GPU puro (`0` readbacks CPU) e `TimestampMeasurementErrors == 0`.
 2. **Concluído localmente (`M0.4`) — Branch `integration/m0-windows-closure`:**
-   - Consolidou via merge commits (`--no-ff`, sem squash nem rebase) `fix/m0-validation-gates-hardening` (contendo integralmente `fix/windows-idd-device-start`, `feature/windows-frame-extraction-ipc`, `feature/windows-gpu-shared-textures-nvenc`, `6b297856` e `f1d2565e`) e `docs/universal-architecture-redefinition`, qualificada por builds e testes automatizados locais.
+   - Consolidou via merge commits (`--no-ff`, sem squash nem rebase) `fix/m0-validation-gates-hardening` (contendo integralmente `fix/windows-idd-device-start`, `feature/windows-frame-extraction-ipc`, `feature/windows-gpu-shared-textures-nvenc`, `6b297856` e `f1d2565e`) e `docs/universal-architecture-redefinition`, em qualificação local por builds e testes automatizados antes da publicação.
 3. **Pendente (aguardando autorização explícita) — Publicação e merge em `origin/dev`:**
    - Abrir e revisar PR `integration/m0-windows-closure -> dev` utilizando estratégia **Merge commit** (nunca *squash* ou *rebase*) para preservar integralmente a rastreabilidade do commit funcional validado `6b297856`. Somente após o merge efetivo em `dev`, atualizar este documento encerrando formalmente a `M0` e iniciando a `M1`.
 
