@@ -1,5 +1,7 @@
 # LumaBridge Display - Backlog
 
+> **Nota histórica e de estado (`M0.6`):** As tabelas abaixo preservam o backlog inicial da fase `M0–M3`. O planejamento vigente encontra-se em [`UNIVERSAL_ROADMAP.md`](./UNIVERSAL_ROADMAP.md), [`MIGRATION_PLAN.md`](./MIGRATION_PLAN.md) e [`ci-and-test-matrix.md`](../setup/ci-and-test-matrix.md). O emissor Windows (`M0`) foi integrado em `origin/dev` via PR #37 (`23a28046`); a Issue `#33` (persistência de `MonitorContainerId` em `PLUGPLAY_REGKEY_DEVICE`) permanece aberta para tratamento antes de expansão multi-monitor/multi-instância, `M0_FORMALLY_CLOSED = False` até conclusão do PR `M0.6`, e `M1_STARTED = False`.
+
 Este backlog transforma `REQUISITOS_LUMABRIDGE.md` em entregas pequenas e verificaveis. As issues devem ser criadas manualmente no GitHub depois da revisao humana.
 
 ## Prioridades

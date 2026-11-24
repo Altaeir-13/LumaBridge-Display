@@ -224,3 +224,9 @@ Suíte PowerShell:
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File windows\driver\tests\LumaBridgeFunctionalToolingTests.ps1
 ```
+
+## Separacao entre CI Convencional e Qualificacao Especializada (`M0.6`)
+
+- A matriz completa de dependencias de todas as `10` suites C++ (`157` casos), `9` testes E2E e `71` testes PowerShell encontra-se documentada em [ci-and-test-matrix.md](../../../docs/setup/ci-and-test-matrix.md).
+- O workflow inicial nao administrativo em `.github/workflows/ci-windows.yml` (via `scripts/ci/Invoke-LumaBridgeCiWindowsTests.ps1`) compila `lumabridge-host.exe` (compile-only), executa as suites C++ independentes de WDK/GPU/NVENC fisica e o subconjunto explicitamente listado (`21/71`) de testes PowerShell sem dependencia do WDK/pacote `Release|x64`.
+- As suites `DriverPackageValidationTests` (`WDK_REQUIRED`), `NvencEncoderTests` (`GPU_REQUIRED` / `NVENC_REQUIRED`), `FrameEndToEndIntegrationTests` (`9/9` E2E), os `50/71` casos PowerShell dependentes do WDK e a validacao real em `WUDFHost.exe` (`Benchmark30s` / `ProlongedStability`) permanecem exclusivamente na trilha especializada Windows 11 x64 local/dedicada e preservam a qualificacao historica do commit `6b297856`.

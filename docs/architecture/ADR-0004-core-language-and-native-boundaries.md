@@ -13,7 +13,7 @@
 
 Com a redefinição do LumaBridge Display para uma plataforma bidirecional entre Windows, Linux (Wayland/X11) e Android (com expansão futura para macOS e iOS/iPadOS), o núcleo de protocolo, segurança, descoberta, transporte de rede e máquina de estados de sessão precisa rodar de forma idêntica e segura em todas as plataformas, sem duplicar lógica crítica em C++, Kotlin e Swift.
 
-Ao mesmo tempo, o projeto já possui aproximadamente 20 mil linhas de código e testes C++17/WDK/PowerShell para Windows (`LumaBridgeIddDriver` e o host D3D11/NVENC em branch de desenvolvimento), altamente acopladas a contratos nativos da Microsoft (`WDF`, `IddCx`, `COM`, `D3D11`, `DXGI`, `Media Foundation`, `nvEncodeAPI.h`).
+Ao mesmo tempo, o projeto já possui aproximadamente 20 mil linhas de código e testes C++17/WDK/PowerShell para Windows (`LumaBridgeIddDriver` e o host D3D11/NVENC, integrados em `dev` via PR #37 / `23a28046`), altamente acopladas a contratos nativos da Microsoft (`WDF`, `IddCx`, `COM`, `D3D11`, `DXGI`, `Media Foundation`, `nvEncodeAPI.h`).
 
 ## Decisão proposta
 

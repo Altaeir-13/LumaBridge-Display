@@ -289,11 +289,13 @@ Esta secao consolida o fechamento da validacao funcional do emissor Windows (`M0
 
 ### 7.6 Estado de governanca e limitacoes remanescentes (nao bloqueantes para `M0`)
 
-- **Diferenciacao de marcos e integracao:**
-  - `M0` funcionalmente aprovada no commit `6b297856af535a1737658da97d381c19231913e4` (seguido do commit documental `f1d2565e82b9878f8655aeb8ddb3d4a4ace3ecac`).
-  - `M0` consolidada localmente na branch `integration/m0-windows-closure`.
-  - **`M0` ainda nao integrada em `dev` remoto (`origin/dev`).**
-  - **`M1` ainda nao iniciada.**
+- **Diferenciacao de marcos e integracao (`M0.6`):**
+  - `M0` funcionalmente aprovada no commit `6b297856af535a1737658da97d381c19231913e4` (seguido do commit documental `f1d2565e82b9878f8655aeb8ddb3d4a4ace3ecac` e do PR #37 / `a9ad7e43c06f41b59cbec7906cd6a7ced0f7ac78`).
+  - **`M0` integrada em `dev` remoto (`origin/dev`, `M0_INTEGRATED_IN_DEV = True`)** via Merge commit `23a2804606b02a85d915a55b75663b67bd5af58b` (arvore qualificada `7f1685f7ed1da22baa56f4e41c1dd1b50880c6a0` preservada integralmente).
+  - **PR de governanca `chore/m0-governance-closure` aberto para revisao (`M0_FORMALLY_CLOSED = False`):** adota `Apache-2.0` para o codigo proprio do LumaBridge (`LICENSE`), preserva avisos de terceiros (`NOTICE` e `THIRD_PARTY_NOTICES.md` para `nvEncodeAPI.h` MIT), estabelece DCO 1.1 prospectivo (`CONTRIBUTING.md`) e cria workflows iniciais nao administrativos em `.github/workflows/` (separados da qualificacao especializada conforme [ci-and-test-matrix.md](./ci-and-test-matrix.md)).
+  - **Issue `#33` mantida aberta:** ausencia de persistencia de `MonitorContainerId` em `PLUGPLAY_REGKEY_DEVICE` (a tratar antes de cenarios multi-monitor/multi-instancia, sem alteracao em `Adapter.cpp` ou `VirtualMonitor.cpp` nesta rodada).
+  - **Issue `#34`:** checklist de validacao auditado item a item no PR `M0.6` (sem fechamento manual antes da revisao final).
+  - **`M1` ainda nao iniciada (`M1_STARTED = False`).**
 - **Observabilidade PDH/GPU:** cada consulta de contadores PDH GPU consumiu `~5,6 - 6,4 s` no runner, elevando o intervalo efetivo medio para `~20,7 s` em `180 s` e mantendo `DedicatedVram` do servidor visto internamente pelo host como `NOT_MEASURED`.
 - **Duracao de 180 s e regime `> 65.536` amostras:** comprova estabilidade para encerramento funcional da `M0`, mas nao substitui ensaios de longa duracao de varias horas (inclusive alem de `65.536` amostras, onde entra `ReservoirSampledEstimate_AlgorithmR`).
 - **Distincao de politica de fallback no servidor:** o driver ainda registra o default estrutural `AllowCpuFallback = 1` em `SessionSummary` mesmo quando o host negocia `--require-gpu-shared` (`0` frames CPU); a explicitao por handshake fica para refinamento incremental sem alterar contratos `M0`.
