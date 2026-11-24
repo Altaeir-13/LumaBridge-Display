@@ -160,8 +160,9 @@ function Invoke-NativeTool {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Executable,
-        [Parameter(Mandatory = $true)]
-        [string[]]$Arguments,
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyCollection()]
+        [string[]]$Arguments = @(),
         [Parameter(Mandatory = $true)]
         [string]$WorkingDirectory
     )
@@ -171,7 +172,12 @@ function Invoke-NativeTool {
         $prevEap = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         try {
-            $output = @(& $Executable @Arguments 2>&1 | ForEach-Object { [string]$_ })
+            if ($null -ne $Arguments -and $Arguments.Count -gt 0) {
+                $output = @(& $Executable @Arguments 2>&1 | ForEach-Object { [string]$_ })
+            }
+            else {
+                $output = @(& $Executable 2>&1 | ForEach-Object { [string]$_ })
+            }
             $exitCode = $LASTEXITCODE
         }
         finally {

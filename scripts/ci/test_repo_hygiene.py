@@ -202,7 +202,7 @@ class RepoHygieneTests(unittest.TestCase):
             # Construct negative test payloads dynamically so this test file stays clean.
             fake_tok = "ghp_" + ("A1b2C3d4E5" * 3)
             fake_key = "-----BEGIN " + "RSA PRIVATE KEY-----"
-            fake_path = "C:\\Users\\AlicePersonal\\Documents\\secret.txt"
+            fake_path = "C:\\" + "Users\\AlicePersonal\\Documents\\secret.txt"
             write_repo_file(repo, "leak.txt", f"{fake_tok}\n{fake_key}\n{fake_path}\n")
             git(repo, "add", "leak.txt")
 
