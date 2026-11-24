@@ -117,8 +117,27 @@ else {
 Copy-Item -LiteralPath $sourceInf -Destination $stagedInf -Force
 Copy-Item -LiteralPath $sourceDll -Destination $stagedDll -Force
 
+$certSnapshotBefore = Get-LumaBridgeCertificateStoreSnapshot -Thumbprint $(if ($null -ne $signingCert) { $signingCert.Thumbprint } else { $CertificateThumbprint }) -Subject $CertificateSubject
+$certWasPreExisting = ($null -ne $signingCert)
+$certCreatedInRun = $false
+
 if ($null -eq $signingCert) {
     $signingCert = New-LumaBridgeSigningCertificate -CertificateSubject $CertificateSubject -ValidMonths 6
+    $certCreatedInRun = $true
+}
+
+$normThumb = $signingCert.Thumbprint.ToUpperInvariant()
+$alreadyInRoot = $false
+$alreadyInTrustedPublisher = $false
+if ($certWasPreExisting -and $null -ne $certSnapshotBefore -and $null -ne $certSnapshotBefore.Stores) {
+    $rootStore = $certSnapshotBefore.Stores.'Cert:\LocalMachine\Root'
+    $tpStore = $certSnapshotBefore.Stores.'Cert:\LocalMachine\TrustedPublisher'
+    if ($null -ne $rootStore) {
+        $alreadyInRoot = (@($rootStore.Certs | Where-Object { $_.Thumbprint -ieq $normThumb }).Count -gt 0)
+    }
+    if ($null -ne $tpStore) {
+        $alreadyInTrustedPublisher = (@($tpStore.Certs | Where-Object { $_.Thumbprint -ieq $normThumb }).Count -gt 0)
+    }
 }
 
 $signDllArgs = @('sign', '/fd', 'SHA256', '/sha1', $signingCert.Thumbprint)
@@ -148,9 +167,17 @@ $null = Invoke-LumaBridgeExternalCommand -FilePath $signtoolPath -Arguments $sig
 # Export public certificate only after Inf2Cat finishes so the directory hashed by Inf2Cat stays clean.
 Export-LumaBridgeCertificateFile -Certificate $signingCert -FilePath $cerExportPath
 
+$trustedInRunRoot = $false
+$trustedInRunPublisher = $false
 if ($TrustCertificate) {
-    $null = Invoke-LumaBridgeExternalCommand -FilePath 'certutil.exe' -Arguments @('-addstore', 'Root', $cerExportPath)
-    $null = Invoke-LumaBridgeExternalCommand -FilePath 'certutil.exe' -Arguments @('-addstore', 'TrustedPublisher', $cerExportPath)
+    if (-not $alreadyInRoot) {
+        $null = Invoke-LumaBridgeExternalCommand -FilePath 'certutil.exe' -Arguments @('-addstore', 'Root', $cerExportPath)
+        $trustedInRunRoot = $true
+    }
+    if (-not $alreadyInTrustedPublisher) {
+        $null = Invoke-LumaBridgeExternalCommand -FilePath 'certutil.exe' -Arguments @('-addstore', 'TrustedPublisher', $cerExportPath)
+        $trustedInRunPublisher = $true
+    }
 }
 
 $verification = Test-LumaBridgePackageArtifacts `
@@ -172,10 +199,17 @@ if ($sourceHashesBefore.Inf -ne $sourceHashesAfter.Inf -or
 }
 
 [pscustomobject]@{
-    StagingDir               = $StagingDir
-    CertificatePath          = $cerExportPath
-    CertificateThumbprint    = $signingCert.Thumbprint
-    CertificateTrusted       = $TrustCertificate.IsPresent
-    SourceArtifactsPreserved = $true
-    Verification             = $verification
+    StagingDir                       = $StagingDir
+    CertificatePath                  = $cerExportPath
+    CertificateThumbprint            = $signingCert.Thumbprint
+    CertificateTrusted               = $TrustCertificate.IsPresent
+    CertificateWasPreExisting        = $certWasPreExisting
+    CertificateCreatedInRun          = $certCreatedInRun
+    CertificateAlreadyTrustedRoot    = $alreadyInRoot
+    CertificateAlreadyTrustedPub     = $alreadyInTrustedPublisher
+    CertificateTrustedInRunRoot      = $trustedInRunRoot
+    CertificateTrustedInRunPublisher = $trustedInRunPublisher
+    CertificateTrustedInRun          = ($trustedInRunRoot -or $trustedInRunPublisher)
+    SourceArtifactsPreserved         = $true
+    Verification                     = $verification
 }

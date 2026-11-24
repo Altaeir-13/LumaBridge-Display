@@ -15,6 +15,14 @@ param(
 
     [switch]$SkipTestSigningCheck,
 
+    [string]$DiagnosticsOutputDir,
+
+    [string]$DebugLogPath,
+
+    [string]$EtlPath,
+
+    [switch]$SkipPreRollbackDiagnostics,
+
     [switch]$DryRun,
 
     [switch]$Force
@@ -151,6 +159,64 @@ try {
 catch {
     $primaryError = $_.Exception.Message
     $rollbackActions = New-Object System.Collections.Generic.List[string]
+    $collectDiagnosticsScript = Join-Path -Path $PSScriptRoot -ChildPath 'Collect-LumaBridgeDiagnostics.ps1'
+
+    $failureDiagDir = $null
+    $preRollbackDiagCaptured = $false
+    $preRollbackDiagError = $null
+    $capturedProblemStatusHex = $null
+    $capturedLastSuccessfulStage = $null
+
+    if (-not $SkipPreRollbackDiagnostics) {
+        if (-not [string]::IsNullOrWhiteSpace($DiagnosticsOutputDir)) {
+            $failureDiagDir = $DiagnosticsOutputDir
+        }
+        else {
+            $localAppData = if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+                $env:LOCALAPPDATA
+            }
+            else {
+                [Environment]::GetFolderPath('LocalApplicationData')
+            }
+            $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+            $failureDiagDir = Join-Path -Path $localAppData -ChildPath ("LumaBridgeDisplay\Diagnostics\InstallFailure_{0}" -f $stamp)
+        }
+
+        try {
+            $diagParams = @{
+                Configuration  = $Configuration
+                OutputDir      = $failureDiagDir
+                StagingDir     = $StagingDir
+                FailureContext = $primaryError
+            }
+            if (-not [string]::IsNullOrWhiteSpace($DebugLogPath)) {
+                $diagParams['DebugLogPath'] = $DebugLogPath
+            }
+            if (-not [string]::IsNullOrWhiteSpace($EtlPath)) {
+                $diagParams['EtlPath'] = $EtlPath
+            }
+
+            $diagResult = & $collectDiagnosticsScript @diagParams
+            $preRollbackDiagCaptured = $true
+
+            if ($null -ne $diagResult -and $null -ne $diagResult.Summary) {
+                if ($null -ne $diagResult.Summary.Prerequisites) {
+                    $pnpSnaps = @($diagResult.Summary.Prerequisites.PnpInstances)
+                    if ($pnpSnaps.Count -gt 0 -and ($pnpSnaps[0].PSObject.Properties.Name -contains 'ProblemStatusHex')) {
+                        $capturedProblemStatusHex = $pnpSnaps[0].ProblemStatusHex
+                    }
+                }
+                if (($diagResult.Summary.PSObject.Properties.Name -contains 'StageExecutionSummary') -and
+                    $null -ne $diagResult.Summary.StageExecutionSummary -and
+                    ($diagResult.Summary.StageExecutionSummary.PSObject.Properties.Name -contains 'LastSuccessfulStage')) {
+                    $capturedLastSuccessfulStage = $diagResult.Summary.StageExecutionSummary.LastSuccessfulStage
+                }
+            }
+        }
+        catch {
+            $preRollbackDiagError = $_.Exception.Message
+        }
+    }
 
     if (-not $isUpdate) {
         try {
@@ -225,6 +291,48 @@ catch {
         }
     }
 
+    if (-not $SkipPreRollbackDiagnostics -and -not [string]::IsNullOrWhiteSpace($failureDiagDir)) {
+        try {
+            if (-not (Test-Path -LiteralPath $failureDiagDir)) {
+                $null = New-Item -Path $failureDiagDir -ItemType Directory -Force
+            }
+            $remainingInstances = @(Get-LumaBridgePnpInstances)
+            $remainingPackages = @(Get-LumaBridgeDriverStorePackages)
+            $postRollbackPayload = [pscustomobject]@{
+                CapturedAtUtc                = (Get-Date).ToUniversalTime().ToString('o')
+                Configuration                = $Configuration
+                StagingDir                   = $StagingDir
+                IsUpdate                     = $isUpdate
+                PrimaryError                 = $primaryError
+                PreRollbackDiagCaptured      = $preRollbackDiagCaptured
+                PreRollbackDiagnosticsError  = $preRollbackDiagError
+                PreRollbackProblemStatusHex  = $capturedProblemStatusHex
+                PreRollbackLastSuccessStage  = $capturedLastSuccessfulStage
+                RollbackActions              = @($rollbackActions.ToArray())
+                RemainingInstances           = $remainingInstances
+                RemainingDriverStorePackages = $remainingPackages
+            }
+            $postRollbackPath = Join-Path -Path $failureDiagDir -ChildPath 'post-rollback-status.json'
+            $postRollbackPayload | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $postRollbackPath -Encoding UTF8
+        }
+        catch {
+        }
+    }
+
     $rollbackSummary = if ($rollbackActions.Count -gt 0) { $rollbackActions -join '; ' } else { 'No rollback actions required' }
-    throw ("Driver installation/update failed: {0}. Rollback: {1}." -f $primaryError, $rollbackSummary)
+    $diagDetailParts = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace($capturedProblemStatusHex)) {
+        $diagDetailParts.Add(("ProblemStatus={0}" -f $capturedProblemStatusHex))
+    }
+    if (-not [string]::IsNullOrWhiteSpace($capturedLastSuccessfulStage)) {
+        $diagDetailParts.Add(("LastSuccessfulStage={0}" -f $capturedLastSuccessfulStage))
+    }
+    $diagMeta = if ($diagDetailParts.Count -gt 0) { " ({0})" -f ($diagDetailParts -join ', ') } else { '' }
+    $diagSuffix = if (-not $SkipPreRollbackDiagnostics -and -not [string]::IsNullOrWhiteSpace($failureDiagDir)) {
+        " Diagnostics preserved at '{0}'{1}." -f $failureDiagDir, $diagMeta
+    }
+    else {
+        ''
+    }
+    throw ("Driver installation/update failed: {0}. Rollback: {1}.{2}" -f $primaryError, $rollbackSummary, $diagSuffix)
 }

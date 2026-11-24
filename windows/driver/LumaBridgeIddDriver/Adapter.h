@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Driver.h"
+#include "DiagnosticStageConfig.h"
 #include "AdapterStateMachine.h"
 #include "MonitorModes.h"
 #include "SwapChainProcessor.h"
@@ -13,9 +14,17 @@ struct DeviceSwapChainHost;
 
 inline constexpr UINT kMaxMonitorsSupported = 1;
 inline constexpr DWORD kAdapterInitSlotWaitTimeoutMs = 5000;
-inline constexpr UINT kEndpointMajorVersion = 0;
+inline constexpr bool kDefaultFrameExtractionEnabled = false;
+inline constexpr UINT kEndpointMajorVersion = 1;
 inline constexpr UINT kEndpointMinorVersion = 1;
 inline constexpr UINT kEndpointBuildVersion = 0;
+
+// Workaround for Windows 11 IddCx.dll (10.0.26100.9818) Validate(IDDCX_ADAPTER_CAPS)
+// off-by-one check that rejects IDDCX_TRANSMISSION_TYPE_NETWORK_OTHER (9) with 0xC000000D.
+inline constexpr IDDCX_TRANSMISSION_TYPE kAdapterTransmissionType = IDDCX_TRANSMISSION_TYPE_WIRED_OTHER;
+static_assert(
+    IsSupportedIddCxRuntimeTransmissionType(static_cast<uint32_t>(kAdapterTransmissionType)),
+    "kAdapterTransmissionType must be accepted by IddCx.dll Validate(IDDCX_ADAPTER_CAPS).");
 
 inline constexpr wchar_t kEndpointFriendlyName[] = L"LumaBridge Virtual Display Adapter";
 inline constexpr wchar_t kEndpointModelName[] = L"LumaBridge Indirect Display";

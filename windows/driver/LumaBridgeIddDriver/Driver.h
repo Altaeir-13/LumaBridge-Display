@@ -23,3 +23,15 @@ EVT_WDF_DRIVER_UNLOAD LumaBridgeEvtDriverUnload;
 EVT_WDF_DRIVER_DEVICE_ADD LumaBridgeEvtDeviceAdd;
 EVT_WDF_DEVICE_D0_ENTRY LumaBridgeEvtDeviceD0Entry;
 EVT_WDF_DEVICE_D0_EXIT LumaBridgeEvtDeviceD0Exit;
+
+/// Returns the number of DLL_PROCESS_ATTACH notifications observed by DllMain.
+ULONG
+LumaBridgeGetDllProcessAttachCount() noexcept;
+
+/// Returns the HRESULT produced by TraceLoggingRegister during DriverEntry.
+HRESULT
+LumaBridgeGetTraceLoggingRegisterResult() noexcept;
+
+/// Returns true if TraceLoggingRegister succeeded and an ETW session has enabled the provider.
+bool
+LumaBridgeIsTraceLoggingEnabled() noexcept;

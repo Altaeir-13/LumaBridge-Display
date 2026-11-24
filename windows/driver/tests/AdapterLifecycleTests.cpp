@@ -14,6 +14,7 @@ using NTSTATUS = LONG;
 #endif
 
 #include "../LumaBridgeIddDriver/AdapterStateMachine.h"
+#include "../LumaBridgeIddDriver/DiagnosticStageConfig.h"
 
 namespace {
 
@@ -483,6 +484,155 @@ TestLateCommitModesAfterFailureOrCleanupIsRejected()
     }
 }
 
+void
+TestDiagnosticStageSuccessProgressionTracksLastSuccessfulStage()
+{
+    AdapterLifecycleTracker tracker{};
+    EXPECT_EQ(tracker.LastStage, DriverDiagnosticStage::None);
+    EXPECT_EQ(tracker.LastSuccessfulStage, DriverDiagnosticStage::None);
+    EXPECT_EQ(tracker.LastStageStatus, STATUS_SUCCESS);
+
+    TransitionOnDeviceConfigured(tracker);
+    EXPECT_EQ(tracker.LastSuccessfulStage, DriverDiagnosticStage::DeviceInitConfig);
+    EXPECT_EQ(tracker.LastStageStatus, STATUS_SUCCESS);
+
+    RecordDiagnosticSuccess(tracker, DriverDiagnosticStage::WdfDeviceCreate, STATUS_SUCCESS);
+    EXPECT_EQ(tracker.LastStage, DriverDiagnosticStage::WdfDeviceCreate);
+    EXPECT_EQ(tracker.LastSuccessfulStage, DriverDiagnosticStage::WdfDeviceCreate);
+    EXPECT_EQ(tracker.LastStageStatus, STATUS_SUCCESS);
+
+    TransitionOnDeviceInitialized(tracker, STATUS_SUCCESS);
+    EXPECT_EQ(tracker.LastSuccessfulStage, DriverDiagnosticStage::IddCxDeviceInitialize);
+    EXPECT_EQ(tracker.LastStageStatus, STATUS_SUCCESS);
+
+    EXPECT_EQ(TransitionOnD0EntryBegin(tracker).Action, D0EntryAction::StartAsyncInit);
+    EXPECT_EQ(tracker.LastSuccessfulStage, DriverDiagnosticStage::DeviceD0Entry);
+    EXPECT_EQ(tracker.LastStageStatus, STATUS_SUCCESS);
+
+    EXPECT_EQ(TransitionOnAdapterInitAsyncSubmitted(tracker, STATUS_SUCCESS, true), STATUS_SUCCESS);
+    EXPECT_EQ(tracker.LastSuccessfulStage, DriverDiagnosticStage::AdapterInitAsync);
+    EXPECT_EQ(tracker.LastStageStatus, STATUS_SUCCESS);
+
+    EXPECT_EQ(TransitionOnAdapterInitFinished(tracker, STATUS_SUCCESS), STATUS_SUCCESS);
+    EXPECT_EQ(tracker.LastSuccessfulStage, DriverDiagnosticStage::AdapterInitFinished);
+    EXPECT_EQ(tracker.LastStageStatus, STATUS_SUCCESS);
+}
+
+void
+TestDeviceInitializeFailurePreservesPreviousSuccessfulStage()
+{
+    AdapterLifecycleTracker tracker{};
+    TransitionOnDeviceConfigured(tracker);
+    RecordDiagnosticSuccess(tracker, DriverDiagnosticStage::WdfDeviceCreate, STATUS_SUCCESS);
+
+    TransitionOnDeviceInitialized(tracker, STATUS_DEVICE_POWER_FAILURE);
+    EXPECT_EQ(tracker.State, AdapterLifecycleState::AdapterFailed);
+    EXPECT_EQ(tracker.LastStage, DriverDiagnosticStage::IddCxDeviceInitialize);
+    EXPECT_EQ(tracker.LastSuccessfulStage, DriverDiagnosticStage::WdfDeviceCreate);
+    EXPECT_EQ(tracker.LastErrorStage, DriverDiagnosticStage::IddCxDeviceInitialize);
+    EXPECT_EQ(tracker.LastErrorStatus, STATUS_DEVICE_POWER_FAILURE);
+    EXPECT_EQ(tracker.LastStageStatus, STATUS_DEVICE_POWER_FAILURE);
+}
+
+void
+TestAdapterInitFailuresPreserveLastSuccessfulStage()
+{
+    // Synchronous failure in IddCxAdapterInitAsync must preserve DeviceD0Entry as last successful stage.
+    {
+        AdapterLifecycleTracker tracker{};
+        TransitionOnDeviceConfigured(tracker);
+        TransitionOnDeviceInitialized(tracker, STATUS_SUCCESS);
+        EXPECT_EQ(TransitionOnD0EntryBegin(tracker).Action, D0EntryAction::StartAsyncInit);
+
+        EXPECT_EQ(
+            TransitionOnAdapterInitAsyncSubmitted(tracker, STATUS_DEVICE_POWER_FAILURE, false),
+            STATUS_DEVICE_POWER_FAILURE);
+        EXPECT_EQ(tracker.State, AdapterLifecycleState::AdapterFailed);
+        EXPECT_EQ(tracker.LastSuccessfulStage, DriverDiagnosticStage::DeviceD0Entry);
+        EXPECT_EQ(tracker.LastErrorStage, DriverDiagnosticStage::AdapterInitAsync);
+        EXPECT_EQ(tracker.LastErrorStatus, STATUS_DEVICE_POWER_FAILURE);
+        EXPECT_EQ(tracker.LastStageStatus, STATUS_DEVICE_POWER_FAILURE);
+    }
+
+    // Asynchronous failure in EvtIddCxAdapterInitFinished must preserve AdapterInitAsync as last successful stage.
+    {
+        AdapterLifecycleTracker tracker{};
+        TransitionOnDeviceConfigured(tracker);
+        TransitionOnDeviceInitialized(tracker, STATUS_SUCCESS);
+        EXPECT_EQ(TransitionOnD0EntryBegin(tracker).Action, D0EntryAction::StartAsyncInit);
+        EXPECT_EQ(TransitionOnAdapterInitAsyncSubmitted(tracker, STATUS_SUCCESS, true), STATUS_SUCCESS);
+
+        EXPECT_EQ(
+            TransitionOnAdapterInitFinished(tracker, STATUS_DEVICE_POWER_FAILURE),
+            STATUS_DEVICE_POWER_FAILURE);
+        EXPECT_EQ(tracker.State, AdapterLifecycleState::AdapterFailed);
+        EXPECT_EQ(tracker.LastSuccessfulStage, DriverDiagnosticStage::AdapterInitAsync);
+        EXPECT_EQ(tracker.LastErrorStage, DriverDiagnosticStage::AdapterInitFinished);
+        EXPECT_EQ(tracker.LastErrorStatus, STATUS_DEVICE_POWER_FAILURE);
+        EXPECT_EQ(tracker.LastStageStatus, STATUS_DEVICE_POWER_FAILURE);
+    }
+}
+
+void
+TestIddCxRuntimeTransmissionTypeValidatorRejectsNetworkOtherAndAcceptsWiredOther()
+{
+    // Exact runtime validator in Windows 11 IddCx.dll (10.0.26100.9818)
+    // IddCx!Validate(IDDCX_ADAPTER_CAPS)+0x13e rejects 0 and 9 (NETWORK_OTHER).
+    EXPECT_TRUE(!IsSupportedIddCxRuntimeTransmissionType(0U));
+    EXPECT_TRUE(!IsSupportedIddCxRuntimeTransmissionType(9U));
+    EXPECT_TRUE(!IsSupportedIddCxRuntimeTransmissionType(10U));
+
+    for (uint32_t tx = 1U; tx <= 8U; ++tx)
+    {
+        EXPECT_TRUE(IsSupportedIddCxRuntimeTransmissionType(tx));
+    }
+
+    EXPECT_TRUE(IsSupportedIddCxRuntimeTransmissionType(3U));          // IDDCX_TRANSMISSION_TYPE_WIRED_OTHER
+    EXPECT_TRUE(IsSupportedIddCxRuntimeTransmissionType(0xFFFFFFFFU)); // IDDCX_TRANSMISSION_TYPE_OTHER
+}
+
+void
+TestDiagnosticStageCapabilitiesProgressMonotonicallyFromStage1ToStage6()
+{
+    EXPECT_EQ(kActiveDiagnosticStage, 6U);
+
+    const auto s1 = GetDiagnosticStageCapabilities(1U);
+    EXPECT_TRUE(s1.EnableCoreWdfAndIddCxAdapterInit);
+    EXPECT_TRUE(!s1.EnableAdapterStateMachineAndSync);
+    EXPECT_TRUE(!s1.EnableTraceLoggingAndRegistryBreadcrumbs);
+    EXPECT_TRUE(!s1.EnableVirtualMonitor);
+    EXPECT_TRUE(!s1.EnableSwapChainProcessor);
+    EXPECT_TRUE(!s1.EnableFullHostTelemetry);
+
+    const auto s2 = GetDiagnosticStageCapabilities(2U);
+    EXPECT_TRUE(s2.EnableCoreWdfAndIddCxAdapterInit);
+    EXPECT_TRUE(s2.EnableAdapterStateMachineAndSync);
+    EXPECT_TRUE(!s2.EnableTraceLoggingAndRegistryBreadcrumbs);
+    EXPECT_TRUE(!s2.EnableVirtualMonitor);
+    EXPECT_TRUE(!s2.EnableSwapChainProcessor);
+    EXPECT_TRUE(!s2.EnableFullHostTelemetry);
+
+    const auto s3 = GetDiagnosticStageCapabilities(3U);
+    EXPECT_TRUE(s3.EnableTraceLoggingAndRegistryBreadcrumbs);
+    EXPECT_TRUE(!s3.EnableVirtualMonitor);
+
+    const auto s4 = GetDiagnosticStageCapabilities(4U);
+    EXPECT_TRUE(s4.EnableVirtualMonitor);
+    EXPECT_TRUE(!s4.EnableSwapChainProcessor);
+
+    const auto s5 = GetDiagnosticStageCapabilities(5U);
+    EXPECT_TRUE(s5.EnableSwapChainProcessor);
+    EXPECT_TRUE(!s5.EnableFullHostTelemetry);
+
+    const auto s6 = GetDiagnosticStageCapabilities(6U);
+    EXPECT_TRUE(s6.EnableCoreWdfAndIddCxAdapterInit);
+    EXPECT_TRUE(s6.EnableAdapterStateMachineAndSync);
+    EXPECT_TRUE(s6.EnableTraceLoggingAndRegistryBreadcrumbs);
+    EXPECT_TRUE(s6.EnableVirtualMonitor);
+    EXPECT_TRUE(s6.EnableSwapChainProcessor);
+    EXPECT_TRUE(s6.EnableFullHostTelemetry);
+}
+
 template <typename Fn>
 void
 RunTest(
@@ -526,6 +676,21 @@ main()
     RunTest("CleanupDuringPendingInitialization", TestCleanupDuringPendingInitialization);
     RunTest("LateAsyncInitFinishedAfterCleanupIsRejected", TestLateAsyncInitFinishedAfterCleanupIsRejected);
     RunTest("LateCommitModesAfterFailureOrCleanupIsRejected", TestLateCommitModesAfterFailureOrCleanupIsRejected);
+    RunTest(
+        "DiagnosticStageSuccessProgressionTracksLastSuccessfulStage",
+        TestDiagnosticStageSuccessProgressionTracksLastSuccessfulStage);
+    RunTest(
+        "DeviceInitializeFailurePreservesPreviousSuccessfulStage",
+        TestDeviceInitializeFailurePreservesPreviousSuccessfulStage);
+    RunTest(
+        "AdapterInitFailuresPreserveLastSuccessfulStage",
+        TestAdapterInitFailuresPreserveLastSuccessfulStage);
+    RunTest(
+        "IddCxRuntimeTransmissionTypeValidatorRejectsNetworkOtherAndAcceptsWiredOther",
+        TestIddCxRuntimeTransmissionTypeValidatorRejectsNetworkOtherAndAcceptsWiredOther);
+    RunTest(
+        "DiagnosticStageCapabilitiesProgressMonotonicallyFromStage1ToStage6",
+        TestDiagnosticStageCapabilitiesProgressMonotonicallyFromStage1ToStage6);
 
     std::printf("Summary: %d tests run, %d assertion failures.\n", g_TestsRun, g_TestsFailed);
     return (g_TestsFailed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;

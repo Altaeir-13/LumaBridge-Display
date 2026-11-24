@@ -2,7 +2,7 @@
 
 ## Escopo atual
 
-`AdapterLifecycleTests.cpp` executa **16 testes unitarios deterministicos** sobre a maquina de estados (`AdapterLifecycleTracker`) e o slot de associacao em voo (`InFlightAdapterBindingSlot`) definidos em `windows/driver/LumaBridgeIddDriver/AdapterStateMachine.h`:
+`AdapterLifecycleTests.cpp` executa **21 testes unitarios deterministicos** sobre a maquina de estados (`AdapterLifecycleTracker`), o slot de associacao em voo (`InFlightAdapterBindingSlot`) e a configuracao de validacao/estagios (`DiagnosticStageConfig.h`) definidos em `windows/driver/LumaBridgeIddDriver/`:
 
 1. `NormalInitializationLifecycle` — fluxo normal `DeviceConfigured -> DeviceInitialized -> AdapterInitPending -> AdapterReady`;
 2. `EarlyAsyncCompletionBeforeInitAsyncReturns` — conclusao assincrona (`EvtIddCxAdapterInitFinished`) chegando antes do retorno pos-processado de `IddCxAdapterInitAsync`;
@@ -19,15 +19,21 @@
 13. `CleanupDuringInFlightInitPreventsCrossDeviceLateCallbackBinding` — regressao garantindo que cleanup do dispositivo A em voo (`MarkDeviceCleanedUp` + `HasBoundDevice`) impede liberacao prematura do slot e vinculacao cruzada de callbacks tardios de A no dispositivo B;
 14. `CleanupDuringPendingInitialization` — cleanup de adaptador e dispositivo durante inicializacao pendente (`AdapterInitPending`), com rejeicao de `D0Entry` posterior;
 15. `LateAsyncInitFinishedAfterCleanupIsRejected` — rejeicao de conclusao assincrona/sincrona tardia ou duplicada apos cleanup/falha sem ressuscitar handles ou estado;
-16. `LateCommitModesAfterFailureOrCleanupIsRejected` — rejeicao de `TransitionOnCommitModes` em `AdapterFailed` ou apos cleanup sem alterar `CommittedPathCount`.
+16. `LateCommitModesAfterFailureOrCleanupIsRejected` — rejeicao de `TransitionOnCommitModes` em `AdapterFailed` ou apos cleanup sem alterar `CommittedPathCount`;
+17. `DiagnosticStageSuccessProgressionTracksLastSuccessfulStage` — progressao de `LastSuccessfulStage` e `LastStageStatus` ao longo das etapas de inicializacao (`DeviceInitConfig` -> `WdfDeviceCreate` -> `IddCxDeviceInitialize` -> `DeviceD0Entry` -> `AdapterInitAsync` -> `AdapterInitFinished`);
+18. `DeviceInitializeFailurePreservesPreviousSuccessfulStage` — preservacao de `LastSuccessfulStage = WdfDeviceCreate` quando `IddCxDeviceInitialize` falha com `STATUS_DEVICE_POWER_FAILURE`;
+19. `AdapterInitFailuresPreserveLastSuccessfulStage` — preservacao de `LastSuccessfulStage` (`DeviceD0Entry` na falha sincrona e `AdapterInitAsync` na falha assincrona) em falhas `STATUS_DEVICE_POWER_FAILURE`;
+20. `IddCxRuntimeTransmissionTypeValidatorRejectsNetworkOtherAndAcceptsWiredOther` — valida a regra binaria de runtime do `IddCx.dll` (`10.0.26100.9818`) que rejeita `0` e `9` (`IDDCX_TRANSMISSION_TYPE_NETWORK_OTHER`) e aceita `[1..8]` (incluindo `3 = IDDCX_TRANSMISSION_TYPE_WIRED_OTHER`) e `0xFFFFFFFF`;
+21. `DiagnosticStageCapabilitiesProgressMonotonicallyFromStage1ToStage6` — valida `kActiveDiagnosticStage == 6` por padrao e o escalonamento incremental de capacidades dos Estagios `1..6`.
 
-`DriverPackageValidationTests.cpp` executa **5 verificacoes automatizadas** sobre o INF fonte e os pacotes gerados em `windows/driver/x64/Debug/` e `windows/driver/x64/Release/`:
+`DriverPackageValidationTests.cpp` executa **6 verificacoes automatizadas** sobre o INF fonte e os pacotes gerados em `windows/driver/x64/Debug/` e `windows/driver/x64/Release/`:
 
 1. `ParserAndHelperRejectInvalidInputs` — valida parsing de secao/arquivos referenciados e rejeicao de placeholders/PEs invalidos;
 2. `SourceInfContainsStampInfPlaceholders` — confirma tokens `NT$ARCH$.10.0...22000`, `$UMDFVERSION$` e `CatalogFile` no INF fonte;
 3. `DebugPackageArtifactsValidAndConsistent` — valida DLL x64 sem assinatura embutida (`IMAGE_DIRECTORY_ENTRY_SECURITY` + `WinVerifyTrust`), INF carimbado sem tokens nao expandidos e com todas as diretivas obrigatorias UMDF/IddCx (`wudfrd.inf`, `IddCx0102`, `IndirectKmd`, `DeviceGroupId`, `AllowKernelModeClients`, `ProcessSharingDisabled`, `NTamd64.10.0...22000`), integridade do catalogo via APIs oficiais do Windows (`CryptCATOpen`, `CryptCATEnumerateCatAttr` para Windows 11 `_v100_X64_21H2`/`22H2`/`24H2`, `CryptCATEnumerateMember`, hashes Authenticode/SIP via `CryptCATAdminCalcHashFromFileHandle2`, ausencia de assinatura via `CryptQueryObject`/`WinVerifyTrust`) e paridade entre `$(PackageDir)` e `$(OutDir)` em `Debug|x64`;
 4. `ReleasePackageArtifactsValidAndConsistent` — repete a verificacao integral para o pacote `Release|x64`;
-5. `NegativeTamperedAndInconsistentPackagesRejected` — testes negativos cobrindo adulteracao de `.dll` e `.inf`, catalogo corrompido, catalogo inconsistente entre configuracoes e artefato ausente.
+5. `NegativeTamperedAndInconsistentPackagesRejected` — testes negativos cobrindo adulteracao de `.dll` e `.inf`, catalogo corrompido, catalogo inconsistente entre configuracoes e artefato ausente;
+6. `AdapterSourceEnforcesSupportedIddCxTransmissionTypeAndStageConfig` — garante uso de `kAdapterTransmissionType = IDDCX_TRANSMISSION_TYPE_WIRED_OTHER`, `kEndpointMajorVersion = 1`, `WDF_REGKEY_DEVICE_SUBKEY`, `DiagBuildStage`, ausencia de `IDDCX_TRANSMISSION_TYPE_NETWORK_OTHER` em `Adapter.cpp` e propagacao nao mascarada de falha em `LumaBridgeEvtDeviceD0Entry`.
 
 `MonitorModesTests.cpp` executa **12 testes unitarios deterministicos** sobre `MonitorModes.h` / `MonitorModes.cpp`:
 
@@ -80,7 +86,7 @@
 14. `ReentrantBackendCallbacksDoNotDeadlockOrLeakReferences` — garante ausencia de deadlock e balanco exato de referencias em callbacks reentrantes;
 15. `DerivedContainerIdsAreUniqueAndRfc4122ValidPerInstance` — confirma `ContainerId` deterministico, unico por instancia/conector e valido segundo RFC 4122.
 
-`LumaBridgeFunctionalToolingTests.ps1` executa **18 testes automatizados PowerShell** com mocks isolados e assinaturas efemeras em diretorio temporario sobre `windows/driver/scripts/`:
+`LumaBridgeFunctionalToolingTests.ps1` executa **71 verificacoes automatizadas PowerShell** com mocks isolados e assinaturas efemeras em diretorio temporario sobre `windows/driver/scripts/`:
 
 1. `PackageSigningAndCryptographicVerificationPositive` — valida assinatura em staging isolado, hashes SIP de `.dll` e `.inf` no `.cat`, assinatura PKCS#7 e correspondencia de certificados preservando hashes originais de build;
 2. `InfTamperingRejectedEvenWithAllowUntrustedChain` — comprova bloqueio de `.inf` adulterado inclusive com `-AllowUntrustedChain`;
@@ -99,7 +105,75 @@
 15. `UninstallOmitsForceByDefaultAndSupportsOptInForce` — garante ausencia de `/force` por padrao e suporte opt-in a `-ForceDriverStoreDelete`;
 16. `UninstallCertificateRemovalRequiresThumbprintAndConfirmation` — exige thumbprint SHA-1 valido e confirmacao dedicada (`-ConfirmCertificateRemoval`);
 17. `DiagnosticsIdentifiesLumaBridgeWudfHostProcess` — valida correlacao exata do processo `WUDFHost.exe` associado ao LumaBridge;
-18. `AllScriptsDryRunDoNotMutateSystemState` — confirma execucao limpa de `-DryRun` em todos os scripts sem efeitos colaterais.
+18. `AllScriptsDryRunDoNotMutateSystemState` — confirma execucao limpa de `-DryRun` em todos os scripts (incluindo `Invoke-LumaBridgeEtwTrace.ps1`) sem efeitos colaterais;
+19. `PnpProblemStatusAndStartupBreadcrumbsCollected` — valida formatacao de `DEVPKEY_Device_ProblemStatus` (`0xC000009E`), leitura de `UpperFilters` (`IndirectKmd`), leitura de breadcrumbs `Diag*` e exposicao em `Test-LumaBridgeDeviceDriverBinding`;
+20. `InstallFailurePreservesPreRollbackDiagnosticsBeforeCleanup` — simula falha real de start (`ROOT\DISPLAY\0000`, `oem68.inf`, `ProblemCode=10`, `0xC000009E`) e garante preservacao de `diagnostics-summary.json`, `diagnostics-summary.md`, `setupapi-excerpt.log` e `post-rollback-status.json` apos rollback completo;
+21. `SetupApiExcerptAndEventChannelCollection` — valida parser filtrado de `setupapi.dev.log` (WDF `2.23` vs `2.31` e `CM_PROB_FAILED_START`) e coleta multi-canal (`Kernel-PnP`, `CodeIntegrity`, `WerKernel`) pulando canais desabilitados;
+22. `DriverStageSummaryIdentifiesLastSuccessfulAndFailingStage` — valida correlacao combinada de traces `[LB-DRIVER]`, eventos TraceLogging ETL e breadcrumbs `Diag*` para identificar `LastSuccessfulStage` e `FirstFailureStage`;
+23. `CrashDumpInventoryAndEtwTraceDryRun` — valida inventario de dumps (`CrashDumps`, `AutoLogger`), `-DryRun` do `Invoke-LumaBridgeEtwTrace.ps1` (sessoes `Core` + `Dxg`) e `-Action ExportSummary`;
+24. `EtwTraceUsesProviderFileAndSeparatesDxgKrnlSession` — valida arquivos `-pf` (`6` providers Core sem comentarios `#` e `2` providers `DxgKrnl`/`Watchdog-Events`), verificacao imediata de GUIDs via `Test-LumaBridgeEtwSessionProviders` e ausencia de `DxgKrnl` sem `-IncludeDxgKrnl`;
+25. `StreamingEtlQueryAppliesNativeXPathWithoutPreFilterCap` — valida geracao de XPath nativo (`Provider`, `TimeCreated`, `Execution[@ProcessID]`, exclusao padrao `DxgKrnl`/`Watchdog-Events`), streaming sem teto de 500 eventos pre-filtro, exposicao de `CircularWrapWarning` e filtro estreito do `setupapi.dev.log` excluindo `VBoxSup.inf`;
+26. `WppTmfCacheAndDecodeDryRunAndStreamFilter` — valida `-DryRun` de `Initialize-LumaBridgeWppTmfCache` e decodificacao WPP em streaming (`Invoke-LumaBridgeWppEtlDecode`) filtrando PID `23812` e excluindo ruido `DxgKrnl`/`Watchdog-Events`;
+27. `PrepareIddSampleReferenceDryRunEnforcesIsolation` — valida bloqueio de diretorios dentro do repositorio e execucao limpa de `Prepare-IddSampleReference.ps1 -DryRun` sem criar arquivos nem instalar drivers;
+28. `DiagnosticStageBuildManifestAndSubkeyBreadcrumbs` — valida leitura automatica de `Diag*` (incluindo `DiagBuildStage`) na subchave `Device Parameters\LumaBridgeIddDriver` e geracao isolada de manifesto/SHA-256 em `Build-LumaBridgeDiagnosticStage.ps1`;
+29. `ObservabilityVerifyProvidersAndUnclampedEtlTraceLoggingRecovery` — valida exposicao de `AllProvidersVerified` no nivel raiz de `VerifyProviders`, nao truncamento de `Collect-LumaBridgeDiagnostics.ps1` por eventos PnP antigos e recuperacao direcionada de eventos TraceLogging sem manifesto (`ProviderId` sem `ProviderName`) apos teto `MaxMatchedEvents`;
+30. `FunctionalValidationScriptDryRunAndFinallyRollbackOnFailure` — valida `Invoke-LumaBridgeFunctionalValidation.ps1 -DryRun`, uso estrito de `$signResult.StagingDir` na documentacao/script e rollback garantido no bloco `finally` (reversao de `EnableFrameExtraction=0`, limpeza de `AuthorizedHostUserSid`, restauracao de `EnableVirtualMonitor`, parada da sessao ETW e restart do dispositivo) mesmo apos falha no host ou erro no meio do fluxo;
+31–57. Cobertura `M4.2.1` / `M0.1` / `M0.2.1` / `M0.2.2` — gates estritos por subperfil (`Benchmark30s` sem desconto de duracao, `ProlongedStability >= 180s`), identidade `WUDFHost`, metodologia de percentis (`ExactPopulation`, `ReservoirSampledEstimate_AlgorithmR`, `NotAvailable`), `RuntimeInformation` isolado contra `PSReadLine` e diagnosticos `M0.2.2`;
+58–65. Cobertura `M0.2.4` — independencia de `FunctionalSmokePassed` no `Benchmark30s`, classificacao `ControlledExitGateFailure` / `TimeoutKilled` / `CrashOrAbnormalExit`, rejeicao de frames CPU em sessao GPU-only, reuso criptograficamente verificado de staging assinado (`-ReuseSignedStaging`) com protecao contra sobrescrita de relatorios historicos e telemetria desacoplada (`-GpuSampleIntervalSec` sem `Get-Counter` na fase `End`);
+66–71. Cobertura `M0.2.5.1` — encaminhamento `-StimulusBackend Dxgi|Gdi|Auto` no `DryRun` (`Benchmark30s` e `ProlongedStability`), gate estrito zero-default para `Dxgi` (rejeicao de fallback GDI, `PresentSucceeded=0`, `CompletedCleanly=false`, `TerminalFailure=true`, campos ausentes/invalidos e cadencia insuficiente com `PresentSucceeded>0`), reprovacao por falha/timeout no `H264DecodeValidation.Worker`, compatibilidade retroativa/erro terminal em `Auto`, selecao `Gdi` e `Benchmark30s -StimulusBackend Dxgi -DryRun` isolado com `PSReadLine` + `StrictMode Latest`.
+
+`FrameExtractionTests.cpp` executa **12 testes deterministicos e D3D11 reais** sobre `FrameExtractor.h` / `FrameExtractor.cpp` (dispositivo D3D11 real hardware/WARP e injecao de falhas via `ID3d11ExtractionHooks`):
+
+1. `ValidRealD3d11Texture720pAnd1080pExtraction` — extrai texturas D3D11 reais `1280x720` e `1920x1080` (`BGRA8` e `RGBA8`), reutilizacao de staging e integridade byte-a-byte de padrao sintetico + CRC-32;
+2. `InvalidDimensionsAndBoundsRejected` — rejeita dimensoes nulas e acima de `kMaxFrameWidth`/`kMaxFrameHeight`;
+3. `UnsupportedDxgiFormatRejected` — rejeita formatos nao suportados (`DXGI_FORMAT_R16G16B16A16_FLOAT`) com `DXGI_ERROR_UNSUPPORTED`;
+4. `InvalidMipLevelsArraySizeAndMsaaRejected` — rejeita `MipLevels > 1`, `ArraySize > 1` e MSAA (`SampleDesc.Count > 1`);
+5. `NullSurfaceAndMissingDeviceRejected` — rejeita dispositivo ausente, superficie nula e `IDXGIResource` sem `ID3D11Texture2D`;
+6. `ProtectedContentRejectedWithoutExposingPixels` — rejeita `HwProtectedSurface` e `D3D11_RESOURCE_MISC_HW_PROTECTED` com `DXGI_ERROR_ACCESS_DENIED` sem expor pixels;
+7. `StagingAllocationFailureHandledCleanly` — trata `E_OUTOFMEMORY` na alocacao da textura staging e recupera no frame seguinte;
+8. `MapAndCopyFailureHandledCleanly` — trata erros de `CopyResource` / `Map`, garante `Unmap` RAII e reempacotamento de linhas quando `RowPitch > Width * 4`;
+9. `DeviceRemovedAndResetPropagated` — propaga `DXGI_ERROR_DEVICE_REMOVED` / `DXGI_ERROR_DEVICE_RESET` limpando a staging texture;
+10. `AcquiredSurfaceComReferenceLifetimeReleasedBeforeReturn` — comprova via stub COM rastreado (incluindo `AdoptSourceTexture` via `ComPtr::Detach()`) que a referencia `ID3D11Texture2D`/`IDXGIResource` adquirida e liberada antes do `Map` e antes do retorno de `ExtractFrame`;
+11. `PoolBufferMemoryBoundsAndFlushStorageRelease` — valida retencao de capacidade ate `kMaxRetainedPoolBufferBytes` (`~14.06 MiB` para 720p/1080p/1440p), liberacao automatica de picos de `64 MiB` na reciclagem, rejeicao acima de `kMaxFramePayloadBytes` e zeragem integral da memoria em `FlushQueue()`;
+12. `SwapChainProcessorIntegrationWithExtractionAndIddCxFinish` — integra `SwapChainProcessor`, extrator D3D11 real, fila limitada e `FinishProcessingFrame`.
+
+`FrameIpcTests.cpp` executa **31 testes deterministicos** sobre `FrameIpcProtocol.h`, `FrameTransport.h/.cpp` e `FrameConsumer.h/.cpp`:
+
+1. `ValidHandshakeFrameTransferAndAck` — handshake versionado, sessao, transferencia de frames BGRA8 e confirmacao `FrameIpcFrameAck`;
+2. `IncompatibleProtocolVersionRejected` — rejeicao de `VersionMajor` incompativel com `VersionMismatch` e aceitacao subsequente de cliente valido;
+3. `InvalidMessageLengthAndBadMagicRejected` — validacao de envelope, magic invalido, tamanho divergente e cliente truncado no pipe;
+4. `IncorrectSessionIdRejected` — rejeicao de `SessionId` nulo ou divergente no header e no `FrameAck` em execucao no pipe;
+5. `FrameSequenceMonotonicityAndGapDetection` — sequencia monotonica e contabilizacao exata de `SequenceGapsDetected`;
+6. `PayloadLimitsAndOverflowValidation` — protecao contra overflow de 64 bits, pitch invalido, teto de 64 MiB e formatos invalidos;
+7. `UnauthorizedClientRejected` — rejeicao de `ClientProcessId` nulo ou falsificado via `GetNamedPipeClientProcessId` antes de qualquer transmissao de pixels, alem de verificacao real de DACL e SACL do Named Pipe (`WinNetworkSid`/`WinAnonymousSid` negados, `IU` ausente por padrao, `SYSTEM`/`BA`/`LS`/SID do proprietario permitidos, `WinMediumLabelSid` presente);
+8. `HostDisconnectReconnectAndMidFrameDisconnect` — desconexao abrupta no meio do frame, preservacao do servidor e reconexao com nova sessao;
+9. `BoundedQueueBackpressureSlowConsumerAndNoBusyWait` — politica `drop-oldest` (`MaxQueueDepth = 3`), ausencia de bloqueio no produtor sem host e ausencia de busy-wait;
+10. `ConcurrentShutdownSuspendAndResourceCleanup` — encerramento limpo (`Stop()`) sob producao e conexoes concorrentes sem deadlocks;
+11. `CrossUserSidAuthorizationAndRestrictedDaclRejection` — testes negativos de acesso entre usuarios via `AuthorizedUserSid` (rejeicao no handshake e na DACL restrita do kernel quando `RestrictDaclToAuthorizedSid` esta ativo, sem vazamento de pixels) e aceitacao com SID exato autorizado;
+12. `CrossSessionAndSpoofedSessionRejection` — rejeicao de cliente fora da sessao permitida (`AllowedClientSessionId`) e de `ClientSessionId` adulterado no handshake em desacordo com `TokenSessionId` do kernel;
+13. `ProcessIntegrityAndAnonymousSqosRejectionBeforePixels` — rejeicao por `MinimumIntegrityRid` insuficiente, bloqueio de `SECURITY_ANONYMOUS` SQOS e bloqueio real no kernel de thread com token duplicado em `SECURITY_MANDATORY_LOW_RID` (`ERROR_ACCESS_DENIED`), mantendo frame enfileirado intacto para consumidor autorizado;
+14–25. Cobertura `M4.1.1` / `M4.2` / `M0.2.1` — limites de pool, razoes de saida smoke/idle, sessoes repetidas, negociacao v1.1 GPU Shared Texture, bloqueio de clientes nao autorizados/LUID divergente, reservoir sampling e duracao conectada QPC;
+26–31. Cobertura `M0.2.4` — transicoes `CPU->GPU` e `GPU->CPU` com descarte de frames stale/mismatch, estresse concorrente de publicacao e desconexao mid-stream, wraparound `UINT64_MAX -> 1` + descarte nao bloqueante sem consumidor, rejeicao de `FrameHeader` CPU em sessao GPU-only, pacing racional QPC sem drift (`108k` ticks) + recusa de fallback em monitor fisico + `PacingCorrelation`, e ciclo DXGI stimulus em superficie explicita de teste.
+
+`HostValidationWorkerAndStimulusTests.cpp` executa **28 testes unitarios e de componentes deterministicos** (M0.2.5.1) cobrindo:
+- P0-A (5 testes): ausencia de consolidacao de percentis por pacote, equivalencia estatistica M0.2.1, escalas sinteticas (`1800`, `10800`, `65536`, `65537` e `216000` amostras), semantica nula em zero pacotes e falhas de decode/drain;
+- P0-C (8 regressoes de `VirtualDisplayStimulus`): erro terminal pos-start preservando `HRESULT`, falha de init, parada normal limpa, oclusao temporaria recuperada, oclusao persistente em `Dxgi` sem fallback, recriaçao de swapchain com recuperacao e falha definitiva, proibicao de fallback GDI em `Dxgi`, e fallback autorizado em `Auto`;
+- P0-D (15 testes de `AsyncH264ValidationWorker` e `EvaluateHostGates`): startup/shutdown, ordem FIFO + move sem copia, saturacao de fila, timeout de enqueue e propagacao aos gates, falha de prewarm, excecao `std::bad_alloc` via seam sem perda silenciosa, falha de decodificacao, rejeicao pos-stop, drain de fila pendente, falha/deadline de drain sem `detach()`, `WatchdogForcedTermination`, consolidacao final antes de gates/JSON, balanco COM/MF real na thread do worker MFT e lifecycle explicito do fallback sincrono.
+
+`FrameEndToEndIntegrationTests.cpp` executa **9 testes de integracao multiprocesso reais** com D3D11 real + `D3d11SharedTexturePool` + `FrameIpcServer` + processo filho `lumabridge-host.exe` lancado via `CreateProcessW` (incluindo `EndToEndProlonged1080p60GpuNvenc30SecondBenchmark`, parametro opcional `--only-bench30s` e variavel `LUMABRIDGE_BENCH30S_EVIDENCE_PATH` para preservacao de evidencia JSON, alem de classificacao explicita `BLOCKED_BY_ENVIRONMENT` quando DXGI sofre `DXGI_STATUS_OCCLUDED` em desktop isolado):
+
+1. `EndToEndRealD3d11ExtractionToSeparateHostProcess720pAnd1080p` — extrai texturas D3D11 reais `1280x720` e `1920x1080` com padrao sintetico, envia pelo pipe local e valida recebimento de 6/6 frames e CRC-32/pixels no processo separado `lumabridge-host.exe`;
+2. `EndToEndHostDisconnectAndReconnectDuringActiveSwapChainLoop` — executa `SwapChainProcessor` ativo enquanto dois processos `lumabridge-host.exe` conectam, desconectam e reconectam com janela intermediaria de backpressure;
+3. `EndToEndSmokeDurationExitAndMinFramesVsTargetCli` — valida perfis CLI de smoke (`--min-frames`) vs target (`--require-max-frames`);
+4. `EndToEndThroughputAndLatencyBenchmark720pAnd1080p` — mede throughput e latencia reais M4.1.1 para 30 frames `1280x720` e `1920x1080`;
+5. `VirtualDisplayStimulusHighResTimer60FpsVerification` — valida `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` atingindo ~60 FPS reais no `VirtualDisplayStimulus`;
+6. `EndToEndPhaseAGpuSharedTextureSeparateHostProcess720pAnd1080p` — comprova todos os 7 criterios da Fase A em processos separados (`CpuStagingReadsPerformed == 0` no modo normal, integridade visual no modo sintetico, `GpuFramesOpened`, `IDXGIKeyedMutex` e liberacao limpa pos-ACK);
+7. `EndToEndPhaseBGpuSharedTexturePlusNvencAndIndependentDecode720pAnd1080p` — valida pipeline completo GPU Shared -> NVENC H.264 -> decodificador Media Foundation independente em 720p e 1080p;
+8. `EndToEndControlledThreeWayBenchmark720pAnd1080p` — benchmark controlado comparando M4.1.1 (CPU Staging), M4.2 Fase A (GPU Shared) e M4.2 Fase B (GPU Shared + NVENC H.264) para 120 frames em `1280x720` e `1920x1080`.
+
+`GpuSharedTextureTests.cpp` executa **9 testes deterministas da Fase A** (criacao NT handle/KeyedMutex, sincronizacao GPU sem leitura CPU, backpressure/pool esgotado, LUID incompativel, DACL restrita/SDDL, desconexao durante mutex ativo, timeout, `DXGI_ERROR_DEVICE_REMOVED` / `ReconstructSession`, recriacao de swapchain + separacao de metricas GPU/CPU e liberacao pos-flush).
+
+`NvencEncoderTests.cpp` executa **7 testes reais de hardware NVIDIA NVENC H.264** (`ProbeAvailability`, sessao 720p/1080p, `DirectArgb` vs `ID3D11VideoProcessor` GPU `NV12`, rejeicao de formato DXGI incompativel, IDR periodico/forcado, injecao de `NV_ENC_ERR_ENCODER_BUSY` / `DEVICE_REMOVED` + `ReconstructSession`, e validacao independente de PSNR com `Microsoft H.264 Video Decoder MFT`).
 
 ## Fronteira com validacao em runtime WDF/IddCx
 
@@ -107,7 +181,7 @@ Estes testes validam exclusivamente a logica deterministica de transicoes de est
 
 ## Como compilar e executar
 
-Em ambiente x64 do Visual Studio (`VsDevCmd.bat -arch=x64 -host_arch=x64`), apos o rebuild de `Debug|x64` e `Release|x64` da solucao, os artefatos de teste sao direcionados para `windows/driver/x64/Debug/` (ignorado por `windows/driver/.gitignore`):
+Em ambiente x64 do Visual Studio (`VsDevCmd.bat -arch=amd64 -host_arch=amd64`), apos o rebuild de `Debug|x64` e `Release|x64` da solucao, os artefatos de teste sao direcionados para `windows/driver/x64/Debug/` (ignorado por `windows/driver/.gitignore`):
 
 ```bat
 cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\AdapterLifecycleTests.cpp /Fowindows\driver\x64\Debug\AdapterLifecycleTests.obj /Fe:windows\driver\x64\Debug\AdapterLifecycleTests.exe
@@ -124,6 +198,25 @@ windows\driver\x64\Debug\SwapChainLifecycleTests.exe
 
 cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\VirtualMonitorLifecycleTests.cpp windows\driver\LumaBridgeIddDriver\VirtualMonitor.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\VirtualMonitorLifecycleTests.exe
 windows\driver\x64\Debug\VirtualMonitorLifecycleTests.exe
+
+cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\FrameExtractionTests.cpp windows\driver\LumaBridgeIddDriver\FrameExtractor.cpp windows\driver\LumaBridgeIddDriver\FrameTransport.cpp windows\driver\LumaBridgeIddDriver\SharedTexturePool.cpp windows\driver\LumaBridgeIddDriver\SwapChainProcessor.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\FrameExtractionTests.exe /link d3d11.lib dxgi.lib advapi32.lib
+windows\driver\x64\Debug\FrameExtractionTests.exe
+
+cl /nologo /std:c++17 /W4 /WX /EHsc /DUNICODE /D_UNICODE /Iwindows\driver\LumaBridgeIddDriver windows\driver\tests\GpuSharedTextureTests.cpp windows\driver\LumaBridgeIddDriver\SharedTexturePool.cpp windows\driver\LumaBridgeIddDriver\FrameTransport.cpp windows\driver\LumaBridgeIddDriver\SwapChainProcessor.cpp windows\host\FrameConsumer.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\GpuSharedTextureTests.exe /link d3d11.lib dxgi.lib advapi32.lib user32.lib gdi32.lib
+windows\driver\x64\Debug\GpuSharedTextureTests.exe
+
+cl /nologo /std:c++17 /W4 /WX /EHsc /DUNICODE /D_UNICODE windows\driver\tests\FrameIpcTests.cpp windows\driver\LumaBridgeIddDriver\SharedTexturePool.cpp windows\driver\LumaBridgeIddDriver\FrameTransport.cpp windows\host\FrameConsumer.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\FrameIpcTests.exe /link d3d11.lib dxgi.lib advapi32.lib user32.lib gdi32.lib
+windows\driver\x64\Debug\FrameIpcTests.exe
+
+cl /nologo /std:c++17 /W4 /WX /EHsc /DUNICODE /D_UNICODE /Iwindows\host /Iwindows\driver\LumaBridgeIddDriver windows\driver\tests\NvencEncoderTests.cpp windows\host\NvencH264Encoder.cpp windows\host\H264BitstreamValidator.cpp windows\host\FrameConsumer.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\NvencEncoderTests.exe /link d3d11.lib dxgi.lib advapi32.lib user32.lib gdi32.lib mfplat.lib mfuuid.lib wmcodecdspuuid.lib ole32.lib
+windows\driver\x64\Debug\NvencEncoderTests.exe
+
+cl /nologo /std:c++20 /W4 /WX /EHsc /O2 /MD /DNDEBUG /DUNICODE /D_UNICODE /Iwindows\driver\LumaBridgeIddDriver /Iwindows\host windows\host\main.cpp windows\host\FrameConsumer.cpp windows\host\NvencH264Encoder.cpp windows\host\H264BitstreamValidator.cpp /Fowindows\driver\x64\Release\ /Fe:windows\driver\x64\Release\lumabridge-host.exe /link d3d11.lib dxgi.lib advapi32.lib user32.lib gdi32.lib mfplat.lib mfuuid.lib wmcodecdspuuid.lib ole32.lib psapi.lib
+cl /nologo /std:c++20 /W4 /WX /EHsc /O2 /MD /DNDEBUG /DUNICODE /D_UNICODE /Iwindows\driver\LumaBridgeIddDriver /Iwindows\host windows\driver\tests\FrameEndToEndIntegrationTests.cpp windows\driver\LumaBridgeIddDriver\SharedTexturePool.cpp windows\driver\LumaBridgeIddDriver\FrameExtractor.cpp windows\driver\LumaBridgeIddDriver\FrameTransport.cpp windows\driver\LumaBridgeIddDriver\SwapChainProcessor.cpp /Fowindows\driver\x64\Release\ /Fe:windows\driver\x64\Release\FrameEndToEndIntegrationTests.exe /link d3d11.lib dxgi.lib advapi32.lib user32.lib gdi32.lib
+windows\driver\x64\Release\FrameEndToEndIntegrationTests.exe
+
+cl /nologo /std:c++20 /W4 /WX /EHsc /Od /Zi /MDd /DUNICODE /D_UNICODE /Iwindows\host /Iwindows\driver\LumaBridgeIddDriver windows\driver\tests\HostValidationWorkerAndStimulusTests.cpp windows\host\FrameConsumer.cpp windows\host\NvencH264Encoder.cpp windows\host\H264BitstreamValidator.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\HostValidationWorkerAndStimulusTests.exe /link d3d11.lib dxgi.lib advapi32.lib user32.lib gdi32.lib mfplat.lib mfuuid.lib wmcodecdspuuid.lib ole32.lib
+windows\driver\x64\Debug\HostValidationWorkerAndStimulusTests.exe
 ```
 
 Suíte PowerShell:
