@@ -1467,6 +1467,7 @@ private:
                 {
                     {
                         std::lock_guard<std::mutex> lock(m_stateMutex);
+                        m_activeBackend = StimulusBackend::D3d11DxgiVSync;
                         m_terminalFailure = true;
                         m_lastHResult = initHr;
                         m_threadError = dxgiErr.empty()

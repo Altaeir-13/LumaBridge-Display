@@ -638,8 +638,10 @@ private:
         const char* message
         ) noexcept
     {
+        m_metrics.Healthy = false;
         if (m_metrics.CompletionState == H264WorkerCompletionState::Running ||
             m_metrics.CompletionState == H264WorkerCompletionState::NotStarted ||
+            m_metrics.CompletionState == H264WorkerCompletionState::NormalShutdown ||
             state == H264WorkerCompletionState::EnqueueTimeout)
         {
             m_metrics.CompletionState = state;
