@@ -1,6 +1,6 @@
 # Roadmap Universal Incremental (`M0–M6`) — LumaBridge Display
 
-> **Nota de governança:** A formalização documental da arquitetura universal não depende da execução de testes administrativos do driver Windows. Contudo, **a validação funcional real da `M4.2.1` com o driver carregado em `WUDFHost.exe`, monitor virtual ativo e estímulo contínuo é gate obrigatório** antes de declarar concluído o pipeline Windows e antes de utilizá-lo como base comprovada do MVP integrado (`M2`). Este documento não adota estimativas arbitrárias de tempo ou percentuais.
+> **Nota de governança (`M0.4`):** A validação funcional real da `M0` com o driver carregado em `WUDFHost.exe` (`Benchmark30s` 30 s e `ProlongedStability` 180 s no commit funcional `6b297856`) foi **aprovada** e a pilha Windows + documentação universal encontra-se consolidada localmente na branch `integration/m0-windows-closure`. Contudo, **`M0` ainda não foi integrada em `dev` remoto (`origin/dev`)** e **`M1` ainda não foi iniciada**. Este documento não adota estimativas arbitrárias de tempo ou percentuais.
 
 ---
 
@@ -8,7 +8,7 @@
 
 Embora a ordem de integração siga a dependência lógica `M0 → M1 → M2 → M3 → M4 → M5 → M6`, várias frentes podem avançar em **trilhas paralelas** sem bloquear umas às outras:
 
-- **Trilha A (Estabilização & Gate Windows):** validação real ao vivo da `M4.2.1` em `WUDFHost.exe`, revisão e merge ordenado das branches empilhadas em `dev`, atualização da dívida documental de driver/testes.
+- **Trilha A (Encerramento `M0`):** gate real em `WUDFHost.exe` concluído e consolidado em `integration/m0-windows-closure`; pendente apenas revisão/publicação em `dev` remoto e emissão de `LICENSE`/CI inicial.
 - **Trilha B (Núcleo Multiplataforma & CI):** PoC Rust ↔ C++ Windows (`ADR-0004`), implementação de `lumabridge-protocol`, `lumabridge-security`, `lumabridge-transport` (benchmark QUIC vs TCP/TLS 1.3), `lumabridge-core` e pipelines CI (Windows + Linux). *(Pode iniciar em paralelo à Trilha A sobre frames sintéticos.)*
 - **Trilha C (Receptor Linux Wayland/X11):** protótipo e construção do receptor Linux consumindo stream sintético do núcleo (`M1`) antes mesmo de receber quadros reais do driver Windows (`M2`).
 - **Trilha D (Expansão Multi-GPU, Android e Emissores):** abstrações `IVideoEncoder`/Multi-GPU Windows e app receptor Android podem ser prototipados assim que `M1` congelar o protocolo v1.
@@ -48,23 +48,22 @@ O marco `M2` será avaliado por métricas reproduzíveis coletadas sem registro 
 
 ### `M0` — Preservação, Validação Real Windows e Consolidação de Governança
 
-- **Objetivo:** Formalizar a documentação da visão universal (feita em branch isolada), fechar a validação funcional ao vivo da `M4.2.1` no Windows 11, consolidar em `dev` por revisão explícita a pilha de branches Windows pendentes e preparar a base de repositório open source.
-- **Dependências:** Estado atual das branches `fix/windows-idd-device-start`, `feature/windows-frame-extraction-ipc`, `feature/windows-gpu-shared-textures-nvenc` e `docs/universal-architecture-redefinition`; autorização explícita do operador para executar a validação administrativa Windows.
+- **Estado atual (`M0.4`):** **Funcionalmente aprovada** (`6b297856`) e **consolidada localmente** (`integration/m0-windows-closure`); **ainda não integrada em `dev` remoto** (e `LICENSE`/`.github/workflows/` pendentes antes do fechamento formal em `dev`).
+- **Objetivo:** Formalizar a documentação da visão universal, fechar a validação funcional ao vivo no Windows 11, consolidar para `dev` preservando a ancestralidade dos commits validados e preparar a base open source (`M1` ainda não iniciada).
+- **Dependências:** Branches empilhadas `fix/windows-idd-device-start`, `feature/windows-frame-extraction-ipc`, `feature/windows-gpu-shared-textures-nvenc`, `fix/m0-validation-gates-hardening` e `docs/universal-architecture-redefinition`; autorização explícita para publicar em `dev`.
 - **Artefatos produzidos:**
   - Documentação da arquitetura universal, ADRs `0003–0005`, protocolo rascunho `LBWP v1`, roadmap, plano de migração, registro de riscos e revisão de licenças;
-  - Relatórios reais ao vivo pós-`M4.2.1` (`Benchmark30s` 1080p60 + `ProlongedStability` com rollback verificado);
-  - Consolidação ordenada para `dev` com atualização de `windows/driver/README.md` e `windows/driver/tests/README.md` nos respectivos merges;
-  - Decisão final e criação de `LICENSE` (`Apache-2.0` candidata), `NOTICE` / `THIRD_PARTY_NOTICES.md` e `.github/workflows/` inicial (lint/build Windows e Linux).
+  - Relatórios reais ao vivo aprovados (`Benchmark30s` 30 s e `ProlongedStability` 180 s com `D3d11DxgiVSync`, transporte GPU puro e rollback verificado no commit `6b297856`);
+  - Branch local de integração `integration/m0-windows-closure` com `windows/driver/README.md`, `windows/driver/tests/README.md` e documentação `M0` reconciliados;
+  - *(Pendentes de publicação/execução antes de encerrar `M0` formalmente em `dev`)*: merge em `dev`, decisão final e criação de `LICENSE` (`Apache-2.0` candidata), `NOTICE`/`THIRD_PARTY_NOTICES.md` e `.github/workflows/` inicial.
 - **Critérios objetivos de aceitação:**
-  - `128/128` testes C++ e `33/33` testes PowerShell aprovados na base `M4.2.1`;
-  - Execução real ao vivo pós-`M4.2.1` em `WUDFHost.exe` com `TimestampMeasurementErrors == 0`, `CpuStagingReadsPerformed == 0`, `ProlongedStabilityProven == true` e `RollbackClean == true`;
-  - Histórico em `dev` livre de conflitos e com dívida documental de contagens resolvida;
+  - `157/157` testes C++ unitários/componentes, `9/9` E2E, `71/71` testes PowerShell e `InfVerif` aprovados na árvore integrada;
+  - Execução real ao vivo em `WUDFHost.exe` com `TimestampMeasurementErrors == 0`, `CpuStagingReadsPerformed == 0`, `ProlongedStabilityProven == true` e `RollbackClean == true` *(atendido em `6b297856`)*;
+  - Histórico em `dev` livre de conflitos preservando ancestralidade de `6b297856` *(aguardando merge autorizado em `dev`)*;
   - Nenhuma regressão no driver `LumaBridgeIddDriver` (`EnableVirtualMonitor=0` por padrão).
-- **Testes necessários:** Categorias **1, 2, 3, 4 (obrigatório)** e **7 (local 30 s + estabilidade prolongada)**.
-- **Riscos e estratégias de recuperação:**
-  - *Falha no gate ao vivo `WUDFHost.exe` ou regressão em merge empilhado:* manter a branch problemática fora de `dev`, coletar ETL/dumps via `Collect-LumaBridgeDiagnostics.ps1` e corrigir antes de integrar.
+- **Testes necessários:** Categorias **1, 2, 3, 4 (obrigatório)** e **7 (local 30 s + estabilidade prolongada 180 s)**.
 - **Condições para avançar ao próximo marco (`M1` / `M2`):**
-  - Gate real `M4.2.1` aprovado e documentado (Trilha B de `M1` pode começar a PoC Rust/protocolo em paralelo com streams sintéticos, mas integração `M2` só ocorre após aprovação do gate Windows).
+  - Gate real aprovado e documentado *(cumprido)*; integração definitiva em `dev` autorizada para abertura formal da **`M1` (ainda não iniciada)**.
 
 ---
 

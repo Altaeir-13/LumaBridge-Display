@@ -1,6 +1,6 @@
 # Arquitetura da Plataforma Universal — LumaBridge Display
 
-> **Nota de estado do repositório:** Os módulos multiplataforma `core/`, `platforms/linux/` e `platforms/android/` descritos neste documento representam a **arquitetura proposta** (ainda não implementados no código). Em `origin/dev` (`0c3ddab`) reside a base do driver virtual Windows (`M3`). Os avanços de extração D3D11, IPC local v1.1 (`LBIF`), pool de texturas compartilhadas e codificação `NVENC H.264` (`M4.1–M4.2.1`) residem atualmente nas branches de desenvolvimento não integradas `fix/windows-idd-device-start`, `feature/windows-frame-extraction-ipc` e `feature/windows-gpu-shared-textures-nvenc`.
+> **Nota de estado do repositório (`M0.4`):** Os módulos multiplataforma `core/`, `platforms/linux/` e `platforms/android/` descritos neste documento representam a **arquitetura proposta (`M1` ainda não iniciada)**. Em `origin/dev` (`0c3ddab`) reside apenas a base do driver virtual Windows (`M3`): **`M0` ainda não foi integrada em `dev` remoto**. As entregas Windows completas (`M4.1–M0.3`, incluindo extração D3D11, IPC local `LBIF` v1.0/v1.1, pool GPU compartilhado, codificação `NVENC H.264`, estímulo DXGI e validações reais aprovadas de `30 s` e `180 s` em `WUDFHost.exe` no commit funcional `6b297856`) e esta documentação universal foram consolidadas localmente na branch de integração `integration/m0-windows-closure`, aguardando publicação e merge em `origin/dev`.
 
 ---
 

@@ -4,7 +4,7 @@
 >
 > Esta especificação permanece em estado de **rascunho** até que existam testes automatizados de serialização, *round-trip*, *fuzzing*, compatibilidade de versões e validação de segurança no módulo `lumabridge-protocol` (`M1`).
 >
-> **Independência estrita do IPC local Windows:** Este protocolo (`LBWP`) governa exclusivamente a comunicação remota entre dispositivos (LAN, Wi-Fi, IP direto, USB compatível e futuro WAN). Ele é totalmente independente do protocolo local Windows `LBIF` v1.0/v1.1 (`Named Pipe` + `HANDLE` NT compartilhado + `QPC` / `DXGI_FORMAT` definido em `FrameIpcProtocol.h` na branch de desenvolvimento `feature/windows-gpu-shared-textures-nvenc`).
+> **Independência estrita do IPC local Windows:** Este protocolo (`LBWP`) governa exclusivamente a comunicação remota entre dispositivos (LAN, Wi-Fi, IP direto, USB compatível e futuro WAN). Ele é totalmente independente do protocolo local Windows `LBIF` v1.0/v1.1 (`Named Pipe` + `HANDLE` NT compartilhado + `QPC` / `DXGI_FORMAT` definido em `windows/driver/LumaBridgeIddDriver/FrameIpcProtocol.h`, consolidado localmente em `integration/m0-windows-closure` e ainda não integrado em `origin/dev`).
 
 ---
 

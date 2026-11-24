@@ -46,7 +46,7 @@ Fica formalizada como definição oficial do projeto **LumaBridge Display**:
 
 ### Preservação do investimento técnico existente
 
-- O driver virtual Windows `LumaBridgeIddDriver` (C++/WDK/UMDF 2.31/IddCx 1.4), o pipeline D3D11/NVENC em desenvolvimento nas branches `fix/windows-idd-device-start`, `feature/windows-frame-extraction-ipc` e `feature/windows-gpu-shared-textures-nvenc` (M4.1–M4.2.1), os testes automatizados e o protocolo IPC local Windows (`LBIF` v1.0/v1.1) **serão integralmente preservados e reutilizados**.
+- O driver virtual Windows `LumaBridgeIddDriver` (C++/WDK/UMDF 2.31/IddCx 1.4), o pipeline D3D11/NVENC consolidado nas branches `fix/windows-idd-device-start`, `feature/windows-frame-extraction-ipc`, `feature/windows-gpu-shared-textures-nvenc` e `fix/m0-validation-gates-hardening` (`M4.1–M0.3`, consolidado localmente em `integration/m0-windows-closure` e ainda não integrado em `origin/dev`), os testes automatizados e o protocolo IPC local Windows (`LBIF` v1.0/v1.1) **serão integralmente preservados e reutilizados**.
 - O driver IddCx permanece estritamente responsável por emulação de adaptador/monitor virtual e entrega local de quadros; **não** incorporará transporte remoto de rede nem lógica de codificação de vídeo.
 - O protocolo de rede multiplataforma será independente do contrato IPC local `LBIF`.
 

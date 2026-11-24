@@ -173,7 +173,7 @@
 
 `GpuSharedTextureTests.cpp` executa **9 testes deterministas da Fase A** (criacao NT handle/KeyedMutex, sincronizacao GPU sem leitura CPU, backpressure/pool esgotado, LUID incompativel, DACL restrita/SDDL, desconexao durante mutex ativo, timeout, `DXGI_ERROR_DEVICE_REMOVED` / `ReconstructSession`, recriacao de swapchain + separacao de metricas GPU/CPU e liberacao pos-flush).
 
-`NvencEncoderTests.cpp` executa **7 testes reais de hardware NVIDIA NVENC H.264** (`ProbeAvailability`, sessao 720p/1080p, `DirectArgb` vs `ID3D11VideoProcessor` GPU `NV12`, rejeicao de formato DXGI incompativel, IDR periodico/forcado, injecao de `NV_ENC_ERR_ENCODER_BUSY` / `DEVICE_REMOVED` + `ReconstructSession`, e validacao independente de PSNR com `Microsoft H.264 Video Decoder MFT`).
+`NvencEncoderTests.cpp` executa **8 testes reais de hardware NVIDIA NVENC H.264** (`ProbeAvailability`, sessao 720p/1080p, `DirectArgb` vs `ID3D11VideoProcessor` GPU `NV12`, rejeicao de formato DXGI incompativel, IDR periodico/forcado, injecao de `NV_ENC_ERR_ENCODER_BUSY` / `DEVICE_REMOVED` + `ReconstructSession`, validacao independente de PSNR com `Microsoft H.264 Video Decoder MFT`, e `TestNvencTimestampCoverageValidationAndStageBreakdown` cobrindo timestamps causais e breakdown por estagio NVENC).
 
 ## Fronteira com validacao em runtime WDF/IddCx
 
