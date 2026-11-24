@@ -1,0 +1,161 @@
+name: M1.1 FFI & Cross-Target PoC CI
+
+on:
+  pull_request:
+    branches: [dev]
+  push:
+    branches: [dev, 'feature/m1-*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-ffi-poc:
+    name: Windows Rust + MSVC Debug/Release FFI PoC
+    runs-on: windows-2025
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Ensure pinned Rust toolchain 1.100.0 components
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
+          if ((Test-Path -LiteralPath $cargoBin) -and -not ($env:PATH.Split(';') -contains $cargoBin)) {
+            $env:PATH = "$cargoBin;$env:PATH"
+          }
+          rustup toolchain install 1.100.0 --profile minimal --component rustfmt,clippy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default 1.100.0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc --version
+          cargo --version
+
+      - name: Run Windows M1.1 FFI PoC CI suite
+        shell: powershell
+        run: |
+          powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/ci/Invoke-LumaBridgeFfiPocCi.ps1 `
+            -RepoRoot $env:GITHUB_WORKSPACE `
+            -SummaryPath $env:GITHUB_STEP_SUMMARY `
+            -JsonReportPath (Join-Path $env:RUNNER_TEMP 'ci-ffi-poc-windows.json') `
+            -BuildRoot (Join-Path $env:RUNNER_TEMP 'ci-ffi-poc-build') `
+            -InstallMissingTools `
+            -RequireCargoDeny
+          exit $LASTEXITCODE
+
+      - name: Upload Windows FFI PoC CI report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-ffi-poc-report
+          path: ${{ runner.temp }}/ci-ffi-poc-windows.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+  linux-rust-and-android-poc:
+    name: Linux Rust Tests + Android ARM64 & UniFFI PoC
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Ensure pinned Rust toolchain 1.100.0 + Android target + tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install 1.100.0 --profile minimal --component rustfmt,clippy --target aarch64-linux-android
+          rustup default 1.100.0
+          rustc --version
+          cargo --version
+          cargo install --locked cbindgen --version 0.29.4
+          cargo install --locked cargo-deny --version 0.22.1
+          cargo install --locked cargo-ndk --version 4.1.2
+
+      - name: Verify Rust formatting, cbindgen header, clippy, tests, and cargo-deny
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cd core
+          cargo fmt --all --check
+          cbindgen --config crates/lumabridge-ffi/cbindgen.toml --crate lumabridge-ffi --output "$RUNNER_TEMP/lumabridge_ffi.generated.h"
+          diff -u <(tr -d '\r' < crates/lumabridge-ffi/include/lumabridge_ffi.h) <(tr -d '\r' < "$RUNNER_TEMP/lumabridge_ffi.generated.h")
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy --workspace --all-targets --features poc-fault-injection -- -D warnings
+          cargo clippy --workspace --all-targets --features uniffi -- -D warnings
+          cargo test --workspace
+          cargo test --workspace --features poc-fault-injection
+          cargo test --workspace --features uniffi
+          cargo deny check licenses bans sources
+
+      - name: Build Android ARM64 .so and verify ELF symbols + UniFFI Kotlin generation
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          NDK_PATH="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [ -z "$NDK_PATH" ] && [ -d "${ANDROID_SDK_ROOT:-}/ndk" ]; then
+            NDK_PATH="$(find "${ANDROID_SDK_ROOT}/ndk" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -n 1)"
+          fi
+          if [ -z "$NDK_PATH" ] || [ ! -d "$NDK_PATH" ]; then
+            echo "Android NDK installation not found on runner." >&2
+            exit 1
+          fi
+          export ANDROID_NDK_HOME="$NDK_PATH"
+          export ANDROID_NDK_ROOT="$NDK_PATH"
+          echo "Using Android NDK directory: $(basename "$NDK_PATH")"
+
+          cd core
+          cargo ndk -t arm64-v8a -P 29 --manifest-path Cargo.toml -- build -p lumabridge-ffi --features uniffi --release
+          SO_PATH="target/aarch64-linux-android/release/liblumabridge_ffi.so"
+          test -f "$SO_PATH"
+
+          READELF="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          "$READELF" -h -d "$SO_PATH" > "$RUNNER_TEMP/android-so-elf.txt"
+          grep -q "Machine:[[:space:]]*AArch64" "$RUNNER_TEMP/android-so-elf.txt"
+          grep -q "Type:[[:space:]]*DYN" "$RUNNER_TEMP/android-so-elf.txt"
+          "$READELF" --dyn-syms -W "$SO_PATH" > "$RUNNER_TEMP/android-so-syms.txt"
+          grep -q "lb_core_create" "$RUNNER_TEMP/android-so-syms.txt"
+          grep -q "uniffi_lumabridge_ffi" "$RUNNER_TEMP/android-so-syms.txt"
+          if grep -q "lb_core_poc_trigger_panic" "$RUNNER_TEMP/android-so-syms.txt"; then
+            echo "Unexpected lb_core_poc_trigger_panic export found in Android .so" >&2
+            exit 1
+          fi
+
+          KT_OUT="$RUNNER_TEMP/kotlin-bindings"
+          mkdir -p "$KT_OUT"
+          cargo run --manifest-path Cargo.toml -p lumabridge-ffi --features uniffi-cli --bin uniffi-bindgen -- \
+            generate --library "$SO_PATH" --language kotlin --out-dir "$KT_OUT" --no-format
+          test -s "$KT_OUT/uniffi/lumabridge_ffi/lumabridge_ffi.kt"
+
+          {
+            echo "## Linux Rust + Android ARM64 & UniFFI PoC Summary"
+            echo ""
+            echo "- Rust fmt/clippy/test (default, poc-fault-injection, uniffi) + cbindgen drift + cargo-deny: PASSED"
+            echo "- Android ARM64 ELF64 AArch64 DYN (liblumabridge_ffi.so) & UniFFI Kotlin generation: PASSED"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Android ELF metadata artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-android-poc-metadata
+          path: |
+            ${{ runner.temp }}/android-so-elf.txt
+          if-no-files-found: ignore
+          retention-days: 14
