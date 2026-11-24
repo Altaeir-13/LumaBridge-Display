@@ -49,7 +49,13 @@ const _: () = {
 };
 
 /// Opaque native handle owning a `CoreSession`.
-/// Must be destroyed exactly once via `lb_core_destroy` after all concurrent calls have finished.
+///
+/// # Caller Contract & DLL/DSO Lifetime
+/// - Must be destroyed exactly once via `lb_core_destroy` after all concurrent calls on `handle`
+///   have returned (except cooperative `lb_core_stop` / `lb_core_simulate_disconnect`).
+/// - Caller MUST keep the `lumabridge_ffi` shared library loaded in process memory while any
+///   `LbCoreHandle` OR any Rust-allocated `LbOwnedBuffer` handed to native output callbacks
+///   remains unreleased.
 pub struct LbCoreHandle {
     session: CoreSession,
 }
@@ -122,6 +128,14 @@ pub type LbBufferReleaseFn =
     Option<extern "C" fn(user_ctx: *mut c_void, data: *const u8, len: usize, capacity: usize)>;
 
 /// Explicit ownership-transferring byte buffer descriptor (`ADR-0004`).
+///
+/// # Ownership & Lifetime Rules
+/// - Native -> Rust (`lb_core_submit_owned_encoded_frame`): on `LB_STATUS_OK`, Rust zeros
+///   `*buffer` (`release == NULL`) and guarantees `release` is invoked **noexcept** exactly once
+///   outside internal mutexes.
+/// - Rust -> Native (`LbOutputPacketCallback`): native consumer owns the delivered descriptor and
+///   must call `lb_core_release_buffer(&owned)` (or `owned.release(...)`) once from any thread,
+///   including after `lb_core_destroy`, while keeping `lumabridge_ffi` loaded.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct LbOwnedBuffer {
@@ -165,6 +179,11 @@ pub type LbStateChangeCallback =
     Option<extern "C" fn(user_ctx: *mut c_void, new_state: u32, status_code: u32)>;
 
 /// Session configuration structure passed to `lb_core_create`.
+///
+/// # Memory Budget Note
+/// `expected_frame_bytes_hint` guides bounded buffer recycling (eager preallocation capped at
+/// 4 MiB total / 8 slots); individual queued encoded frames remain bounded by
+/// `LB_FFI_MAX_FRAME_BYTES` (8 MiB), with an explicit total-byte admission cap planned for M1/M2.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct LbCoreConfig {
@@ -240,6 +259,56 @@ fn validate_abi_header<T>(header: &LbAbiHeader) -> Result<(), LbStatus> {
         return Err(LbStatus::InvalidStructSize);
     }
     if header.reserved != 0 {
+        return Err(LbStatus::InvalidArgument);
+    }
+    Ok(())
+}
+
+/// Validates pointer non-nullness, 16-byte `LbAbiHeader` (before reading full `T`),
+/// and full `T` alignment before reading `T` by value.
+///
+/// # Safety
+/// - If `ptr` is non-null and aligned for `LbAbiHeader`, at least 16 bytes at `ptr` must be readable.
+/// - If `validate_abi_header::<T>` succeeds and `ptr` is aligned for `T`, `size_of::<T>()` bytes
+///   at `ptr` must be readable.
+unsafe fn read_and_validate_abi_input<T: Copy>(ptr: *const T) -> Result<T, LbStatus> {
+    if ptr.is_null() {
+        return Err(LbStatus::InvalidArgument);
+    }
+    let hdr_ptr = ptr.cast::<LbAbiHeader>();
+    if !hdr_ptr.is_aligned() {
+        return Err(LbStatus::InvalidArgument);
+    }
+    // SAFETY: Caller guarantees 16 readable `LbAbiHeader` bytes when non-null & header-aligned.
+    let header = unsafe { ptr::read(hdr_ptr) };
+    validate_abi_header::<T>(&header)?;
+    if !ptr.is_aligned() {
+        return Err(LbStatus::InvalidArgument);
+    }
+    // SAFETY: Alignment and `struct_size == size_of::<T>()` were validated before full read.
+    Ok(unsafe { ptr::read(ptr) })
+}
+
+/// Validates pointer non-nullness, 16-byte `LbAbiHeader` (before creating any `&mut T` or writing),
+/// and full `T` alignment for an caller-initialized output structure.
+///
+/// # Safety
+/// - If `ptr` is non-null and aligned for `LbAbiHeader`, the 16-byte `LbAbiHeader` prefix at `ptr`
+///   must be readable.
+/// - If `validate_abi_header::<T>` succeeds and `ptr` is aligned for `T`, `size_of::<T>()` bytes
+///   at `ptr` must be writable.
+unsafe fn validate_abi_output<T>(ptr: *mut T) -> Result<(), LbStatus> {
+    if ptr.is_null() {
+        return Err(LbStatus::InvalidArgument);
+    }
+    let hdr_ptr = ptr.cast_const().cast::<LbAbiHeader>();
+    if !hdr_ptr.is_aligned() {
+        return Err(LbStatus::InvalidArgument);
+    }
+    // SAFETY: Caller guarantees 16 readable `LbAbiHeader` bytes when non-null & header-aligned.
+    let header = unsafe { ptr::read(hdr_ptr) };
+    validate_abi_header::<T>(&header)?;
+    if !ptr.is_aligned() {
         return Err(LbStatus::InvalidArgument);
     }
     Ok(())
@@ -456,9 +525,9 @@ fn run_with_panic_boundary(
         return status;
     }
     if let Some(raw) = handle_opt {
-        if !raw.is_null() {
+        if !raw.is_null() && raw.is_aligned() {
             let _ = panic::catch_unwind(AssertUnwindSafe(|| {
-                // SAFETY: Called only when the handle pointer passed by caller was non-null.
+                // SAFETY: Called only when the handle pointer passed by caller was non-null and aligned.
                 // Marks instance `Faulted` with sanitized reason without re-throwing across C ABI.
                 let wrapper = unsafe { &*raw };
                 wrapper
@@ -473,19 +542,22 @@ fn run_with_panic_boundary(
 /// Query ABI major and minor version supported by this compiled binary.
 ///
 /// # Safety
-/// If `out_major` or `out_minor` is non-null, it must be valid for writing one `u32`.
+/// If `out_major` or `out_minor` is non-null, it must be properly aligned and valid for writing one `u32`.
 #[no_mangle]
 pub unsafe extern "C" fn lb_core_abi_version(out_major: *mut u32, out_minor: *mut u32) -> LbStatus {
     run_with_panic_boundary(None, || {
-        if out_major.is_null() && out_minor.is_null() {
+        if (out_major.is_null() && out_minor.is_null())
+            || (!out_major.is_null() && !out_major.is_aligned())
+            || (!out_minor.is_null() && !out_minor.is_aligned())
+        {
             return LbStatus::InvalidArgument;
         }
         if !out_major.is_null() {
-            // SAFETY: Caller contract guarantees writable pointer for 1 `u32`.
+            // SAFETY: Caller contract guarantees writable aligned pointer for 1 `u32`.
             unsafe { ptr::write(out_major, LB_FFI_ABI_MAJOR) };
         }
         if !out_minor.is_null() {
-            // SAFETY: Caller contract guarantees writable pointer for 1 `u32`.
+            // SAFETY: Caller contract guarantees writable aligned pointer for 1 `u32`.
             unsafe { ptr::write(out_minor, LB_FFI_ABI_MINOR) };
         }
         LbStatus::Ok
@@ -495,26 +567,30 @@ pub unsafe extern "C" fn lb_core_abi_version(out_major: *mut u32, out_minor: *mu
 /// Create a new core handle in `LB_CORE_STATE_CREATED`.
 ///
 /// # Safety
-/// - `config` and `out_handle` must be valid, properly aligned non-null pointers.
+/// - `out_handle` must be a valid, properly aligned non-null pointer (`*out_handle` is zeroed on entry).
+/// - `config` must be non-null, `LbAbiHeader`-aligned with at least 16 readable bytes; if
+///   `config->abi.struct_size >= sizeof(LbCoreConfig)` and `config` is `LbCoreConfig`-aligned,
+///   all `sizeof(LbCoreConfig)` bytes must be readable.
 /// - If callbacks are supplied in `config`, `callback_user_ctx` must remain valid until
-///   `lb_core_destroy` completes, and callbacks must be `noexcept` and never invoke `lb_core_destroy`.
+///   `lb_core_destroy` completes, callbacks must be `noexcept` and never invoke `lb_core_destroy`,
+///   and the caller must keep `lumabridge_ffi` loaded while handles or Rust `LbOwnedBuffer`s exist.
 #[no_mangle]
 pub unsafe extern "C" fn lb_core_create(
     config: *const LbCoreConfig,
     out_handle: *mut *mut LbCoreHandle,
 ) -> LbStatus {
     run_with_panic_boundary(None, || {
-        if config.is_null() || out_handle.is_null() {
+        if config.is_null() || out_handle.is_null() || !out_handle.is_aligned() {
             return LbStatus::InvalidArgument;
         }
-        // SAFETY: Caller guarantees `out_handle` is writable for `*mut LbCoreHandle`.
+        // SAFETY: Caller guarantees `out_handle` is aligned and writable for `*mut LbCoreHandle`.
         unsafe { ptr::write(out_handle, ptr::null_mut()) };
 
-        // SAFETY: Caller guarantees `config` points to a readable `LbCoreConfig`.
-        let cfg = unsafe { &*config };
-        if let Err(err_status) = validate_abi_header::<LbCoreConfig>(&cfg.abi) {
-            return err_status;
-        }
+        // SAFETY: Validates 16-byte `LbAbiHeader` and alignment before reading `LbCoreConfig`.
+        let cfg = match unsafe { read_and_validate_abi_input(config) } {
+            Ok(c) => c,
+            Err(err_status) => return err_status,
+        };
 
         let core_cfg = CoreConfig {
             queue_capacity: cfg.queue_capacity as usize,
@@ -532,7 +608,7 @@ pub unsafe extern "C" fn lb_core_create(
         };
 
         let boxed = Box::new(LbCoreHandle { session });
-        // SAFETY: Caller guarantees `out_handle` is valid and receives unique ownership.
+        // SAFETY: Caller guarantees `out_handle` is aligned, writable, and receives unique ownership.
         unsafe { ptr::write(out_handle, Box::into_raw(boxed)) };
         LbStatus::Ok
     })
@@ -541,14 +617,14 @@ pub unsafe extern "C" fn lb_core_create(
 /// Start the core worker thread (`Created -> Running`).
 ///
 /// # Safety
-/// `handle` must be a valid non-null handle returned by `lb_core_create` and not yet destroyed.
+/// `handle` must be a valid aligned non-null handle returned by `lb_core_create` and not yet destroyed.
 #[no_mangle]
 pub unsafe extern "C" fn lb_core_start(handle: *mut LbCoreHandle) -> LbStatus {
     run_with_panic_boundary(Some(handle), || {
-        if handle.is_null() {
+        if handle.is_null() || !handle.is_aligned() {
             return LbStatus::InvalidArgument;
         }
-        // SAFETY: `handle` is non-null and alive per caller precondition.
+        // SAFETY: `handle` is non-null, aligned, and alive per caller precondition.
         let wrapper = unsafe { &*handle };
         match wrapper.session.start() {
             Ok(()) => LbStatus::Ok,
@@ -557,12 +633,13 @@ pub unsafe extern "C" fn lb_core_start(handle: *mut LbCoreHandle) -> LbStatus {
     })
 }
 
-/// Synchronously submit a caller-borrowed encoded frame buffer.
-/// Rust copies `data[0..data_len]` into an internal bounded buffer before returning,
+/// Synchronously enqueue a copy of a caller-borrowed encoded frame buffer without waiting on worker/network I/O.
+/// Acquires an internal queue mutex briefly, copies `data[0..data_len]` into a bounded internal buffer before returning,
 /// or returns `LB_STATUS_BACKPRESSURE` without retaining `data`.
 ///
 /// # Safety
-/// - `handle` and `meta` must be valid non-null pointers.
+/// - `handle` must be a valid aligned non-null handle returned by `lb_core_create`.
+/// - `meta` must have 16 readable `LbAbiHeader` bytes (and full `LbEncodedFrameMeta` readable once valid).
 /// - `data` must be readable for `data_len` bytes during this call (`data_len` in `1..=8 MiB`).
 #[no_mangle]
 pub unsafe extern "C" fn lb_core_submit_encoded_frame(
@@ -572,20 +649,23 @@ pub unsafe extern "C" fn lb_core_submit_encoded_frame(
     data_len: usize,
 ) -> LbStatus {
     run_with_panic_boundary(Some(handle), || {
-        if handle.is_null() || meta.is_null() || data.is_null() {
+        if handle.is_null() || !handle.is_aligned() || meta.is_null() || data.is_null() {
             return LbStatus::InvalidArgument;
         }
         if data_len == 0 || data_len > MAX_ENCODED_FRAME_BYTES {
             return LbStatus::InvalidArgument;
         }
-        // SAFETY: Caller guarantees `handle` and `meta` are valid during this call.
-        let wrapper = unsafe { &*handle };
-        // SAFETY: Caller guarantees `meta` is readable.
-        let raw_meta = unsafe { &*meta };
-        let parsed_meta = match map_meta_from_ffi(raw_meta) {
+        // SAFETY: Validates 16-byte `LbAbiHeader` and alignment before reading `LbEncodedFrameMeta`.
+        let raw_meta = match unsafe { read_and_validate_abi_input(meta) } {
             Ok(m) => m,
             Err(s) => return s,
         };
+        let parsed_meta = match map_meta_from_ffi(&raw_meta) {
+            Ok(m) => m,
+            Err(s) => return s,
+        };
+        // SAFETY: Caller guarantees `handle` is aligned and valid during this call.
+        let wrapper = unsafe { &*handle };
         // SAFETY: Caller guarantees `data` points to `data_len` valid immutable bytes for the call duration.
         let bytes = unsafe { slice::from_raw_parts(data, data_len) };
         match wrapper.session.submit_borrowed(&parsed_meta, bytes) {
@@ -595,8 +675,8 @@ pub unsafe extern "C" fn lb_core_submit_encoded_frame(
     })
 }
 
-/// Asynchronously transfer ownership of a native-allocated `LbOwnedBuffer` into the core
-/// using two-phase transactional commit.
+/// Enqueue transfer of ownership of a native-allocated `LbOwnedBuffer` into the core
+/// using two-phase transactional commit without waiting on worker/network I/O (acquires an internal mutex briefly).
 /// - On `LB_STATUS_OK`, Rust owns the buffer, zeroes `*buffer` (`release == NULL`), and
 ///   guarantees `release` is called **noexcept** exactly once outside internal mutexes.
 /// - On any non-panic error status (`InvalidArgument`, `InvalidState`, `Backpressure`,
@@ -608,7 +688,8 @@ pub unsafe extern "C" fn lb_core_submit_encoded_frame(
 ///   Calling `lb_core_release_buffer(buffer)` on cleanup safely handles both outcomes without double-free.
 ///
 /// # Safety
-/// - `handle`, `meta`, and `buffer` must be valid aligned non-null pointers.
+/// - `handle` and `buffer` must be valid aligned non-null pointers.
+/// - `meta` must have 16 readable `LbAbiHeader` bytes (and full `LbEncodedFrameMeta` readable once valid).
 /// - `buffer->data` must be valid and immutable for `buffer->len` bytes until `buffer->release` runs.
 #[no_mangle]
 pub unsafe extern "C" fn lb_core_submit_owned_encoded_frame(
@@ -617,18 +698,24 @@ pub unsafe extern "C" fn lb_core_submit_owned_encoded_frame(
     buffer: *mut LbOwnedBuffer,
 ) -> LbStatus {
     run_with_panic_boundary(Some(handle), || {
-        if handle.is_null() || meta.is_null() || buffer.is_null() {
+        if handle.is_null()
+            || !handle.is_aligned()
+            || meta.is_null()
+            || buffer.is_null()
+            || !buffer.is_aligned()
+        {
             return LbStatus::InvalidArgument;
         }
-        // SAFETY: Caller guarantees readable pointers for `handle` and `meta`.
-        let wrapper = unsafe { &*handle };
-        // SAFETY: Caller guarantees readable `LbEncodedFrameMeta`.
-        let raw_meta = unsafe { &*meta };
-        let parsed_meta = match map_meta_from_ffi(raw_meta) {
+        // SAFETY: Validates 16-byte `LbAbiHeader` and alignment before reading `LbEncodedFrameMeta`.
+        let raw_meta = match unsafe { read_and_validate_abi_input(meta) } {
             Ok(m) => m,
             Err(s) => return s,
         };
-        // SAFETY: Caller guarantees readable/writable `LbOwnedBuffer`.
+        let parsed_meta = match map_meta_from_ffi(&raw_meta) {
+            Ok(m) => m,
+            Err(s) => return s,
+        };
+        // SAFETY: Caller guarantees aligned readable/writable `LbOwnedBuffer`.
         let owned = unsafe { ptr::read(buffer) };
         if owned.data.is_null()
             || owned.len == 0
@@ -640,6 +727,8 @@ pub unsafe extern "C" fn lb_core_submit_owned_encoded_frame(
         let Some(release_fn) = owned.release else {
             return LbStatus::InvalidArgument;
         };
+        // SAFETY: Caller guarantees aligned live `handle`.
+        let wrapper = unsafe { &*handle };
 
         let guard_box = Box::new(NativeOwnedBufferGuard {
             data: owned.data,
@@ -660,45 +749,51 @@ pub unsafe extern "C" fn lb_core_submit_owned_encoded_frame(
 
 /// Release a buffer via its embedded `release` callback and zero out the descriptor fields.
 /// Convenience helper for native consumers holding a Rust-allocated `LbOwnedBuffer`.
+/// May be called from any thread (including after `lb_core_destroy`), provided the `lumabridge_ffi`
+/// shared library remains loaded in process memory.
 ///
 /// # Safety
-/// `buffer` must be null or point to a valid writable `LbOwnedBuffer` owned by the caller.
+/// `buffer` must be null or point to a valid aligned writable `LbOwnedBuffer` owned by the caller.
 #[no_mangle]
 pub unsafe extern "C" fn lb_core_release_buffer(buffer: *mut LbOwnedBuffer) -> LbStatus {
     run_with_panic_boundary(None, || {
-        if buffer.is_null() {
+        if buffer.is_null() || !buffer.is_aligned() {
             return LbStatus::InvalidArgument;
         }
-        // SAFETY: Caller guarantees mutable access to one `LbOwnedBuffer` owned by caller.
-        let desc = unsafe { &mut *buffer };
-        if let Some(rel) = desc.release.take() {
-            let data = desc.data;
-            let len = desc.len;
-            let cap = desc.capacity;
-            let ctx = desc.user_ctx;
-            desc.data = ptr::null();
-            desc.len = 0;
-            desc.capacity = 0;
-            desc.user_ctx = ptr::null_mut();
-            rel(ctx, data, len, cap);
-            LbStatus::Ok
-        } else {
-            LbStatus::InvalidArgument
+        // SAFETY: Caller guarantees aligned mutable ownership of one `LbOwnedBuffer`.
+        let owned = unsafe { ptr::read(buffer) };
+        let Some(rel) = owned.release else {
+            return LbStatus::InvalidArgument;
+        };
+        // SAFETY: Zero descriptor BEFORE invoking `rel` so reentrant checks see empty descriptor.
+        unsafe {
+            ptr::write(
+                buffer,
+                LbOwnedBuffer {
+                    data: ptr::null(),
+                    len: 0,
+                    capacity: 0,
+                    release: None,
+                    user_ctx: ptr::null_mut(),
+                },
+            );
         }
+        rel(owned.user_ctx, owned.data, owned.len, owned.capacity);
+        LbStatus::Ok
     })
 }
 
 /// Simulate an abrupt session disconnect, draining and releasing all queued buffers cleanly.
 ///
 /// # Safety
-/// `handle` must be a valid non-null handle returned by `lb_core_create`.
+/// `handle` must be a valid aligned non-null handle returned by `lb_core_create`.
 #[no_mangle]
 pub unsafe extern "C" fn lb_core_simulate_disconnect(handle: *mut LbCoreHandle) -> LbStatus {
     run_with_panic_boundary(Some(handle), || {
-        if handle.is_null() {
+        if handle.is_null() || !handle.is_aligned() {
             return LbStatus::InvalidArgument;
         }
-        // SAFETY: Caller guarantees live handle.
+        // SAFETY: Caller guarantees aligned live handle.
         let wrapper = unsafe { &*handle };
         match wrapper.session.simulate_disconnect() {
             Ok(()) => LbStatus::Ok,
@@ -709,16 +804,18 @@ pub unsafe extern "C" fn lb_core_simulate_disconnect(handle: *mut LbCoreHandle) 
 
 /// Cooperatively stop the session (`Running/Created -> Stopping -> Stopped`).
 /// Idempotent and reentrancy-safe from within callbacks (never self-joins the worker thread).
+/// External callers block until any active worker callbacks finish, worker threads exit cleanly,
+/// and all prior state notifications complete before returning.
 ///
 /// # Safety
-/// `handle` must be a valid non-null handle returned by `lb_core_create`.
+/// `handle` must be a valid aligned non-null handle returned by `lb_core_create`.
 #[no_mangle]
 pub unsafe extern "C" fn lb_core_stop(handle: *mut LbCoreHandle) -> LbStatus {
     run_with_panic_boundary(Some(handle), || {
-        if handle.is_null() {
+        if handle.is_null() || !handle.is_aligned() {
             return LbStatus::InvalidArgument;
         }
-        // SAFETY: Caller guarantees live handle.
+        // SAFETY: Caller guarantees aligned live handle.
         let wrapper = unsafe { &*handle };
         match wrapper.session.stop() {
             Ok(()) => LbStatus::Ok,
@@ -732,17 +829,18 @@ pub unsafe extern "C" fn lb_core_stop(handle: *mut LbCoreHandle) -> LbStatus {
 /// - `lb_core_destroy` is NOT called concurrently with other API calls on `handle`;
 /// - `lb_core_destroy` is NOT called from inside a worker callback;
 /// - `handle` is NEVER used again after `lb_core_destroy` returns (zero post-free guarantee
-///   against stale opaque pointers cannot be provided in raw C without generation indirection).
+///   against stale opaque pointers cannot be provided in raw C without generation indirection);
+/// - Keep `lumabridge_ffi` loaded while any Rust-allocated `LbOwnedBuffer` remains unreleased.
 ///
 /// # Safety
-/// `handle` must be a live handle returned by `lb_core_create` or null (returns `InvalidArgument`).
+/// `handle` must be a valid aligned live handle returned by `lb_core_create` or null (returns `InvalidArgument`).
 #[no_mangle]
 pub unsafe extern "C" fn lb_core_destroy(handle: *mut LbCoreHandle) -> LbStatus {
     run_with_panic_boundary(None, || {
-        if handle.is_null() {
+        if handle.is_null() || !handle.is_aligned() {
             return LbStatus::InvalidArgument;
         }
-        // SAFETY: Caller guarantees exclusive teardown ownership on a live handle.
+        // SAFETY: Caller guarantees exclusive teardown ownership on a live aligned handle.
         let wrapper = unsafe { &*handle };
         if wrapper.session.is_current_thread_worker() {
             return LbStatus::InvalidState;
@@ -758,38 +856,44 @@ pub unsafe extern "C" fn lb_core_destroy(handle: *mut LbCoreHandle) -> LbStatus 
 /// Query per-instance metrics and queue occupancy counters.
 ///
 /// # Safety
-/// `handle` and `out_metrics` must be valid non-null pointers.
+/// - `handle` must be a valid aligned non-null pointer.
+/// - `out_metrics` must have 16 readable `LbAbiHeader` bytes (and full `LbCoreMetrics` writable once valid).
 #[no_mangle]
 pub unsafe extern "C" fn lb_core_get_metrics(
     handle: *const LbCoreHandle,
     out_metrics: *mut LbCoreMetrics,
 ) -> LbStatus {
     run_with_panic_boundary(None, || {
-        if handle.is_null() || out_metrics.is_null() {
+        if handle.is_null() || !handle.is_aligned() || out_metrics.is_null() {
             return LbStatus::InvalidArgument;
         }
-        // SAFETY: Caller guarantees readable `LbCoreMetrics` header at `out_metrics`.
-        let out_ref = unsafe { &mut *out_metrics };
-        if let Err(s) = validate_abi_header::<LbCoreMetrics>(&out_ref.abi) {
+        // SAFETY: Validates 16-byte `LbAbiHeader` and alignment before writing `LbCoreMetrics`.
+        if let Err(s) = unsafe { validate_abi_output(out_metrics) } {
             return s;
         }
-        // SAFETY: Caller guarantees readable `LbCoreHandle`.
+        // SAFETY: Caller guarantees aligned readable `LbCoreHandle`.
         let wrapper = unsafe { &*handle };
         let m = wrapper.session.metrics();
-        *out_ref = LbCoreMetrics {
-            abi: LbAbiHeader::new::<LbCoreMetrics>(),
-            state: m.state,
-            queue_depth: m.queue_depth,
-            queue_peak_depth: m.queue_peak_depth,
-            reserved0: 0,
-            packets_submitted: m.packets_submitted,
-            packets_processed: m.packets_processed,
-            bytes_processed: m.bytes_processed,
-            backpressure_events: m.backpressure_events,
-            native_owned_submitted: m.native_owned_submitted,
-            native_owned_dropped: m.native_owned_dropped,
-            panic_faults: m.panic_faults,
-        };
+        // SAFETY: Header validation & `LbCoreMetrics` alignment succeeded above.
+        unsafe {
+            ptr::write(
+                out_metrics,
+                LbCoreMetrics {
+                    abi: LbAbiHeader::new::<LbCoreMetrics>(),
+                    state: m.state,
+                    queue_depth: m.queue_depth,
+                    queue_peak_depth: m.queue_peak_depth,
+                    reserved0: 0,
+                    packets_submitted: m.packets_submitted,
+                    packets_processed: m.packets_processed,
+                    bytes_processed: m.bytes_processed,
+                    backpressure_events: m.backpressure_events,
+                    native_owned_submitted: m.native_owned_submitted,
+                    native_owned_dropped: m.native_owned_dropped,
+                    panic_faults: m.panic_faults,
+                },
+            );
+        }
         LbStatus::Ok
     })
 }
@@ -797,7 +901,8 @@ pub unsafe extern "C" fn lb_core_get_metrics(
 /// Copy sanitized diagnostic error message (empty if none) into caller buffer (`NUL`-terminated).
 ///
 /// # Safety
-/// `handle` and `out_buf` must be valid non-null pointers; `out_buf` must be writable for `buf_cap`.
+/// `handle` and `out_buf` must be valid aligned non-null pointers; `out_buf` must be writable for `buf_cap`.
+/// If `out_len` is non-null, it must be aligned and writable for one `usize`.
 #[no_mangle]
 pub unsafe extern "C" fn lb_core_get_last_error(
     handle: *const LbCoreHandle,
@@ -806,15 +911,20 @@ pub unsafe extern "C" fn lb_core_get_last_error(
     out_len: *mut usize,
 ) -> LbStatus {
     run_with_panic_boundary(None, || {
-        if handle.is_null() || out_buf.is_null() || buf_cap == 0 {
+        if handle.is_null()
+            || !handle.is_aligned()
+            || out_buf.is_null()
+            || buf_cap == 0
+            || (!out_len.is_null() && !out_len.is_aligned())
+        {
             return LbStatus::InvalidArgument;
         }
-        // SAFETY: Caller guarantees readable `LbCoreHandle`.
+        // SAFETY: Caller guarantees aligned readable `LbCoreHandle`.
         let wrapper = unsafe { &*handle };
         let msg = wrapper.session.last_error();
         let bytes = msg.as_bytes();
         if !out_len.is_null() {
-            // SAFETY: Caller guarantees writable `out_len`.
+            // SAFETY: Caller guarantees aligned writable `out_len`.
             unsafe { ptr::write(out_len, bytes.len()) };
         }
         let max_copy = buf_cap.saturating_sub(1);
@@ -837,34 +947,36 @@ pub unsafe extern "C" fn lb_core_get_last_error(
 /// `in_flight_buffers`, Rust vs native buffer release balance).
 ///
 /// # Safety
-/// `out_counters` must be a valid non-null writable pointer initialized with `LbAbiHeader`.
+/// `out_counters` must have 16 readable `LbAbiHeader` bytes (and full `LbGlobalResourceCounters` writable once valid).
 #[no_mangle]
 pub unsafe extern "C" fn lb_core_get_global_resource_counters(
     out_counters: *mut LbGlobalResourceCounters,
 ) -> LbStatus {
     run_with_panic_boundary(None, || {
-        if out_counters.is_null() {
-            return LbStatus::InvalidArgument;
-        }
-        // SAFETY: Caller guarantees readable/writable `LbGlobalResourceCounters`.
-        let out_ref = unsafe { &mut *out_counters };
-        if let Err(s) = validate_abi_header::<LbGlobalResourceCounters>(&out_ref.abi) {
+        // SAFETY: Validates 16-byte `LbAbiHeader` and alignment before writing `LbGlobalResourceCounters`.
+        if let Err(s) = unsafe { validate_abi_output(out_counters) } {
             return s;
         }
         let snap = global_resource_snapshot();
-        *out_ref = LbGlobalResourceCounters {
-            abi: LbAbiHeader::new::<LbGlobalResourceCounters>(),
-            active_instances: snap.active_instances,
-            active_worker_threads: snap.active_worker_threads,
-            in_flight_buffers: snap.in_flight_buffers,
-            callbacks_in_progress: snap.callbacks_in_progress,
-            callbacks_invoked_total: snap.callbacks_invoked_total,
-            rust_buffers_allocated: snap.rust_buffers_allocated,
-            rust_buffers_released: snap.rust_buffers_released,
-            native_buffers_received: snap.native_buffers_received,
-            native_buffers_released: snap.native_buffers_released,
-            disconnect_drains: snap.disconnect_drains,
-        };
+        // SAFETY: Header validation & alignment succeeded above.
+        unsafe {
+            ptr::write(
+                out_counters,
+                LbGlobalResourceCounters {
+                    abi: LbAbiHeader::new::<LbGlobalResourceCounters>(),
+                    active_instances: snap.active_instances,
+                    active_worker_threads: snap.active_worker_threads,
+                    in_flight_buffers: snap.in_flight_buffers,
+                    callbacks_in_progress: snap.callbacks_in_progress,
+                    callbacks_invoked_total: snap.callbacks_invoked_total,
+                    rust_buffers_allocated: snap.rust_buffers_allocated,
+                    rust_buffers_released: snap.rust_buffers_released,
+                    native_buffers_received: snap.native_buffers_received,
+                    native_buffers_released: snap.native_buffers_released,
+                    disconnect_drains: snap.disconnect_drains,
+                },
+            );
+        }
         LbStatus::Ok
     })
 }
@@ -872,41 +984,43 @@ pub unsafe extern "C" fn lb_core_get_global_resource_counters(
 /// Return Rust-computed structure sizes and key field offsets for cross-language verification.
 ///
 /// # Safety
-/// `out_sig` must be a valid non-null writable pointer initialized with `LbAbiHeader`.
+/// `out_sig` must have 16 readable `LbAbiHeader` bytes (and full `LbAbiLayoutSignature` writable once valid).
 #[no_mangle]
 pub unsafe extern "C" fn lb_core_layout_signature(out_sig: *mut LbAbiLayoutSignature) -> LbStatus {
     run_with_panic_boundary(None, || {
-        if out_sig.is_null() {
-            return LbStatus::InvalidArgument;
-        }
-        // SAFETY: Caller guarantees readable/writable `LbAbiLayoutSignature`.
-        let sig_ref = unsafe { &mut *out_sig };
-        if let Err(s) = validate_abi_header::<LbAbiLayoutSignature>(&sig_ref.abi) {
+        // SAFETY: Validates 16-byte `LbAbiHeader` and alignment before writing `LbAbiLayoutSignature`.
+        if let Err(s) = unsafe { validate_abi_output(out_sig) } {
             return s;
         }
-        *sig_ref = LbAbiLayoutSignature {
-            abi: LbAbiHeader::new::<LbAbiLayoutSignature>(),
-            #[allow(clippy::cast_possible_truncation)]
-            size_abi_header: size_of::<LbAbiHeader>() as u32,
-            #[allow(clippy::cast_possible_truncation)]
-            size_owned_buffer: size_of::<LbOwnedBuffer>() as u32,
-            #[allow(clippy::cast_possible_truncation)]
-            size_encoded_frame_meta: size_of::<LbEncodedFrameMeta>() as u32,
-            #[allow(clippy::cast_possible_truncation)]
-            size_core_config: size_of::<LbCoreConfig>() as u32,
-            #[allow(clippy::cast_possible_truncation)]
-            size_core_metrics: size_of::<LbCoreMetrics>() as u32,
-            #[allow(clippy::cast_possible_truncation)]
-            size_global_counters: size_of::<LbGlobalResourceCounters>() as u32,
-            #[allow(clippy::cast_possible_truncation)]
-            offset_meta_codec: offset_of!(LbEncodedFrameMeta, codec) as u32,
-            #[allow(clippy::cast_possible_truncation)]
-            offset_meta_gop_id: offset_of!(LbEncodedFrameMeta, gop_id) as u32,
-            #[allow(clippy::cast_possible_truncation)]
-            offset_owned_release: offset_of!(LbOwnedBuffer, release) as u32,
-            #[allow(clippy::cast_possible_truncation)]
-            offset_config_on_output: offset_of!(LbCoreConfig, on_output_packet) as u32,
-        };
+        // SAFETY: Header validation & alignment succeeded above.
+        unsafe {
+            ptr::write(
+                out_sig,
+                LbAbiLayoutSignature {
+                    abi: LbAbiHeader::new::<LbAbiLayoutSignature>(),
+                    #[allow(clippy::cast_possible_truncation)]
+                    size_abi_header: size_of::<LbAbiHeader>() as u32,
+                    #[allow(clippy::cast_possible_truncation)]
+                    size_owned_buffer: size_of::<LbOwnedBuffer>() as u32,
+                    #[allow(clippy::cast_possible_truncation)]
+                    size_encoded_frame_meta: size_of::<LbEncodedFrameMeta>() as u32,
+                    #[allow(clippy::cast_possible_truncation)]
+                    size_core_config: size_of::<LbCoreConfig>() as u32,
+                    #[allow(clippy::cast_possible_truncation)]
+                    size_core_metrics: size_of::<LbCoreMetrics>() as u32,
+                    #[allow(clippy::cast_possible_truncation)]
+                    size_global_counters: size_of::<LbGlobalResourceCounters>() as u32,
+                    #[allow(clippy::cast_possible_truncation)]
+                    offset_meta_codec: offset_of!(LbEncodedFrameMeta, codec) as u32,
+                    #[allow(clippy::cast_possible_truncation)]
+                    offset_meta_gop_id: offset_of!(LbEncodedFrameMeta, gop_id) as u32,
+                    #[allow(clippy::cast_possible_truncation)]
+                    offset_owned_release: offset_of!(LbOwnedBuffer, release) as u32,
+                    #[allow(clippy::cast_possible_truncation)]
+                    offset_config_on_output: offset_of!(LbCoreConfig, on_output_packet) as u32,
+                },
+            );
+        }
         let _ = align_of::<LbEncodedFrameMeta>();
         LbStatus::Ok
     })
@@ -924,17 +1038,17 @@ pub unsafe extern "C" fn lb_core_layout_signature(out_sig: *mut LbAbiLayoutSigna
 /// (caught and mapped to `LB_STATUS_INTERNAL_PANIC`).
 ///
 /// # Safety
-/// `handle` must be a valid non-null handle returned by `lb_core_create`.
+/// `handle` must be a valid aligned non-null handle returned by `lb_core_create`.
 #[no_mangle]
 pub unsafe extern "C" fn lb_core_poc_trigger_panic(
     handle: *mut LbCoreHandle,
     mode: u32,
 ) -> LbStatus {
     run_with_panic_boundary(Some(handle), || {
-        if handle.is_null() {
+        if handle.is_null() || !handle.is_aligned() {
             return LbStatus::InvalidArgument;
         }
-        // SAFETY: Caller guarantees live handle.
+        // SAFETY: Caller guarantees aligned live handle.
         let wrapper = unsafe { &*handle };
         match mode {
             1 => {
@@ -1312,6 +1426,150 @@ mod tests {
     fn transactional_ownership_pre_and_post_commit_panics_never_double_free() {
         run_transactional_panic_case(3, false);
         run_transactional_panic_case(4, true);
+    }
+
+    #[test]
+    #[allow(clippy::cast_ptr_alignment)]
+    fn abi_preread_rejects_smaller_legacy_buffers() {
+        #[repr(C, align(8))]
+        struct SmallLegacyStruct {
+            abi: LbAbiHeader,
+            sentinel_tail: u64,
+        }
+
+        let small_hdr = LbAbiHeader {
+            abi_major: LB_FFI_ABI_MAJOR,
+            abi_minor: LB_FFI_ABI_MINOR,
+            #[allow(clippy::cast_possible_truncation)]
+            struct_size: size_of::<LbAbiHeader>() as u32,
+            reserved: 0,
+        };
+        let mut handle: *mut LbCoreHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                lb_core_create(
+                    (&raw const small_hdr).cast::<LbCoreConfig>(),
+                    &raw mut handle,
+                )
+            },
+            LbStatus::InvalidStructSize
+        );
+        assert!(handle.is_null());
+
+        let mut small_out = SmallLegacyStruct {
+            abi: LbAbiHeader {
+                abi_major: LB_FFI_ABI_MAJOR,
+                abi_minor: LB_FFI_ABI_MINOR,
+                #[allow(clippy::cast_possible_truncation)]
+                struct_size: size_of::<SmallLegacyStruct>() as u32,
+                reserved: 0,
+            },
+            sentinel_tail: 0xCCCC_CCCC_CCCC_CCCC,
+        };
+        assert_eq!(
+            unsafe {
+                lb_core_get_global_resource_counters(
+                    (&raw mut small_out).cast::<LbGlobalResourceCounters>(),
+                )
+            },
+            LbStatus::InvalidStructSize
+        );
+        assert_eq!(small_out.sentinel_tail, 0xCCCC_CCCC_CCCC_CCCC);
+
+        assert_eq!(
+            unsafe {
+                lb_core_layout_signature((&raw mut small_out).cast::<LbAbiLayoutSignature>())
+            },
+            LbStatus::InvalidStructSize
+        );
+        assert_eq!(small_out.sentinel_tail, 0xCCCC_CCCC_CCCC_CCCC);
+
+        let valid_cfg = LbCoreConfig {
+            abi: LbAbiHeader::new::<LbCoreConfig>(),
+            queue_capacity: 4,
+            expected_frame_bytes_hint: 512,
+            on_output_packet: None,
+            on_state_change: None,
+            callback_user_ctx: ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { lb_core_create(&raw const valid_cfg, &raw mut handle) },
+            LbStatus::Ok
+        );
+        assert_eq!(unsafe { lb_core_start(handle) }, LbStatus::Ok);
+
+        let bytes = [1u8, 2, 3, 4];
+        assert_eq!(
+            unsafe {
+                lb_core_submit_encoded_frame(
+                    handle,
+                    (&raw const small_out).cast::<LbEncodedFrameMeta>(),
+                    bytes.as_ptr(),
+                    bytes.len(),
+                )
+            },
+            LbStatus::InvalidStructSize
+        );
+        assert_eq!(
+            unsafe { lb_core_get_metrics(handle, (&raw mut small_out).cast::<LbCoreMetrics>()) },
+            LbStatus::InvalidStructSize
+        );
+        assert_eq!(small_out.sentinel_tail, 0xCCCC_CCCC_CCCC_CCCC);
+
+        assert_eq!(unsafe { lb_core_stop(handle) }, LbStatus::Ok);
+        assert_eq!(unsafe { lb_core_destroy(handle) }, LbStatus::Ok);
+    }
+
+    #[test]
+    #[allow(clippy::cast_ptr_alignment)]
+    fn abi_rejects_misaligned_pointers() {
+        let valid_cfg = LbCoreConfig {
+            abi: LbAbiHeader::new::<LbCoreConfig>(),
+            queue_capacity: 4,
+            expected_frame_bytes_hint: 512,
+            on_output_packet: None,
+            on_state_change: None,
+            callback_user_ctx: ptr::null_mut(),
+        };
+        let mut handle: *mut LbCoreHandle = ptr::null_mut();
+        let mut backing = [0xAAu8; 256];
+        let base_ptr = backing.as_mut_ptr();
+        let offset = base_ptr.align_offset(16) + 1;
+        let unaligned_u8 = unsafe { base_ptr.add(offset) };
+
+        assert_eq!(
+            unsafe { lb_core_abi_version(unaligned_u8.cast::<u32>(), ptr::null_mut()) },
+            LbStatus::InvalidArgument
+        );
+        assert_eq!(
+            unsafe { lb_core_create(unaligned_u8.cast::<LbCoreConfig>(), &raw mut handle) },
+            LbStatus::InvalidArgument
+        );
+        assert_eq!(
+            unsafe {
+                lb_core_create(
+                    &raw const valid_cfg,
+                    unaligned_u8.cast::<*mut LbCoreHandle>(),
+                )
+            },
+            LbStatus::InvalidArgument
+        );
+        assert_eq!(
+            unsafe { lb_core_start(unaligned_u8.cast::<LbCoreHandle>()) },
+            LbStatus::InvalidArgument
+        );
+        assert_eq!(
+            unsafe {
+                lb_core_get_global_resource_counters(
+                    unaligned_u8.cast::<LbGlobalResourceCounters>(),
+                )
+            },
+            LbStatus::InvalidArgument
+        );
+        assert_eq!(
+            unsafe { lb_core_release_buffer(unaligned_u8.cast::<LbOwnedBuffer>()) },
+            LbStatus::InvalidArgument
+        );
     }
 
     #[test]

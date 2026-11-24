@@ -28,6 +28,7 @@
 extern "C" {
 void LbC11GetLayoutSignature(LbAbiLayoutSignature* out_sig);
 LbStatus LbC11ProbeAbiVersion(uint32_t* out_major, uint32_t* out_minor);
+int LbC11RunSmallLegacyAndAlignmentChecks(void);
 }
 
 namespace {
@@ -183,7 +184,9 @@ bool TestAbiLayoutAndVersion() {
     REQUIRE_TRUE(rust_sig.offset_config_on_output == offsetof(LbCoreConfig, on_output_packet), "offsetof on_output_packet");
 
     REQUIRE_TRUE(std::memcmp(&rust_sig, &c11_sig, sizeof(rust_sig)) == 0, "Rust == C++20 == C11 layout signature");
-    std::printf("[PASS] TestAbiLayoutAndVersion (C11 == C++20 == Rust verified)\n");
+    REQUIRE_TRUE(LbC11RunSmallLegacyAndAlignmentChecks() == 1,
+                 "C11 pre-read small legacy struct & misaligned pointer rejection");
+    std::printf("[PASS] TestAbiLayoutAndVersion (C11 == C++20 == Rust + pre-read header validation verified)\n");
     return true;
 }
 
@@ -287,6 +290,40 @@ bool TestInputValidationAndErrorContract() {
     REQUIRE_STATUS(lb_core_stop(handle), LB_STATUS_OK, "stop 2 idempotent");
     REQUIRE_STATUS(lb_core_submit_encoded_frame(handle, &meta, sample, sizeof(sample)),
                    LB_STATUS_INVALID_STATE, "submit after stop rejected");
+
+    // Pre-read ABI header & alignment checks with genuinely smaller struct + 0xCC sentinels.
+    struct alignas(8) SmallLegacyStruct {
+        LbAbiHeader abi;
+        uint64_t tail;
+    } small_legacy{
+        {LB_FFI_ABI_MAJOR, LB_FFI_ABI_MINOR, static_cast<uint32_t>(sizeof(SmallLegacyStruct)), 0U},
+        0xCCCCCCCCCCCCCCCCULL};
+    REQUIRE_STATUS(lb_core_submit_encoded_frame(handle, reinterpret_cast<const LbEncodedFrameMeta*>(&small_legacy),
+                                                sample, sizeof(sample)),
+                   LB_STATUS_INVALID_STRUCT_SIZE, "small legacy meta rejected via 16B header pre-read");
+    REQUIRE_STATUS(lb_core_get_metrics(handle, reinterpret_cast<LbCoreMetrics*>(&small_legacy)),
+                   LB_STATUS_INVALID_STRUCT_SIZE, "small legacy metrics rejected without overwriting tail");
+    REQUIRE_TRUE(small_legacy.tail == 0xCCCCCCCCCCCCCCCCULL, "small legacy metrics tail untouched");
+
+    LbCoreMetrics sentinel_metrics{};
+    std::memset(&sentinel_metrics, 0xCC, sizeof(sentinel_metrics));
+    sentinel_metrics.abi = MakeHeader<LbCoreMetrics>();
+    sentinel_metrics.abi.reserved = 7U;
+    LbCoreMetrics expected_sentinel = sentinel_metrics;
+    REQUIRE_STATUS(lb_core_get_metrics(handle, &sentinel_metrics), LB_STATUS_INVALID_ARGUMENT,
+                   "non-zero reserved rejected on output metrics");
+    REQUIRE_TRUE(std::memcmp(&sentinel_metrics, &expected_sentinel, sizeof(sentinel_metrics)) == 0,
+                 "rejected output struct retains caller 0xCC sentinel bytes");
+
+    alignas(16) uint8_t unaligned_backing[256]{};
+    std::memset(unaligned_backing, 0xCC, sizeof(unaligned_backing));
+    uint8_t* unaligned_ptr = unaligned_backing + 1;
+    REQUIRE_STATUS(lb_core_start(reinterpret_cast<LbCoreHandle*>(unaligned_ptr)), LB_STATUS_INVALID_ARGUMENT,
+                   "misaligned handle start rejected");
+    REQUIRE_STATUS(lb_core_get_metrics(handle, reinterpret_cast<LbCoreMetrics*>(unaligned_ptr)),
+                   LB_STATUS_INVALID_ARGUMENT, "misaligned out_metrics rejected");
+    REQUIRE_STATUS(lb_core_submit_owned_encoded_frame(handle, &meta, reinterpret_cast<LbOwnedBuffer*>(unaligned_ptr)),
+                   LB_STATUS_INVALID_ARGUMENT, "misaligned owned buffer rejected");
 
     // Verify get_last_error works with small and sufficient buffer
     uint8_t err_buf[256]{};

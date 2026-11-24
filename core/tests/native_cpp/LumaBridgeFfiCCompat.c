@@ -48,3 +48,63 @@ void LbC11GetLayoutSignature(LbAbiLayoutSignature *out_sig) {
 LbStatus LbC11ProbeAbiVersion(uint32_t *out_major, uint32_t *out_minor) {
     return lb_core_abi_version(out_major, out_minor);
 }
+
+int LbC11RunSmallLegacyAndAlignmentChecks(void) {
+    typedef struct LbC11SmallLegacy {
+        LbAbiHeader abi;
+        uint64_t sentinel_tail;
+    } LbC11SmallLegacy;
+
+    LbAbiHeader tiny_hdr = {
+        LB_FFI_ABI_MAJOR,
+        LB_FFI_ABI_MINOR,
+        (uint32_t)sizeof(LbAbiHeader),
+        0u,
+    };
+    LbCoreHandle *handle = NULL;
+    if (lb_core_create((const LbCoreConfig *)&tiny_hdr, &handle) != LB_STATUS_INVALID_STRUCT_SIZE ||
+        handle != NULL) {
+        return 0;
+    }
+
+    LbC11SmallLegacy small = {
+        {
+            LB_FFI_ABI_MAJOR,
+            LB_FFI_ABI_MINOR,
+            (uint32_t)sizeof(LbC11SmallLegacy),
+            0u,
+        },
+        0xCCCCCCCCCCCCCCCCULL,
+    };
+    if (lb_core_get_global_resource_counters((LbGlobalResourceCounters *)&small) !=
+            LB_STATUS_INVALID_STRUCT_SIZE ||
+        small.sentinel_tail != 0xCCCCCCCCCCCCCCCCULL) {
+        return 0;
+    }
+    if (lb_core_layout_signature((LbAbiLayoutSignature *)&small) != LB_STATUS_INVALID_STRUCT_SIZE ||
+        small.sentinel_tail != 0xCCCCCCCCCCCCCCCCULL) {
+        return 0;
+    }
+
+    /* Misaligned (+1 byte) pointers must return InvalidArgument without dereferencing. */
+    _Alignas(16) uint8_t scratch[256];
+    for (size_t i = 0; i < sizeof(scratch); ++i) {
+        scratch[i] = 0xAAu;
+    }
+    uint8_t *misaligned = scratch + 1;
+    if (lb_core_abi_version((uint32_t *)misaligned, NULL) != LB_STATUS_INVALID_ARGUMENT) {
+        return 0;
+    }
+    if (lb_core_create((const LbCoreConfig *)misaligned, &handle) != LB_STATUS_INVALID_ARGUMENT ||
+        handle != NULL) {
+        return 0;
+    }
+    if (lb_core_get_global_resource_counters((LbGlobalResourceCounters *)misaligned) !=
+        LB_STATUS_INVALID_ARGUMENT) {
+        return 0;
+    }
+    if (lb_core_release_buffer((LbOwnedBuffer *)misaligned) != LB_STATUS_INVALID_ARGUMENT) {
+        return 0;
+    }
+    return 1;
+}

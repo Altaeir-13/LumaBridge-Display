@@ -92,7 +92,13 @@ typedef uint32_t LbEncodedCodec;
 
 /**
  * Opaque native handle owning a `CoreSession`.
- * Must be destroyed exactly once via `lb_core_destroy` after all concurrent calls have finished.
+ *
+ * # Caller Contract & DLL/DSO Lifetime
+ * - Must be destroyed exactly once via `lb_core_destroy` after all concurrent calls on `handle`
+ *   have returned (except cooperative `lb_core_stop` / `lb_core_simulate_disconnect`).
+ * - Caller MUST keep the `lumabridge_ffi` shared library loaded in process memory while any
+ *   `LbCoreHandle` OR any Rust-allocated `LbOwnedBuffer` handed to native output callbacks
+ *   remains unreleased.
  */
 typedef struct LbCoreHandle LbCoreHandle;
 
@@ -131,6 +137,14 @@ typedef void (*LbBufferReleaseFn)(void *user_ctx, const uint8_t *data, size_t le
 
 /**
  * Explicit ownership-transferring byte buffer descriptor (`ADR-0004`).
+ *
+ * # Ownership & Lifetime Rules
+ * - Native -> Rust (`lb_core_submit_owned_encoded_frame`): on `LB_STATUS_OK`, Rust zeros
+ *   `*buffer` (`release == NULL`) and guarantees `release` is invoked **noexcept** exactly once
+ *   outside internal mutexes.
+ * - Rust -> Native (`LbOutputPacketCallback`): native consumer owns the delivered descriptor and
+ *   must call `lb_core_release_buffer(&owned)` (or `owned.release(...)`) once from any thread,
+ *   including after `lb_core_destroy`, while keeping `lumabridge_ffi` loaded.
  */
 typedef struct LbOwnedBuffer {
   const uint8_t *data;
@@ -157,6 +171,11 @@ typedef void (*LbStateChangeCallback)(void *user_ctx, uint32_t new_state, uint32
 
 /**
  * Session configuration structure passed to `lb_core_create`.
+ *
+ * # Memory Budget Note
+ * `expected_frame_bytes_hint` guides bounded buffer recycling (eager preallocation capped at
+ * 4 MiB total / 8 slots); individual queued encoded frames remain bounded by
+ * `LB_FFI_MAX_FRAME_BYTES` (8 MiB), with an explicit total-byte admission cap planned for M1/M2.
  */
 typedef struct LbCoreConfig {
   struct LbAbiHeader abi;
@@ -227,17 +246,22 @@ extern "C" {
  * Query ABI major and minor version supported by this compiled binary.
  *
  * # Safety
- * If `out_major` or `out_minor` is non-null, it must be valid for writing one `u32`.
+ * If `out_major` or `out_minor` is non-null, it must be properly aligned and valid for writing one `u32`.
  */
-LbStatus lb_core_abi_version(uint32_t *out_major, uint32_t *out_minor);
+LbStatus lb_core_abi_version(uint32_t *out_major,
+                             uint32_t *out_minor);
 
 /**
  * Create a new core handle in `LB_CORE_STATE_CREATED`.
  *
  * # Safety
- * - `config` and `out_handle` must be valid, properly aligned non-null pointers.
+ * - `out_handle` must be a valid, properly aligned non-null pointer (`*out_handle` is zeroed on entry).
+ * - `config` must be non-null, `LbAbiHeader`-aligned with at least 16 readable bytes; if
+ *   `config->abi.struct_size >= sizeof(LbCoreConfig)` and `config` is `LbCoreConfig`-aligned,
+ *   all `sizeof(LbCoreConfig)` bytes must be readable.
  * - If callbacks are supplied in `config`, `callback_user_ctx` must remain valid until
- *   `lb_core_destroy` completes, and callbacks must be `noexcept` and never invoke `lb_core_destroy`.
+ *   `lb_core_destroy` completes, callbacks must be `noexcept` and never invoke `lb_core_destroy`,
+ *   and the caller must keep `lumabridge_ffi` loaded while handles or Rust `LbOwnedBuffer`s exist.
  */
 LbStatus lb_core_create(const struct LbCoreConfig *config,
                         struct LbCoreHandle **out_handle);
@@ -246,17 +270,18 @@ LbStatus lb_core_create(const struct LbCoreConfig *config,
  * Start the core worker thread (`Created -> Running`).
  *
  * # Safety
- * `handle` must be a valid non-null handle returned by `lb_core_create` and not yet destroyed.
+ * `handle` must be a valid aligned non-null handle returned by `lb_core_create` and not yet destroyed.
  */
 LbStatus lb_core_start(struct LbCoreHandle *handle);
 
 /**
- * Synchronously submit a caller-borrowed encoded frame buffer.
- * Rust copies `data[0..data_len]` into an internal bounded buffer before returning,
+ * Synchronously enqueue a copy of a caller-borrowed encoded frame buffer without waiting on worker/network I/O.
+ * Acquires an internal queue mutex briefly, copies `data[0..data_len]` into a bounded internal buffer before returning,
  * or returns `LB_STATUS_BACKPRESSURE` without retaining `data`.
  *
  * # Safety
- * - `handle` and `meta` must be valid non-null pointers.
+ * - `handle` must be a valid aligned non-null handle returned by `lb_core_create`.
+ * - `meta` must have 16 readable `LbAbiHeader` bytes (and full `LbEncodedFrameMeta` readable once valid).
  * - `data` must be readable for `data_len` bytes during this call (`data_len` in `1..=8 MiB`).
  */
 LbStatus lb_core_submit_encoded_frame(struct LbCoreHandle *handle,
@@ -265,8 +290,8 @@ LbStatus lb_core_submit_encoded_frame(struct LbCoreHandle *handle,
                                       size_t data_len);
 
 /**
- * Asynchronously transfer ownership of a native-allocated `LbOwnedBuffer` into the core
- * using two-phase transactional commit.
+ * Enqueue transfer of ownership of a native-allocated `LbOwnedBuffer` into the core
+ * using two-phase transactional commit without waiting on worker/network I/O (acquires an internal mutex briefly).
  * - On `LB_STATUS_OK`, Rust owns the buffer, zeroes `*buffer` (`release == NULL`), and
  *   guarantees `release` is called **noexcept** exactly once outside internal mutexes.
  * - On any non-panic error status (`InvalidArgument`, `InvalidState`, `Backpressure`,
@@ -278,7 +303,8 @@ LbStatus lb_core_submit_encoded_frame(struct LbCoreHandle *handle,
  *   Calling `lb_core_release_buffer(buffer)` on cleanup safely handles both outcomes without double-free.
  *
  * # Safety
- * - `handle`, `meta`, and `buffer` must be valid aligned non-null pointers.
+ * - `handle` and `buffer` must be valid aligned non-null pointers.
+ * - `meta` must have 16 readable `LbAbiHeader` bytes (and full `LbEncodedFrameMeta` readable once valid).
  * - `buffer->data` must be valid and immutable for `buffer->len` bytes until `buffer->release` runs.
  */
 LbStatus lb_core_submit_owned_encoded_frame(struct LbCoreHandle *handle,
@@ -288,9 +314,11 @@ LbStatus lb_core_submit_owned_encoded_frame(struct LbCoreHandle *handle,
 /**
  * Release a buffer via its embedded `release` callback and zero out the descriptor fields.
  * Convenience helper for native consumers holding a Rust-allocated `LbOwnedBuffer`.
+ * May be called from any thread (including after `lb_core_destroy`), provided the `lumabridge_ffi`
+ * shared library remains loaded in process memory.
  *
  * # Safety
- * `buffer` must be null or point to a valid writable `LbOwnedBuffer` owned by the caller.
+ * `buffer` must be null or point to a valid aligned writable `LbOwnedBuffer` owned by the caller.
  */
 LbStatus lb_core_release_buffer(struct LbOwnedBuffer *buffer);
 
@@ -298,16 +326,18 @@ LbStatus lb_core_release_buffer(struct LbOwnedBuffer *buffer);
  * Simulate an abrupt session disconnect, draining and releasing all queued buffers cleanly.
  *
  * # Safety
- * `handle` must be a valid non-null handle returned by `lb_core_create`.
+ * `handle` must be a valid aligned non-null handle returned by `lb_core_create`.
  */
 LbStatus lb_core_simulate_disconnect(struct LbCoreHandle *handle);
 
 /**
  * Cooperatively stop the session (`Running/Created -> Stopping -> Stopped`).
  * Idempotent and reentrancy-safe from within callbacks (never self-joins the worker thread).
+ * External callers block until any active worker callbacks finish, worker threads exit cleanly,
+ * and all prior state notifications complete before returning.
  *
  * # Safety
- * `handle` must be a valid non-null handle returned by `lb_core_create`.
+ * `handle` must be a valid aligned non-null handle returned by `lb_core_create`.
  */
 LbStatus lb_core_stop(struct LbCoreHandle *handle);
 
@@ -317,10 +347,11 @@ LbStatus lb_core_stop(struct LbCoreHandle *handle);
  * - `lb_core_destroy` is NOT called concurrently with other API calls on `handle`;
  * - `lb_core_destroy` is NOT called from inside a worker callback;
  * - `handle` is NEVER used again after `lb_core_destroy` returns (zero post-free guarantee
- *   against stale opaque pointers cannot be provided in raw C without generation indirection).
+ *   against stale opaque pointers cannot be provided in raw C without generation indirection);
+ * - Keep `lumabridge_ffi` loaded while any Rust-allocated `LbOwnedBuffer` remains unreleased.
  *
  * # Safety
- * `handle` must be a live handle returned by `lb_core_create` or null (returns `InvalidArgument`).
+ * `handle` must be a valid aligned live handle returned by `lb_core_create` or null (returns `InvalidArgument`).
  */
 LbStatus lb_core_destroy(struct LbCoreHandle *handle);
 
@@ -328,15 +359,18 @@ LbStatus lb_core_destroy(struct LbCoreHandle *handle);
  * Query per-instance metrics and queue occupancy counters.
  *
  * # Safety
- * `handle` and `out_metrics` must be valid non-null pointers.
+ * - `handle` must be a valid aligned non-null pointer.
+ * - `out_metrics` must have 16 readable `LbAbiHeader` bytes (and full `LbCoreMetrics` writable once valid).
  */
-LbStatus lb_core_get_metrics(const struct LbCoreHandle *handle, struct LbCoreMetrics *out_metrics);
+LbStatus lb_core_get_metrics(const struct LbCoreHandle *handle,
+                             struct LbCoreMetrics *out_metrics);
 
 /**
  * Copy sanitized diagnostic error message (empty if none) into caller buffer (`NUL`-terminated).
  *
  * # Safety
- * `handle` and `out_buf` must be valid non-null pointers; `out_buf` must be writable for `buf_cap`.
+ * `handle` and `out_buf` must be valid aligned non-null pointers; `out_buf` must be writable for `buf_cap`.
+ * If `out_len` is non-null, it must be aligned and writable for one `usize`.
  */
 LbStatus lb_core_get_last_error(const struct LbCoreHandle *handle,
                                 uint8_t *out_buf,
@@ -348,7 +382,7 @@ LbStatus lb_core_get_last_error(const struct LbCoreHandle *handle,
  * `in_flight_buffers`, Rust vs native buffer release balance).
  *
  * # Safety
- * `out_counters` must be a valid non-null writable pointer initialized with `LbAbiHeader`.
+ * `out_counters` must have 16 readable `LbAbiHeader` bytes (and full `LbGlobalResourceCounters` writable once valid).
  */
 LbStatus lb_core_get_global_resource_counters(struct LbGlobalResourceCounters *out_counters);
 
@@ -356,7 +390,7 @@ LbStatus lb_core_get_global_resource_counters(struct LbGlobalResourceCounters *o
  * Return Rust-computed structure sizes and key field offsets for cross-language verification.
  *
  * # Safety
- * `out_sig` must be a valid non-null writable pointer initialized with `LbAbiHeader`.
+ * `out_sig` must have 16 readable `LbAbiHeader` bytes (and full `LbAbiLayoutSignature` writable once valid).
  */
 LbStatus lb_core_layout_signature(struct LbAbiLayoutSignature *out_sig);
 
@@ -373,7 +407,7 @@ LbStatus lb_core_layout_signature(struct LbAbiLayoutSignature *out_sig);
  * (caught and mapped to `LB_STATUS_INTERNAL_PANIC`).
  *
  * # Safety
- * `handle` must be a valid non-null handle returned by `lb_core_create`.
+ * `handle` must be a valid aligned non-null handle returned by `lb_core_create`.
  */
 LbStatus lb_core_poc_trigger_panic(struct LbCoreHandle *handle,
                                    uint32_t mode);
