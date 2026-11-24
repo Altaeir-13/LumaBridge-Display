@@ -41,6 +41,9 @@ enum class DriverDiagnosticStage : UINT32
     MonitorAssignSwapChain,
     MonitorUnassignSwapChain,
     MonitorCallbackStub,
+    DllProcessAttach,
+    IddCxGetVersion,
+    WdfDeviceSetFailed,
 };
 
 /// Action determined when entering D0 based on current lifecycle state.
@@ -65,7 +68,9 @@ struct AdapterLifecycleTracker
 {
     AdapterLifecycleState State{AdapterLifecycleState::Uninitialized};
     DriverDiagnosticStage LastStage{DriverDiagnosticStage::None};
+    DriverDiagnosticStage LastSuccessfulStage{DriverDiagnosticStage::None};
     DriverDiagnosticStage LastErrorStage{DriverDiagnosticStage::None};
+    NTSTATUS LastStageStatus{STATUS_SUCCESS};
     NTSTATUS LastAdapterInitStatus{STATUS_PENDING};
     NTSTATUS LastErrorStatus{STATUS_SUCCESS};
     UINT32 CommittedPathCount{0};
@@ -156,7 +161,20 @@ NormalizeFailureStatus(
     return NT_SUCCESS(status) ? STATUS_UNSUCCESSFUL : status;
 }
 
-/// Records stage and error metadata for post-mortem diagnostics.
+/// Records the latest completed stage and status without clearing error history.
+inline void
+RecordDiagnosticSuccess(
+    AdapterLifecycleTracker& tracker,
+    DriverDiagnosticStage stage,
+    NTSTATUS status = STATUS_SUCCESS
+    ) noexcept
+{
+    tracker.LastStage = stage;
+    tracker.LastSuccessfulStage = stage;
+    tracker.LastStageStatus = status;
+}
+
+/// Records stage and error metadata for post-mortem diagnostics without overwriting LastSuccessfulStage.
 inline void
 RecordDiagnosticFailure(
     AdapterLifecycleTracker& tracker,
@@ -165,6 +183,7 @@ RecordDiagnosticFailure(
     ) noexcept
 {
     tracker.LastStage = stage;
+    tracker.LastStageStatus = status;
     tracker.LastErrorStage = stage;
     tracker.LastErrorStatus = status;
 }
@@ -175,7 +194,7 @@ TransitionOnDeviceConfigured(
     AdapterLifecycleTracker& tracker
     ) noexcept
 {
-    tracker.LastStage = DriverDiagnosticStage::DeviceInitConfig;
+    RecordDiagnosticSuccess(tracker, DriverDiagnosticStage::DeviceInitConfig, STATUS_SUCCESS);
     tracker.State = AdapterLifecycleState::DeviceConfigured;
     tracker.IsCleanedUp = false;
 }
@@ -187,9 +206,9 @@ TransitionOnDeviceInitialized(
     NTSTATUS status
     ) noexcept
 {
-    tracker.LastStage = DriverDiagnosticStage::IddCxDeviceInitialize;
     if (IsSucceededNonPendingStatus(status))
     {
+        RecordDiagnosticSuccess(tracker, DriverDiagnosticStage::IddCxDeviceInitialize, status);
         tracker.State = AdapterLifecycleState::DeviceInitialized;
         return;
     }
@@ -219,6 +238,7 @@ TransitionOnD0EntryBegin(
         const NTSTATUS failureStatus = !IsSucceededNonPendingStatus(tracker.LastErrorStatus)
             ? tracker.LastErrorStatus
             : NormalizeFailureStatus(tracker.LastAdapterInitStatus);
+        tracker.LastStageStatus = failureStatus;
         return {D0EntryAction::FailPreviousError, failureStatus};
     }
 
@@ -236,14 +256,17 @@ TransitionOnD0EntryBegin(
     {
         if (tracker.AdapterInitCompleted)
         {
+            RecordDiagnosticSuccess(tracker, DriverDiagnosticStage::DeviceD0Entry, STATUS_SUCCESS);
             tracker.State = AdapterLifecycleState::AdapterReady;
             return {D0EntryAction::ResumeReady, STATUS_SUCCESS};
         }
 
+        RecordDiagnosticSuccess(tracker, DriverDiagnosticStage::DeviceD0Entry, STATUS_SUCCESS);
         tracker.State = AdapterLifecycleState::AdapterInitPending;
         return {D0EntryAction::WaitPendingInit, STATUS_SUCCESS};
     }
 
+    RecordDiagnosticSuccess(tracker, DriverDiagnosticStage::DeviceD0Entry, STATUS_SUCCESS);
     tracker.State = AdapterLifecycleState::AdapterInitPending;
     tracker.LastAdapterInitStatus = STATUS_PENDING;
     tracker.AdapterInitCompleted = false;
@@ -284,11 +307,13 @@ TransitionOnAdapterInitAsyncSubmitted(
     {
         if (tracker.State == AdapterLifecycleState::AdapterFailed)
         {
+            tracker.LastSuccessfulStage = DriverDiagnosticStage::AdapterInitAsync;
             return NormalizeFailureStatus(tracker.LastAdapterInitStatus);
         }
         return STATUS_SUCCESS;
     }
 
+    RecordDiagnosticSuccess(tracker, DriverDiagnosticStage::AdapterInitAsync, callStatus);
     tracker.State = tracker.IsInD0
         ? AdapterLifecycleState::AdapterInitPending
         : AdapterLifecycleState::DeviceStopped;
@@ -325,6 +350,7 @@ TransitionOnAdapterInitFinished(
         return failureStatus;
     }
 
+    RecordDiagnosticSuccess(tracker, DriverDiagnosticStage::AdapterInitFinished, STATUS_SUCCESS);
     tracker.LastAdapterInitStatus = STATUS_SUCCESS;
     tracker.State = tracker.IsInD0
         ? AdapterLifecycleState::AdapterReady
@@ -349,7 +375,7 @@ TransitionOnCommitModes(
         return STATUS_INVALID_DEVICE_STATE;
     }
 
-    tracker.LastStage = DriverDiagnosticStage::AdapterCommitModes;
+    RecordDiagnosticSuccess(tracker, DriverDiagnosticStage::AdapterCommitModes, STATUS_SUCCESS);
     tracker.CommittedPathCount = pathCount;
     return STATUS_SUCCESS;
 }

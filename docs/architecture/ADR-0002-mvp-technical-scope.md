@@ -4,6 +4,8 @@
 
 Aceita para planejamento inicial.
 
+> **Nota de evolução arquitetural (2026-11-23):** Esta ADR foi **parcialmente superada** pela [ADR-0003 - Visão oficial da plataforma universal](./ADR-0003-universal-platform-vision.md) (`Accepted`). A definição definitiva do produto passou a ser uma plataforma open source, multiplataforma, bidirecional e independente de fabricantes para espelhamento, extensão real de desktop e interação remota autorizada (Windows, Linux Wayland/X11 e Android, com expansão futura para macOS e iOS/iPadOS). O recorte `Windows 11 → Linux` abaixo permanece preservado como registro histórico e como **primeiro fluxo funcional vertical completo (`M2`)**, não mais como definição ou limite arquitetural do produto.
+
 ## Contexto
 
 O objetivo do LumaBridge Display e fazer um laptop Linux funcionar como monitor secundario real para um PC Windows 11. O requisito central e que o Windows reconheca um monitor virtual adicional. O produto nao deve se limitar a screen sharing da tela principal.

@@ -1,0 +1,388 @@
+#pragma once
+
+#include "SwapChainProcessor.h"
+#include "FrameIpcProtocol.h"
+#include "FrameExtractor.h"
+#include "SharedTexturePool.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <cwchar>
+#include <memory>
+
+namespace lumabridge::driver {
+
+inline constexpr size_t kMaxSupportedQueueDepth = 16U;
+inline constexpr size_t kMaxSupportedPoolSize = 20U;
+inline constexpr DWORD kMinIpcIoTimeoutMs = 50U;
+inline constexpr DWORD kMaxIpcIoTimeoutMs = 5000U;
+
+/// Configuration for the bounded local Named Pipe IPC transport server.
+struct FrameTransportConfig
+{
+    FrameTransportConfig() noexcept
+    {
+        SetPipeName(ipc::kDefaultFrameIpcPipeName);
+    }
+
+    void SetPipeName(const wchar_t* pipeName) noexcept
+    {
+        if (pipeName == nullptr)
+        {
+            PipeName[0] = L'\0';
+            return;
+        }
+        (void)wcsncpy_s(PipeName, ARRAYSIZE(PipeName), pipeName, _TRUNCATE);
+    }
+
+    void SetAuthorizedUserSid(const wchar_t* sidString) noexcept
+    {
+        if (sidString == nullptr)
+        {
+            AuthorizedUserSid[0] = L'\0';
+            return;
+        }
+        (void)wcsncpy_s(AuthorizedUserSid, ARRAYSIZE(AuthorizedUserSid), sidString, _TRUNCATE);
+    }
+
+    void SetAllowedClientSessionId(DWORD sessionId) noexcept
+    {
+        HasExplicitAllowedSessionId = true;
+        AllowedClientSessionId = sessionId;
+    }
+
+    wchar_t PipeName[260]{};
+    wchar_t AuthorizedUserSid[128]{};
+    size_t MaxQueueDepth{ipc::kDefaultMaxFrameQueueDepth};
+    size_t BufferPoolSize{ipc::kDefaultFrameBufferPoolSize};
+    DWORD IoTimeoutMs{ipc::kDefaultIpcIoTimeoutMs};
+    LUID AdapterLuid{0, 0};
+    bool PreallocatePoolOnStart{true};
+    bool RequireClientAck{true};
+    bool RestrictDaclToAuthorizedSid{false};
+    bool AllowSameUserAccess{true};
+    bool AllowBuiltinAdmins{true};
+    bool AllowActiveConsoleInteractiveUser{true};
+    bool RequireMatchingClientSession{true};
+    bool HasExplicitAllowedSessionId{false};
+    DWORD AllowedClientSessionId{0U};
+    DWORD MinimumIntegrityRid{SECURITY_MANDATORY_MEDIUM_RID};
+    bool EnableGpuSharedTransport{true};
+    bool AllowCpuFallbackWhenGpuNegotiated{true};
+    size_t SharedTexturePoolSize{ipc::kDefaultSharedTexturePoolSize};
+    DWORD GpuKeyedMutexTimeoutMs{ipc::kDefaultGpuKeyedMutexTimeoutMs};
+    D3d11SharedTexturePool* SharedTexturePool{nullptr};
+    /// Assigns 1-based monotonic FrameSequence atomically under m_queueLock at EnqueueFrame time.
+    bool AssignSequenceOnEnqueue{true};
+    /// Rejects unbound frames when no authorized host session is active (enabled by driver backend).
+    bool RequireActiveSessionForEnqueue{false};
+    /// Flushes remaining queued frames on session start/disconnect (enabled by driver backend).
+    bool FlushQueueOnSessionStart{false};
+    /// If true and queue is empty on session start, resets sequence to 1; default false keeps
+    /// server-instance monotonic continuity across reconnects without consumer LastFrameSequence reset.
+    bool ResetSequenceOnSessionStart{false};
+};
+
+/// Atomic snapshot of the currently authorized IPC session and negotiated transport contract.
+struct TransportSessionSnapshot
+{
+    uint64_t SessionId{0ULL};
+    uint64_t SessionGeneration{0ULL};
+    bool HasActiveConsumer{false};
+    bool ClientAuthorized{false};
+    ipc::FrameIpcTransportMode NegotiatedMode{ipc::FrameIpcTransportMode::CpuStagingPipe};
+    bool AllowCpuFallback{false};
+    bool RequireGpuOnly{false};
+};
+
+/// Final driver-side counters captured for an IPC session (populated on client disconnect/teardown).
+struct DriverSessionSummarySnapshot
+{
+    bool Valid{false};
+    uint64_t SessionId{0ULL};
+    uint64_t SessionGeneration{0ULL};
+    ipc::FrameIpcTransportMode NegotiatedMode{ipc::FrameIpcTransportMode::CpuStagingPipe};
+    bool AllowCpuFallback{false};
+    uint64_t FramesPublished{0ULL};
+    uint64_t FramesDelivered{0ULL};
+    uint64_t FramesDroppedByBackpressure{0ULL};
+    uint64_t FramesDiscardedStaleSession{0ULL};
+    uint64_t FramesDiscardedTransportMismatch{0ULL};
+    uint64_t FramesFlushedOnSessionTransition{0ULL};
+    uint64_t GpuFramesShared{0ULL};
+    uint64_t GpuFramesDropped{0ULL};
+    uint64_t GpuSyncTimeouts{0ULL};
+    uint64_t LastFrameSequence{0ULL};
+    HRESULT DisconnectReason{S_OK};
+};
+
+/// Thread-safe snapshot of bounded queue and local IPC delivery metrics.
+struct FrameTransportMetricsSnapshot
+{
+    bool Running{false};
+    uint32_t QueueDepth{0U};
+    uint32_t PeakQueueDepth{0U};
+    uint32_t TotalPoolSlots{0U};
+    uint32_t FreePoolSlots{0U};
+    uint32_t InFlightSlots{0U};
+    uint32_t PeakInFlightSlots{0U};
+    uint32_t ActiveHostConnections{0U};
+    uint64_t ActiveSessionId{0ULL};
+    uint64_t SessionGeneration{0ULL};
+    uint64_t LastFrameSequence{0ULL};
+    uint64_t FramesEnqueued{0ULL};
+    uint64_t FramesPublished{0ULL};
+    uint64_t FramesDroppedByBackpressure{0ULL};
+    uint64_t QueueEvictionsByBackpressure{0ULL};
+    uint64_t PoolExhaustionDrops{0ULL};
+    uint64_t PoolAllocationFailures{0ULL};
+    uint64_t FramesDiscardedNoConsumer{0ULL};
+    uint64_t FramesDiscardedStaleSession{0ULL};
+    uint64_t FramesDiscardedTransportMismatch{0ULL};
+    uint64_t FramesFlushedOnSessionTransition{0ULL};
+    uint64_t SequenceWrapAroundCount{0ULL};
+    uint64_t PendingAckCount{0ULL};
+    uint64_t FramesDelivered{0ULL};
+    uint64_t PreConnectFramesDelivered{0ULL};
+    uint64_t FrameTransportFailures{0ULL};
+    uint64_t ClientConnectionsAccepted{0ULL};
+    uint64_t ClientConnectionsRejected{0ULL};
+    uint64_t ClientDisconnects{0ULL};
+    uint64_t LastDeliveredFrameSequence{0ULL};
+    uint64_t LastQueueWaitLatencyUs{0ULL};
+    uint64_t TotalQueueWaitLatencyUs{0ULL};
+    uint64_t AvgQueueWaitLatencyUs{0ULL};
+    uint64_t MaxQueueWaitLatencyUs{0ULL};
+    uint64_t LastDeliveryLatencyUs{0ULL};
+    uint64_t TotalDeliveryLatencyUs{0ULL};
+    uint64_t AvgDeliveryLatencyUs{0ULL};
+    uint64_t MaxDeliveryLatencyUs{0ULL};
+    HRESULT LastTransportError{S_OK};
+    bool GpuSharedTransportConfigured{false};
+    uint32_t SharedTexturePoolSize{0U};
+    uint32_t SharedTexturePoolPeakUsage{0U};
+    uint64_t GpuFramesShared{0ULL};
+    uint64_t GpuFramesDropped{0ULL};
+    uint64_t GpuSyncTimeouts{0ULL};
+    uint64_t LastGpuSyncWaitUs{0ULL};
+    uint64_t AvgGpuSyncWaitUs{0ULL};
+    uint64_t MaxGpuSyncWaitUs{0ULL};
+    uint64_t HandleDuplicationFailures{0ULL};
+};
+
+/// Fixed-capacity ring buffer of unique_ptr<ExtractedFrameBuffer> (exception-free for UMDF).
+template <size_t Capacity>
+class BoundedBufferRing final
+{
+public:
+    bool Empty() const noexcept { return m_count == 0U; }
+    size_t Size() const noexcept { return m_count; }
+
+    bool PushBack(std::unique_ptr<ExtractedFrameBuffer> item) noexcept
+    {
+        if (m_count >= Capacity || item == nullptr)
+        {
+            return false;
+        }
+        const size_t idx = (m_head + m_count) % Capacity;
+        m_items[idx] = std::move(item);
+        ++m_count;
+        return true;
+    }
+
+    std::unique_ptr<ExtractedFrameBuffer> PopFront() noexcept
+    {
+        if (m_count == 0U)
+        {
+            return nullptr;
+        }
+        std::unique_ptr<ExtractedFrameBuffer> item = std::move(m_items[m_head]);
+        m_head = (m_head + 1U) % Capacity;
+        --m_count;
+        return item;
+    }
+
+    void FreeAllPixelStorage() noexcept
+    {
+        for (size_t i = 0U; i < m_count; ++i)
+        {
+            const size_t idx = (m_head + i) % Capacity;
+            if (m_items[idx] != nullptr)
+            {
+                m_items[idx]->ResetMetadataAndFreePixels();
+            }
+        }
+    }
+
+    void Clear() noexcept
+    {
+        while (m_count > 0U)
+        {
+            m_items[m_head].reset();
+            m_head = (m_head + 1U) % Capacity;
+            --m_count;
+        }
+        m_head = 0U;
+    }
+
+private:
+    std::unique_ptr<ExtractedFrameBuffer> m_items[Capacity]{};
+    size_t m_head{0U};
+    size_t m_count{0U};
+};
+
+/// Bounded drop-oldest frame queue and overlapped local Named Pipe server.
+/// Lock ordering: m_lifecycleLock -> m_queueLock / m_metricsLock (never held across I/O or waits).
+class FrameIpcServer final
+{
+public:
+    FrameIpcServer() noexcept = default;
+    ~FrameIpcServer();
+
+    FrameIpcServer(const FrameIpcServer&) = delete;
+    FrameIpcServer& operator=(const FrameIpcServer&) = delete;
+
+    /// Creates the secured Named Pipe endpoint, initializes the reusable buffer pool,
+    /// and starts the dedicated IPC transport worker thread.
+    HRESULT Start(
+        const FrameTransportConfig& config
+        ) noexcept;
+
+    /// Signals cooperative cancellation, cancels pending overlapped pipe I/O,
+    /// joins the transport thread, closes handles, and frees queued/pooled buffers.
+    void Stop() noexcept;
+
+    /// Returns true when the IPC server is active and not stopping.
+    bool IsRunning() const noexcept;
+
+    /// Obtains a reusable frame buffer slot without blocking on IPC.
+    /// Evicts the oldest queued frame if all pool slots are currently occupied.
+    std::unique_ptr<ExtractedFrameBuffer> AcquireBufferSlot() noexcept;
+
+    /// Returns an unused or rejected buffer slot back to the reusable pool.
+    void RecycleBufferSlot(
+        std::unique_ptr<ExtractedFrameBuffer> slot
+        ) noexcept;
+
+    /// Enqueues an extracted frame using a bounded drop-oldest policy when full.
+    /// Assigns the authoritative monotonic wire FrameSequence under m_queueLock when configured.
+    HRESULT EnqueueFrame(
+        std::unique_ptr<ExtractedFrameBuffer> frame,
+        bool& outEvictedOldest,
+        uint64_t* outAssignedSequence = nullptr
+        ) noexcept;
+
+    /// Recycles all currently queued frames back into the pool without disconnecting the host.
+    void FlushQueue() noexcept;
+
+    /// Returns a consistent snapshot of the active authorized host session and transport mode.
+    TransportSessionSnapshot GetActiveSessionSnapshot() const noexcept;
+
+    /// Retrieves the most recent completed session summary (recorded on disconnect/teardown).
+    bool GetLastCompletedSessionSummary(
+        DriverSessionSummarySnapshot& outSummary
+        ) const noexcept;
+
+    /// Returns a synchronized snapshot of queue and IPC delivery metrics.
+    FrameTransportMetricsSnapshot GetMetricsSnapshot() const noexcept;
+
+    /// Fault-injection seam for deterministic unit testing of slot allocation failures.
+    void SetSimulateSlotAllocationFailureForTesting(
+        bool simulateFailure
+        ) noexcept;
+
+    /// Testability seam to position the serialized publication sequence counter (must be >= 1).
+    void SetNextPublishSequenceForTesting(
+        uint64_t nextSequence
+        ) noexcept;
+
+    /// Returns whether an authenticated host is connected and requested GPU shared transport.
+    bool ShouldProduceGpuSharedFrame() const noexcept;
+
+private:
+    struct PendingGpuSlotRelease
+    {
+        bool Valid{false};
+        uint32_t SlotIndex{0U};
+        uint32_t SlotGeneration{0U};
+        bool CountAsDrop{false};
+    };
+
+    static DWORD WINAPI WorkerThreadProc(LPVOID context) noexcept;
+
+    void WorkerLoop() noexcept;
+
+    bool PopNextQueuedFrame(
+        std::unique_ptr<ExtractedFrameBuffer>& outFrame
+        ) noexcept;
+
+    void UpdatePoolMetricsLocked() noexcept;
+    void ClearAllBuffersLocked() noexcept;
+    void ReturnBufferToFreePoolLocked(
+        std::unique_ptr<ExtractedFrameBuffer> buffer,
+        bool freePixelStorage
+        ) noexcept;
+    void ReleaseFrameResources(
+        const ExtractedFrameBuffer* frame,
+        bool countGpuAsDrop
+        ) noexcept;
+    void ReleasePendingGpuSlots(
+        const PendingGpuSlotRelease* pending,
+        size_t count
+        ) noexcept;
+
+    HRESULT CreateSecuredPipeHandle(
+        const FrameTransportConfig& config,
+        ScopedWin32Handle& outPipeHandle
+        ) noexcept;
+
+    ipc::FrameIpcStatus VerifyConnectedClientIdentity(
+        HANDLE pipeHandle,
+        const ipc::FrameIpcClientHello& clientHello,
+        ScopedWin32Handle* outClientProcess = nullptr
+        ) const noexcept;
+
+    mutable SRWLOCK m_lifecycleLock{SRWLOCK_INIT};
+    mutable SRWLOCK m_queueLock{SRWLOCK_INIT};
+    mutable SRWLOCK m_metricsLock{SRWLOCK_INIT};
+
+    FrameTransportConfig m_config{};
+    size_t m_effectiveMaxQueueDepth{ipc::kDefaultMaxFrameQueueDepth};
+    size_t m_effectiveMaxPoolSize{ipc::kDefaultFrameBufferPoolSize};
+    size_t m_totalPoolSlots{0U};
+    size_t m_inFlightSlots{0U};
+    uint64_t m_poolEpoch{0ULL};
+
+    volatile LONG m_running{0};
+    volatile LONG m_stopRequested{0};
+    volatile LONG m_simulateSlotAllocationFailure{0};
+    volatile LONG m_activeSessionNegotiatedGpu{0};
+    volatile LONG64 m_nextSessionId{0};
+
+    ScopedWin32Handle m_pipeHandle{};
+    ScopedWin32Handle m_stopEvent{};
+    ScopedWin32Handle m_frameAvailableEvent{};
+    ScopedWin32Handle m_workerThread{};
+
+    BoundedBufferRing<kMaxSupportedQueueDepth> m_queue{};
+    BoundedBufferRing<kMaxSupportedPoolSize> m_freePool{};
+
+    // Serialized under m_queueLock to maintain single-domain sequence and session state consistency.
+    uint64_t m_nextPublishSequence{1ULL};
+    uint64_t m_sessionGeneration{0ULL};
+    uint64_t m_activeSessionId{0ULL};
+    bool m_activeSessionAuthorized{false};
+    ipc::FrameIpcTransportMode m_activeSessionMode{ipc::FrameIpcTransportMode::CpuStagingPipe};
+    bool m_activeSessionAllowCpuFallback{false};
+    DriverSessionSummarySnapshot m_currentSessionSummary{};
+    DriverSessionSummarySnapshot m_lastCompletedSessionSummary{};
+    uint64_t m_sessionStartGpuSharedBaseline{0ULL};
+    uint64_t m_sessionStartGpuDroppedBaseline{0ULL};
+    uint64_t m_sessionStartGpuSyncTimeoutsBaseline{0ULL};
+    volatile LONG64 m_pendingAckCount{0};
+
+    FrameTransportMetricsSnapshot m_queueMetrics{};
+    FrameTransportMetricsSnapshot m_transportMetrics{};
+};
+
+} // namespace lumabridge::driver

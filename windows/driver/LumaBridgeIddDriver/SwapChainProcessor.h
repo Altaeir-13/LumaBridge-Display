@@ -1,6 +1,6 @@
 #pragma once
 
-#ifndef WIN32_NO_STATUS
+#if !defined(WIN32_NO_STATUS) && !defined(_WINNT_)
 #define WIN32_NO_STATUS
 #define LUMABRIDGE_SWAPCHAIN_DEFINED_WIN32_NO_STATUS
 #endif
@@ -10,7 +10,14 @@
 #undef LUMABRIDGE_SWAPCHAIN_DEFINED_WIN32_NO_STATUS
 #endif
 
+#if !defined(WIN32_NO_STATUS) && defined(_WINNT_)
+#pragma warning(push)
+#pragma warning(disable : 4005)
 #include <ntstatus.h>
+#pragma warning(pop)
+#else
+#include <ntstatus.h>
+#endif
 
 #include <cstdint>
 
@@ -58,7 +65,7 @@ SwapChainProcessorStateToString(
     }
 }
 
-/// Per-frame metadata extracted from IDDCX_METADATA without copying desktop pixel contents.
+/// Per-frame metadata extracted from IDDCX_METADATA and optional D3D11 pixel extraction status.
 struct SwapChainFrameMetadata
 {
     uint32_t PresentationFrameNumber{0};
@@ -66,7 +73,25 @@ struct SwapChainFrameMetadata
     uint32_t MoveRegionCount{0};
     bool HwProtectedSurface{false};
     uint64_t PresentDisplayQPCTime{0};
+    uint64_t RawIddCxPresentDisplayQPCTime{0};
+    uint64_t SwapChainAcquireQpcTime{0};
+    bool PresentDisplayQpcWasFutureTarget{false};
     bool HasValidSurface{false};
+    bool ExtractionAttempted{false};
+    bool ExtractionAccepted{false};
+    bool AcquiredWithoutConsumer{false};
+    bool PixelsCopied{false};
+    bool ProtectedContentRejected{false};
+    bool EvictedOldestByBackpressure{false};
+    uint32_t ExtractedWidth{0};
+    uint32_t ExtractedHeight{0};
+    uint32_t ExtractedFormat{0};
+    uint64_t FrameSequence{0};
+    uint64_t SwapChainGeneration{0};
+    uint64_t SessionId{0};
+    uint64_t SessionGeneration{0};
+    uint64_t CopyLatencyUs{0};
+    HRESULT ExtractionHResult{S_OK};
 };
 
 /// Synchronized snapshot of swapchain lifecycle, errors, circuit breaker, and frame-processing metrics.
@@ -98,6 +123,48 @@ struct SwapChainMetricsSnapshot
     LUID ActiveRenderAdapterLuid{0, 0};
     SwapChainProcessorState State{SwapChainProcessorState::Ready};
     bool IsActive{false};
+    bool FrameExtractionEnabled{false};
+    uint64_t FramesExtractionAccepted{0};
+    uint64_t FramesCopied{0};
+    uint64_t FramesDelivered{0};
+    uint64_t FramesDroppedByBackpressure{0};
+    uint64_t ProtectedFramesRejected{0};
+    uint64_t FrameCopyFailures{0};
+    uint64_t FrameTransportFailures{0};
+    uint32_t ActiveHostConnections{0};
+    uint64_t LastFrameSequence{0};
+    uint64_t FrameCopyLatencyUs{0};
+    uint64_t TotalFrameCopyLatencyUs{0};
+    uint64_t AvgFrameCopyLatencyUs{0};
+    uint64_t MaxFrameCopyLatencyUs{0};
+    uint64_t FrameDeliveryLatencyUs{0};
+    uint64_t AvgFrameDeliveryLatencyUs{0};
+    uint64_t MaxFrameDeliveryLatencyUs{0};
+    uint32_t QueueDepth{0};
+    uint32_t PeakQueueDepth{0};
+    uint32_t LastExtractedWidth{0};
+    uint32_t LastExtractedHeight{0};
+    uint32_t LastExtractedFormat{0};
+    HRESULT LastExtractionError{S_OK};
+    HRESULT LastTransportError{S_OK};
+    bool GpuSharedTransportEnabled{false};
+    uint32_t SharedTexturePoolSize{0};
+    uint32_t SharedTexturePoolPeakUsage{0};
+    uint64_t GpuFramesShared{0};
+    uint64_t GpuFramesDropped{0};
+    uint64_t GpuSyncTimeouts{0};
+    uint64_t GpuSyncWaitUs{0};
+    uint64_t SwapChainGeneration{0};
+    uint64_t SessionGeneration{0};
+    uint64_t ActiveSessionId{0};
+    uint64_t FramesAcquiredWithoutConsumer{0};
+    uint64_t FramesPublished{0};
+    uint64_t FramesDiscardedNoConsumer{0};
+    uint64_t FramesDiscardedStaleSession{0};
+    uint64_t FramesDiscardedTransportMismatch{0};
+    uint64_t FramesFlushedOnSessionTransition{0};
+    uint64_t SequenceWrapAroundCount{0};
+    uint64_t PendingAckCount{0};
 };
 
 /// Abstraction over D3D11/DXGI device setup and IddCx swapchain DDIs for testability.
@@ -129,6 +196,14 @@ public:
     virtual void DeleteSwapChainObject(
         void* swapChainHandle
         ) noexcept = 0;
+
+    /// Populates transport/IPC delivery and backpressure metrics from the backend if supported.
+    virtual void QueryFrameTransportMetrics(
+        SwapChainMetricsSnapshot& inoutSnapshot
+        ) const noexcept
+    {
+        (void)inoutSnapshot;
+    }
 };
 
 /// RAII wrapper for driver-owned Win32 handles (e.g., internal events and worker thread).

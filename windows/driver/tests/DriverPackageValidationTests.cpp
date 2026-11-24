@@ -1038,6 +1038,55 @@ TestNegativeTamperedAndInconsistentPackagesRejected()
     }
 }
 
+std::string
+ReadTextFile(
+    const std::filesystem::path& path
+    )
+{
+    std::vector<uint8_t> rawBytes;
+    if (!ReadBinaryFile(path, rawBytes))
+    {
+        return {};
+    }
+    return std::string(rawBytes.begin(), rawBytes.end());
+}
+
+void
+TestAdapterSourceEnforcesSupportedIddCxTransmissionTypeAndStageConfig()
+{
+    const std::string adapterHeader = ReadTextFile("windows/driver/LumaBridgeIddDriver/Adapter.h");
+    const std::string adapterSource = ReadTextFile("windows/driver/LumaBridgeIddDriver/Adapter.cpp");
+    const std::string driverSource = ReadTextFile("windows/driver/LumaBridgeIddDriver/Driver.cpp");
+    const std::string stageConfigHeader = ReadTextFile("windows/driver/LumaBridgeIddDriver/DiagnosticStageConfig.h");
+
+    EXPECT_TRUE(!adapterHeader.empty());
+    EXPECT_TRUE(!adapterSource.empty());
+    EXPECT_TRUE(!driverSource.empty());
+    EXPECT_TRUE(!stageConfigHeader.empty());
+
+    EXPECT_TRUE(adapterHeader.find("kEndpointMajorVersion = 1") != std::string::npos);
+    EXPECT_TRUE(
+        adapterHeader.find("kAdapterTransmissionType = IDDCX_TRANSMISSION_TYPE_WIRED_OTHER") !=
+        std::string::npos);
+    EXPECT_TRUE(
+        adapterHeader.find("IsSupportedIddCxRuntimeTransmissionType(static_cast<uint32_t>(kAdapterTransmissionType))") !=
+        std::string::npos);
+
+    EXPECT_TRUE(
+        adapterSource.find("adapterCaps.EndPointDiagnostics.TransmissionType = lumabridge::driver::kAdapterTransmissionType;") !=
+        std::string::npos);
+    EXPECT_TRUE(adapterSource.find("IDDCX_TRANSMISSION_TYPE_NETWORK_OTHER") == std::string::npos);
+    EXPECT_TRUE(adapterSource.find("PLUGPLAY_REGKEY_DEVICE | WDF_REGKEY_DEVICE_SUBKEY") != std::string::npos);
+    EXPECT_TRUE(adapterSource.find("DiagBuildStage") != std::string::npos);
+
+    // Ensure EvtDeviceD0Entry never masks LumaBridgeStartAdapter failure as STATUS_SUCCESS.
+    const size_t d0StartPos = driverSource.find("LumaBridgeStartAdapter(Device);");
+    EXPECT_TRUE(d0StartPos != std::string::npos);
+    EXPECT_TRUE(driverSource.find("return status;", d0StartPos) != std::string::npos);
+
+    EXPECT_TRUE(stageConfigHeader.find("#define LUMABRIDGE_DIAGNOSTIC_STAGE 6") != std::string::npos);
+}
+
 template <typename Fn>
 void
 RunTest(
@@ -1069,6 +1118,9 @@ main()
     RunTest("DebugPackageArtifactsValidAndConsistent", TestDebugPackageArtifactsValidAndConsistent);
     RunTest("ReleasePackageArtifactsValidAndConsistent", TestReleasePackageArtifactsValidAndConsistent);
     RunTest("NegativeTamperedAndInconsistentPackagesRejected", TestNegativeTamperedAndInconsistentPackagesRejected);
+    RunTest(
+        "AdapterSourceEnforcesSupportedIddCxTransmissionTypeAndStageConfig",
+        TestAdapterSourceEnforcesSupportedIddCxTransmissionTypeAndStageConfig);
 
     std::printf("Summary: %d tests run, %d assertion failures.\n", g_TestsRun, g_TestsFailed);
     return (g_TestsFailed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;

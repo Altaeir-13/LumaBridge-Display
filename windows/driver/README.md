@@ -4,40 +4,34 @@
 
 `windows/driver` e o modulo responsavel pelo driver virtual Indirect Display (`IddCx`) do LumaBridge Display no Windows.
 
-Nesta etapa, o modulo implementa a inicializacao do dispositivo WDF/IddCx e a criacao assincrona do adaptador de display indireto (`IDDCX_ADAPTER`) com maquina de estados explicita, sincronizacao entre callbacks assincronos e diagnostico UMDF `[LB-DRIVER]`. A enumeracao de monitor virtual, a exposicao de modos de video e o processamento de swapchain serao entregues nas proximas issues incrementais.
+Ao encerramento da etapa `M0` (`M0.3`), o modulo implementa a inicializacao WDF/IddCx com maquina de estados deterministica e diagnostico de estagios, monitor virtual opt-in, modos CTA-861, pipeline de swapchain Direct3D 11, extracao de quadros com pool limitado de texturas compartilhadas (`D3D11_RESOURCE_MISC_SHARED_NTHANDLE | SHARED_KEYEDMUTEX`), IPC local autenticado (`LBIF` v1.0/v1.1 via Named Pipe com `SessionSummary` ETW) e conjunto automatizado de empacotamento, validacao e rollback controlado em Windows 11 x64.
 
 ## Escopo atual
 
-Incluido agora:
+Incluido no fechamento da `M0`:
 
 - solucao Visual Studio/MSBuild (`Debug|x64` e `Release|x64`);
 - projeto WDK UMDF x64 compatibilizado com Windows 11 host (`UMDF 2.31`, minimo `2.25`, `IddCx 1.4`, minimo `4`);
 - entrada `DriverEntry`, configuracao `WDF_DRIVER_CONFIG_INIT`, `WdfDriverCreate` e `LumaBridgeEvtDriverUnload`;
 - `LumaBridgeEvtDeviceAdd` com callbacks PnP/Power (`EvtDeviceD0Entry`, `EvtDeviceD0Exit`), `IddCxDeviceInitConfig`, criacao de `WDFDEVICE` com `LumaBridgeDeviceContext` e `IddCxDeviceInitialize`;
-- modulo `Adapter.*` e `AdapterStateMachine.h` com estados deterministicos, sincronizacao multi-dispositivo (`g_AdapterInitGate` + `g_AdapterInitSlotCv` + `InFlightAdapterBindingSlot` -> `DeviceContext::StateLock`), `IddCxGetVersion`, `IddCxAdapterInitAsync` (`LumaBridgeAdapterContext`), retencao de handle com `WdfObjectReference`/`WdfObjectDereference` antes de `WdfDeviceSetFailed`, `LumaBridgeEvtAdapterInitFinished`, `LumaBridgeEvtAdapterCommitModes`, rejeicao de callbacks tardios apos cleanup (`IsCleanedUp`) e limpeza deterministica de contextos;
-- tracing UMDF estruturado em `Trace.h` com prefixos `[LB-DRIVER]` e `[LB-DRIVER] [METRICS]` via `OutputDebugStringA`, registrando estado de adaptador/monitor/swapchain, FPS de aquisicao/processamento, latencia de processamento em microssegundos, erros DXGI/transitorios e consumo de memoria/handles sem armazenar conteudo de pixels;
+- modulo `Adapter.*`, `AdapterStateMachine.h` e `DiagnosticStageConfig.h` com estados deterministicos, sincronizacao multi-dispositivo (`g_AdapterInitGate` + `g_AdapterInitSlotCv` + `InFlightAdapterBindingSlot` -> `DeviceContext::StateLock`), `IddCxGetVersion`, `IddCxAdapterInitAsync` (`LumaBridgeAdapterContext`), retencao de handle com `WdfObjectReference`/`WdfObjectDereference` antes de `WdfDeviceSetFailed`, `LumaBridgeEvtAdapterInitFinished`, `LumaBridgeEvtAdapterCommitModes`, rejeicao de callbacks tardios apos cleanup (`IsCleanedUp`), breadcrumbs de inicializacao e limpeza deterministica de contextos;
+- tracing TraceLogging/UMDF estruturado em `Trace.h` (`DriverStage`, `DriverMetrics`, `SessionSummary` e prefixos `[LB-DRIVER]`), registrando estado de adaptador/monitor/swapchain, FPS, latencias em microssegundos, geracao de swapchain/sessao, conservacao de quadros e consumo de recursos sem armazenar pixels;
 - modulo `MonitorModes.*` com especificacao canonica CTA-861 dos modos SDR progressivos (`1280x720@60` e `1920x1080@60` preferencial), separacao explicita de `vSyncFreqDivider` (`0` para `IDDCX_MONITOR_MODE`, `1` para `IDDCX_TARGET_MODE` e paths ativos), validacao de timings/pixel rate sem overflow, correspondencia exata com modos anunciados, deduplicacao, limite unico `kMaxDisplayPipelineRate` e negociacao de buffers;
 - callbacks IddCx de modos implementados em `Adapter.cpp`: `LumaBridgeEvtParseMonitorDescription` (recusa EDID com `STATUS_NOT_SUPPORTED` conforme estrategia `IDDCX_MONITOR_DESCRIPTION_TYPE_EDID` com `DataSize = 0` e `pData = nullptr`), `LumaBridgeEvtMonitorGetDefaultDescriptionModes`, `LumaBridgeEvtMonitorQueryTargetModes` e validacao estrita de paths ativos em `LumaBridgeEvtAdapterCommitModes`;
-- pipeline minimo de swapchain Direct3D 11 / DXGI em `SwapChainProcessor.*` e `Adapter.cpp`: selecao de adaptador por `RenderAdapterLuid` (`EnumAdapterByLuid`), criacao de `ID3D11Device` com `D3D11_CREATE_DEVICE_BGRA_SUPPORT`, `IddCxSwapChainSetDevice`, `IddCxSwapChainReleaseAndAcquireBuffer`, `IddCxSwapChainFinishedProcessingFrame`, estados explicitos (`Ready`, `Active`, `Suspended`, `Stopping`, `Stopped`, `Faulted`), circuit breaker contra loops de recriacao, tratamento distinto de erros transitorios e permanentes, worker thread dedicada com cancelamento cooperativo sem busy-wait, protecao contra reentrancia, RAII (`ScopedWin32Handle`, `ComPtr::Attach`), transferencia estrita de ownership (sem chamar `WdfObjectDelete` em recusas `STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN`), `DeviceSwapChainHost` refcounted, acesso a `MonitorContext` sincronizado por `g_AdapterInitGate`, isolamento de callbacks obsoletos por `UnassignSwapChainForMonitor`, metricas QPC/FPS e telemetria sem armazenar pixels do desktop;
-- callbacks `LumaBridgeEvtMonitorAssignSwapChain` (com checagem de monitor ativo e pinagem WDF) e `LumaBridgeEvtMonitorUnassignSwapChain` integrados ao `SwapChainProcessor` (`OnSuspend`/`OnResume`/`Shutdown` coordenados em `D0Exit`/`D0Entry` e cleanups);
-- modulo `VirtualMonitor.*` (`VirtualMonitorManager` + `IddCxVirtualMonitorBackend`) implementando `IddCxMonitorCreate`, `IddCxMonitorArrival` e `IddCxMonitorDeparture` para 1 monitor virtual MVP (`ConnectorIndex = 0`, `ContainerId` unico deterministico via `DeriveMonitorContainerId`, configuracao sem EDID via `IDDCX_MONITOR_DESCRIPTION_TYPE_EDID` com `DataSize = 0`), estados explicitos (`Suspended`, `Stopping`, `Stopped`, `Faulted`), preservacao de handle caso `IddCxMonitorDeparture` falhe (bloqueando recriacao via `STATUS_DEVICE_BUSY` ate retry ou cleanup WDF), protecao RAII `ScopedWdfObjectRef`/`AcquireMonitorReference`/`ReleaseMonitorReference`, protecao contra callbacks reentrantes/tardios em teardown e **ativacao controlada desabilitada por padrao** (`EnableVirtualMonitor` `REG_DWORD = 1` na chave do dispositivo para habilitar);
-- 15 testes unitarios deterministicos do ciclo de vida do monitor virtual em `windows/driver/tests/VirtualMonitorLifecycleTests.cpp`;
-- 15 testes unitarios deterministicos do ciclo de vida da swapchain (independentes de GPU fisica) em `windows/driver/tests/SwapChainLifecycleTests.cpp`;
-- 12 testes unitarios deterministicos de modos de video e negociacao de buffers em `windows/driver/tests/MonitorModesTests.cpp`;
-- supressao de `C4471` restrita ao bloco de includes WDK em `Driver.h`;
-- 16 testes unitarios deterministicos da maquina de estados e associacao multi-dispositivo em `windows/driver/tests/AdapterLifecycleTests.cpp` (escopo puramente de logica de estado/associacao, distinto de testes em runtime real WDF/IddCx);
-- pacote INF estruturado (`LumaBridgeIddDriver.inf`) com `Include = wudfrd.inf`, `UmdfExtensions = IddCx0102`, `UpperFilters = IndirectKmd`, `ClassVer = 2.0`, `DeviceGroupId`, `UmdfHostProcessSharing = ProcessSharingDisabled` e decoracao `NT$ARCH$.10.0...22000` (politica explicita de suporte exclusivo ao Windows 11 x64), integrado ao `.vcxproj` com `StampInf`, `InfVerif`, `Inf2Cat` (`10_CO_X64;10_NI_X64;10_GE_X64`, cobrindo Windows 11 21H2, 22H2/23H2 e 24H2/25H2+) e `DrvCat` (mantendo `SignMode=Off` e `EnableTestSign=false`, gerando `.dll`, `.inf` e `.cat` nao assinados em `$(PackageDir)` e `$(OutDir)` — ver `docs/setup/windows-idd-driver-packaging.md`);
-- 5 testes automatizados de consistencia estatica e integridade criptografica de catalogo (`CryptCAT*`, `CryptCATAdminCalcHashFromFileHandle2`, `CryptQueryObject`, `WinVerifyTrust` e cenarios negativos) em `windows/driver/tests/DriverPackageValidationTests.cpp`;
-- ferramenta automatizada em `windows/driver/scripts/` (`LumaBridgeDriverCommon.psm1`, `Test-LumaBridgePrerequisites.ps1`, `Invoke-LumaBridgePackageSigning.ps1`, `Install-LumaBridgeDriver.ps1`, `Set-LumaBridgeVirtualMonitor.ps1`, `Collect-LumaBridgeDiagnostics.ps1`, `Uninstall-LumaBridgeDriver.ps1`) com `-DryRun`, lookup PnP exclusivo por `DEVPKEY_Device_HardwareIds`, identificacao estruturada XML do Driver Store, verificacao criptografica INF+DLL+CAT e correspondencia de certificados, staging isolado/limpo, confirmacao do driver vinculado, rollback de falhas parciais, desinstalacao sem `/force` padrao, remocao de certificados somente por thumbprint com confirmacao explicita e identificacao do `WUDFHost.exe` associado ao LumaBridge (ver `docs/setup/windows-idd-functional-validation.md`);
-- 18 testes automatizados PowerShell em `windows/driver/tests/LumaBridgeFunctionalToolingTests.ps1` cobrindo cenarios positivos e negativos (adulteracao de INF/DLL/CAT, falha de assinatura, divergencia de certificados, staging isolado, `DEVPKEY_Device_HardwareIds`, XML Driver Store, duplicidade, instalacao repetida, rollback de instalacao/ativacao, desinstalacao e correlacao `WUDFHost.exe`);
+- pipeline de swapchain Direct3D 11 / DXGI em `SwapChainProcessor.*` e `Adapter.cpp`: selecao de adaptador por `RenderAdapterLuid`, `ID3D11Device` com `D3D11_CREATE_DEVICE_BGRA_SUPPORT`, `IddCxSwapChainSetDevice`, normalizacao causal de `SwapChainAcquireQpcTime` vs `PresentDisplayQPCTime` futuro do DWM, circuit breaker contra loops de recriacao, worker thread dedicada sem busy-wait, protecao RAII/reentrancia e metricas QPC/FPS;
+- modulo `VirtualMonitor.*` (`VirtualMonitorManager` + `IddCxVirtualMonitorBackend`) implementando `IddCxMonitorCreate`, `IddCxMonitorArrival` e `IddCxMonitorDeparture` para 1 monitor virtual MVP (`ConnectorIndex = 0`, `ContainerId` unico deterministico) com **ativacao controlada desabilitada por padrao** (`EnableVirtualMonitor` `REG_DWORD = 1` para habilitar);
+- extracao e transporte local (`FrameExtractor.*`, `SharedTexturePool.*`, `FrameIpcProtocol.h`, `FrameTransport.*`): copia GPU sem bloqueio na thread IddCx (`kDefaultSharedTexturePoolSize = 4`), `IDXGIKeyedMutex` + `DuplicateHandle` autenticado por PID/SID/sessao/integridade (`AllowSameUserAccess = false`), dominio unico serializado de sequencia e transicoes de sessao em `FrameIpcServer`, fallback diagnostico CPU staging v1.0 opt-in e liberacao segura no teardown (`FramesFlushedOnSessionTransition`);
+- suites automatizadas de teste descritas em [tests/README.md](tests/README.md): **157 testes C++ unitarios e de componentes** *(inventario real nos fontes, frente ao valor historico `156` citado antes da conferencia dos `8` testes em `NvencEncoderTests.cpp`)*, **9 testes E2E multiprocesso** (integrando com `../host/lumabridge-host.exe` documentado em [../host/README.md](../host/README.md)) e **71 testes automatizados PowerShell**;
+- pacote INF estruturado (`LumaBridgeIddDriver.inf`) validado por `StampInf`, `InfVerif`, `Inf2Cat` (`10_CO_X64;10_NI_X64;10_GE_X64`, Windows 11 x64 `NTamd64.10.0...22000`) e `DrvCat` mantendo `SignMode=Off` e `EnableTestSign=false` no build padrao (ver [windows-idd-driver-packaging.md](../../docs/setup/windows-idd-driver-packaging.md));
+- ferramental completo em `windows/driver/scripts/` (`LumaBridgeDriverCommon.psm1`, `Test-LumaBridgePrerequisites.ps1`, `Invoke-LumaBridgePackageSigning.ps1`, `Install-LumaBridgeDriver.ps1`, `Set-LumaBridgeVirtualMonitor.ps1`, `Invoke-LumaBridgeEtwTrace.ps1`, `Invoke-LumaBridgeFunctionalValidation.ps1`, `Collect-LumaBridgeDiagnostics.ps1`, `Build-LumaBridgeDiagnosticStage.ps1`, `Prepare-IddSampleReference.ps1`, `Uninstall-LumaBridgeDriver.ps1`) com `-DryRun`, reuso criptografico de staging (`-SkipDriverInstall -ReuseSignedStaging`), diagnosticos sem pixels e rollback garantido em `finally` (ver [windows-idd-functional-validation.md](../../docs/setup/windows-idd-functional-validation.md));
 - `.gitignore` local para artefatos de build.
 
-Fora do escopo atual (issues dedicadas):
+Fora do escopo do driver e transferido para marcos posteriores (`M1`+):
 
-- exposicao de `2560x1440@60` (avaliado, nao obrigatorio no MVP inicial) e modos HDR/VRR;
-- copia de staging/leitura de pixels, encoder NVENC, protocolo e streaming para o cliente Linux;
-- habilitacao de mitigacao Spectre apos instalacao das libs MSVC Spectre (ver issue #20);
-- execucao efetiva de assinatura de teste, instalacao controlada e validacao em runtime no `WUDFHost.exe` (procedimento e plano documentados em `docs/setup/windows-idd-functional-validation.md`).
+- exposicao de `2560x1440@60` e modos HDR/VRR;
+- protocolo de rede multiplataforma (`LBWP v1`), transporte QUIC/TLS, receptor Linux e medicao glass-to-glass;
+- assinatura de producao (WHQL / EV) e empacotamento para distribuicao final;
+- suporte a multiplos adaptadores / GPUs adicionais alem do emissor NVIDIA NVENC no host Windows.
 
 ## Estrutura
 
@@ -50,34 +44,44 @@ windows/
     LumaBridgeIddDriver/
       LumaBridgeIddDriver.vcxproj
       LumaBridgeIddDriver.vcxproj.filters
-      Driver.h
-      Driver.cpp
-      Adapter.h
-      Adapter.cpp
+      Adapter.h / Adapter.cpp
       AdapterStateMachine.h
-      MonitorModes.h
-      MonitorModes.cpp
-      SwapChainProcessor.h
-      SwapChainProcessor.cpp
-      VirtualMonitor.h
-      VirtualMonitor.cpp
+      DiagnosticStageConfig.h
+      Driver.h / Driver.cpp
+      FrameExtractor.h / FrameExtractor.cpp
+      FrameIpcProtocol.h
+      FrameTransport.h / FrameTransport.cpp
+      MonitorModes.h / MonitorModes.cpp
+      SharedTexturePool.h / SharedTexturePool.cpp
+      SwapChainProcessor.h / SwapChainProcessor.cpp
       Trace.h
+      VirtualMonitor.h / VirtualMonitor.cpp
       LumaBridgeIddDriver.inf
     tests/
       README.md
       AdapterLifecycleTests.cpp
       DriverPackageValidationTests.cpp
+      FrameEndToEndIntegrationTests.cpp
+      FrameExtractionTests.cpp
+      FrameIpcTests.cpp
+      GpuSharedTextureTests.cpp
+      HostValidationWorkerAndStimulusTests.cpp
       MonitorModesTests.cpp
+      NvencEncoderTests.cpp
       SwapChainLifecycleTests.cpp
       VirtualMonitorLifecycleTests.cpp
       LumaBridgeFunctionalToolingTests.ps1
     scripts/
       LumaBridgeDriverCommon.psm1
-      Test-LumaBridgePrerequisites.ps1
-      Invoke-LumaBridgePackageSigning.ps1
-      Install-LumaBridgeDriver.ps1
-      Set-LumaBridgeVirtualMonitor.ps1
+      Build-LumaBridgeDiagnosticStage.ps1
       Collect-LumaBridgeDiagnostics.ps1
+      Install-LumaBridgeDriver.ps1
+      Invoke-LumaBridgeEtwTrace.ps1
+      Invoke-LumaBridgeFunctionalValidation.ps1
+      Invoke-LumaBridgePackageSigning.ps1
+      Prepare-IddSampleReference.ps1
+      Set-LumaBridgeVirtualMonitor.ps1
+      Test-LumaBridgePrerequisites.ps1
       Uninstall-LumaBridgeDriver.ps1
 ```
 
@@ -129,26 +133,9 @@ msbuild windows\driver\LumaBridgeIddDriver.sln /t:Rebuild /p:Configuration=Debug
 msbuild windows\driver\LumaBridgeIddDriver.sln /t:Rebuild /p:Configuration=Release /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0.28000.0 /v:minimal
 ```
 
-Testes unitarios deterministicos de maquina de estados e associacao multi-dispositivo (escopo isolado, sem substituir validacao futura em runtime real WDF/`WUDFHost.exe`) e validacao estatica dos pacotes `Debug|x64` e `Release|x64`:
+Os comandos completos para compilar e executar os **157 testes C++ unitarios e de componentes**, os **9 testes E2E multiprocesso** (junto ao consumidor `lumabridge-host.exe` em `../host/`) e os **71 testes automatizados PowerShell** em `windows/driver/scripts/` estao consolidados em [tests/README.md](tests/README.md) e [../host/README.md](../host/README.md).
 
-```bat
-cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\AdapterLifecycleTests.cpp /Fowindows\driver\x64\Debug\AdapterLifecycleTests.obj /Fe:windows\driver\x64\Debug\AdapterLifecycleTests.exe
-windows\driver\x64\Debug\AdapterLifecycleTests.exe
-
-cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\DriverPackageValidationTests.cpp /Fowindows\driver\x64\Debug\DriverPackageValidationTests.obj /Fe:windows\driver\x64\Debug\DriverPackageValidationTests.exe
-windows\driver\x64\Debug\DriverPackageValidationTests.exe
-
-cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\MonitorModesTests.cpp windows\driver\LumaBridgeIddDriver\MonitorModes.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\MonitorModesTests.exe
-windows\driver\x64\Debug\MonitorModesTests.exe
-
-cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\SwapChainLifecycleTests.cpp windows\driver\LumaBridgeIddDriver\SwapChainProcessor.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\SwapChainLifecycleTests.exe
-windows\driver\x64\Debug\SwapChainLifecycleTests.exe
-
-cl /nologo /std:c++17 /W4 /WX /EHsc windows\driver\tests\VirtualMonitorLifecycleTests.cpp windows\driver\LumaBridgeIddDriver\VirtualMonitor.cpp /Fowindows\driver\x64\Debug\ /Fe:windows\driver\x64\Debug\VirtualMonitorLifecycleTests.exe
-windows\driver\x64\Debug\VirtualMonitorLifecycleTests.exe
-```
-
-Testes automatizados PowerShell dos scripts operacionais (`windows/driver/scripts/`):
+Suíte PowerShell dos scripts operacionais:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File windows\driver\tests\LumaBridgeFunctionalToolingTests.ps1
@@ -157,28 +144,23 @@ powershell -NoProfile -ExecutionPolicy Bypass -File windows\driver\tests\LumaBri
 Artefatos locais esperados (ignorados por `windows/driver/.gitignore`):
 
 ```text
-windows/driver/x64/Debug/LumaBridgeIddDriver.dll
-windows/driver/x64/Debug/LumaBridgeIddDriver.inf
-windows/driver/x64/Debug/LumaBridgeIddDriver.cat
+windows/driver/x64/Debug/LumaBridgeIddDriver.{dll,inf,cat}
 windows/driver/x64/Debug/LumaBridgeIddDriver/LumaBridgeIddDriver.{dll,inf} + lumabridgeidddriver.cat
-windows/driver/x64/Debug/AdapterLifecycleTests.exe
-windows/driver/x64/Debug/DriverPackageValidationTests.exe
-windows/driver/x64/Release/LumaBridgeIddDriver.dll
-windows/driver/x64/Release/LumaBridgeIddDriver.inf
-windows/driver/x64/Release/LumaBridgeIddDriver.cat
+windows/driver/x64/Release/LumaBridgeIddDriver.{dll,inf,cat}
 windows/driver/x64/Release/LumaBridgeIddDriver/LumaBridgeIddDriver.{dll,inf} + lumabridgeidddriver.cat
+windows/driver/x64/{Debug,Release}/*.exe (executaveis de testes C++ e lumabridge-host.exe)
 ```
 
-Validacao direta de INF com `InfVerif` e detalhes de assinatura/recuperacao estao documentados em `docs/setup/windows-idd-driver-packaging.md`.
+Validacao direta de INF com `InfVerif`, assinatura controlada e procedimento funcional estao documentados em [windows-idd-driver-packaging.md](../../docs/setup/windows-idd-driver-packaging.md) e [windows-idd-functional-validation.md](../../docs/setup/windows-idd-functional-validation.md).
 
 ## Decisoes de build e dividas tecnicas
 
 - **Compatibilidade UMDF/IddCx com o SO alvo:** O driver usa `UMDF_VERSION_MINOR=31`, `UMDF_MINIMUM_VERSION_REQUIRED=25` e `IDDCX_VERSION_MAJOR=1`, `IDDCX_VERSION_MINOR=4`, `IDDCX_MINIMUM_VERSION_REQUIRED=4`, com pacote INF direcionado exclusivamente a `NTamd64.10.0...22000` e catalogo `10_CO_X64;10_NI_X64;10_GE_X64` (Windows 11 21H2, 22H2/23H2 e 24H2/25H2+ x64, sem declarar suporte a Windows 10). Todas as funcoes usadas estao dentro de `WDF_ALWAYS_AVAILABLE_FUNCTION_COUNT` (`268`) e `IDD_ALWAYS_AVAILABLE_FUNCTION_COUNT` (`23`), garantindo compatibilidade binaria nas versoes Windows 11 x64 suportadas.
 - **Supressao escopada de `C4471`:** O warning `C4471` emitido por `wudfwdm.h` (`typedef enum _DEVICE_RELATION_TYPE`) e suprimido apenas ao redor de `#include <wdf.h>` e `#include <IddCx.h>` em `Driver.h`.
 - **Mitigacao Spectre (issue #20 resolvida):** compilacao e linkagem habilitadas com `<Driver_SpectreMitigation>Spectre</Driver_SpectreMitigation>` (`/Qspectre` + `MSVC\14.51.36231\lib\spectre\x64`) em `Debug|x64` e `Release|x64`, verificadas nos `.tlog`.
-- **Catalogo ativo sem assinatura automatica (issue #21):** `EnableInf2cat=true` gera e valida o `.cat` no build enquanto `EnableTestSign=false` e `SignMode=Off` mantem assinatura digital e alteracao de certificados fora do build padrao ate uma etapa controlada dedicada.
+- **Catalogo ativo sem assinatura automatica (issue #21):** `EnableInf2cat=true` gera e valida o `.cat` no build enquanto `EnableTestSign=false` e `SignMode=Off` mantem assinatura digital e alteracao de certificados fora do build padrao ate etapas controladas em `<StagingDir>`.
 
-## Proximos passos
+## Proximos passos (`Pos-M0`)
 
-1. Executar a validacao funcional controlada com os scripts e o guia de `docs/setup/windows-idd-functional-validation.md` (`EnableVirtualMonitor = 1`).
-2. Implementar extracao/encaminhamento de frames para `lumabridge-host` e encoder NVENC.
+1. Publicar e integrar a branch consolidada `integration/m0-windows-closure` em `dev` remoto (`origin/dev`) preservando a ancestralidade do commit funcional validado (`6b297856`) e do commit documental `M0.3` (`f1d2565e`). **A `M0` encontra-se funcionalmente aprovada, consolidada localmente e requalificada na `M0.4.1` (`2/2` E2E `9/9`, preservando duas reprovacoes `p99` historicas da `M0.4`), porem ainda nao integrada em `dev` remoto nem formalmente encerrada (`LICENSE`, avisos e CI inicial pendentes).**
+2. Iniciar a etapa `M1` *(ainda nao iniciada)* — contratos multiplataforma, nucleo compartilhado, seguranca Fase 1/Fase 2 e protocolo de rede `LBWP v1`, mantendo a fronteira IPC local `LBIF` privada entre `WUDFHost.exe` e o backend Windows.

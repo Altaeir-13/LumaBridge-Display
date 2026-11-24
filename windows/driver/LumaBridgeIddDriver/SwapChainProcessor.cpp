@@ -118,6 +118,51 @@ LastWin32ErrorAsHResult() noexcept
     return (err != ERROR_SUCCESS) ? HRESULT_FROM_WIN32(err) : E_FAIL;
 }
 
+void
+AccumulateExtractionMetricsLocked(
+    SwapChainMetricsSnapshot& metrics,
+    const SwapChainFrameMetadata& frameMeta
+    ) noexcept
+{
+    if (frameMeta.AcquiredWithoutConsumer)
+    {
+        ++metrics.FramesAcquiredWithoutConsumer;
+    }
+    if (!frameMeta.ExtractionAttempted)
+    {
+        return;
+    }
+
+    if (frameMeta.ExtractionAccepted)
+    {
+        ++metrics.FramesExtractionAccepted;
+    }
+    if (frameMeta.ProtectedContentRejected)
+    {
+        ++metrics.ProtectedFramesRejected;
+    }
+    if (frameMeta.PixelsCopied)
+    {
+        ++metrics.FramesCopied;
+        metrics.LastFrameSequence = frameMeta.FrameSequence;
+        metrics.FrameCopyLatencyUs = frameMeta.CopyLatencyUs;
+        metrics.TotalFrameCopyLatencyUs += frameMeta.CopyLatencyUs;
+        metrics.AvgFrameCopyLatencyUs = metrics.TotalFrameCopyLatencyUs / metrics.FramesCopied;
+        if (frameMeta.CopyLatencyUs > metrics.MaxFrameCopyLatencyUs)
+        {
+            metrics.MaxFrameCopyLatencyUs = frameMeta.CopyLatencyUs;
+        }
+        metrics.LastExtractedWidth = frameMeta.ExtractedWidth;
+        metrics.LastExtractedHeight = frameMeta.ExtractedHeight;
+        metrics.LastExtractedFormat = frameMeta.ExtractedFormat;
+    }
+    else if (!frameMeta.ProtectedContentRejected && FAILED(frameMeta.ExtractionHResult))
+    {
+        ++metrics.FrameCopyFailures;
+        metrics.LastExtractionError = frameMeta.ExtractionHResult;
+    }
+}
+
 } // namespace
 
 SwapChainProcessor::SwapChainProcessor(
@@ -261,6 +306,7 @@ SwapChainProcessor::AssignSwapChain(
         InterlockedExchange(&m_workerThreadId, static_cast<LONG>(createdThreadId));
 
         ++m_metrics.AssignCount;
+        ++m_metrics.SwapChainGeneration;
         m_metrics.ActiveRenderAdapterLuid = renderAdapterLuid;
         m_metrics.IsActive = true;
         m_metrics.State = SwapChainProcessorState::Active;
@@ -481,8 +527,16 @@ SwapChainProcessor::Shutdown() noexcept
 SwapChainMetricsSnapshot
 SwapChainProcessor::GetMetricsSnapshot() const noexcept
 {
-    SharedSrwLock metricsGuard(&m_metricsLock);
-    return m_metrics;
+    SwapChainMetricsSnapshot snapshot{};
+    {
+        SharedSrwLock metricsGuard(&m_metricsLock);
+        snapshot = m_metrics;
+    }
+    if (m_backend != nullptr)
+    {
+        m_backend->QueryFrameTransportMetrics(snapshot);
+    }
+    return snapshot;
 }
 
 DWORD WINAPI
@@ -567,6 +621,10 @@ SwapChainProcessor::WorkerLoop(
         (void)QueryPerformanceCounter(&frameStartQpcLi);
 
         SwapChainFrameMetadata frameMeta{};
+        {
+            SharedSrwLock metricsGuard(&m_metricsLock);
+            frameMeta.SwapChainGeneration = m_metrics.SwapChainGeneration;
+        }
         const HRESULT acquireHr = m_backend->ReleaseAndAcquireBuffer(swapChainHandle, frameMeta);
 
         if (acquireHr == E_PENDING)
@@ -593,6 +651,12 @@ SwapChainProcessor::WorkerLoop(
 
         if (FAILED(acquireHr))
         {
+            if (frameMeta.ExtractionAttempted)
+            {
+                ExclusiveSrwLock metricsGuard(&m_metricsLock);
+                AccumulateExtractionMetricsLocked(m_metrics, frameMeta);
+            }
+
             if (IsTransientFrameError(acquireHr))
             {
                 ++consecutiveTransientErrors;
@@ -648,6 +712,7 @@ SwapChainProcessor::WorkerLoop(
             {
                 ++m_metrics.FramesDropped;
             }
+            AccumulateExtractionMetricsLocked(m_metrics, frameMeta);
         }
 
         const HRESULT finishHr = m_backend->FinishProcessingFrame(swapChainHandle);
