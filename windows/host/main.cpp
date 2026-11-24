@@ -4,6 +4,9 @@
 #include "HostGateEvaluator.h"
 #include "NvencH264Encoder.h"
 #include "VirtualDisplayStimulus.h"
+#ifdef LUMABRIDGE_ENABLE_FFI_POC
+#include "FfiPocAdapter.h"
+#endif
 
 #include <objbase.h>
 #include <psapi.h>
@@ -212,6 +215,9 @@ PrintUsage()
         "  --max-nvenc-drop-ratio <r>       Maximum drop ratio (Dropped+QueueDrops)/Submitted [0..1] when --require-nvenc\n"
         "  --json-summary <path>            Write non-visual telemetry summary JSON to file\n"
         "  --quiet                          Suppress per-frame console output\n"
+#ifdef LUMABRIDGE_ENABLE_FFI_POC
+        "  --ffi-poc-selftest               Run isolated M1.1 FFI PoC self-test and exit\n"
+#endif
         "  --help                           Show this help message\n");
 }
 
@@ -1326,6 +1332,12 @@ wmain(
         {
             quiet = true;
         }
+#ifdef LUMABRIDGE_ENABLE_FFI_POC
+        else if (arg == L"--ffi-poc-selftest")
+        {
+            return lumabridge::host::RunLumaBridgeFfiPocSelfTest();
+        }
+#endif
         else
         {
             std::fprintf(stderr, "Unknown or incomplete argument: %s\n", NarrowAsciiFromWide(arg.c_str()).c_str());

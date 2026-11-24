@@ -1,0 +1,11 @@
+target/
+generated/
+**/*.obj
+**/*.pdb
+**/*.dll
+**/*.lib
+**/*.exp
+**/*.so
+**/*.a
+**/*.exe
+**/*.ilk

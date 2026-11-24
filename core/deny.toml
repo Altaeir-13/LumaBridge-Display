@@ -1,0 +1,26 @@
+# License and dependency compliance policy aligned with docs/planning/LICENSE_COMPLIANCE_REVIEW.md
+[graph]
+all-features = true
+
+[advisories]
+ignore = []
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "Unicode-3.0",
+    "MPL-2.0",
+]
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
