@@ -21,7 +21,7 @@ pub const CHANNEL_0_MAX_PAYLOAD: usize = 65_536;
 /// including the 44-byte `VideoPacketHeader`.
 pub const CHANNEL_1_STREAM_MAX_PAYLOAD: usize = 16_384;
 
-/// Maximum payload length for `Channel 2` (Feedback, ClockSync & Heartbeat): 4 KiB.
+/// Maximum payload length for `Channel 2` (Feedback, `ClockSync` & Heartbeat): 4 KiB.
 pub const CHANNEL_2_MAX_PAYLOAD: usize = 4_096;
 
 /// Maximum payload length for `Channel 3` (Remote Input): 1 KiB.

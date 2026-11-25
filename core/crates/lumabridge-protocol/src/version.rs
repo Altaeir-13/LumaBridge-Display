@@ -70,6 +70,33 @@ impl Alpn {
     }
 }
 
+/// Supported video codecs negotiated in `LBWP v1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum CodecId {
+    H264 = 1,
+    Hevc = 2,
+    Av1 = 3,
+}
+
+impl CodecId {
+    /// Parse a wire codec identifier strictly.
+    #[must_use]
+    pub const fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            1 => Some(Self::H264),
+            2 => Some(Self::Hevc),
+            3 => Some(Self::Av1),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
 /// Negotiate the effective LBWP version between `local` and `remote`.
 ///
 /// Major versions MUST match (`!=` fails with [`ErrorCode::UnsupportedVersion`]);

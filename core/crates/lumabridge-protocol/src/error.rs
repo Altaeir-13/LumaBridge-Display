@@ -248,10 +248,7 @@ pub enum VideoHeaderError {
 impl VideoHeaderError {
     #[must_use]
     pub const fn error_class(self) -> ErrorClass {
-        match self {
-            Self::PacketTooLarge { .. } => ErrorClass::DropDatagram,
-            _ => ErrorClass::DropDatagram,
-        }
+        ErrorClass::DropDatagram
     }
 }
 

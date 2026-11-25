@@ -219,7 +219,7 @@ impl<'a> CborArrayEncoder<'a> {
 fn write_i64(encoder: &mut Encoder<&mut Vec<u8>>, val: i64) -> Result<(), CborError> {
     if val >= 0 {
         encoder
-            .push(Header::Positive(val as u64))
+            .push(Header::Positive(val.cast_unsigned()))
             .map_err(|_| CborError::EncodeBufferError)
     } else {
         // CBOR negative integer encodes `n = -1 - val` where `val < 0`.
@@ -269,7 +269,7 @@ impl<'a> CborReader<'a> {
     fn pull_checked(&mut self) -> Result<Header, CborError> {
         self.bump_item_count()?;
         let start = self.decoder.offset();
-        let hdr = self.decoder.pull().map_err(map_ll_error)?;
+        let hdr = self.decoder.pull().map_err(|e| map_ll_error(&e))?;
         let header_bytes = self.decoder.offset().saturating_sub(start);
 
         match hdr {
@@ -350,9 +350,8 @@ impl<'a> CborReader<'a> {
         let mut unknown_count = 0usize;
 
         for _ in 0..entries {
-            let key = match self.pull_checked()? {
-                Header::Positive(k) => k,
-                _ => return Err(CborError::ForbiddenType("map key must be unsigned integer")),
+            let Header::Positive(key) = self.pull_checked()? else {
+                return Err(CborError::ForbiddenType("map key must be unsigned integer"));
             };
 
             match self.options.mode {
@@ -490,8 +489,8 @@ impl<'a> CborReader<'a> {
         let mut out = Vec::with_capacity(len);
         let mut segments = self.decoder.bytes(Some(len));
         let mut scratch = [0u8; 256];
-        while let Some(mut segment) = segments.pull().map_err(map_ll_error)? {
-            while let Some(chunk) = segment.pull(&mut scratch).map_err(map_ll_error)? {
+        while let Some(mut segment) = segments.pull().map_err(|e| map_ll_error(&e))? {
+            while let Some(chunk) = segment.pull(&mut scratch).map_err(|e| map_ll_error(&e))? {
                 out.extend_from_slice(chunk);
             }
         }
@@ -521,8 +520,11 @@ impl<'a> CborReader<'a> {
         let mut out = String::with_capacity(len);
         let mut segments = self.decoder.text(Some(len));
         let mut scratch = [0u8; 256];
-        while let Some(mut segment) = segments.pull().map_err(map_ll_text_error)? {
-            while let Some(chunk) = segment.pull(&mut scratch).map_err(map_ll_text_error)? {
+        while let Some(mut segment) = segments.pull().map_err(|e| map_ll_text_error(&e))? {
+            while let Some(chunk) = segment
+                .pull(&mut scratch)
+                .map_err(|e| map_ll_text_error(&e))?
+            {
                 out.push_str(chunk);
             }
         }
@@ -547,8 +549,12 @@ impl<'a> CborReader<'a> {
                 }
                 let mut segments = self.decoder.bytes(Some(len));
                 let mut scratch = [0u8; 256];
-                while let Some(mut segment) = segments.pull().map_err(map_ll_error)? {
-                    while segment.pull(&mut scratch).map_err(map_ll_error)?.is_some() {}
+                while let Some(mut segment) = segments.pull().map_err(|e| map_ll_error(&e))? {
+                    while segment
+                        .pull(&mut scratch)
+                        .map_err(|e| map_ll_error(&e))?
+                        .is_some()
+                    {}
                 }
                 Ok(())
             }
@@ -561,10 +567,10 @@ impl<'a> CborReader<'a> {
                 }
                 let mut segments = self.decoder.text(Some(len));
                 let mut scratch = [0u8; 256];
-                while let Some(mut segment) = segments.pull().map_err(map_ll_text_error)? {
+                while let Some(mut segment) = segments.pull().map_err(|e| map_ll_text_error(&e))? {
                     while segment
                         .pull(&mut scratch)
-                        .map_err(map_ll_text_error)?
+                        .map_err(|e| map_ll_text_error(&e))?
                         .is_some()
                     {}
                 }
@@ -631,14 +637,14 @@ impl<'a> CborReader<'a> {
     }
 }
 
-fn map_ll_error<E>(err: ciborium_ll::Error<E>) -> CborError {
+fn map_ll_error<E>(err: &ciborium_ll::Error<E>) -> CborError {
     match err {
         ciborium_ll::Error::Io(_) => CborError::Truncated,
         ciborium_ll::Error::Syntax(_) => CborError::ForbiddenType("malformed CBOR syntax"),
     }
 }
 
-fn map_ll_text_error<E>(err: ciborium_ll::Error<E>) -> CborError {
+fn map_ll_text_error<E>(err: &ciborium_ll::Error<E>) -> CborError {
     match err {
         ciborium_ll::Error::Io(_) => CborError::Truncated,
         ciborium_ll::Error::Syntax(_) => CborError::InvalidUtf8,
