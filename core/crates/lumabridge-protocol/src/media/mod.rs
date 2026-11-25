@@ -5,3 +5,5 @@
 
 pub mod fragmentation;
 pub mod header;
+pub mod reassembly;
+pub mod recovery;

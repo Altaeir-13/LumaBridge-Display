@@ -280,6 +280,7 @@ impl ReassemblyConfig {
 pub struct RecoveryConfig {
     pub idr_request_cooldown_us: u64,
     pub max_reorder_completed_frames: usize,
+    pub reorder_gap_timeout_us: u64,
     pub frame_id_renewal_threshold: u32,
 }
 
@@ -288,6 +289,7 @@ impl Default for RecoveryConfig {
         Self {
             idr_request_cooldown_us: DEFAULT_IDR_COOLDOWN_US,
             max_reorder_completed_frames: DEFAULT_MAX_REORDER_COMPLETED_FRAMES,
+            reorder_gap_timeout_us: DEFAULT_FRAGMENT_TIMEOUT_US,
             frame_id_renewal_threshold: FRAME_ID_RENEWAL_THRESHOLD,
         }
     }
@@ -306,6 +308,11 @@ impl RecoveryConfig {
         if self.max_reorder_completed_frames > 16 {
             return Err(LimitConfigError::InvalidValue(
                 "max_reorder_completed_frames must be <= 16",
+            ));
+        }
+        if self.reorder_gap_timeout_us == 0 {
+            return Err(LimitConfigError::InvalidValue(
+                "reorder_gap_timeout_us must be non-zero",
             ));
         }
         if self.frame_id_renewal_threshold == 0 {
