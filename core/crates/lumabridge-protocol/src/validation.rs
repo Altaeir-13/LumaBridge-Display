@@ -248,6 +248,9 @@ const fn check_operational_phase(
         },
         ConnectionPhase::OperationalAuthenticated => match msg_type {
             MsgType::DisplayConfigUpdate
+            | MsgType::SessionClose
+            | MsgType::PermissionUpgradeRequest
+            | MsgType::PermissionUpdate
             | MsgType::MediaFeedback
             | MsgType::DiagnosticsSummary
             | MsgType::InputBatch => Err(reject_contextual(
@@ -291,12 +294,25 @@ pub fn validate_message_context(
         }
     }
 
-    if let (Some(expected_sid), Some(msg_sid)) = (ctx.active_session_id, msg.session_id()) {
-        if expected_sid != msg_sid {
-            return Err(reject_contextual(
-                ErrorCode::SessionNotFound,
-                "message session_id does not match active session",
-            ));
+    let is_session_bound = matches!(
+        msg,
+        ControlMessage::DisplayConfigUpdate(_)
+            | ControlMessage::SessionClose(_)
+            | ControlMessage::PermissionUpgradeRequest(_)
+            | ControlMessage::PermissionUpdate(_)
+            | ControlMessage::MediaFeedback(_)
+            | ControlMessage::DiagnosticsSummary(_)
+            | ControlMessage::InputBatch(_)
+            | ControlMessage::Heartbeat(_)
+    );
+    if is_session_bound {
+        if let (Some(expected_sid), Some(msg_sid)) = (ctx.active_session_id, msg.session_id()) {
+            if expected_sid != msg_sid {
+                return Err(reject_contextual(
+                    ErrorCode::SessionNotFound,
+                    "message session_id does not match active session",
+                ));
+            }
         }
     }
 

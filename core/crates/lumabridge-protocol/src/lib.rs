@@ -12,5 +12,6 @@ pub mod control;
 pub mod error;
 pub mod framing;
 pub mod limits;
+pub mod media;
 pub mod validation;
 pub mod version;
