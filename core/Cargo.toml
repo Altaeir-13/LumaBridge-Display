@@ -3,6 +3,10 @@ resolver = "2"
 members = [
     "crates/lumabridge-core",
     "crates/lumabridge-ffi",
+    "crates/lumabridge-protocol",
+]
+exclude = [
+    "crates/lumabridge-protocol/fuzz",
 ]
 
 [workspace.package]

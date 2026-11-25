@@ -1,0 +1,14 @@
+[package]
+name = "lumabridge-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deterministic, transport-independent LBWP v1 binary and CBOR wire protocol."
+
+[dependencies]
+ciborium-io = { version = "0.2.2", default-features = false, features = ["alloc"] }
+ciborium-ll = "0.2.2"
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
