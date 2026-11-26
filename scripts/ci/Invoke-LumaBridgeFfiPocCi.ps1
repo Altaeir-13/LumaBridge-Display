@@ -187,6 +187,10 @@ try {
 
     if (Get-Command 'cargo-deny.exe' -ErrorAction SilentlyContinue) {
         Invoke-NativeChecked -Label 'CARGO DENY CHECK' -Executable 'cargo' -Arguments @('deny', '--locked', 'check', 'advisories', 'licenses', 'bans', 'sources') -WorkingDirectory $coreDir | Out-Null
+        $protoFuzzDir = Join-Path $coreDir 'crates\lumabridge-protocol\fuzz'
+        $secFuzzDir = Join-Path $coreDir 'crates\lumabridge-security\fuzz'
+        Invoke-NativeChecked -Label 'CARGO DENY CHECK (PROTOCOL FUZZ)' -Executable 'cargo' -Arguments @('deny', '--locked', 'check', 'advisories', 'licenses', 'bans', 'sources') -WorkingDirectory $protoFuzzDir | Out-Null
+        Invoke-NativeChecked -Label 'CARGO DENY CHECK (SECURITY FUZZ)' -Executable 'cargo' -Arguments @('deny', '--locked', 'check', 'advisories', 'licenses', 'bans', 'sources') -WorkingDirectory $secFuzzDir | Out-Null
         $report.cargo_deny_checked = $true
     }
     elseif ($RequireCargoDeny) {
