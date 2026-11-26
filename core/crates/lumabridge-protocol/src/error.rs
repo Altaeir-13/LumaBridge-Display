@@ -99,6 +99,10 @@ pub enum FrameError {
     },
     UnexpectedEofInHeader,
     UnexpectedEofInPayload,
+    PendingBufferedInput {
+        buffered_bytes: usize,
+    },
+    StreamClosed,
     StreamPoisoned,
 }
 
@@ -148,6 +152,11 @@ impl fmt::Display for FrameError {
             ),
             Self::UnexpectedEofInHeader => write!(f, "unexpected EOF inside 8-byte frame header"),
             Self::UnexpectedEofInPayload => write!(f, "unexpected EOF inside frame payload"),
+            Self::PendingBufferedInput { buffered_bytes } => write!(
+                f,
+                "cannot finalize EOF or bypass queue while {buffered_bytes} unread bytes remain; drain with next_frame() first"
+            ),
+            Self::StreamClosed => write!(f, "stream decoder already finalized at EOF"),
             Self::StreamPoisoned => write!(f, "stream decoder poisoned after fatal framing error"),
         }
     }

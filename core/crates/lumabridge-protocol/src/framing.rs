@@ -342,6 +342,7 @@ impl StreamDecoderCore {
 pub struct StreamFrameDecoder {
     core: StreamDecoderCore,
     buffered_input: VecDeque<u8>,
+    eof_closed: bool,
 }
 
 impl fmt::Debug for StreamFrameDecoder {
@@ -349,6 +350,7 @@ impl fmt::Debug for StreamFrameDecoder {
         f.debug_struct("StreamFrameDecoder")
             .field("core", &self.core)
             .field("buffered_input_len", &self.buffered_input.len())
+            .field("eof_closed", &self.eof_closed)
             .finish()
     }
 }
@@ -370,6 +372,7 @@ impl StreamFrameDecoder {
                 },
             },
             buffered_input: VecDeque::new(),
+            eof_closed: false,
         })
     }
 
@@ -383,6 +386,12 @@ impl StreamFrameDecoder {
     #[must_use]
     pub const fn is_poisoned(&self) -> bool {
         matches!(self.core.state, DecoderState::Poisoned(_))
+    }
+
+    /// Return `true` if [`Self::finish_eof`] cleanly closed the stream at a frame boundary.
+    #[must_use]
+    pub const fn is_eof(&self) -> bool {
+        self.eof_closed
     }
 
     /// Return total bytes currently retained across partial headers, partial payloads, and unread queue.
@@ -399,17 +408,33 @@ impl StreamFrameDecoder {
     /// Consume bytes directly from `chunk` until either one complete frame is decoded, `chunk` is
     /// exhausted (`NeedMoreData`), or a fatal framing error poisons the stream.
     ///
-    /// Note: This direct-step method does not enqueue leftovers; callers holding leftover slices
-    /// advance by `consumed`. For push-and-drain ergonomics across arbitrary buffers, use
-    /// [`Self::feed`] + [`Self::next_frame`].
+    /// Returns [`FrameError::PendingBufferedInput`] (without poisoning) if unread bytes remain
+    /// queued from [`Self::feed`], preventing out-of-order byte consumption between the two APIs.
+    /// Returns [`FrameError::StreamClosed`] after a clean [`Self::finish_eof`].
     pub fn step_slice(&mut self, chunk: &[u8]) -> Result<DecodeStep, FrameError> {
+        if let DecoderState::Poisoned(err) = self.core.state {
+            return Err(err);
+        }
+        if self.eof_closed {
+            return Err(FrameError::StreamClosed);
+        }
+        if !self.buffered_input.is_empty() {
+            return Err(FrameError::PendingBufferedInput {
+                buffered_bytes: self.buffered_input.len(),
+            });
+        }
         self.core.step_slice(chunk)
     }
 
     /// Append a read chunk into the bounded internal queue for draining via [`Self::next_frame`].
+    ///
+    /// Returns [`FrameError::StreamClosed`] after a clean [`Self::finish_eof`].
     pub fn feed(&mut self, chunk: &[u8]) -> Result<(), FrameError> {
         if let DecoderState::Poisoned(err) = self.core.state {
             return Err(err);
+        }
+        if self.eof_closed {
+            return Err(FrameError::StreamClosed);
         }
         if self.buffered_input.len().saturating_add(chunk.len()) > Self::MAX_FEED_BACKLOG_BYTES {
             let err = FrameError::FrameTooLarge {
@@ -446,18 +471,30 @@ impl StreamFrameDecoder {
         }
     }
 
-    /// Signal transport EOF and verify no truncated header or truncated payload remains buffered.
+    /// Finalize the stream at transport EOF.
+    ///
+    /// Requires any bytes queued via [`Self::feed`] to be drained via [`Self::next_frame`] first:
+    /// if unread queue bytes remain, returns [`FrameError::PendingBufferedInput`] non-destructively
+    /// (without consuming records or poisoning the decoder). Once the queue is empty, verifies that
+    /// no truncated header or payload remains buffered, marking the decoder EOF-closed or poisoning
+    /// with [`FrameError::UnexpectedEofInHeader`] / [`FrameError::UnexpectedEofInPayload`].
     pub fn finish_eof(&mut self) -> Result<(), FrameError> {
-        if !self.buffered_input.is_empty() && self.next_frame()?.is_some() {
-            return Err(FrameError::UnexpectedEofInPayload);
-        }
-        if !self.buffered_input.is_empty() {
-            let err = FrameError::UnexpectedEofInPayload;
-            self.core.state = DecoderState::Poisoned(err);
+        if let DecoderState::Poisoned(err) = self.core.state {
             return Err(err);
         }
+        if self.eof_closed {
+            return Ok(());
+        }
+        if !self.buffered_input.is_empty() {
+            return Err(FrameError::PendingBufferedInput {
+                buffered_bytes: self.buffered_input.len(),
+            });
+        }
         match &self.core.state {
-            DecoderState::ReadingHeader { filled: 0, .. } => Ok(()),
+            DecoderState::ReadingHeader { filled: 0, .. } => {
+                self.eof_closed = true;
+                Ok(())
+            }
             DecoderState::ReadingHeader { .. } => {
                 let err = FrameError::UnexpectedEofInHeader;
                 self.core.state = DecoderState::Poisoned(err);
