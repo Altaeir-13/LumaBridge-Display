@@ -1,0 +1,35 @@
+# Dedicated dependency and license policy for the lumabridge-protocol libFuzzer workspace.
+# Restricts the NCSA exception solely to the fuzzing harness crate (`libfuzzer-sys`) while
+# inheriting strict registry, advisory, and non-path wildcard bans from core/deny.toml.
+
+[graph]
+all-features = true
+
+[advisories]
+ignore = []
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "MPL-2.0",
+]
+exceptions = [
+    { allow = ["NCSA"], crate = "libfuzzer-sys" },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
