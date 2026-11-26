@@ -248,10 +248,10 @@ impl ReassemblyConfig {
     /// Validate internal consistency across hierarchical memory and count budgets.
     pub fn validate(&self) -> Result<(), LimitConfigError> {
         if self.max_incomplete_frames_per_display == 0
-            || self.max_incomplete_frames_per_display > 16
+            || self.max_incomplete_frames_per_display > MAX_INCOMPLETE_FRAMES_PER_DISPLAY
         {
             return Err(LimitConfigError::InvalidValue(
-                "max_incomplete_frames_per_display must be within 1..=16",
+                "max_incomplete_frames_per_display must be within normative 1..=4",
             ));
         }
         if self.max_frame_bytes == 0 || self.max_frame_bytes > MAX_FRAME_BYTES {

@@ -6,9 +6,35 @@
 //! Enforces configurable limits on per-frame payload bytes, per-display bytes, per-session bytes,
 //! global bytes, total tracked displays, total pending frames, and per-fragment metadata overhead
 //! BEFORE allocating memory. Never pre-allocates `frag_count` buffers or `8 MiB` per frame.
+//!
+//! # Security and Trust Boundary
+//!
+//! [`Reassembler`] enforces **packet structural validation** (`VideoPacketHeader` invariants,
+//! payload length equality, budget bounds) only. It does **NOT** establish cryptographic peer
+//! identity, ALPN/session authorization, capture/input permissions, or compressed bitstream
+//! validity (`H.264`/`HEVC`/`AV1` syntax); those belong to caller `validation`, future `M1.3`
+//! `security`, and the downstream codec decoder.
+//!
+//! # Memory Accounting Categories
+//!
+//! 1. **Incomplete reassembly payloads (`stats().global_payload_bytes`):** strictly bounded by
+//!    frame/display/session/global byte limits.
+//! 2. **Estimated per-fragment metadata (`stats().global_metadata_bytes`):** linear
+//!    `metadata_overhead_per_fragment_bytes` (`64 B` default) per stored fragment.
+//! 3. **Transient concatenation peak in `finalize_frame`:** single-fragment frames move the
+//!    stored `Vec<u8>` with zero extra copy; multi-fragment frames temporarily hold the target
+//!    `Vec::with_capacity(payload_bytes)` alongside remaining unmerged chunks (`<= 2x` frame).
+//! 4. **Completed frames buffered for GOP reordering:** tracked separately by
+//!    [`crate::media::recovery::GopRecoveryStateMachine`] against `RecoveryConfig::max_reorder_bytes`.
+//! 5. **Frames delivered to consumer:** once [`ReassemblyOutcome::Completed`] leaves this module,
+//!    ownership transfers out of `Reassembler`; external jitter/decoder queues must apply their
+//!    own downstream limits.
+//! 6. **Physical allocator overhead:** allocator fragmentation and metadata reside outside pure
+//!    protocol accounting; configured budgets (`64 MiB` experimental global default) serve as
+//!    bounded admission controls rather than process RSS hard caps.
 
 use core::fmt;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::{ReassemblyError, VideoHeaderError};
 use crate::limits::ReassemblyConfig;
@@ -20,7 +46,8 @@ const MAX_RETIRED_IDS_PER_DISPLAY: usize = 256;
 /// Complete reassembled frame handed to the consumer.
 ///
 /// Note on memory accounting: once delivered to the consumer, ownership of `payload` transfers
-/// out of the [`Reassembler`] and no longer counts against the reassembly byte budget.
+/// out of [`Reassembler`] (and once released by `GopRecoveryStateMachine`, downstream decoder/jitter
+/// buffers are accountable for retained frame memory).
 #[derive(Clone, PartialEq, Eq)]
 pub struct ReassembledFrame {
     pub session_id: u64,
@@ -51,6 +78,11 @@ impl fmt::Debug for ReassembledFrame {
 }
 
 /// Distinct semantic event signaled when the sender replaces content due to DRM/HDCP protection.
+///
+/// **Transport requirement (`M1.4`):** an unreliable `Channel 1` datagram carrying
+/// `FLAG_PROTECTED_BLANK` is NOT sufficient by itself to guarantee remote hiding if dropped by
+/// the network; `M1.4` operational transport MUST also deliver reliable protection-transition
+/// signaling taking precedence over obsolete media frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProtectedBlankEvent {
     pub session_id: u64,
@@ -162,7 +194,6 @@ struct DisplayState {
     accounted_bytes: usize,
     retired_floor: u32,
     retired_set: BTreeSet<u32>,
-    retired_order: VecDeque<u32>,
 }
 
 impl DisplayState {
@@ -170,19 +201,22 @@ impl DisplayState {
         frame_id <= self.retired_floor || self.retired_set.contains(&frame_id)
     }
 
-    fn retire_id(&mut self, frame_id: u32) {
+    /// Retire `frame_id`, popping the **minimum** set entry when bounded capacity overflows
+    /// so `retired_floor` advances monotonically; returns `Some(new_floor)` if `retired_floor` grew.
+    fn retire_id(&mut self, frame_id: u32) -> Option<u32> {
         if frame_id <= self.retired_floor || !self.retired_set.insert(frame_id) {
-            return;
+            return None;
         }
-        self.retired_order.push_back(frame_id);
-        while self.retired_order.len() > MAX_RETIRED_IDS_PER_DISPLAY {
-            if let Some(evicted) = self.retired_order.pop_front() {
-                self.retired_set.remove(&evicted);
-                if evicted > self.retired_floor {
-                    self.retired_floor = evicted;
+        let mut new_floor = None;
+        while self.retired_set.len() > MAX_RETIRED_IDS_PER_DISPLAY {
+            if let Some(min_retired) = self.retired_set.pop_first() {
+                if min_retired > self.retired_floor {
+                    self.retired_floor = min_retired;
+                    new_floor = Some(self.retired_floor);
                 }
             }
         }
+        new_floor
     }
 
     fn retire_all_at_or_below(&mut self, frame_id: u32) {
@@ -196,11 +230,10 @@ impl DisplayState {
                 break;
             }
         }
-        self.retired_order.retain(|&id| id > self.retired_floor);
     }
 }
 
-/// Bounded multi-session, multi-display media packet reassembler.
+/// Bounded multi-session, multi-display media packet reassembler with privacy-redacted [`fmt::Debug`].
 pub struct Reassembler {
     config: ReassemblyConfig,
     displays: BTreeMap<(u64, u16), DisplayState>,
@@ -208,6 +241,15 @@ pub struct Reassembler {
     global_payload_bytes: usize,
     global_metadata_bytes: usize,
     total_pending_frames: usize,
+}
+
+impl fmt::Debug for Reassembler {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Reassembler")
+            .field("config", &self.config)
+            .field("stats", &self.stats())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Reassembler {
@@ -255,7 +297,8 @@ impl Reassembler {
             .is_some_and(|oldest| oldest < frame_id)
     }
 
-    /// Decode and ingest a raw media packet (`44 B header + fragment`) at caller clock `now_us`.
+    /// Decode and validate a raw media packet (`44 B header + fragment`) against `max_packet_budget`,
+    /// then submit it into bounded reassembly at caller clock `now_us`.
     pub fn ingest_packet(
         &mut self,
         packet: &[u8],
@@ -264,11 +307,32 @@ impl Reassembler {
     ) -> Result<ReassemblyReport, IngestPacketError> {
         let (header, fragment) = decode_video_packet(packet, max_packet_budget)
             .map_err(IngestPacketError::InvalidPacket)?;
-        Ok(self.ingest_decoded(header, fragment, now_us))
+        Ok(self.ingest_validated(header, fragment, now_us))
     }
 
-    /// Ingest an already-validated [`VideoPacketHeader`] and fragment payload slice.
+    /// Structurally validate `header` (`VideoPacketHeader::validate(u16::MAX)`) and
+    /// `fragment.len() == header.payload_len`, then ingest into bounded reassembly at `now_us`.
+    ///
+    /// **Trust boundary note:** this enforces packet structural invariants only; cryptographic peer
+    /// identity, ALPN/session authorization, permissions, and compressed bitstream validity remain
+    /// the responsibility of caller validation, `M1.3` security, and downstream codecs.
     pub fn ingest_decoded(
+        &mut self,
+        header: VideoPacketHeader,
+        fragment: &[u8],
+        now_us: u64,
+    ) -> Result<ReassemblyReport, VideoHeaderError> {
+        header.validate(usize::from(u16::MAX))?;
+        if fragment.len() != usize::from(header.payload_len) {
+            return Err(VideoHeaderError::PayloadLenMismatch {
+                header_len: header.payload_len,
+                actual_len: fragment.len(),
+            });
+        }
+        Ok(self.ingest_validated(header, fragment, now_us))
+    }
+
+    fn ingest_validated(
         &mut self,
         header: VideoPacketHeader,
         fragment: &[u8],
@@ -330,9 +394,7 @@ impl Reassembler {
                     reason: DiscardReason::ConflictingMetadata,
                 });
             }
-            if let Some(d) = self.displays.get_mut(&key) {
-                d.retire_id(header.frame_id);
-            }
+            self.retire_frame_id(key, header.frame_id, &mut discarded);
             return ReassemblyReport {
                 outcome: ReassemblyOutcome::Rejected(
                     ReassemblyError::ConflictingFragmentMetadata {
@@ -496,9 +558,7 @@ impl Reassembler {
                 reason,
             });
         }
-        if let Some(d) = self.displays.get_mut(&key) {
-            d.retire_id(frame_id);
-        }
+        self.retire_frame_id(key, frame_id, discarded);
     }
 
     fn ingest_new_frame(
@@ -520,10 +580,7 @@ impl Reassembler {
                 .copied()
                 .expect("pending non-empty");
             if header.frame_id < oldest_fid {
-                // Incoming frame is already older than the entire active window; do not evict newer work.
-                if let Some(d) = self.displays.get_mut(&key) {
-                    d.retire_id(header.frame_id);
-                }
+                self.retire_frame_id(key, header.frame_id, &mut discarded);
                 discarded.push(DiscardedFrameNotice {
                     session_id: header.session_id,
                     display_id: header.display_id,
@@ -547,9 +604,7 @@ impl Reassembler {
                     reason: DiscardReason::EvictedByWindow,
                 });
             }
-            if let Some(d) = self.displays.get_mut(&key) {
-                d.retire_id(oldest_fid);
-            }
+            self.retire_frame_id(key, oldest_fid, &mut discarded);
         }
 
         if self.total_pending_frames >= self.config.max_pending_frames {
@@ -677,10 +732,18 @@ impl Reassembler {
             .remove_pending_frame(key, frame_id)
             .expect("completed pending frame exists");
 
-        let mut payload = Vec::with_capacity(pf.payload_bytes);
-        for (_, chunk) in pf.fragments {
-            payload.extend_from_slice(&chunk);
-        }
+        let total_payload_bytes = pf.payload_bytes;
+        let mut iter = pf.fragments.into_values();
+        let payload = if iter.len() == 1 {
+            // Fast path: move the single stored fragment buffer with zero extra allocation/copy.
+            iter.next().expect("single fragment exists")
+        } else {
+            let mut assembled = Vec::with_capacity(total_payload_bytes);
+            for chunk in iter {
+                assembled.extend_from_slice(&chunk);
+            }
+            assembled
+        };
 
         let mut raw_flags = pf.invariant_flags | VideoFlags::END_OF_FRAME.raw();
         if pf.has_codec_config {
@@ -697,8 +760,8 @@ impl Reassembler {
             if let Some(d) = self.displays.get_mut(&key) {
                 d.retire_all_at_or_below(frame_id);
             }
-        } else if let Some(d) = self.displays.get_mut(&key) {
-            d.retire_id(frame_id);
+        } else {
+            self.retire_frame_id(key, frame_id, &mut discarded);
         }
 
         let frame = ReassembledFrame {
@@ -716,6 +779,52 @@ impl Reassembler {
         ReassemblyReport {
             outcome: ReassemblyOutcome::Completed(frame),
             discarded,
+        }
+    }
+
+    fn retire_frame_id(
+        &mut self,
+        key: (u64, u16),
+        frame_id: u32,
+        notices: &mut Vec<DiscardedFrameNotice>,
+    ) {
+        let Some(d) = self.displays.get_mut(&key) else {
+            return;
+        };
+        if d.retire_id(frame_id).is_some() {
+            self.enforce_retired_floor_invariant(key, notices);
+        }
+    }
+
+    fn enforce_retired_floor_invariant(
+        &mut self,
+        key: (u64, u16),
+        notices: &mut Vec<DiscardedFrameNotice>,
+    ) {
+        loop {
+            let Some(floor) = self.displays.get(&key).map(|d| d.retired_floor) else {
+                return;
+            };
+            let stale_pending: Vec<u32> = self.displays[&key]
+                .pending
+                .keys()
+                .copied()
+                .take_while(|&fid| fid <= floor)
+                .collect();
+            if stale_pending.is_empty() {
+                return;
+            }
+            for fid in stale_pending {
+                if let Some(removed) = self.remove_pending_frame(key, fid) {
+                    notices.push(DiscardedFrameNotice {
+                        session_id: key.0,
+                        display_id: key.1,
+                        frame_id: fid,
+                        gop_id: removed.gop_id,
+                        reason: DiscardReason::EvictedByWindow,
+                    });
+                }
+            }
         }
     }
 
@@ -744,9 +853,7 @@ impl Reassembler {
                     reason,
                 });
             }
-            if let Some(d) = self.displays.get_mut(&key) {
-                d.retire_id(fid);
-            }
+            self.retire_frame_id(key, fid, &mut notices);
         }
         notices
     }
@@ -795,9 +902,7 @@ impl Reassembler {
                     reason: DiscardReason::Expired,
                 });
             }
-            if let Some(d) = self.displays.get_mut(&key) {
-                d.retire_id(fid);
-            }
+            self.retire_frame_id(key, fid, &mut notices);
         }
         notices
     }

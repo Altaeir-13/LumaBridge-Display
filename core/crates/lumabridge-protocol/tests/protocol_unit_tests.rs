@@ -1060,7 +1060,9 @@ fn reassembly_window_near_cap_stress_and_expiry_release_all_memory() {
         capture_ts_us: 100,
         encode_done_ts_us: 100,
     };
-    reasm.ingest_decoded(spoof_hdr, &[0x11; 100], 1_000);
+    let _ = reasm
+        .ingest_decoded(spoof_hdr, &[0x11; 100], 1_000)
+        .expect("valid spoof hdr");
     assert_eq!(reasm.stats().global_payload_bytes, 100);
     assert_eq!(reasm.stats().global_metadata_bytes, 64);
 
@@ -1068,7 +1070,9 @@ fn reassembly_window_near_cap_stress_and_expiry_release_all_memory() {
         let mut h = spoof_hdr;
         h.frame_id = fid;
         h.frag_count = 2;
-        let rep = reasm.ingest_decoded(h, &[0x22; 100], 2_000);
+        let rep = reasm
+            .ingest_decoded(h, &[0x22; 100], 2_000)
+            .expect("valid window pkt");
         if fid == 5 {
             assert_eq!(rep.discarded.len(), 1);
             assert_eq!(rep.discarded[0].frame_id, 1);
@@ -1125,7 +1129,9 @@ fn reassembly_window_near_cap_stress_and_expiry_release_all_memory() {
             encode_done_ts_us: 100,
         };
         let chunk = vec![0x33u8; u16::MAX as usize];
-        let rep = reasm.ingest_decoded(h, &chunk, 51_000);
+        let rep = reasm
+            .ingest_decoded(h, &chunk, 51_000)
+            .expect("valid oversized test chunk");
         if let ReassemblyOutcome::Rejected(err) = rep.outcome {
             assert!(matches!(err, ReassemblyError::GlobalBudgetExceeded));
             hit_global_cap = true;

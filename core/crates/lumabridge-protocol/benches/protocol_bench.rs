@@ -287,7 +287,9 @@ fn bench_media_pipeline_sizes() {
             for (idx, pkt) in packets.iter().enumerate() {
                 let (mut hdr, body) = decode_video_packet(pkt, 1136).expect("hdr");
                 hdr.frame_id = fid;
-                let rep = reasm.ingest_decoded(hdr, body, 10_000 + (idx as u64));
+                let rep = reasm
+                    .ingest_decoded(hdr, body, 10_000 + (idx as u64))
+                    .expect("validated decoded packet");
                 if idx == packets.len() - 1 {
                     assert!(matches!(rep.outcome, ReassemblyOutcome::Completed(_)));
                 }
