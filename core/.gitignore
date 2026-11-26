@@ -9,3 +9,6 @@ generated/
 **/*.a
 **/*.exe
 **/*.ilk
+crates/lumabridge-protocol/fuzz/target/
+crates/lumabridge-protocol/fuzz/corpus/
+crates/lumabridge-protocol/fuzz/artifacts/

@@ -1,0 +1,50 @@
+[package]
+name = "lumabridge-protocol-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lumabridge-protocol = { path = ".." }
+
+[[bin]]
+name = "fuzz_framing"
+path = "fuzz_targets/fuzz_framing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_cbor_control"
+path = "fuzz_targets/fuzz_cbor_control.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_video_header"
+path = "fuzz_targets/fuzz_video_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_media_reassembly"
+path = "fuzz_targets/fuzz_media_reassembly.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_contextual_validation"
+path = "fuzz_targets/fuzz_contextual_validation.rs"
+test = false
+doc = false
+bench = false
