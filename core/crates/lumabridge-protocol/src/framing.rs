@@ -3,6 +3,7 @@
 
 //! Transport-independent Big-Endian 8-byte framing and bounded incremental stream decoder.
 
+use core::fmt;
 use std::collections::VecDeque;
 
 use crate::error::FrameError;
@@ -144,11 +145,20 @@ impl FrameHeader {
     }
 }
 
-/// Decoded raw frame returned by [`StreamFrameDecoder`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Decoded raw frame returned by [`StreamFrameDecoder`] with privacy-redacted [`fmt::Debug`].
+#[derive(Clone, PartialEq, Eq)]
 pub struct RawStreamFrame {
     pub header: FrameHeader,
     pub payload: Vec<u8>,
+}
+
+impl fmt::Debug for RawStreamFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RawStreamFrame")
+            .field("header", &self.header)
+            .field("payload_len", &self.payload.len())
+            .finish()
+    }
 }
 
 /// Stream-to-channel binding policy enforcing channel isolation on dedicated QUIC streams
@@ -175,7 +185,7 @@ pub enum DecodeStep {
     NeedMoreData { consumed: usize },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum DecoderState {
     ReadingHeader {
         buf: [u8; FRAME_HEADER_LEN],
@@ -188,11 +198,38 @@ enum DecoderState {
     Poisoned(FrameError),
 }
 
-#[derive(Debug, Clone)]
+impl fmt::Debug for DecoderState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReadingHeader { filled, .. } => f
+                .debug_struct("ReadingHeader")
+                .field("filled", filled)
+                .finish(),
+            Self::ReadingPayload { header, payload } => f
+                .debug_struct("ReadingPayload")
+                .field("header", header)
+                .field("received_bytes", &payload.len())
+                .finish(),
+            Self::Poisoned(err) => f.debug_tuple("Poisoned").field(err).finish(),
+        }
+    }
+}
+
+#[derive(Clone)]
 struct StreamDecoderCore {
     limits: FramingLimits,
     binding: StreamBindingMode,
     state: DecoderState,
+}
+
+impl fmt::Debug for StreamDecoderCore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StreamDecoderCore")
+            .field("limits", &self.limits)
+            .field("binding", &self.binding)
+            .field("state", &self.state)
+            .finish()
+    }
 }
 
 impl StreamDecoderCore {
@@ -301,10 +338,19 @@ impl StreamDecoderCore {
 ///
 /// Never allocates the payload buffer until the 8-byte header has passed all size, channel,
 /// and reserved-flag validations.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct StreamFrameDecoder {
     core: StreamDecoderCore,
     buffered_input: VecDeque<u8>,
+}
+
+impl fmt::Debug for StreamFrameDecoder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StreamFrameDecoder")
+            .field("core", &self.core)
+            .field("buffered_input_len", &self.buffered_input.len())
+            .finish()
+    }
 }
 
 impl StreamFrameDecoder {
