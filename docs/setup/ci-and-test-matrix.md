@@ -143,14 +143,14 @@ A qualificação funcional completa da `M0` referente ao commit funcional `6b297
 
 ---
 
-## 6. Matriz Adicional de Verificação `M1.1` / `M1.2` (`core/` Rust + `LBWP v1`)
+## 6. Matriz Adicional de Verificação `M1.1` / `M1.2` / `M1.3` (`core/` Rust + `LBWP v1` + `lumabridge-security`)
 
 Sem alterar as contagens históricas de `237` casos Windows (`M0`) ou `9` autotestes Python, os dois checks Rust obrigatórios definidos em [`.github/workflows/ci-ffi-poc.yml`](../../.github/workflows/ci-ffi-poc.yml) executam continuamente:
 
 - **`Windows Rust + MSVC Debug/Release FFI PoC`** (`scripts/ci/Invoke-LumaBridgeFfiPocCi.ps1`) e **`Linux Rust Tests + Android ARM64 & UniFFI PoC`:**
   - `cargo fmt --all --check` e deriva de `cbindgen` (`lumabridge_ffi.h`);
   - `cargo clippy --locked --workspace --all-targets -- -D warnings` em `default`, `--features poc-fault-injection` e `--features uniffi`;
-  - `cargo test --locked --workspace`: **`45/45`** (`default`), **`47/47`** (`poc-fault-injection`) e **`46/46`** (`uniffi`), incluindo **`33`** testes de `lumabridge-protocol` (`22` unitários e de regressão, `6` de golden vectors + corpus malformado + `40` amostras de regressão de fuzzing em [`fuzz_regression_corpus.hex`](../../core/crates/lumabridge-protocol/tests/corpus/fuzz_regression_corpus.hex), `5` *property tests*);
-  - `cargo deny --locked check advisories licenses bans sources` contra [`core/deny.toml`](../../core/deny.toml) no workspace principal (`core/Cargo.toml`);
-  - Cross-build Android ARM64 (`aarch64-linux-android`, API `29`) de `lumabridge-protocol` (`liblumabridge_protocol.rlib`) e `lumabridge-ffi` (`liblumabridge_ffi.so`) + verificação ELF / geração Kotlin UniFFI;
-  - Nota de escopo: o workspace isolado `fuzz/` (`5` alvos `libFuzzer` + AddressSanitizer e `22` pacotes resolvidos em `fuzz/Cargo.lock`) é auditado e executado sob demanda em campanhas explícitas (não coberto automaticamente pelo `cargo deny` do workspace principal `core/` nem como execução ilimitada por push em CI).
+  - `cargo test --locked --workspace`: `58` testes (`default`), `60` (`poc-fault-injection`) e `59` (`uniffi`), somando **`33`** testes de `lumabridge-protocol` (`22` unitários/regressão, `6` golden/corpus, `5` *property tests*) e **`13`** testes de `lumabridge-security` (`4` RFC 8032/9382 & identidade/X.509, `3` TLS 1.3 mTLS / SPAKE2 / QR + MITM + corrida, `6` autorização/tokens/rate-limit/anti-replay/sentinels + [`fuzz_regression_corpus.hex`](../../core/crates/lumabridge-security/tests/corpus/fuzz_regression_corpus.hex));
+  - `cargo deny --locked check advisories licenses bans sources` contra [`core/deny.toml`](../../core/deny.toml) no workspace principal e contra os `deny.toml` dedicados em [`lumabridge-protocol/fuzz/deny.toml`](../../core/crates/lumabridge-protocol/fuzz/deny.toml) e [`lumabridge-security/fuzz/deny.toml`](../../core/crates/lumabridge-security/fuzz/deny.toml);
+  - Cross-build Android ARM64 (`aarch64-linux-android`, API `29`) de `lumabridge-protocol` (`liblumabridge_protocol.rlib`), `lumabridge-security` (`liblumabridge_security.rlib`) e `lumabridge-ffi` (`liblumabridge_ffi.so`) + verificação ELF / geração Kotlin UniFFI;
+  - Nota de escopo: os `10` alvos `libFuzzer` + AddressSanitizer (`5` em `lumabridge-protocol/fuzz` e `5` em `lumabridge-security/fuzz`) têm políticas `cargo-deny --locked` checadas em CI e campanhas ASan executadas sob demanda.
