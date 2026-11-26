@@ -18,7 +18,7 @@
 
 | Camada | Candidatos Principais | Licenças Típicas | Vínculo Pretendido |
 |---|---|---|---|
-| **Núcleo Rust (`M1`)** | `tokio`, `quinn`, `rustls`, `webpki`, `ed25519-dalek`, `spake2`, `prost`/`ciborium`, `mdns-sd` | Predominantemente **MIT OR Apache-2.0**; algumas crates cripto/FFI podem usar **ISC**, **BSD-3-Clause** ou **MPL-2.0** (ex.: `ring`/`aws-lc-rs`, `webpki`, `cbindgen`, `uniffi`) | Compilação estática no crate/biblioteca `lumabridge-core` |
+| **Núcleo Rust (`M1`)** | `ciborium-ll` / `ciborium-io` (`0.2.2`, `lumabridge-protocol`); planejadas para `M1.3`+: `tokio`, `quinn`, `rustls`, `webpki`, `ed25519-dalek`, `spake2`, `mdns-sd` | **`Apache-2.0`** (`ciborium-*`), **`MIT OR Apache-2.0`** (`half`), **`BSD-2-Clause OR Apache-2.0 OR MIT`** (`zerocopy`); opcionais/FFI/crypto futuras podem usar **ISC**, **BSD-3-Clause** ou **MPL-2.0** (`uniffi`, `cbindgen`); dev/fuzzing isolado (`proptest` `MIT OR Apache-2.0`, `libfuzzer-sys` `NCSA`) | Compilação estática no crate `core/`; `cargo deny --locked` valida `advisories`, `licenses`, `bans` e `sources` |
 | **Vídeo Hardware Windows (`M3`)** | **AMD AMF** headers, **Intel oneVPL** headers/dispatcher | **MIT** | Headers + carregamento dinâmico do runtime instalado pelo driver GPU do usuário (`amfrt64.dll`, runtime QSV/oneVPL) ou Media Foundation HW MFT do SO |
 | **Linux Display & Captura (`M2`/`M4`)** | `wayland-client`, `pipewire` (`libpipewire`), `libxcb`/`libx11`, `libei`, `libva`, `vulkan-headers`, `SDL3` | **MIT** / **Expat** / **zlib** (`SDL3`) / **Apache-2.0** | Link dinâmico com bibliotecas de sistema da distribuição Linux |
 | **Android (`M3`/`M5`)** | Android SDK/NDK, Kotlin stdlib, Jetpack Compose, `MediaCodec`, `MediaProjection`, `UsbManager` | **Apache-2.0** (+ termos Android SDK) | APIs do SO e bibliotecas Jetpack |
@@ -100,4 +100,4 @@ Em vez de aplicar uma proibição genérica simplista a toda tecnologia associad
   - [`NOTICE`](../../NOTICE) (atribuição do projeto LumaBridge Display e referência a `nvEncodeAPI.h`)
   - [`THIRD_PARTY_NOTICES.md`](../../THIRD_PARTY_NOTICES.md) (registrando `nvEncodeAPI.h` MIT, revisão `IddSampleDriver` e dependências não redistribuídas de build/runtime/CI)
   - [`CONTRIBUTING.md`](../../CONTRIBUTING.md) (política prospectiva DCO 1.1 e fluxo de contribuição)
-- [ ] Configuração de verificação automatizada de licenças (`cargo-deny` quando o workspace `core/` for criado em `M1`).
+- [x] Configuração de verificação automatizada de licenças (`cargo-deny --locked` em `core/deny.toml` ativo nos checks Rust de `M1.1.1`/`M1.2`).

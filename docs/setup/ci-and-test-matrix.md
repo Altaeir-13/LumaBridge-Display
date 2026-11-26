@@ -139,4 +139,18 @@ A qualificação funcional completa da `M0` referente ao commit funcional `6b297
 - **Issue #33 (mantida ABERTA — dívida técnica aceita):** ausência de persistência de `MonitorContainerId` em `PLUGPLAY_REGKEY_DEVICE` em [`Adapter.cpp`](../../windows/driver/LumaBridgeIddDriver/Adapter.cpp) / [`VirtualMonitor.cpp`](../../windows/driver/LumaBridgeIddDriver/VirtualMonitor.cpp), a ser tratada antes da expansão para múltiplos monitores virtuais ou múltiplas instâncias dependentes de identidade persistente.
 - **Issue #34 (mantida ABERTA com escopo residual não bloqueante):** escopo funcional núcleo de `M0` validado em `6b297856`; itens operacionais residuais (monitor inicialmente desabilitado dedicado em §7.5, alternância real 720p60/1080p60, bateria dedicada de desativação/reativação, desinstalação pós-sucesso, remoção de certificado e restauração de segurança) permanecem documentados para VM descartável ou ambiente dedicado sem bloquear o encerramento da `M0` nem o início futuro da `M1`.
 - **Critério verificável de encerramento da `M0`:** a `M0` é considerada formalmente encerrada somente após integração por Merge commit do PR de governança `#38` em `dev`, aprovação dos checks pós-merge em `dev` (`Linux Repository Hygiene & Governance` e `Windows Non-Admin CI`), reconciliação registrada do `PR #36` / `Issue #33` / `Issue #34` e verificação da proteção configurada para `refs/heads/dev`.
-- **Rust / Cargo / FFI / `LBWP v1`:** pertencem à **`M1`** e não fazem parte da etapa `M0`.
+- **Rust / Cargo / FFI / `LBWP v1`:** pertencem à **`M1`** e são validados em workflow dedicado sem alterar a matriz `M0` acima.
+
+---
+
+## 6. Matriz Adicional de Verificação `M1.1` / `M1.2` (`core/` Rust + `LBWP v1`)
+
+Sem alterar as contagens históricas de `237` casos Windows (`M0`) ou `9` autotestes Python, os dois checks Rust obrigatórios definidos em [`.github/workflows/ci-ffi-poc.yml`](../../.github/workflows/ci-ffi-poc.yml) executam continuamente:
+
+- **`Windows Rust + MSVC Debug/Release FFI PoC`** (`scripts/ci/Invoke-LumaBridgeFfiPocCi.ps1`) e **`Linux Rust Tests + Android ARM64 & UniFFI PoC`:**
+  - `cargo fmt --all --check` e deriva de `cbindgen` (`lumabridge_ffi.h`);
+  - `cargo clippy --locked --workspace --all-targets -- -D warnings` em `default`, `--features poc-fault-injection` e `--features uniffi`;
+  - `cargo test --locked --workspace`: **`37/37`** (`default`), **`39/39`** (`poc-fault-injection`) e **`38/38`** (`uniffi`), incluindo **`25`** testes de `lumabridge-protocol` (`14` unitários, `6` de golden vectors + corpus malformado + `40` amostras de regressão de fuzzing em [`fuzz_regression_corpus.hex`](../../core/crates/lumabridge-protocol/tests/corpus/fuzz_regression_corpus.hex), `5` *property tests*);
+  - `cargo deny --locked check advisories licenses bans sources` contra [`core/deny.toml`](../../core/deny.toml);
+  - Cross-build Android ARM64 (`aarch64-linux-android`, API `29`) de `lumabridge-protocol` (`liblumabridge_protocol.rlib`) e `lumabridge-ffi` (`liblumabridge_ffi.so`) + verificação ELF / geração Kotlin UniFFI;
+  - Nota de escopo: o harness `fuzz/` isolado (`5` alvos `libFuzzer` + AddressSanitizer) é verificado sob demanda em campanhas explícitas (não como execução ilimitada por push em CI).
