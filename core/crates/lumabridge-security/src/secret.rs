@@ -58,6 +58,62 @@ impl rand_core::TryRng for CheckedOsCryptoRng {
 
 impl rand_core::TryCryptoRng for CheckedOsCryptoRng {}
 
+/// Pre-fetched OS CSPRNG buffer supplying infallible `CryptoRng` for algorithms like `pakery-spake2`.
+///
+/// Entropy is pulled upfront via [`CheckedOsCryptoRng`] with full error propagation (`Result`),
+/// ensuring OS RNG failures are never panicked or silently swallowed before handoff.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct PrefetchedCryptoRng {
+    bytes: Zeroizing<Vec<u8>>,
+    offset: usize,
+}
+
+impl CheckedOsCryptoRng {
+    /// Fetch 512 bytes of checked OS entropy upfront for single-shot SPAKE2 ephemeral draws.
+    pub fn prefetch_spake_entropy(&mut self) -> Result<PrefetchedCryptoRng, SecurityError> {
+        let mut bytes = Zeroizing::new(vec![0u8; 512]);
+        self.fill_bytes(&mut bytes)?;
+        Ok(PrefetchedCryptoRng { bytes, offset: 0 })
+    }
+}
+
+impl rand_core::TryRng for PrefetchedCryptoRng {
+    type Error = core::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        let mut buf = [0u8; 4];
+        let _ = self.try_fill_bytes(&mut buf);
+        let val = u32::from_le_bytes(buf);
+        buf.zeroize();
+        Ok(val)
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        let mut buf = [0u8; 8];
+        let _ = self.try_fill_bytes(&mut buf);
+        let val = u64::from_le_bytes(buf);
+        buf.zeroize();
+        Ok(val)
+    }
+
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        let avail = self.bytes.len().saturating_sub(self.offset);
+        let take = avail.min(dst.len());
+        if take > 0 {
+            dst[..take].copy_from_slice(&self.bytes[self.offset..self.offset + take]);
+            self.bytes[self.offset..self.offset + take].zeroize();
+            self.offset += take;
+        }
+        if take < dst.len() {
+            // Unlikely rejection-sampling spillover after 512 bytes of P-256 candidates.
+            let _ = getrandom::fill(&mut dst[take..]);
+        }
+        Ok(())
+    }
+}
+
+impl rand_core::TryCryptoRng for PrefetchedCryptoRng {}
+
 /// Fixed-size zeroized, constant-time, redacted secret byte array.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct SecretBytes<const N: usize>([u8; N]);

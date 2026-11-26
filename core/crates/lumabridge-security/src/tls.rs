@@ -22,8 +22,13 @@ use rustls::{
 use std::io::{Read, Write};
 use std::sync::Arc;
 
-/// ALPN identifier mandated for LBWP v1 over TLS 1.3.
-pub const LUMABRIDGE_ALPN_V1: &[u8] = b"lumabridge/1";
+use lumabridge_protocol::version::{ALPN_OPERATIONAL_V1, ALPN_PAIRING_V1};
+
+/// Operational ALPN identifier mandated for LBWP v1 over TLS 1.3.
+pub const LUMABRIDGE_ALPN_V1: &[u8] = ALPN_OPERATIONAL_V1.as_bytes();
+
+/// Pairing ALPN identifier mandated for LBWP v1 initial pairing over TLS 1.3.
+pub const LUMABRIDGE_PAIR_ALPN_V1: &[u8] = ALPN_PAIRING_V1.as_bytes();
 
 /// Peer trust verification mode enforced during the TLS 1.3 mTLS handshake.
 #[derive(Clone)]
@@ -44,6 +49,17 @@ pub enum TlsPeerTrustPolicy {
     PinnedPeer { expected_device_id: DeviceId },
 }
 
+impl TlsPeerTrustPolicy {
+    /// ALPN token required for connections under this policy.
+    #[must_use]
+    pub const fn expected_alpn(&self) -> &'static [u8] {
+        match self {
+            Self::Pairing { .. } => LUMABRIDGE_PAIR_ALPN_V1,
+            Self::Trusted { .. } | Self::PinnedPeer { .. } => LUMABRIDGE_ALPN_V1,
+        }
+    }
+}
+
 /// Authenticated TLS 1.3 session metadata bound to peer certificate and RFC 9266 exporter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedTlsSession {
@@ -52,11 +68,12 @@ pub struct AuthenticatedTlsSession {
     pub negotiated_alpn: Vec<u8>,
 }
 
-/// Build a `rustls::ClientConfig` enforcing TLS 1.3-only mTLS (`lumabridge/1`) with `ring`.
+/// Build a `rustls::ClientConfig` enforcing TLS 1.3-only mTLS (`lumabridge/1` or `lumabridge-pair/1`) with `ring`.
 pub fn build_tls13_client_config(
     local_cert: &GeneratedDeviceCertificate,
     peer_policy: TlsPeerTrustPolicy,
 ) -> Result<Arc<ClientConfig>, SecurityError> {
+    let alpn = peer_policy.expected_alpn().to_vec();
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier = Arc::new(LumaBridgeCertVerifier::new(&provider, peer_policy));
 
@@ -73,15 +90,16 @@ pub fn build_tls13_client_config(
         .with_client_auth_cert(cert_chain, key)
         .map_err(|_| SecurityError::TlsConfiguration("failed to configure client mTLS cert"))?;
 
-    cfg.alpn_protocols = vec![LUMABRIDGE_ALPN_V1.to_vec()];
+    cfg.alpn_protocols = vec![alpn];
     Ok(Arc::new(cfg))
 }
 
-/// Build a `rustls::ServerConfig` enforcing mandatory TLS 1.3-only mTLS (`lumabridge/1`) with `ring`.
+/// Build a `rustls::ServerConfig` enforcing mandatory TLS 1.3-only mTLS (`lumabridge/1` or `lumabridge-pair/1`) with `ring`.
 pub fn build_tls13_server_config(
     local_cert: &GeneratedDeviceCertificate,
     peer_policy: TlsPeerTrustPolicy,
 ) -> Result<Arc<ServerConfig>, SecurityError> {
+    let alpn = peer_policy.expected_alpn().to_vec();
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier = Arc::new(LumaBridgeCertVerifier::new(&provider, peer_policy));
 
@@ -97,13 +115,23 @@ pub fn build_tls13_server_config(
         .with_single_cert(cert_chain, key)
         .map_err(|_| SecurityError::TlsConfiguration("failed to configure server mTLS cert"))?;
 
-    cfg.alpn_protocols = vec![LUMABRIDGE_ALPN_V1.to_vec()];
+    cfg.alpn_protocols = vec![alpn];
     Ok(Arc::new(cfg))
 }
 
-/// Inspect a completed TLS 1.3 connection, verify ALPN and peer cert, and export RFC 9266 CB.
+/// Inspect a completed TLS 1.3 connection, verify ALPN (`lumabridge/1` or `lumabridge-pair/1`),
+/// verify peer cert, and export RFC 9266 channel binding.
 pub fn extract_authenticated_session<D>(
     conn: &ConnectionCommon<D>,
+    now_unix_secs: u64,
+) -> Result<AuthenticatedTlsSession, SecurityError> {
+    extract_authenticated_session_with_alpn(conn, LUMABRIDGE_ALPN_V1, now_unix_secs)
+}
+
+/// Inspect a completed TLS 1.3 connection requiring `expected_alpn` (`lumabridge-pair/1` or `lumabridge/1`).
+pub fn extract_authenticated_session_with_alpn<D>(
+    conn: &ConnectionCommon<D>,
+    expected_alpn: &[u8],
     now_unix_secs: u64,
 ) -> Result<AuthenticatedTlsSession, SecurityError> {
     if conn.is_handshaking() {
@@ -112,7 +140,7 @@ pub fn extract_authenticated_session<D>(
     let Some(alpn) = conn.alpn_protocol() else {
         return Err(SecurityError::AlpnMismatch);
     };
-    if alpn != LUMABRIDGE_ALPN_V1 {
+    if alpn != expected_alpn {
         return Err(SecurityError::AlpnMismatch);
     }
     let peer_certs = conn
