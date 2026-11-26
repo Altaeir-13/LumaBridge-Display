@@ -1170,7 +1170,7 @@ fn test_frame(
 
 #[test]
 fn gop_recovery_reorder_cooldown_and_wraparound() {
-    let mut sm = GopRecoveryStateMachine::new(RecoveryConfig::default()).expect("sm");
+    let mut sm = GopRecoveryStateMachine::new(1, 0, RecoveryConfig::default()).expect("sm");
     assert_eq!(sm.state(), RecoveryState::InitialAwaitingIdr);
 
     let a0 = sm.on_frame_completed(test_frame(1, 65_535, false), 1_000_000, false);
@@ -1197,30 +1197,34 @@ fn gop_recovery_reorder_cooldown_and_wraparound() {
     let ids: Vec<u32> = a3.deliver_frames.iter().map(|f| f.frame_id).collect();
     assert_eq!(ids, vec![3, 4]);
 
-    // Frame loss transitions to AwaitingIdr + respects 200 ms IDR request cooldown.
-    let a4 = sm.on_frame_lost(5, 65_535, 1_020_000);
-    assert!(a4.request_idr);
+    // Loss at 1_020_000 (20 ms after initial IDR request at 1_000_000) enters AwaitingIdr
+    // while persistent cooldown rate-limits the immediate IDR request!
+    let a4_cd = sm.on_frame_lost(1, 0, 5, 65_535, 1_020_000);
+    assert!(!a4_cd.request_idr);
     assert!(matches!(
         sm.state(),
         RecoveryState::AwaitingIdr {
             broken_gop_id: 65_535,
             last_good_frame_id: 4,
-            ..
         }
     ));
 
-    let drop_p = sm.on_frame_completed(test_frame(6, 65_535, false), 1_025_000, false);
+    // Once persistent cooldown from 1_000_000 expires at 1_220_000, IDR request is allowed.
+    let a4 = sm.on_frame_lost(1, 0, 5, 65_535, 1_220_000);
+    assert!(a4.request_idr);
+
+    let drop_p = sm.on_frame_completed(test_frame(6, 65_535, false), 1_225_000, false);
     assert_eq!(drop_p.dropped_dependent_frames, 1);
     assert!(!drop_p.request_idr);
 
-    let within_cd = sm.on_frame_lost(6, 65_535, 1_020_000 + DEFAULT_IDR_COOLDOWN_US - 1);
+    let within_cd = sm.on_frame_lost(1, 0, 6, 65_535, 1_220_000 + DEFAULT_IDR_COOLDOWN_US - 1);
     assert!(!within_cd.request_idr);
 
-    let past_cd = sm.on_frame_lost(7, 65_535, 1_020_000 + DEFAULT_IDR_COOLDOWN_US);
+    let past_cd = sm.on_frame_lost(1, 0, 7, 65_535, 1_220_000 + DEFAULT_IDR_COOLDOWN_US);
     assert!(past_cd.request_idr);
 
     // Modular gop_id wraparound 65_535 -> 0 on clean IDR recovers Healthy.
-    let a7 = sm.on_frame_completed(test_frame(8, 0, true), 1_250_000, false);
+    let a7 = sm.on_frame_completed(test_frame(8, 0, true), 1_450_000, false);
     assert_eq!(a7.deliver_frames.len(), 1);
     assert!(matches!(
         sm.state(),
@@ -1234,7 +1238,7 @@ fn gop_recovery_reorder_cooldown_and_wraparound() {
 #[test]
 fn gop_recovery_reorder_timeout_protected_blank_and_renewal() {
     let reasm = Reassembler::new(ReassemblyConfig::default()).expect("reasm");
-    let mut sm = GopRecoveryStateMachine::new(RecoveryConfig::default()).expect("sm");
+    let mut sm = GopRecoveryStateMachine::new(1, 0, RecoveryConfig::default()).expect("sm");
     let _ = sm.on_frame_completed(test_frame(1, 1, true), 10_000, false);
 
     // Buffer frame 3 with gap (2 missing), then expire reorder timeout.

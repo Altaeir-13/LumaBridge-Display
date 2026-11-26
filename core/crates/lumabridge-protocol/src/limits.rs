@@ -73,6 +73,19 @@ pub const MAX_IDR_COOLDOWN_US: u64 = 250_000;
 /// frame on the same display is still in flight.
 pub const DEFAULT_MAX_REORDER_COMPLETED_FRAMES: usize = 3;
 
+/// Default maximum total payload bytes retained across completed frames waiting in the GOP
+/// reorder queue for a single display (`16 MiB`).
+pub const DEFAULT_MAX_REORDER_BYTES: usize = 16 * 1024 * 1024;
+
+/// Hard upper bound for configurable per-display GOP reorder byte budgets (`32 MiB`).
+pub const MAX_REORDER_BYTES_CEILING: usize = 32 * 1024 * 1024;
+
+/// Default maximum unanswered `request_idr` emissions permitted while remaining in `AwaitingIdr`.
+pub const DEFAULT_MAX_UNANSWERED_IDR_REQUESTS: u32 = 16;
+
+/// Architectural ceiling for simultaneous incomplete frames per display (`4`).
+pub const MAX_INCOMPLETE_FRAMES_PER_DISPLAY: usize = DEFAULT_MAX_INCOMPLETE_FRAMES_PER_DISPLAY;
+
 /// `frame_id` renewal threshold triggering controlled session renewal before exhausting `u32`.
 pub const FRAME_ID_RENEWAL_THRESHOLD: u32 = u32::MAX - 10_000;
 
@@ -280,7 +293,9 @@ impl ReassemblyConfig {
 pub struct RecoveryConfig {
     pub idr_request_cooldown_us: u64,
     pub max_reorder_completed_frames: usize,
+    pub max_reorder_bytes: usize,
     pub reorder_gap_timeout_us: u64,
+    pub max_unanswered_idr_requests: u32,
     pub frame_id_renewal_threshold: u32,
 }
 
@@ -289,7 +304,9 @@ impl Default for RecoveryConfig {
         Self {
             idr_request_cooldown_us: DEFAULT_IDR_COOLDOWN_US,
             max_reorder_completed_frames: DEFAULT_MAX_REORDER_COMPLETED_FRAMES,
+            max_reorder_bytes: DEFAULT_MAX_REORDER_BYTES,
             reorder_gap_timeout_us: DEFAULT_FRAGMENT_TIMEOUT_US,
+            max_unanswered_idr_requests: DEFAULT_MAX_UNANSWERED_IDR_REQUESTS,
             frame_id_renewal_threshold: FRAME_ID_RENEWAL_THRESHOLD,
         }
     }
@@ -310,9 +327,21 @@ impl RecoveryConfig {
                 "max_reorder_completed_frames must be <= 16",
             ));
         }
+        if self.max_reorder_completed_frames > 0
+            && (self.max_reorder_bytes == 0 || self.max_reorder_bytes > MAX_REORDER_BYTES_CEILING)
+        {
+            return Err(LimitConfigError::InvalidValue(
+                "max_reorder_bytes must be within 1..=32 MiB when reordering is enabled",
+            ));
+        }
         if self.reorder_gap_timeout_us == 0 {
             return Err(LimitConfigError::InvalidValue(
                 "reorder_gap_timeout_us must be non-zero",
+            ));
+        }
+        if self.max_unanswered_idr_requests == 0 || self.max_unanswered_idr_requests > 64 {
+            return Err(LimitConfigError::InvalidValue(
+                "max_unanswered_idr_requests must be within 1..=64",
             ));
         }
         if self.frame_id_renewal_threshold == 0 {
