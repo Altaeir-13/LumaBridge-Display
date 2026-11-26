@@ -1247,6 +1247,28 @@ fn gop_recovery_reorder_timeout_protected_blank_and_renewal() {
     assert_eq!(sm.queued_reorder_len(), 0);
 
     let mut r_blank = Reassembler::new(ReassemblyConfig::default()).expect("r");
+    let pkt_budget = PacketBudget::new(1024, 1500).expect("b");
+    let older_pkts = fragment_frame(
+        &FrameToFragment {
+            session_id: 1,
+            display_id: 0,
+            codec_id: CodecId::H264,
+            frame_id: 8,
+            gop_id: 1,
+            capture_ts_us: 8000,
+            encode_done_ts_us: 8000,
+            kind: FrameKind::InterFrame,
+            has_codec_config: false,
+            mirror_source: false,
+            payload: &[0x55u8; 1500],
+        },
+        pkt_budget,
+    )
+    .expect("2 frags");
+    let _ = r_blank
+        .ingest_packet(&older_pkts[0], 1024, 1_255_000)
+        .expect("old frag0");
+
     let blank_pkt = fragment_frame(
         &FrameToFragment {
             session_id: 1,
@@ -1261,14 +1283,42 @@ fn gop_recovery_reorder_timeout_protected_blank_and_renewal() {
             mirror_source: false,
             payload: &[],
         },
-        PacketBudget::new(1024, 1500).expect("b"),
+        pkt_budget,
     )
     .expect("blank");
     let rep_b = r_blank
         .ingest_packet(&blank_pkt[0], 1024, 1_260_000)
         .expect("ok");
+    assert_eq!(rep_b.discarded.len(), 1);
+    assert_eq!(
+        rep_b.discarded[0].reason,
+        DiscardReason::EvictedByProtectedBlank
+    );
     let blank_actions = sm.on_reassembly_report(rep_b, 1_260_000, &reasm);
     assert!(blank_actions.hide_content_for_protected_blank);
+    assert!(matches!(
+        sm.state(),
+        RecoveryState::ProtectedBlanked {
+            last_blank_frame_id: 9
+        }
+    ));
+
+    // Late delayed fragment from frame 8 MUST be StaleIgnored and cannot re-present prior content.
+    let late_rep = r_blank
+        .ingest_packet(&older_pkts[1], 1024, 1_265_000)
+        .expect("late ignored");
+    assert_eq!(
+        late_rep.outcome,
+        ReassemblyOutcome::StaleIgnored { frame_id: 8 }
+    );
+    assert_eq!(r_blank.stats().global_total_bytes(), 0);
+    let late_actions = sm.on_reassembly_report(late_rep, 1_265_000, &r_blank);
+    assert!(late_actions.deliver_frames.is_empty());
+
+    // Orphan P-frame 10 remains suppressed while ProtectedBlanked until clean IDR.
+    let p_after_blank = sm.on_frame_completed(test_frame(10, 1, false), 1_270_000, false);
+    assert!(p_after_blank.deliver_frames.is_empty());
+    assert_eq!(p_after_blank.dropped_dependent_frames, 1);
     assert!(matches!(
         sm.state(),
         RecoveryState::ProtectedBlanked {

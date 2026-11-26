@@ -387,3 +387,111 @@ fn cbor_distinguishes_representation_vs_semantic_errors_and_handles_unknown_fiel
         CborError::DepthExceeded
     );
 }
+
+#[test]
+fn fuzz_regression_corpus_never_panics() {
+    use lumabridge_protocol::limits::{ReassemblyConfig, VIDEO_HEADER_LEN};
+    use lumabridge_protocol::media::header::decode_video_packet;
+    use lumabridge_protocol::media::reassembly::Reassembler;
+    use lumabridge_protocol::validation::{
+        validate_frame_context, ConnectionPhase, Direction, ValidationContext,
+    };
+    use lumabridge_protocol::version::Alpn;
+
+    let raw = include_str!("corpus/fuzz_regression_corpus.hex");
+    let flimits = FramingLimits::default();
+    let cfg = ReassemblyConfig::default();
+    let all_msg_types = [
+        MsgType::PairHello,
+        MsgType::PairSpakeMsg,
+        MsgType::PairQrAuth,
+        MsgType::PairConfirm,
+        MsgType::PairCancel,
+        MsgType::Hello,
+        MsgType::HelloAck,
+        MsgType::NodeCapabilities,
+        MsgType::SessionOpenRequest,
+        MsgType::SessionOpenResponse,
+        MsgType::DisplayConfigUpdate,
+        MsgType::SessionResumeRequest,
+        MsgType::SessionResumeResponse,
+        MsgType::SessionClose,
+        MsgType::PermissionUpgradeRequest,
+        MsgType::PermissionUpdate,
+        MsgType::MediaFeedback,
+        MsgType::ClockSyncPing,
+        MsgType::ClockSyncPong,
+        MsgType::Heartbeat,
+        MsgType::DiagnosticsSummary,
+        MsgType::InputBatch,
+        MsgType::ErrorNotice,
+    ];
+
+    let mut replayed = 0usize;
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.split('|').collect();
+        assert_eq!(parts.len(), 3, "expected 3 pipe-separated fields");
+        let target = parts[0].trim();
+        let data = decode_hex(parts[2]);
+        replayed += 1;
+
+        match target {
+            "fuzz_framing" => {
+                let mut dec =
+                    StreamFrameDecoder::new(flimits, StreamBindingMode::Multiplexed).expect("dec");
+                let payload = data.get(2..).unwrap_or(&data);
+                for ch in payload.chunks(7) {
+                    if dec.feed(ch).is_err() {
+                        break;
+                    }
+                    while matches!(dec.next_frame(), Ok(Some(_))) {}
+                }
+                let _ = dec.finish_eof();
+            }
+            "fuzz_cbor_control" => {
+                let idx = usize::from(data.first().copied().unwrap_or(0)) % all_msg_types.len();
+                let body = data.get(2..).unwrap_or(&data);
+                let _ = ControlMessage::decode_cbor(
+                    all_msg_types[idx],
+                    body,
+                    CborDecodeOptions::default(),
+                );
+            }
+            "fuzz_video_header" => {
+                let pkt = if data.len() >= 2 { &data[2..] } else { &data };
+                let _ = decode_video_packet(pkt, flimits.max_media_stream_bytes);
+            }
+            "fuzz_media_reassembly" => {
+                let mut reasm = Reassembler::new(cfg).expect("reasm");
+                if data.len() >= VIDEO_HEADER_LEN {
+                    let _ = reasm.ingest_packet(&data, flimits.max_media_stream_bytes, 10_000);
+                }
+                assert!(reasm.stats().global_total_bytes() <= cfg.max_global_bytes);
+            }
+            "fuzz_contextual_validation" => {
+                let ctx = ValidationContext {
+                    alpn: Alpn::Operational,
+                    channel: ChannelId::Control,
+                    direction: Direction::InitiatorToAcceptor,
+                    phase: ConnectionPhase::OperationalAuthenticated,
+                    effective_perms: Permissions::VIEW_MIRROR,
+                    active_session_id: Some(1),
+                };
+                if data.len() >= 8 {
+                    let mut raw_hdr: [u8; 8] = data[..8].try_into().expect("8B");
+                    raw_hdr[7] &= 0x01;
+                    if let Ok(hdr) = FrameHeader::decode(&raw_hdr, &flimits) {
+                        let _ = validate_frame_context(&ctx, hdr);
+                    }
+                }
+            }
+            other => panic!("unexpected fuzz target in regression corpus: {other}"),
+        }
+    }
+
+    assert_eq!(replayed, 40, "all 40 fuzz regression vectors must replay");
+}

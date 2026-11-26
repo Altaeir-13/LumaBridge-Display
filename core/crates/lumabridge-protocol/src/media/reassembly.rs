@@ -725,7 +725,7 @@ impl Reassembler {
         threshold_frame_id: u32,
         reason: DiscardReason,
     ) -> Vec<DiscardedFrameNotice> {
-        let older_ids: Vec<u32> = self.displays.get(&key).map_or_default(|d| {
+        let older_ids: Vec<u32> = self.displays.get(&key).map_or_else(Vec::new, |d| {
             d.pending
                 .keys()
                 .copied()
