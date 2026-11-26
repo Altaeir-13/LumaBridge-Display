@@ -21,11 +21,18 @@ fuzz_target!(|data: &[u8]| {
         metadata_overhead_per_fragment_bytes: 64,
         fragment_timeout_us: 150_000,
     };
+    let rec_cfg = RecoveryConfig {
+        max_reorder_bytes: 128 * 1024,
+        ..RecoveryConfig::default()
+    };
 
     let Ok(mut reasm) = Reassembler::new(cfg) else {
         return;
     };
-    let Ok(mut recovery) = GopRecoveryStateMachine::new(RecoveryConfig::default()) else {
+    let Ok(mut rec_s1_d0) = GopRecoveryStateMachine::new(1, 0, rec_cfg) else {
+        return;
+    };
+    let Ok(mut rec_s2_d0) = GopRecoveryStateMachine::new(2, 0, rec_cfg) else {
         return;
     };
 
@@ -42,25 +49,26 @@ fuzz_target!(|data: &[u8]| {
         match op & 0xE0 {
             0xE0 => {
                 let notices = reasm.expire(now_us);
-                let _ = recovery.on_discarded_notices(&notices, now_us);
+                let _ = rec_s1_d0.on_discarded_notices(&notices, now_us);
+                let _ = rec_s2_d0.on_discarded_notices(&notices, now_us);
             }
             0xC0 => {
-                let _ = recovery.poll_reorder_timeout(now_us);
+                let _ = rec_s1_d0.poll_timers(now_us);
+                let _ = rec_s2_d0.poll_timers(now_us);
             }
             0xA0 => {
                 if (op & 0x01) == 0 {
-                    reasm.remove_display(u64::from(op & 0x03), u16::from((op >> 2) & 0x03));
+                    reasm.remove_display(u64::from((op & 0x03) + 1), u16::from((op >> 2) & 0x03));
                 } else {
-                    reasm.remove_session(u64::from(op & 0x03));
+                    reasm.remove_session(u64::from((op & 0x03) + 1));
                 }
             }
             0x80 => {
-                // Structured-but-fuzzed VideoPacketHeader path so deep reassembly/GOP state runs
                 if cursor + 10 > data.len() {
                     break;
                 }
-                let sid = u64::from((data[cursor] & 0x03) + 1);
-                let did = u16::from(data[cursor + 1] & 0x03);
+                let sid = u64::from((data[cursor] & 0x01) + 1);
+                let did = u16::from(data[cursor + 1] & 0x01);
                 let fid = u32::from((data[cursor + 2] & 0x1F) + 1);
                 let gop = u16::from(data[cursor + 3] & 0x07);
                 let frag_count = u16::from((data[cursor + 4] & 0x07) + 1);
@@ -99,16 +107,22 @@ fuzz_target!(|data: &[u8]| {
                     capture_ts_us: cts,
                     encode_done_ts_us: cts + 50,
                 };
-                if hdr.validate(2048).is_ok() {
-                    let report = reasm.ingest_decoded(hdr, chunk, now_us);
+                // Exercise untrusted-style ingest_decoded directly without pre-validating hdr.
+                if let Ok(report) = reasm.ingest_decoded(hdr, chunk, now_us) {
                     if let ReassemblyOutcome::Completed(ref f) = report.outcome {
                         assert!(f.payload.len() <= cfg.max_frame_bytes);
                     }
-                    let _ = recovery.on_reassembly_report(report, now_us, &reasm);
+                    let a1 = rec_s1_d0.on_reassembly_report(report.clone(), now_us, &reasm);
+                    let a2 = rec_s2_d0.on_reassembly_report(report, now_us, &reasm);
+                    if sid == 2 || did != 0 {
+                        assert!(a1.deliver_frames.is_empty());
+                    }
+                    if sid == 1 || did != 0 {
+                        assert!(a2.deliver_frames.is_empty());
+                    }
                 }
             }
             _ => {
-                // Arbitrary raw bytes path into decode_video_packet + Reassembler
                 if cursor + 2 > data.len() {
                     break;
                 }
@@ -119,7 +133,8 @@ fuzz_target!(|data: &[u8]| {
                 cursor += take;
 
                 if let Ok(report) = reasm.ingest_packet(pkt, 2048, now_us) {
-                    let _ = recovery.on_reassembly_report(report, now_us, &reasm);
+                    let _ = rec_s1_d0.on_reassembly_report(report.clone(), now_us, &reasm);
+                    let _ = rec_s2_d0.on_reassembly_report(report, now_us, &reasm);
                 }
             }
         }
@@ -128,6 +143,8 @@ fuzz_target!(|data: &[u8]| {
         assert!(stats.global_total_bytes() <= cfg.max_global_bytes);
         assert!(stats.total_pending_frames <= cfg.max_pending_frames);
         assert!(stats.total_displays <= cfg.max_total_displays);
+        assert!(rec_s1_d0.queued_reorder_bytes() <= rec_cfg.max_reorder_bytes);
+        assert!(rec_s2_d0.queued_reorder_bytes() <= rec_cfg.max_reorder_bytes);
     }
 
     reasm.clear();

@@ -1343,3 +1343,594 @@ fn gop_recovery_reorder_timeout_protected_blank_and_renewal() {
     );
     assert!(renewal.session_renewal_required);
 }
+
+#[test]
+fn diagnostic_privacy_redacts_raw_stream_decoder_and_protocol_sentinels() {
+    let flimits = FramingLimits::default();
+    let stream_sentinel = b"PARTIAL_STREAM_CAFEBABE_987654";
+    let raw = encode_stream_frame(
+        ChannelId::Control,
+        MsgType::Hello.as_u16(),
+        FrameFlags::NONE,
+        stream_sentinel,
+        &flimits,
+    )
+    .expect("encode sentinel");
+
+    // 1. Complete RawStreamFrame & DecodeStep::Frame must redact raw payload bytes.
+    let mut dec = StreamFrameDecoder::new(flimits, StreamBindingMode::Multiplexed).expect("dec");
+    dec.feed(&raw[..raw.len() - 4])
+        .expect("feed partial payload");
+    assert!(dec.next_frame().expect("no error").is_none());
+    dec.feed(b"TAIL_QUEUE_DEAD_BEEF_77").expect("queue bytes");
+
+    let dec_dbg = format!("{dec:?}");
+    let dec_pretty = format!("{dec:#?}");
+    assert!(dec_dbg.contains("received_bytes"));
+    assert!(dec_dbg.contains("buffered_input_len"));
+    assert!(!dec_dbg.contains("CAFEBABE") && !dec_pretty.contains("CAFEBABE"));
+    assert!(!dec_dbg.contains("80, 65") && !dec_pretty.contains("80, 65"));
+    assert!(!dec_dbg.contains("TAIL_QUEUE") && !dec_pretty.contains("84, 65"));
+
+    let mut dec_full =
+        StreamFrameDecoder::new(flimits, StreamBindingMode::Multiplexed).expect("full");
+    dec_full.feed(&raw).expect("feed");
+    let frame = dec_full.next_frame().expect("ok").expect("complete");
+    let step = DecodeStep::Frame {
+        frame: frame.clone(),
+        consumed: raw.len(),
+    };
+    for txt in [
+        format!("{frame:?}"),
+        format!("{frame:#?}"),
+        format!("{step:?}"),
+        format!("{step:#?}"),
+    ] {
+        assert!(txt.contains("payload_len"));
+        assert!(!txt.contains("CAFEBABE") && !txt.contains("80, 65"));
+    }
+
+    // 2. Reassembler & GopRecoveryStateMachine & Input/Pairing messages redact secrets/payloads.
+    let mut reasm = Reassembler::new(ReassemblyConfig::default()).expect("reasm");
+    let pkt = fragment_frame(
+        &FrameToFragment {
+            session_id: 1,
+            display_id: 0,
+            codec_id: CodecId::H264,
+            frame_id: 1,
+            gop_id: 1,
+            capture_ts_us: 100,
+            encode_done_ts_us: 100,
+            kind: FrameKind::InterFrame,
+            has_codec_config: false,
+            mirror_source: false,
+            payload: b"VIDEO_SENTINEL_SECRET",
+        },
+        PacketBudget::new(512, 1500).expect("b"),
+    )
+    .expect("pkt");
+    let _ = reasm.ingest_packet(&pkt[0], 1500, 500).expect("ingest");
+    let mut sm = GopRecoveryStateMachine::new(1, 0, RecoveryConfig::default()).expect("sm");
+    let _ = sm.on_frame_completed(test_frame(1, 1, true), 500, false);
+
+    let reasm_dbg = format!("{reasm:?}\n{reasm:#?}");
+    let sm_dbg = format!("{sm:?}\n{sm:#?}");
+    assert!(reasm_dbg.contains("stats") && !reasm_dbg.contains("VIDEO_SENTINEL"));
+    assert!(sm_dbg.contains("queued_reorder_bytes") && !sm_dbg.contains("VIDEO_SENTINEL"));
+
+    for msg in sample_all_23_messages() {
+        let s = format!("{msg:?}\n{msg:#?}");
+        assert!(!s.contains("32768"), "input x_norm leaked in {s}");
+        assert!(!s.contains("hid_usage_id"), "keycode leaked in {s}");
+        assert!(
+            !s.contains("153,") && !s.contains("153\n"),
+            "resume token leaked"
+        );
+    }
+}
+
+#[test]
+fn stream_eof_contract_all_seven_scenarios_and_mixed_mode_anti_reordering() {
+    let flimits = FramingLimits::default();
+    let frame1 = encode_stream_frame(
+        ChannelId::Control,
+        MsgType::Hello.as_u16(),
+        FrameFlags::NONE,
+        b"first-complete-record",
+        &flimits,
+    )
+    .expect("f1");
+    let frame2 = encode_stream_frame(
+        ChannelId::Feedback,
+        MsgType::Heartbeat.as_u16(),
+        FrameFlags::NONE,
+        b"second-record-truncated",
+        &flimits,
+    )
+    .expect("f2");
+
+    // 1. Empty stream -> clean EOF, idempotent, blocks new writes.
+    let mut d1 = StreamFrameDecoder::new(flimits, StreamBindingMode::Multiplexed).expect("d1");
+    assert!(d1.finish_eof().is_ok());
+    assert!(d1.is_eof());
+    assert!(d1.finish_eof().is_ok());
+    assert_eq!(d1.feed(&frame1), Err(FrameError::StreamClosed));
+    assert_eq!(d1.step_slice(&frame1), Err(FrameError::StreamClosed));
+
+    // 2 & 3. Complete record pending in feed() queue MUST NOT be lost on finish_eof().
+    let mut d3 = StreamFrameDecoder::new(flimits, StreamBindingMode::Multiplexed).expect("d3");
+    d3.feed(&frame1).expect("feed");
+    assert_eq!(
+        d3.finish_eof(),
+        Err(FrameError::PendingBufferedInput {
+            buffered_bytes: frame1.len()
+        })
+    );
+    assert!(!d3.is_poisoned());
+    // Mixed-mode anti-reordering check while bytes are queued:
+    assert_eq!(
+        d3.step_slice(b"bypass"),
+        Err(FrameError::PendingBufferedInput {
+            buffered_bytes: frame1.len()
+        })
+    );
+    let recovered = d3.next_frame().expect("drain ok").expect("preserved f1");
+    assert_eq!(recovered.payload, b"first-complete-record");
+    assert!(d3.next_frame().expect("empty").is_none());
+    assert!(d3.finish_eof().is_ok());
+
+    // 4 & 5. Incomplete header & incomplete payload after draining -> poison & error.
+    let mut d4 = StreamFrameDecoder::new(flimits, StreamBindingMode::Multiplexed).expect("d4");
+    d4.feed(&frame1[..5]).expect("hdr");
+    assert!(d4.next_frame().expect("need more").is_none());
+    assert_eq!(d4.finish_eof(), Err(FrameError::UnexpectedEofInHeader));
+    assert!(d4.is_poisoned());
+
+    let mut d5 = StreamFrameDecoder::new(flimits, StreamBindingMode::Multiplexed).expect("d5");
+    d5.feed(&frame1[..frame1.len() - 2]).expect("payload");
+    assert!(d5.next_frame().expect("need more").is_none());
+    assert_eq!(d5.finish_eof(), Err(FrameError::UnexpectedEofInPayload));
+    assert!(d5.is_poisoned());
+
+    // 6. Complete record followed by truncated second record -> delivers #1 then errors on #2.
+    let mut d6 = StreamFrameDecoder::new(flimits, StreamBindingMode::Multiplexed).expect("d6");
+    let mut combined = frame1.clone();
+    combined.extend_from_slice(&frame2[..12]);
+    d6.feed(&combined).expect("feed combined");
+    assert!(matches!(
+        d6.finish_eof(),
+        Err(FrameError::PendingBufferedInput { .. })
+    ));
+    let got1 = d6.next_frame().expect("ok").expect("got frame1");
+    assert_eq!(got1.payload, b"first-complete-record");
+    assert!(d6.next_frame().expect("need more for frame2").is_none());
+    assert_eq!(d6.finish_eof(), Err(FrameError::UnexpectedEofInPayload));
+
+    // 7. Previously poisoned decoder stays poisoned on finish_eof().
+    assert_eq!(d6.finish_eof(), Err(FrameError::UnexpectedEofInPayload));
+}
+
+#[test]
+fn recovery_isolation_across_displays_and_sessions() {
+    let cfg = ReassemblyConfig {
+        fragment_timeout_us: 100_000,
+        ..ReassemblyConfig::default()
+    };
+    let mut reasm = Reassembler::new(cfg).expect("reasm");
+
+    let mut rec_s1_d0 =
+        GopRecoveryStateMachine::new(1, 0, RecoveryConfig::default()).expect("s1d0");
+    let mut rec_s1_d1 =
+        GopRecoveryStateMachine::new(1, 1, RecoveryConfig::default()).expect("s1d1");
+    let mut rec_s2_d0 =
+        GopRecoveryStateMachine::new(2, 0, RecoveryConfig::default()).expect("s2d0");
+
+    // Initialize IDRs on s1d0 and s2d0; s1d1 stays InitialAwaitingIdr.
+    let make = |sid: u64, did: u16, fid: u32, gop: u16, key: bool| {
+        lumabridge_protocol::media::reassembly::ReassembledFrame {
+            session_id: sid,
+            display_id: did,
+            codec_id: CodecId::H264,
+            frame_id: fid,
+            gop_id: gop,
+            flags: if key {
+                VideoFlags::KEYFRAME
+            } else {
+                VideoFlags::NONE
+            },
+            capture_ts_us: 1000,
+            encode_done_ts_us: 1100,
+            payload: vec![0xAA; 16],
+        }
+    };
+    let _ = rec_s1_d0.on_frame_completed(make(1, 0, 1, 7, true), 10_000, false);
+    let _ = rec_s2_d0.on_frame_completed(make(2, 0, 1, 7, true), 10_000, false);
+
+    // Foreign ProtectedBlank or frame loss MUST be ignored with zero state mutation.
+    let blank_s2_d0_hdr = VideoPacketHeader {
+        flags: VideoFlags::PROTECTED_BLANK.union(VideoFlags::END_OF_FRAME),
+        session_id: 2,
+        display_id: 0,
+        codec_id: CodecId::H264,
+        frame_id: 2,
+        gop_id: 7,
+        frag_index: 0,
+        frag_count: 1,
+        payload_len: 0,
+        capture_ts_us: 2000,
+        encode_done_ts_us: 2000,
+    };
+    let rep_blank = reasm
+        .ingest_decoded(blank_s2_d0_hdr, &[], 20_000)
+        .expect("blank");
+    let a_foreign_s1d0 = rec_s1_d0.on_reassembly_report(rep_blank.clone(), 20_000, &reasm);
+    assert_eq!(a_foreign_s1d0.ignored_foreign_events, 1);
+    assert!(!a_foreign_s1d0.hide_content_for_protected_blank);
+    assert!(matches!(
+        rec_s1_d0.state(),
+        RecoveryState::Healthy {
+            active_gop_id: 7,
+            last_delivered_frame_id: 1
+        }
+    ));
+
+    let a_own_s2d0 = rec_s2_d0.on_reassembly_report(rep_blank, 20_000, &reasm);
+    assert!(a_own_s2d0.hide_content_for_protected_blank);
+    assert!(matches!(
+        rec_s2_d0.state(),
+        RecoveryState::ProtectedBlanked {
+            last_blank_frame_id: 2
+        }
+    ));
+
+    // Global expire across multiple displays routes cleanly only to matching machine.
+    let budget = PacketBudget::new(512, 1500).expect("b");
+    let p_s1d1 = fragment_frame(
+        &FrameToFragment {
+            session_id: 1,
+            display_id: 1,
+            codec_id: CodecId::H264,
+            frame_id: 2,
+            gop_id: 7,
+            capture_ts_us: 3000,
+            encode_done_ts_us: 3100,
+            kind: FrameKind::InterFrame,
+            has_codec_config: false,
+            mirror_source: false,
+            payload: &[0x11; 900],
+        },
+        budget,
+    )
+    .expect("2 frags");
+    let _ = reasm.ingest_packet(&p_s1d1[0], 1500, 30_000).expect("f0");
+    let notices = reasm.expire(30_000 + cfg.fragment_timeout_us);
+    assert_eq!(notices.len(), 1);
+
+    let ign_s1d0 = rec_s1_d0.on_discarded_notices(&notices, 130_000);
+    assert_eq!(ign_s1d0.ignored_foreign_events, 1);
+    assert!(!ign_s1d0.request_idr);
+    let act_s1d1 = rec_s1_d1.on_discarded_notices(&notices, 130_000);
+    assert!(act_s1d1.request_idr);
+
+    // remove_session(1) must leave session 2 untouched.
+    let p_s2_pending = fragment_frame(
+        &FrameToFragment {
+            session_id: 2,
+            display_id: 0,
+            codec_id: CodecId::H264,
+            frame_id: 5,
+            gop_id: 8,
+            capture_ts_us: 5000,
+            encode_done_ts_us: 5100,
+            kind: FrameKind::InterFrame,
+            has_codec_config: false,
+            mirror_source: false,
+            payload: &[0x22; 900],
+        },
+        budget,
+    )
+    .expect("2 frags");
+    let _ = reasm
+        .ingest_packet(&p_s2_pending[0], 1500, 140_000)
+        .expect("s2");
+    let _ = reasm.remove_session(1);
+    assert_eq!(reasm.stats().total_pending_frames, 1);
+}
+
+#[test]
+fn recovery_idr_cooldown_all_eight_scenarios_and_retry_cap() {
+    let rec_cfg = RecoveryConfig {
+        max_unanswered_idr_requests: 3,
+        ..RecoveryConfig::default()
+    };
+    let mut sm = GopRecoveryStateMachine::new(1, 0, rec_cfg).expect("sm");
+    let mut other = GopRecoveryStateMachine::new(1, 1, rec_cfg).expect("other");
+
+    // 1. First loss at t=1_000_000 -> emits IDR (1/3).
+    assert!(sm.on_frame_lost(1, 0, 1, 1, 1_000_000).request_idr);
+    // 8. Independent display still unaffected and emits at same timestamp.
+    assert!(other.on_frame_lost(1, 1, 1, 1, 1_000_000).request_idr);
+
+    // 2. Consecutive losses inside 200ms suppressed.
+    assert!(!sm.on_frame_lost(1, 0, 2, 1, 1_050_000).request_idr);
+
+    // 3. Recovery AwaitingIdr -> Healthy, then new loss BEFORE cooldown expires (< 200ms).
+    let _ = sm.on_frame_completed(test_frame(3, 2, true), 1_060_000, false);
+    let immediate_loss = sm.on_frame_lost(1, 0, 4, 2, 1_100_000);
+    assert!(!immediate_loss.request_idr);
+    assert_eq!(sm.last_idr_request_us(), Some(1_000_000));
+
+    // 4. Recovery followed by loss AFTER cooldown (>= 1_200_000) emits cleanly.
+    let _ = sm.on_frame_completed(test_frame(5, 3, true), 1_150_000, false);
+    assert!(sm.on_frame_lost(1, 0, 6, 3, 1_200_000).request_idr);
+
+    // 5 & 6. Unanswered IDR timers retry after cooldown up to max_unanswered_idr_requests (3).
+    assert!(!sm.poll_idr_retry(1_399_999).request_idr);
+    assert!(sm.poll_idr_retry(1_400_000).request_idr); // retry #2
+    assert!(sm.poll_idr_retry(1_600_000).request_idr); // retry #3 (hits cap)
+    assert!(!sm.poll_idr_retry(1_800_000).request_idr); // capped!
+
+    // 7. Reset clears cooldown and unanswered counter.
+    sm.reset();
+    assert_eq!(sm.last_idr_request_us(), None);
+    assert!(sm.on_frame_lost(1, 0, 1, 1, 1_800_100).request_idr);
+}
+
+#[test]
+fn recovery_reorder_timeout_all_scenarios_and_byte_budget() {
+    let rec_cfg = RecoveryConfig {
+        max_reorder_completed_frames: 3,
+        max_reorder_bytes: 2000,
+        reorder_gap_timeout_us: 150_000,
+        ..RecoveryConfig::default()
+    };
+    let mut sm = GopRecoveryStateMachine::new(1, 0, rec_cfg).expect("sm");
+    let mk = |fid: u32, size: usize, key: bool| {
+        lumabridge_protocol::media::reassembly::ReassembledFrame {
+            session_id: 1,
+            display_id: 0,
+            codec_id: CodecId::H264,
+            frame_id: fid,
+            gop_id: 1,
+            flags: if key {
+                VideoFlags::KEYFRAME
+            } else {
+                VideoFlags::NONE
+            },
+            capture_ts_us: u64::from(fid) * 1000,
+            encode_done_ts_us: u64::from(fid) * 1000,
+            payload: vec![0x55; size],
+        }
+    };
+
+    // Baseline IDR (fid=1).
+    let _ = sm.on_frame_completed(mk(1, 100, true), 10_000, false);
+
+    // Recoverable reorder + duplicate inside queue must not double-count bytes!
+    let _ = sm.on_frame_completed(mk(3, 500, false), 20_000, true);
+    assert_eq!(sm.queued_reorder_bytes(), 500);
+    let dup = sm.on_frame_completed(mk(3, 500, false), 30_000, true);
+    assert_eq!(dup.dropped_dependent_frames, 1);
+    assert_eq!(sm.queued_reorder_bytes(), 500);
+    let drained = sm.on_frame_completed(mk(2, 100, false), 35_000, false);
+    assert_eq!(drained.deliver_frames.len(), 2);
+    assert_eq!(sm.queued_reorder_bytes(), 0);
+
+    // Late lower frame_id MUST NOT shift earlier arrival timeout!
+    // Gap is fid=4: fid=6 arrives at t=100_000; fid=5 arrives late at t=220_000.
+    let _ = sm.on_frame_completed(mk(6, 400, false), 100_000, true);
+    let _ = sm.on_frame_completed(mk(5, 400, false), 220_000, true);
+    assert!(!sm.poll_reorder_timeout(249_999).request_idr);
+    let expired = sm.poll_reorder_timeout(250_000);
+    assert!(expired.request_idr);
+    assert_eq!(expired.dropped_dependent_frames, 2);
+    assert_eq!(sm.queued_reorder_bytes(), 0);
+
+    // Byte budget exceeded inside reorder queue transitions immediately to AwaitingIdr.
+    let _ = sm.on_frame_completed(mk(7, 100, true), 500_000, false);
+    let _ = sm.on_frame_completed(mk(9, 1500, false), 510_000, true);
+    let over_bytes = sm.on_frame_completed(mk(10, 600, false), 520_000, true);
+    assert!(over_bytes.request_idr);
+    assert_eq!(over_bytes.dropped_dependent_frames, 2);
+    assert_eq!(sm.queued_reorder_bytes(), 0);
+}
+
+#[test]
+fn reassembly_config_cap_and_retired_floor_out_of_order_eviction() {
+    let bad_cfg = ReassemblyConfig {
+        max_incomplete_frames_per_display: 5,
+        ..ReassemblyConfig::default()
+    };
+    assert!(bad_cfg.validate().is_err());
+
+    let mut reasm = Reassembler::new(ReassemblyConfig::default()).expect("reasm");
+    let make_frag = |fid: u32, idx: u16, count: u16| VideoPacketHeader {
+        flags: if idx == count - 1 {
+            VideoFlags::END_OF_FRAME
+        } else {
+            VideoFlags::NONE
+        },
+        session_id: 1,
+        display_id: 0,
+        codec_id: CodecId::H264,
+        frame_id: fid,
+        gop_id: 1,
+        frag_index: idx,
+        frag_count: count,
+        payload_len: 100,
+        capture_ts_us: 100,
+        encode_done_ts_us: 100,
+    };
+
+    // Keep frame_id=10 pending (incomplete) while retiring > 256 higher/surrounding non-keyframe IDs!
+    let _ = reasm
+        .ingest_decoded(make_frag(10, 0, 2), &[0x10; 100], 1_000)
+        .expect("pending 10");
+    let _ = reasm
+        .ingest_decoded(make_frag(5, 0, 1), &[0x05; 100], 2_000)
+        .expect("retire 5");
+    for fid in 20..=275u32 {
+        let _ = reasm
+            .ingest_decoded(make_frag(fid, 0, 1), &[0x20; 100], 3_000)
+            .expect("retire high");
+    }
+    // At 257 entries, popping min (5) sets retired_floor=5; frame 10 still alive!
+    assert_eq!(reasm.stats().total_pending_frames, 1);
+
+    // Retiring 276 pops min (20) -> retired_floor advances to 20 -> pending frame 10 MUST be evicted!
+    let rep = reasm
+        .ingest_decoded(make_frag(276, 0, 1), &[0x30; 100], 4_000)
+        .expect("advance floor");
+    assert_eq!(rep.discarded.len(), 1);
+    assert_eq!(rep.discarded[0].frame_id, 10);
+    assert_eq!(rep.discarded[0].reason, DiscardReason::EvictedByWindow);
+    assert_eq!(reasm.stats().total_pending_frames, 0);
+    assert_eq!(reasm.stats().global_total_bytes(), 0);
+}
+
+#[test]
+fn ingest_decoded_enforces_structural_invariants_and_protected_blank_edges() {
+    let mut reasm = Reassembler::new(ReassemblyConfig::default()).expect("reasm");
+    let mut bad = VideoPacketHeader {
+        flags: VideoFlags::END_OF_FRAME,
+        session_id: 0,
+        display_id: 0,
+        codec_id: CodecId::H264,
+        frame_id: 1,
+        gop_id: 1,
+        frag_index: 0,
+        frag_count: 1,
+        payload_len: 4,
+        capture_ts_us: 100,
+        encode_done_ts_us: 100,
+    };
+    assert_eq!(
+        reasm.ingest_decoded(bad, &[1, 2, 3, 4], 10),
+        Err(VideoHeaderError::InvalidSessionIdZero)
+    );
+    bad.session_id = 1;
+    assert_eq!(
+        reasm.ingest_decoded(bad, &[1, 2], 10),
+        Err(VideoHeaderError::PayloadLenMismatch {
+            header_len: 4,
+            actual_len: 2
+        })
+    );
+    assert_eq!(reasm.stats().global_total_bytes(), 0);
+
+    // Conflicting ProtectedBlank sharing frame_id=20 with a pending media frame gets rejected cleanly.
+    let p20 = VideoPacketHeader {
+        flags: VideoFlags::NONE,
+        session_id: 1,
+        display_id: 0,
+        codec_id: CodecId::H264,
+        frame_id: 20,
+        gop_id: 1,
+        frag_index: 0,
+        frag_count: 2,
+        payload_len: 10,
+        capture_ts_us: 100,
+        encode_done_ts_us: 100,
+    };
+    let _ = reasm.ingest_decoded(p20, &[0xAA; 10], 100).expect("p20");
+    let blank20 = VideoPacketHeader {
+        flags: VideoFlags::PROTECTED_BLANK.union(VideoFlags::END_OF_FRAME),
+        frag_count: 1,
+        payload_len: 0,
+        ..p20
+    };
+    let conflict_rep = reasm.ingest_decoded(blank20, &[], 200).expect("conflict");
+    assert!(matches!(
+        conflict_rep.outcome,
+        ReassemblyOutcome::Rejected(ReassemblyError::ConflictingFragmentMetadata { frame_id: 20 })
+    ));
+    assert_eq!(reasm.stats().global_total_bytes(), 0);
+}
+
+#[test]
+fn normative_large_payload_ceilings_64kib_control_and_8mib_media() {
+    let flimits = FramingLimits::default();
+
+    // 1. Exact 64 KiB Channel 0 stream frame succeeds; 64 KiB + 1 rejects BEFORE payload alloc.
+    let ctrl_64k = vec![0x42u8; CHANNEL_0_MAX_PAYLOAD];
+    let encoded_ctrl = encode_stream_frame(
+        ChannelId::Control,
+        MsgType::Hello.as_u16(),
+        FrameFlags::MUST_UNDERSTAND,
+        &ctrl_64k,
+        &flimits,
+    )
+    .expect("exact 64 KiB");
+    let mut dec = StreamFrameDecoder::new(flimits, StreamBindingMode::Multiplexed).expect("dec");
+    dec.feed(&encoded_ctrl).expect("feed 64 KiB");
+    let got_ctrl = dec.next_frame().expect("ok").expect("frame");
+    assert_eq!(got_ctrl.payload.len(), CHANNEL_0_MAX_PAYLOAD);
+    assert!(dec.finish_eof().is_ok());
+
+    let hdr_over = FrameHeader {
+        frame_len: u32::try_from(CHANNEL_0_MAX_PAYLOAD + 1).expect("u32"),
+        channel_id: ChannelId::Control,
+        msg_type: MsgType::Hello.as_u16(),
+        flags: FrameFlags::NONE,
+    };
+    let mut dec_over =
+        StreamFrameDecoder::new(flimits, StreamBindingMode::Multiplexed).expect("over");
+    assert!(matches!(
+        dec_over.step_slice(&hdr_over.encode()),
+        Err(FrameError::FrameTooLarge { .. })
+    ));
+    assert_eq!(dec_over.buffered_bytes(), 0);
+
+    // 2. Exact 8 MiB video frame fragments and reassembles cleanly; 8 MiB + 1 fails upfront.
+    let budget = PacketBudget::new(8192, 8192).expect("8148 payload");
+    let exact_8mib = vec![0x7Eu8; MAX_FRAME_BYTES];
+    let pkts = fragment_frame(
+        &FrameToFragment {
+            session_id: 1,
+            display_id: 0,
+            codec_id: CodecId::H264,
+            frame_id: 1,
+            gop_id: 1,
+            capture_ts_us: 1000,
+            encode_done_ts_us: 2000,
+            kind: FrameKind::Keyframe { chain_reset: true },
+            has_codec_config: true,
+            mirror_source: false,
+            payload: &exact_8mib,
+        },
+        budget,
+    )
+    .expect("exact 8 MiB fragments");
+    let mut reasm = Reassembler::new(ReassemblyConfig::default()).expect("reasm");
+    let mut completed = None;
+    for p in &pkts {
+        let rep = reasm.ingest_packet(p, 8192, 10_000).expect("ingest 8MiB");
+        if let ReassemblyOutcome::Completed(f) = rep.outcome {
+            completed = Some(f);
+        }
+    }
+    let assembled = completed.expect("8 MiB completed");
+    assert_eq!(assembled.payload.len(), MAX_FRAME_BYTES);
+    assert_eq!(reasm.stats().global_total_bytes(), 0);
+
+    let over_8mib = vec![0x7Eu8; MAX_FRAME_BYTES + 1];
+    assert!(matches!(
+        fragment_frame(
+            &FrameToFragment {
+                session_id: 1,
+                display_id: 0,
+                codec_id: CodecId::H264,
+                frame_id: 2,
+                gop_id: 2,
+                capture_ts_us: 1000,
+                encode_done_ts_us: 2000,
+                kind: FrameKind::Keyframe { chain_reset: true },
+                has_codec_config: false,
+                mirror_source: false,
+                payload: &over_8mib,
+            },
+            budget,
+        ),
+        Err(FragmentationError::FrameNotRepresentable { .. })
+    ));
+}
