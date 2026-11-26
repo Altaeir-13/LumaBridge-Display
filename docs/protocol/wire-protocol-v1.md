@@ -1,8 +1,8 @@
 # Especificação do Protocolo de Rede LumaBridge (`LBWP v1`)
 
-> **Status do documento: `Draft` — Revisão Candidata à Estabilização (`M1.2`)**
+> **Status do documento: `Draft` — Revisão Candidata à Estabilização (`M1.2` / `M1.2.1`)**
 >
-> Este documento especifica o protocolo binário **LumaBridge Wire Protocol (`LBWP v1`)** implementado pelo crate `lumabridge-protocol` (`M1.2`). Ele permanece em estado **`Draft` (revisão candidata à estabilização)** — **`LBWP v1.0` NÃO é declarado definitivamente congelado** nesta etapa enquanto contratos criptográficos (`M1.3`: transcript de pareamento, TLS Exporter / channel binding, assinaturas SPKI e confirmação SPAKE2), transporte operacional (`QUIC` / `TCP+TLS 1.3`, `DPLPMTUD`, política `0-RTT`) e interoperabilidade ponta-a-ponta permanecerem pendentes.
+> Este documento especifica o protocolo binário **LumaBridge Wire Protocol (`LBWP v1`)** implementado pelo crate `lumabridge-protocol` (`M1.2`). Ele permanece em estado **`Draft` (revisão candidata à estabilização)** — **`LBWP v1.0` NÃO é declarado definitivamente congelado** nesta etapa enquanto segurança/identidade/autorização (`M1.3`: transcript de pareamento, TLS Exporter / channel binding, Trust Store, assinaturas SPKI e confirmação SPAKE2), transporte operacional (`M1.4`: `QUIC` / `TCP+TLS 1.3`, `DPLPMTUD`, descoberta e entrega confiável de `ProtectedBlank`) e integração operacional de sessões/componentes (`M1.5`) permanecerem pendentes.
 >
 > **Separação estrita entre `LBWP`, `LBIF` e `C ABI`:**
 > - **`LBWP` (`v1.0`):** protocolo de rede multiplataforma independente de transporte (QUIC, TCP/TLS 1.3, futuro USB/WAN), implementado em `core/crates/lumabridge-protocol`.
@@ -141,10 +141,14 @@ O decoder incremental `StreamFrameDecoder` não pressupõe qualquer alinhamento 
 - Suporta cabeçalhos de 8 bytes fragmentados em 1..N entregas parciais.
 - Suporta payloads fragmentados em entregas parciais.
 - Suporta múltiplos registros completos ou parciais concatenados em um único buffer.
-- Informa de forma inequívoca os bytes consumidos e o próximo estado (`Frame(RawFrame)` vs `NeedMoreData`).
-- Detecta `UnexpectedEof` se a conexão encerrar no meio de um cabeçalho ou no meio de um payload.
+- Informa de forma inequívoca os bytes consumidos e o próximo estado (`Frame(RawStreamFrame)` vs `NeedMoreData`).
+- **Contrato explícito de `finish_eof()` e drenagem:**
+  - Exige drenagem prévia de todos os registros completos via `next_frame()` antes de `finish_eof()`: se houver bytes pendentes no buffer interno (inclusive um registro completo ainda não drenado ou bytes subsequentes após um registro completo), `finish_eof()` retorna `PendingBufferedInput { buffered_bytes }` **sem consumir registros nem envenenar (*poison*) o decoder**, preservando todos os quadros para leitura.
+  - Em stream vazio ou com buffer totalmente drenado até `NeedMoreData`, `finish_eof()` conclui de forma limpa (`Ok(())`) e é **idempotente** em chamadas repetidas; após encerramento limpo, chamadas subsequentes a `feed()` retornam `StreamClosed`.
+  - Se o stream terminar no meio de um cabeçalho (após drenar registros anteriores) ou no meio de um payload, `finish_eof()` retorna `UnexpectedEofInHeader` ou `UnexpectedEofInPayload`, respectivamente.
+  - Misturar `feed()`/`next_frame()` com `step_slice()` enquanto houver bytes buffered ou payload pendente no buffer interno é rejeitado com erro sem reordenar bytes involuntariamente.
 - Rejeita `frame_len` excessivo, `channel_id` inválido, flags reservadas ou troca de canal no meio de stream **imediatamente após ler os 8 bytes de cabeçalho, antes de alocar o buffer de payload**.
-- Após erro fatal de stream, o decoder permanece em estado travado (*poisoned*) e recusa leituras subsequentes sem reinterpretar bytes desalinhados.
+- Após erro fatal de stream, o decoder permanece em estado travado (*poisoned*) e recusa leituras/feeds e `finish_eof()` subsequentes sem reinterpretar bytes desalinhados.
 
 ---
 
@@ -582,19 +586,27 @@ O receptor (`Reassembler`) aplica limites configuráveis **antes de alocar** mem
 
 | Limite | Padrão Inicial `M1.2` | Justificativa |
 |---|---|---|
-| `max_incomplete_frames_per_display` | **`4`** | Limita reordenação em voo e evita acúmulo de fila (*bufferbloat*). |
+| `max_incomplete_frames_per_display` | **`4`** *(teto normativo `1..=4`)* | Limita reordenação em voo e evita acúmulo de fila (*bufferbloat*); valores `0` ou `> 4` são rejeitados na validação de `ReassemblyConfig`. |
 | `max_frame_bytes` | **`8 MiB` (`8.388.608 B`)** | Teto arquitetural por quadro codificado. |
 | `max_display_bytes` | **`16 MiB` (`16.777.216 B`)** | Protege contra múltiplos quadros incompletos grandes em um mesmo display. |
 | `max_session_bytes` | **`32 MiB` (`33.554.432 B`)** | Isola sessões concorrentes contra saturação cruzada. |
-| `max_global_bytes` | **`64 MiB` (`67.108.864 B`)** *(experimental configurável)* | Permite até 2 sessões ativas em pico ou múltiplos displays sem risco de OOM em Android/embarcados; será reavaliado sob carga multi-sessão real em `M2+`. |
+| `max_global_bytes` | **`64 MiB` (`67.108.864 B`)** *(experimental configurável)* | Teto lógico interno para payloads incompletos + metadados estimados; **não** representa teto absoluto de RSS do processo. Será reavaliado sob carga multi-sessão real em `M2+`. |
 | `max_total_displays` | **`16`** | Impede criação ilimitada de tabelas por `(session_id, display_id)` forjados. |
 | `max_pending_frames` | **`64`** | Limite global de estruturas de remontagem abertas simultaneamente. |
 | `metadata_overhead_per_fragment_bytes` | **`64 B`** *(contabilizado explicitamente)* | Contabiliza entradas de mapa `BTreeMap<u16, Vec<u8>>` e descritores por fragmento contra os tetos de bytes. |
 | `fragment_timeout_us` | **`150.000 µs` (`150 ms`)** | Expiração determinística por relógio monotônico do chamador. |
+| `max_reorder_bytes` *(recuperação)* | **`16 MiB` (`16.777.216 B`)** *(teto configurável até `32 MiB`)* | Limite explícito de bytes para quadros completos retidos na `reorder_queue` de `GopRecoveryStateMachine`. |
 
 - **Sem pré-alocação baseada em `frag_count`:** o receptor **nunca** pré-aloca `8 MiB` nem `Vec` de `4.096` posições ao receber o primeiro fragmento. Os fragmentos são armazenados incrementalmente conforme chegam.
-- **Liberação garantida:** conclusão, expiração, descarte por conflito/evicção, remoção de display ou encerramento da sessão liberam imediatamente todos os bytes e metadados contabilizados (`global_bytes == 0` quando vazio).
-- **Separação de memória do consumidor:** após a conclusão da remontagem, o `Vec<u8>` consolidado (`ReassembledFrame`) é transferido ao consumidor e **deixa de integrar** o orçamento ativo de remontagem do `Reassembler`. O consumidor/núcleo (`ADR-0004`) é responsável por seu próprio orçamento pós-entrega até a decodificação.
+- **Diferenciação explícita das 6 categorias de memória:**
+  1. **Payloads de remontagens incompletas:** contabilizados exatamente em `global_payload_bytes` (`<= max_global_bytes` descontados os metadados).
+  2. **Metadados estimados:** `frag_count_received * metadata_overhead_per_fragment_bytes` (`64 B/frag` padrão) contabilizado junto aos payloads em `global_bytes`.
+  3. **Memória temporária de concatenação (`finalize_frame`):** para quadros de **1 fragmento** (`frag_count == 1`), há *fast path* zero-copy movendo o `Vec<u8>` diretamente sem segunda cópia; para **múltiplos fragmentos** (`frag_count >= 2`), ocorre pico transitório breve (~`2x` do quadro concluído enquanto os fragmentos removidos são concatenados no `Vec<u8>` final antes da devolução de `ReassembledFrame`).
+  4. **Quadros concluídos retidos pela recuperação (`reorder_queue`):** fora do orçamento do `Reassembler`, limitados separadamente por contagem (`max_reorder_frames <= 4`) **e** por bytes (`max_reorder_bytes = 16 MiB` padrão, teto configurável `32 MiB`) por `(session_id, display_id)`.
+  5. **Quadros transferidos ao consumidor:** após entrega de `ReassembledFrame`, o `Vec<u8>` consolidado deixa o orçamento interno do `Reassembler`; camadas consumidoras (`ADR-0004` / `M1.5`) devem aplicar seu próprio orçamento até a decodificação.
+  6. **Overhead real do alocador/coleções:** fragmentação de heap, crescimento exponencial de `Vec` e nós internos de `BTreeMap`/`BTreeSet` não são interceptados por alocador customizado e explicam por que `64 MiB` é teto interno do estado de remontagem, não limite absoluto de RSS do processo.
+- **Liberação garantida e avanço de `retired_floor`:** conclusão, expiração, descarte por conflito/evicção, remoção de display ou encerramento da sessão liberam imediatamente todos os bytes e metadados contabilizados (`global_bytes == 0` quando vazio). Quando `retired_set` ultrapassa a janela retenida, o menor ID é aposentado em ordem numérica estrita (`BTreeSet::pop_first`) avançando `retired_floor` monotonicamente e removendo/descontabilizando quaisquer quadros pendentes com `frame_id <= retired_floor`.
+- **Fronteira de entrada (`ingest_decoded`):** `Reassembler::ingest_decoded` também valida invariantes estruturais de `VideoPacketHeader` e `fragment.len() == header.payload_len`, não dependendo exclusivamente de o chamador ter usado `decode_packet()`; porém validação estrutural não substitui validação contextual, autenticação mTLS, autorização nem validade de bitstream H.264/HEVC/AV1.
 
 ---
 
@@ -603,11 +615,13 @@ O receptor (`Reassembler`) aplica limites configuráveis **antes de alocar** mem
 1. **Fragmento duplicado idêntico:** ignorado idempotentemente sem dupla contabilização de bytes.
 2. **Fragmento duplicado conflitante ou inconsistência de metadados:** se o payload divergir ou se `codec_id`, `gop_id`, `frag_count`, timestamps ou flags invariantes divergirem no mesmo `frame_id`, toda a remontagem daquele quadro é **invalidada e liberada imediatamente**, registrando evento de perda/corrupção para a máquina de recuperação.
 3. **Fragmento atrasado de quadro já concluído ou descartado:** ignorado silenciosamente sem reabrir entrada de remontagem.
-4. **Reordenação dentro da janela:** fragmentos fora de ordem dentro de um quadro e quadros fora de ordem dentro da janela de `4` quadros por display são tolerados. **A observação de um `frame_id` posterior não declara perda imediata do quadro anterior** enquanto este ainda puder completar dentro da janela e do timeout.
+4. **Reordenação dentro da janela:** fragmentos fora de ordem dentro de um quadro e quadros fora de ordem dentro da janela de `4` quadros por display são tolerados. **A observação de um `frame_id` posterior não declara perda imediata do quadro anterior** enquanto este ainda puder completar dentro da janela e do timeout. O timeout de espera na `reorder_queue` (`poll_reorder_timeout` / `poll_timers`) usa o **instante de chegada mais antigo** (`min(queued_at_us)`) entre os quadros retidos em lacuna — entrada tardia de outro quadro fora de ordem não reinicia o prazo de espera da lacuna já aberta.
 5. **Expiração (`expire(now_us)`):** conduzida por relógio monotônico fornecido pelo chamador (zero `sleep()` no protocolo); descarta quadros expirados e notifica a máquina de recuperação de GOP.
-6. **Máquina de estados `AwaitingIdr` (`GopRecoveryStateMachine`):**
+6. **Isolamento e máquina de estados `AwaitingIdr` (`GopRecoveryStateMachine`):**
+   - Cada instância de `GopRecoveryStateMachine` é vinculada explicitamente a um único par **`(session_id, display_id)`**; eventos, relatórios (`ReassemblyReport`), notificações de descarte (`DiscardedFrameNotice`) e `ProtectedBlank` pertencentes a outra sessão ou outro display são filtrados e contabilizados em `ignored_foreign_events` sem jamais alterar a cadeia local.
    - Mantém estado `InitialAwaitingIdr`, `Healthy`, `AwaitingIdr` ou `ProtectedBlanked`.
-   - Em `Healthy`, se um quadro da cadeia atual expirar ou for descartado antes de completar, transiciona para **`AwaitingIdr`**, limpa quadros `P` dependentes em fila de reordenação, **não entrega** nenhum `P`-frame subsequente da cadeia quebrada ao consumidor e emite solicitação de IDR (`request_idr = true`) respeitando cooldown configurável (**padrão inicial `200 ms`**, dentro da faixa arquitetural `150–250 ms`).
+   - Em `Healthy`, se um quadro da cadeia atual expirar ou for descartado antes de completar (ou se a fila de reordenação expirar/exceder `max_reorder_bytes`), transiciona para **`AwaitingIdr`**, limpa quadros `P` dependentes em fila de reordenação, **não entrega** nenhum `P`-frame subsequente da cadeia quebrada ao consumidor e emite solicitação de IDR (`request_idr = true`) respeitando cooldown configurável (**padrão inicial `200 ms`**, dentro da faixa arquitetural `150–250 ms`).
+   - **Cooldown persistente e retentativa limitada:** `last_idr_request_us` persiste através de transições `AwaitingIdr -> Healthy` no mesmo `(session_id, display_id)`, impedindo tempestade de keyframes em perdas logo após recuperação. Enquanto permanecer em `AwaitingIdr` sem chegada de IDR, novas solicitações respeitam o mesmo cooldown via `poll_idr_retry` / `poll_timers` até o teto configurável **`max_unanswered_idr_requests` (padrão `16`)**; reset de sessão cria nova instância/sessão sem herdar cooldown de sessão encerrada.
    - A chegada de um novo **`IDR` íntegro (`FLAG_KEYFRAME`)** com `frame_id` válido recupera a cadeia e restaura o estado `Healthy`.
    - **Separação de responsabilidades:** `lumabridge-protocol` valida integridade estrutural de headers/fragmentos e cadeia lógica `frame_id`/`gop_id`; **não** decodifica nem valida sintaxe interna de bitstream H.264/HEVC/AV1.
 7. **Sequenciamento e Wraparound:**
@@ -636,11 +650,12 @@ Quando o emissor detectar conteúdo protegido por DRM/HDCP na origem, envia even
 - `flags`: `FLAG_PROTECTED_BLANK | FLAG_END_OF_FRAME` (`0x000A`, opcionalmente `| FLAG_MIRROR_SOURCE` `0x0020`). **Proibido** combinar com `FLAG_KEYFRAME`, `FLAG_HAS_CODEC_CONFIG` ou `FLAG_CHAIN_RESET`.
 - `frag_count = 1`, `frag_index = 0`, `payload_len = 0` (pacote total exato de `44` bytes).
 
-**Semântica obrigatória:**
+**Semântica obrigatória e limitações conhecidas:**
 - **Não** é tratado como perda de pacotes nem dispara `ERR_INVALID_FRAMING` por payload vazio.
-- Descarta quadros anteriores incompletos no display, limpa quadros `P` em fila de reordenação e sinaliza `HideContentAndBlank` para ocultação imediata do último quadro exibido, impedindo vazamento de pixels protegidos.
+- Descarta quadros anteriores incompletos no display, limpa quadros `P` em fila de reordenação e sinaliza `HideContentAndBlank` para ocultação imediata do último quadro exibido, impedindo reapresentação de mídia obsoleta com `frame_id` inferior ou da cadeia anterior.
 - A exibição de vídeo normal retoma exclusivamente na chegada de um novo **IDR íntegro (`FLAG_KEYFRAME`)**.
-- **Nota `M1.2`:** a fronteira `C ABI` da `M1.1` (`lumabridge-ffi`) **não** foi alterada nesta etapa apenas para aceitar buffers vazios.
+- **Limitação explícita de datagramas não confiáveis e requisito obrigatório da `M1.4`:** a entrega de `ProtectedBlank` exclusivamente via datagrama UDP/QUIC não confiável (`RFC 9221`) **não garante** ocultação remota imediata sob perda de pacote, atraso ou reordenação. Fica registrado como **requisito obrigatório da `M1.4` (Transporte Operacional)** prever sinalização **confiável** da transição de proteção (ex.: canal confiável de controle/sessão ou stream confiável sincronizado com o piso de `frame_id`), com precedência sobre mídia obsoleta em trânsito e sem depender exclusivamente de datagrama de vídeo.
+- **Escopo atual:** proteção DRM/HDCP ponta-a-ponta **não** é declarada qualificada nesta etapa (`M1.2` / `M1.2.1`), e a fronteira `C ABI` da `M1.1` (`lumabridge-ffi`) **não** foi alterada para aceitar buffers vazios.
 
 ---
 
@@ -653,7 +668,7 @@ Quando o emissor detectar conteúdo protegido por DRM/HDCP na origem, envia even
 | **`RejectFrame`** | Fragmento conflitante, estouro de orçamento de remontagem (`> 8 MiB` / `> 4` quadros / orçamento global), expiração | Descartar quadro incompleto, liberar orçamento imediatamente e acionar `AwaitingIdr` se afetar cadeia ativa | `MediaFeedback(request_idr = true)` respeitando cooldown (`200 ms`) |
 | **`ContextualError`** | `InputBatch` sem permissão ativa ou `session_id` não ativo em comando não fatal | Descartar comando/evento antes de tocar APIs nativas | `ErrorNotice(ERR_PERMISSION_DENIED / ERR_SESSION_NOT_FOUND, fatal = false)` |
 
-**Privacidade e saneamento:** `Debug`, `Display` e diagnósticos de `lumabridge-protocol` redigem explicitamente `spake_payload`, `key_confirmation`, `one_time_pairing_token`, assinaturas de pareamento, `resume_token`, todo o conteúdo de eventos de teclado/ponteiro/toque/caneta em `InputBatch` e os bytes de bitstream de vídeo.
+**Privacidade e saneamento:** `Debug`, `Display` e diagnósticos de `lumabridge-protocol` redigem explicitamente `spake_payload`, `key_confirmation`, `one_time_pairing_token`, assinaturas de pareamento, `resume_token`, todo o conteúdo de eventos de teclado/ponteiro/toque/caneta em `InputBatch`, bytes de bitstream de vídeo em `ReassembledFrame`/`Reassembler`/`GopRecoveryStateMachine` e buffers/payloads internos de `RawStreamFrame`, `DecoderState`, `StreamDecoderCore` e `StreamFrameDecoder`.
 
 ---
 
@@ -678,14 +693,22 @@ Todos os vetores abaixo são verificados byte a byte nos testes independentes em
 
 ---
 
-## 13. Limitações Atuais e Decisões Pendentes para a `M1.3`
+## 13. Limitações Atuais e Divisão de Responsabilidades (`M1.3` / `M1.4` / `M1.5`)
 
-Esta especificação (`M1.2`) **não implementa** e reserva formalmente para decisão/implementação na **`M1.3` (Segurança e Transporte)**:
+Esta especificação (`M1.2` / `M1.2.1`) **não implementa** criptografia operacional, transporte de rede nem orquestração de sessões, mantendo separação estrita entre os sub-marcos seguintes:
 
-1. **Transcript oficial de pareamento:** definição exata da serialização canônica de entradas do transcript SPAKE2/QR.
-2. **Label TLS Exporter e Channel Binding:** escolha definitiva entre `EXPORTER-Channel-Binding` puro da **RFC 9266** vs exporter específico da aplicação (`EXPORTER-lumabridge-pair-v1` com contexto via RFC 8446 §7.5), evitando mistura semântica dos dois mecanismos.
-3. **Domain separation:** rótulos criptográficos distintos para SPAKE2 key confirmation, assinatura QR, `resume_token` e chaves derivadas.
-4. **Representação SPKI e formato de assinatura:** travar `SubjectPublicKeyInfo` DER (44 bytes Ed25519) vs chave crua (32 bytes) nos campos `spki_ed25519` e assinaturas de `PairQrAuth`/`PairConfirm`.
-5. **Confirmação de chave SPAKE2 (RFC 9382):** algoritmo exato de MAC/HKDF para `key_confirmation`.
-6. **Uso único e expiração de tokens:** ciclo de vida estrito de `one_time_pairing_token`, PINs CSPRNG e `resume_token`.
-7. **Política de `0-RTT` e anti-replay operacional:** desabilitação de `0-RTT` para comandos mutantes/input/sessão e proteção criptográfica contra replay entre conexões.
+- **`M1.3` — Identidade, Pareamento, Segurança e Autorização (`lumabridge-security`):**
+  1. **Transcript oficial de pareamento:** definição exata da serialização canônica de entradas do transcript SPAKE2/QR.
+  2. **Label TLS Exporter e Channel Binding:** escolha definitiva entre `EXPORTER-Channel-Binding` puro da **RFC 9266** vs exporter específico da aplicação (`EXPORTER-lumabridge-pair-v1` com contexto via RFC 8446 §7.5), evitando mistura semântica dos dois mecanismos.
+  3. **Domain separation:** rótulos criptográficos distintos para confirmação de chave SPAKE2, assinatura QR, tokens de retomada e derivação de chaves.
+  4. **Representação SPKI e formato de assinatura:** travar `SubjectPublicKeyInfo` DER (44 bytes Ed25519) vs chave crua (32 bytes) nos campos `[M1.3-PROVISIONAL]` (`spki_ed25519`, `PairQrAuth`, `PairConfirm`).
+  5. **Confirmação de chave SPAKE2 (RFC 9382):** algoritmo exato de MAC/HKDF para `key_confirmation`.
+  6. **Trust Store, armazenamento nativo seguro, revogação, uso único e expiração de tokens:** ciclo de vida estrito e atômico de `one_time_pairing_token`, PINs CSPRNG e `resume_token`, rate limiting e ACL deny-by-default.
+  7. **Política de `0-RTT` e anti-replay operacional:** desabilitação de `0-RTT` para comandos mutantes/input/sessão e proteção criptográfica contra replay entre conexões.
+- **`M1.4` — Transporte Operacional, Descoberta e Benchmarks de Rede (`lumabridge-transport`):**
+  1. Transporte **`QUIC`** (streams dedicados + `RFC 9221` datagrams) e fallback **`TCP + TLS 1.3`** (`TCP_NODELAY` + descarte pré-socket).
+  2. Descoberta LAN (`mDNS`), seleção de `effective_lbwp_packet_budget` e **`DPLPMTUD` (`RFC 8899`)**.
+  3. Entrega **confiável** da sinalização de **`ProtectedBlank`** sem depender exclusivamente de datagrama de vídeo não confiável.
+  4. Benchmarks comparativos reais de rede (`QUIC` vs `TCP/TLS`) necessários para avaliar eventual promoção da `ADR-0005`.
+- **`M1.5` — Integração Operacional de Sessões e Componentes:**
+  1. Integração ponta-a-ponta de `lumabridge-protocol`, `lumabridge-security`, `lumabridge-transport`, `lumabridge-core`, `lumabridge-ffi` e adaptadores nativos, encerrando a `M1` somente após aprovação conjunta dos gates aplicáveis e congelamento explícito da v1.0.

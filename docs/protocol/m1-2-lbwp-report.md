@@ -1,6 +1,6 @@
 # Relatório Técnico de Qualificação — M1.2: Especificação e Implementação do Protocolo Binário `LBWP v1`
 
-> **Estado arquitetural dos documentos:** [`wire-protocol-v1.md`](wire-protocol-v1.md) permanece em **`Draft` (Candidata à Estabilização)**, [`ADR-0004`](../architecture/ADR-0004-core-language-and-native-boundaries.md) permanece **`Accepted`**, [`ADR-0005`](../architecture/ADR-0005-transport-and-security-architecture.md) permanece **`Proposed`** e **`M1_COMPLETE = False`**. **`LBWP v1.0` NÃO é declarado congelado definitivamente** até o fechamento da `M1.3` (criptografia `SPAKE2`/QR/mTLS e transporte `QUIC`/`TCP+TLS 1.3`).
+> **Estado arquitetural dos documentos:** [`wire-protocol-v1.md`](wire-protocol-v1.md) permanece em **`Draft` (Candidata à Estabilização)**, [`ADR-0004`](../architecture/ADR-0004-core-language-and-native-boundaries.md) permanece **`Accepted`**, [`ADR-0005`](../architecture/ADR-0005-transport-and-security-architecture.md) permanece **`Proposed`** e **`M1_COMPLETE = False`**. **`LBWP v1.0` NÃO é declarado congelado definitivamente** até o fechamento de `M1.3` (identidade, pareamento e segurança), `M1.4` (transporte operacional `QUIC`/`TCP+TLS 1.3`, `DPLPMTUD`, descoberta e sinalização confiável de `ProtectedBlank`) e `M1.5` (integração operacional de sessões e componentes).
 
 ---
 
@@ -27,9 +27,10 @@ Principais ambiguidades normativas resolvidas em [`wire-protocol-v1.md`](wire-pr
   - Decodificador streaming zero-alocação de cabeçalhos CBOR escolhido por evitar derivação dependente do layout Rust; toda validação de ordenação, minimalidade, duplicidade, profundidade e limites é aplicada normativamente pelo módulo [`cbor.rs`](../../core/crates/lumabridge-protocol/src/cbor.rs).
 - **Dependências exclusivas de desenvolvimento (`[dev-dependencies]`, não embarcadas):**
   - `proptest 1.12.0` (`MIT OR Apache-2.0`, `default-features = false, features = ["std"]`).
-- **Workspace isolado de fuzzing (`core/crates/lumabridge-protocol/fuzz/Cargo.lock`, excluído de `core/Cargo.toml` e não embarcado):**
-  - `libfuzzer-sys 0.4.13` (`(MIT OR Apache-2.0) AND NCSA`), `arbitrary 1.5.0` (`MIT OR Apache-2.0`), além de dependências auxiliares de build do harness (`cc 1.11.3`, `find-msvc-tools 0.1.15`, `jobserver 0.1.35`, `shlex 2.0.1`, `getrandom 0.4.3`, `libc 0.2.191`).
-- **Resultado do gate `cargo deny --locked check advisories licenses bans sources`:** **`advisories ok, bans ok, licenses ok, sources ok`** (`EXIT=0`, sem alterar `core/deny.toml`; apenas warning informativo pré-existente de duplicata `syn v2.0.119` vs `v3.0.10` introduzido quando features `uniffi*` opcionais estão presentes no lockfile).
+- **Workspace isolado de fuzzing (`core/crates/lumabridge-protocol/fuzz/Cargo.lock`, excluído de `core/Cargo.toml` e não embarcado em binários de produção):**
+  - `22` pacotes resolvidos via `cargo metadata --locked --manifest-path core/crates/lumabridge-protocol/fuzz/Cargo.toml`: `libfuzzer-sys 0.4.13` (`(MIT OR Apache-2.0) AND NCSA`), `arbitrary 1.5.0` (`MIT OR Apache-2.0`), além de dependências de build/harness (`cc 1.11.3`, `find-msvc-tools 0.1.15`, `jobserver 0.1.35`, `shlex 2.0.1`, `getrandom 0.4.3`, `libc 0.2.191`, `r-efi 6.0.0`, `unicode-ident 1.0.27`, etc.).
+  - **Auditoria separada obrigatória:** executar `cargo deny` apenas no workspace principal (`core/Cargo.toml`) **não** audita `fuzz/Cargo.lock`. Executado separadamente contra `fuzz/Cargo.toml` com `core/deny.toml`, `advisories` e `sources` passam, enquanto `licenses` rejeita `NCSA` de `libfuzzer-sys` (uso exclusivo de teste/fuzzing) e `bans` rejeita a dependência local `{ path = ".." }` sem versão fixa no manifest do fuzzer (`cargo_deny_fuzz_exit=6`).
+- **Resultado do gate no workspace principal `core/` (`cargo deny --locked check advisories licenses bans sources`):** **`advisories ok, bans ok, licenses ok, sources ok`** (`EXIT=0`, sem alterar `core/deny.toml`; apenas warning informativo pré-existente de duplicata `syn v2.0.119` vs `v3.0.10` introduzido quando features `uniffi*` opcionais estão presentes no lockfile).
 
 ---
 
@@ -98,6 +99,53 @@ Executado via `cargo bench --locked -p lumabridge-protocol` (`rustc 1.100.0`, pe
 
 ## 6. Portabilidade, Preservação de Baseline e Pendências para `M1.3`
 
-- **Android ARM64:** compilado localmente com sucesso via Android NDK `28.2.13676358` (`cargo ndk -t arm64-v8a -P 29 -- build --locked -p lumabridge-protocol --release`, `liblumabridge_protocol.rlib = 2.307.196 bytes`) e integrado em [`.github/workflows/ci-ffi-poc.yml`](../../.github/workflows/ci-ffi-poc.yml). **Limitação explícita:** `lumabridge-protocol` ainda **não** foi acoplado ao runtime da `lumabridge-ffi`, nem ao receptor Android/Linux.
+- **Android ARM64:** compilado localmente com sucesso via Android NDK `28.2.13676358` (`cargo ndk -t arm64-v8a -P 29 --manifest-path Cargo.toml -- build --locked -p lumabridge-protocol --release`) e integrado em [`.github/workflows/ci-ffi-poc.yml`](../../.github/workflows/ci-ffi-poc.yml). **Limitação explícita:** `lumabridge-protocol` ainda **não** foi acoplado ao runtime da `lumabridge-ffi`, nem ao receptor Android/Linux.
 - **Preservação integral da `M0` / `M1.1.1`:** baseline `Windows` (driver IddCx, `FrameIpcProtocol.h`, `NvencH264Encoder`, `LumaBridgeIddDriver.inf`, scripts), C ABI (`lumabridge_ffi.h`), thresholds históricos e os seis worktrees anteriores permaneceram intactos. Issues `#33` e `#34` não foram alteradas.
-- **Pendências estritamente reservadas à `M1.3`:** definição canônica do transcript de pareamento, escolha definitiva do label TLS Exporter (`RFC 9266` vs aplicação), separação criptográfica de domínios, travamento do formato SPKI/assinatura nos campos `[M1.3-PROVISIONAL]`, algoritmo MAC/HKDF de confirmação `SPAKE2`, expiração e uso único de tokens, política `0-RTT`, além de implementação real de transporte `QUIC` / `TCP+TLS 1.3`, `DPLPMTUD` (`RFC 8899`), `Trust Store` e `mDNS`.
+- **Divisão explícita de pendências pós-`M1.2`:**
+  - **`M1.3` (Identidade, Pareamento, Segurança e Autorização):** transcript canônico, seleção definitiva `RFC 9266` (`EXPORTER-Channel-Binding`) vs exporter da aplicação com contexto `RFC 8446 §7.5`, domain separation, formato SPKI/assinaturas nos campos `[M1.3-PROVISIONAL]`, algoritmo MAC/HKDF de confirmação `SPAKE2`, `Trust Store`, armazenamento seguro nativo por SO, expiração/consumo atômico de PINs/tokens, `mTLS`, revogação, `PermissionUpgradeRequest` deny-by-default, rate limiting e política `0-RTT`/anti-replay.
+  - **`M1.4` (Transporte Operacional, Descoberta e Benchmarks de Rede):** transporte `QUIC` / `TCP+TLS 1.3`, `DPLPMTUD` (`RFC 8899`), descoberta (`mDNS`), **entrega confiável obrigatória de `ProtectedBlank`** sem depender apenas de datagramas de vídeo, e benchmarks comparativos de rede (`ADR-0005`).
+  - **`M1.5` (Integração Operacional):** orquestração de sessões e integração ponta-a-ponta com `lumabridge-core`, `lumabridge-ffi` e backends nativos.
+
+---
+
+## 7. Revisão Final e Endurecimento Incremental (`M1.2.1`)
+
+Após a qualificação inicial (`437e0f5c`), uma auditoria independente gerou os commits incrementais de correção (`dfb7ba4`, `1d3cdb7`, `aa4bbfd`, `5ce225c`), regressões/fuzzers (`test(protocol): qualify incremental protocol hardening`) e esta evidência final, preservando integralmente os `9` commits originais da `M1.2`:
+
+### 7.1 Achados Confirmados, Correções Aplicadas e Contratos de Fronteira
+
+1. **Privacidade diagnóstica (`dfb7ba4` — [`framing.rs`](../../core/crates/lumabridge-protocol/src/framing.rs)):** `RawStreamFrame`, `DecoderState`, `StreamDecoderCore` e `StreamFrameDecoder` implementam agora `fmt::Debug` manual com redação de `payload` / `buf`, expondo apenas metadados não sensíveis e comprimentos de bytes (`GopRecoveryStateMachine` e `Reassembler` também possuem `Debug` redigido). Coberto por teste normal e *pretty* (`{:?}` / `{:#?}`) com sentinelas sintéticas (`diagnostic_privacy_redacts_raw_stream_decoder_and_protocol_sentinels`).
+2. **Contrato explícito de `finish_eof()` (`1d3cdb7` — [`error.rs`](../../core/crates/lumabridge-protocol/src/error.rs), [`framing.rs`](../../core/crates/lumabridge-protocol/src/framing.rs)):** `finish_eof()` não consome nem descarta mais registros completos em buffer (`PendingBufferedInput { buffered_bytes }` sem envenenar o decoder). Adicionados `eof_closed` idempotente, `is_eof()`, `FrameError::StreamClosed` para `feed()` pós-EOF e bloqueio anti-reordenação ao misturar `feed()` com `step_slice()` enquanto houver estado em buffer. Validado nos `7` cenários determinísticos e no alvo `fuzz_framing`.
+3. **Isolamento por `(session_id, display_id)` (`aa4bbfd` — [`recovery.rs`](../../core/crates/lumabridge-protocol/src/media/recovery.rs)):** `GopRecoveryStateMachine::new(session_id, display_id, config)` vincula cada instância a um único par `(session_id, display_id)`. Eventos, relatórios e `ProtectedBlank` de outros displays/sessões são filtrados em `ignored_foreign_events` sem mutar a cadeia local.
+4. **Cooldown persistente de IDR, retentativa limitada e timeout por chegada mais antiga (`aa4bbfd` — [`limits.rs`](../../core/crates/lumabridge-protocol/src/limits.rs), [`recovery.rs`](../../core/crates/lumabridge-protocol/src/media/recovery.rs)):**
+   - `last_idr_request_us` persiste através de `AwaitingIdr -> Healthy` no mesmo `(session_id, display_id)`; enquanto sem IDR em `AwaitingIdr`, `poll_idr_retry` / `poll_timers` reemitem respeitando o cooldown (`200 ms`, faixa `150–250 ms`) até `max_unanswered_idr_requests` (padrão `16`).
+   - `poll_reorder_timeout` usa o **menor `queued_at_us`** dentre os quadros retidos (chegada tardia de `frame_id` menor não adia o prazo da lacuna mais antiga).
+   - Adicionado orçamento explícito por bytes na fila de reordenação (`max_reorder_bytes = 16 MiB` padrão, teto `32 MiB`) e deduplicação de entradas em `reorder_queue`.
+5. **Contabilização de memória, configuração `1..=4`, `retired_floor` e fronteira `ingest_decoded` (`5ce225c` — [`reassembly.rs`](../../core/crates/lumabridge-protocol/src/media/reassembly.rs)):**
+   - `ReassemblyConfig::validate()` restringe `max_incomplete_frames_per_display` ao intervalo normativo `1..=4` (`MAX_INCOMPLETE_FRAMES_PER_DISPLAY`).
+   - `retired_set` aposenta o menor ID via `BTreeSet::pop_first()`, avançando `retired_floor` monotonicamente e removendo/descontabilizando quadros pendentes com `frame_id <= retired_floor`.
+   - Documentadas as `6` categorias de memória: payloads incompletos, metadados estimados (`64 B/frag`), *fast path* zero-copy de `1` fragmento vs pico transitório (~`2x`) em `finalize_frame` multi-fragmento, `reorder_queue` limitada por `max_reorder_bytes`, transferência pós-entrega ao consumidor e overhead de alocador (deixando explícito que `64 MiB` é teto interno do estado de remontagem, não RSS do processo).
+   - `Reassembler::ingest_decoded` valida internamente os invariantes estruturais de `VideoPacketHeader` e `fragment.len() == header.payload_len`, permanecendo estritamente separado de validação contextual, autenticação mTLS, autorização e sintaxe de bitstream H.264/HEVC/AV1.
+6. **`ProtectedBlank` e requisito obrigatório da `M1.4`:** validada ocultação imediata (`HideContentAndBlank`), descarte de incompletos/reordenados, recuperação apenas por novo IDR íntegro e limites sob conflito/duplicação/perda/atraso. Registrado em [`wire-protocol-v1.md`](wire-protocol-v1.md) §10 que datagrama UDP/QUIC não confiável não basta e que **`M1.4` exige sinalização confiável** da transição de proteção.
+
+### 7.2 Inventário Atualizado e Revalidação (`M1.2.1`)
+
+- **Testes automatizados (`rustc 1.100.0`, `--locked`, pós-correções):**
+  - `default`: **`45/45`** (`lumabridge-core`: `7`, `lumabridge-ffi`: `5`, `lumabridge-protocol`: **`33`** = `6` `golden_vectors.rs` + `5` `property_tests.rs` + `22` `protocol_unit_tests.rs`).
+  - `--features poc-fault-injection`: **`47/47`** (`7 + 7 + 33`).
+  - `--features uniffi`: **`46/46`** (`7 + 6 + 33`).
+  - Cobertura determinística adicional nos extremos normativos **`64 KiB`** (`Channel 0`) e **`8 MiB`** (quadro de mídia fragmentado e remontado), além dos `40` vetores de `fuzz_regression_corpus.hex`.
+- **Campanhas incrementais de fuzzing (`2 x 60 s` pós-correções, separadas da baseline histórica `5 x 60 s` / `7.948.657` execuções):**
+  - Ambiente idêntico: Windows MSVC, `nightly-2026-04-01`, `cargo-fuzz 0.13.2`, `sanitizer=address`, `-max_total_time=60 -timeout=5 -rss_limit_mb=2048 -max_len=8192` (limitação `8192 B` compensada pelos testes determinísticos de `64 KiB` / `8 MiB`).
+
+| Alvo Incremental (`M1.2.1`) | Duração Efetiva | Execuções | `exec/s` | Corpus Inicial -> Final (Ativo) | Cobertura (`cov` / `ft`) | Crashes / Timeouts / ASan | Exit |
+|---|---:|---:|---:|---|---|---|---|
+| `fuzz_framing` *(ampliado EOF + `step_slice` + `Debug`)* | `61,48 s` (`61 s`) | `280.632` | `4.600` | `198 -> 256` (`72 / 8.287 B`) | `277 / 1.129` | `0 / 0 / 0` (`rss 450 MB`) | `0` |
+| `fuzz_media_reassembly` *(ampliado `ingest_decoded` + `ProtectedBlank` + `poll_timers`)* | `61,42 s` (`61 s`) | `377.245` | `6.184` | `198 -> 741` (`548 / 74 KB`) | `1.289 / 5.273` | `0 / 0 / 0` (`rss 473 MB`) | `0` |
+
+- **Benchmark sintético comparativo (`cargo bench --locked -p lumabridge-protocol`, estritamente informativo, `budget = 1.136 B`):**
+  - `30 KiB` (`29` frags): frag `avg 2,24 µs` / `p99 3,50 µs` *(ref `1,80 µs`)*; reasm `avg 5,57 µs` / `p50 5,00 µs` / `p99 17,10 µs` *(ref `5,10 µs`)*.
+  - `80 KiB` (`76` frags): frag `avg 30,00 µs` / `p50 28,10 µs` / `p99 54,60 µs` *(ref `28,10 µs`)*; reasm `avg 64,64 µs` / `p50 61,70 µs` / `p99 104,00 µs` *(ref `96,20 µs`)*.
+  - `150 KiB` (`141` frags): frag `avg 63,11 µs` / `p50 56,50 µs` / `p99 137,40 µs` *(ref `82,80 µs`)*; reasm `avg 109,93 µs` / `p50 109,50 µs` / `p99 189,90 µs` *(ref `160,70 µs`)*.
+  - Variação compatível com validação estrutural adicional em `ingest_decoded`, ordenação de aposentadoria via `BTreeSet` e ruído de escalonamento Windows, sem introdução de novos limites arbitrários.
+- **Portabilidade, FFI PoC & Higiene pós-correções:** `cargo ndk -t arm64-v8a -P 29 -- build --locked -p lumabridge-protocol --release` aprovado (`EXIT=0`), `Invoke-LumaBridgeFfiPocCi.ps1 -SkipBenchmark -RequireCargoDeny` aprovado (`EXIT=0`), `test_repo_hygiene.py` (`9/9`) e `check_repo_hygiene.py` aprovados.
