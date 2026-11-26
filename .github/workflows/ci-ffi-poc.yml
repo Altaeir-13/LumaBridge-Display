@@ -103,7 +103,7 @@ jobs:
           cargo test --locked --workspace --features uniffi
           cargo deny --locked check advisories licenses bans sources
 
-      - name: Build Android ARM64 .so and verify ELF symbols + UniFFI Kotlin generation
+      - name: Build Android ARM64 protocol crate + FFI .so and verify ELF symbols + UniFFI Kotlin generation
         shell: bash
         run: |
           set -euo pipefail
@@ -122,6 +122,9 @@ jobs:
           echo "Using Android NDK version: $NDK_VERSION"
 
           cd core
+          cargo ndk -t arm64-v8a -P 29 --manifest-path Cargo.toml -- build --locked -p lumabridge-protocol --release
+          test -f "target/aarch64-linux-android/release/liblumabridge_protocol.rlib"
+
           cargo ndk -t arm64-v8a -P 29 --manifest-path Cargo.toml -- build --locked -p lumabridge-ffi --features uniffi --release
           SO_PATH="target/aarch64-linux-android/release/liblumabridge_ffi.so"
           test -f "$SO_PATH"
@@ -147,9 +150,9 @@ jobs:
           {
             echo "## Linux Rust + Android ARM64 & UniFFI PoC Summary"
             echo ""
-            echo "- Rust fmt/clippy/test (default, poc-fault-injection, uniffi, --locked) + cbindgen drift + cargo-deny (--locked, incl. advisories): PASSED"
-            echo "- Android ARM64 (NDK $NDK_VERSION) ELF64 AArch64 DYN (liblumabridge_ffi.so) & UniFFI Kotlin source generation: PASSED"
-            echo "- Scope note: CI validates ARM64 .so compilation, ELF symbols, and UniFFI Kotlin source generation (Gradle/JNA Kotlin bytecode compilation and Android device/emulator runtime remain outside M1.1 CI)."
+            echo "- Rust fmt/clippy/test (default, poc-fault-injection, uniffi, --locked across core, ffi, and lumabridge-protocol + golden/malformed/fuzz-regression corpora) + cbindgen drift + cargo-deny (--locked, incl. advisories): PASSED"
+            echo "- Android ARM64 (NDK $NDK_VERSION) lumabridge-protocol rlib + ELF64 AArch64 DYN (liblumabridge_ffi.so) & UniFFI Kotlin source generation: PASSED"
+            echo "- Scope note: CI validates ARM64 crate compilation, .so ELF symbols, and UniFFI Kotlin source generation (Android FFI wiring, Gradle/JNA Kotlin bytecode compilation, and Android device/emulator runtime remain outside M1.2 CI)."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Android ELF metadata artifact
