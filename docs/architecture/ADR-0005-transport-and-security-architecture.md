@@ -87,21 +87,22 @@ sequenceDiagram
     participant Acc as Dispositivo Aceitador
 
     Note over Init,Acc: FASE 1 - Primeiro Pareamento (ALPN "lumabridge-pair/1" - Bloqueia Midia e Input)
-    Init->>Acc: Conexao TLS 1.3 com certificado contendo chave Ed25519 (Peer = UnverifiedPeer)
-    Note over Init,Acc: Ambos derivam tls_exporter = TLS-Exporter("EXPORTER-lumabridge-pair-v1", RFC 9266)
-    alt Modo A - Pareamento via PIN (SPAKE2 RFC 9382)
-        Note over Acc: Usuario abre janela de pareamento e gera PIN efemero CSPRNG (6-8 digitos, 90s)
-        Init->>Acc: PairHello + Mensagem SPAKE2 ligada ao contexto (tls_exporter || pk_init || pk_acc)
-        Acc->>Init: Mensagem SPAKE2 + Prova de conhecimento da chave derivada (Key Confirmation)
-        Init->>Acc: Confirmacao de chave SPAKE2 (falha se MITM alterou tls_exporter ou desconhece PIN)
+    Init->>Acc: Conexao TLS 1.3 (RFC 9846) com certificado Ed25519 (Peer = UnverifiedPeer)
+    Note over Init,Acc: Ambos derivam tls_exporter = TLS-Exporter("EXPORTER-Channel-Binding", "", 32B — RFC 9266)
+    alt Modo A - Pareamento via PIN (SPAKE2 RFC 9382 P256-SHA256-HKDF-HMAC)
+        Note over Acc: Usuario abre janela de pareamento e gera PIN efemero CSPRNG (8 digitos, 90s)
+        Init->>Acc: PairHello + Mensagem SPAKE2 com AAD CBOR deterministico ligado ao tls_exporter + SPKIs
+        Acc->>Init: Mensagem SPAKE2 (pB)
+        Init->>Acc: Confirmacao de chave RFC 9382 (cA)
+        Acc->>Init: Confirmacao de chave RFC 9382 (cB) + PairConfirm apos aprovacao humana
     else Modo B - Pareamento via QR Code (Out-of-Band SPKI Pin + Token)
-        Note over Acc: QR contem (spki_sha256_acc, pairing_token >= 128 bits, endpoints, expiracao)
+        Note over Acc: QR contem (spki_sha256_acc, pairing_token 32B CSPRNG, endpoints, expiracao)
         Init->>Init: Valida que spki_sha256 do certificado TLS == spki_sha256_acc ANTES de enviar segredo
-        Init->>Acc: PairQrProof(pairing_token, Sig_Ed25519_Init(tls_exporter || pairing_token || acc_id))
+        Init->>Acc: PairQrAuth(pairing_token, Sig_Ed25519_Init(dominio || contexto CBOR || tls_exporter || sha256(token)))
     end
-    Note over Acc: Usuario aprova explicitamente nome + fingerprint do par (Permissao inicial = VIEW somente)
-    Acc->>Init: PairConfirm(granted_base_perms)
-    Note over Init,Acc: Persistir Ed25519 SPKI pinado em Trust Store seguro do SO e encerrar canal de pareamento
+    Note over Acc: Usuario aprova explicitamente nome + fingerprint do par (Permissao inicial max = VIEW_MIRROR; INPUT_* proibido)
+    Acc->>Init: PairConfirm(granted_base_perms, confirm_signature)
+    Note over Init,Acc: Persistir Ed25519 SPKI (44B DER) pinado em Trust Store seguro do SO e encerrar canal de pareamento
 
     Note over Init,Acc: FASE 2 - Sessoes Operacionais Subsequentes (ALPN "lumabridge/1")
     Init->>Acc: Handshake QUIC/TCP com mTLS estrito (SPKI validado contra Trust Store, sem pares nao confiaveis)
@@ -117,37 +118,38 @@ sequenceDiagram
 
 ### 2.2 Verificação de identidade no primeiro pareamento (sem vulnerabilidade a MITM)
 
-1. **Identidade criptográfica do nó:** cada instalação gera localmente um par de chaves assimétricas **Ed25519** de longo prazo; o `device_id` público deriva do SHA-256 de seu SubjectPublicKeyInfo (`SPKI`).
-2. **Channel Binding obrigatório:** ambos os extremos exportam 32 bytes da sessão TLS corrente via **TLS Exporter** (`RFC 5705` / `RFC 9266`, rótulo `"EXPORTER-lumabridge-pair-v1"`). Qualquer ataque MITM com dois handshakes TLS independentes produzirá valores `tls_exporter` diferentes nos dois lados.
-3. **Autenticação por código/PIN (SPAKE2 — RFC 9382):**
-   - O aceitador gera PIN numérico efêmero via CSPRNG (6 a 8 dígitos, validade curta ex. 90 s, uso único).
-   - O protocolo **SPAKE2** roda vinculado ao contexto criptográfico `H(tls_exporter || spki_init || spki_acc)`. Sem conhecer o PIN, um atacante ativo ou passivo não consegue completar a confirmação de chave (*key confirmation*), e o vínculo com `tls_exporter` impede retransmissão entre duas conexões TLS distintas por um MITM.
+1. **Identidade criptográfica do nó:** cada instalação gera localmente um par de chaves assimétricas **Ed25519** de longo prazo (`RFC 8032`); sua representação canônica em fio/certificado é o `SubjectPublicKeyInfo` DER de **`44 bytes`** (`RFC 8410` / `RFC 9295`, OID `1.3.101.112` sem parâmetros) e o `device_id` público deriva do SHA-256 exato desses `44 bytes`.
+2. **Channel Binding obrigatório (`RFC 9266`):** ambos os extremos exportam exatamente **`32 bytes`** da sessão TLS 1.3 corrente (`RFC 9846`, que substitui a histórica `RFC 8446`) utilizando estritamente o rótulo ASCII **`"EXPORTER-Channel-Binding"`** (sem `NUL`) e **contexto vazio (`""`)** após a conclusão do handshake (com *early exporter* proibido). Qualquer ataque MITM com dois handshakes TLS independentes produzirá valores `tls-exporter` diferentes nos dois lados. A separação de domínio entre pareamento SPAKE2, prova QR e confirmação final reside integralmente nos contextos CBOR determinísticos autenticados/assinados da aplicação, nunca alterando o rótulo da RFC 9266.
+3. **Autenticação por código/PIN (`SPAKE2` — `RFC 9382` `P256-SHA256-HKDF-HMAC`):**
+   - O aceitador gera PIN numérico efêmero via CSPRNG do SO (`8` dígitos preservando zeros à esquerda, amostragem sem viés, validade de `90 s`, uso único).
+   - O protocolo **SPAKE2** (`RFC 9382`, pontos P-256 SEC1 não comprimidos de `65 bytes`, `w` derivado por `HKDF-SHA256` em `64 B` reduzido mod ordem `n`) roda vinculado via campo `AAD` ao contexto CBOR determinístico `"lumabridge.pair.spake2.aad.v1"` (contendo papéis, identidades, SPKIs, `pairing_attempt_id`, versão, ALPN e `tls-exporter`). Sem conhecer o PIN, um atacante ativo ou passivo não consegue completar a confirmação mútua de chave (`cA`/`cB` de `32 B`), e o vínculo com `tls-exporter` impede retransmissão entre duas conexões TLS distintas por um MITM.
 4. **Autenticação por QR Code (canal visual fora de banda):**
-   - O QR Code gerado pelo aceitador embute: `spki_sha256` do aceitador, `pairing_token` aleatório CSPRNG (`>= 128 bits`), dicas de endpoint (IP/porta/mDNS) e timestamp de expiração.
-   - O iniciador verifica o hash do SPKI TLS do aceitador contra `spki_sha256` do QR **antes** de transmitir qualquer credencial, garantindo autenticidade do servidor desde o handshake TLS. Em seguida prova posse de sua própria chave Ed25519 assinando `(tls_exporter || pairing_token || acceptor_device_id)`.
-5. **Confirmação humana final:** antes de gravar no Trust Store, o usuário aceita explicitamente o dispositivo mostrando nome amigável e fingerprint abreviado (ou código visual equivalente).
+   - O QR Code (`LBWP-QR-v1`) gerado pelo aceitador embute: `spki_sha256` do aceitador, `pairing_token` aleatório CSPRNG de **`32 bytes`** (`256 bits`), dicas de endpoint (IP/porta/mDNS, nunca prova de identidade) e timestamp de expiração.
+   - O iniciador verifica o hash do SPKI TLS do aceitador contra `spki_sha256` do QR **antes** de transmitir qualquer credencial, garantindo autenticidade do servidor desde o handshake TLS. Em seguida prova posse de sua própria chave Ed25519 assinando o contexto CBOR `"lumabridge.pair.qr.auth.v1"` vinculado ao `tls-exporter`, `pairing_attempt_id`, SPKIs e `SHA-256(one_time_pairing_token)`.
+5. **Confirmação humana final:** antes de gravar no Trust Store, o usuário aceita explicitamente o dispositivo mostrando nome amigável (explícito como não confiável) e fingerprint abreviado; mensagens `PairConfirm` recebidas da rede jamais simulam consentimento humano local.
 
 ### 2.3 Armazenamento seguro das identidades pareadas
 
-- Chaves privadas Ed25519 locais e registros de pares confiáveis (`device_id`, `spki_sha256`, apelido, conjunto de permissões concedidas, timestamps de criação/uso, flag de revogação) são protegidos pelos cofres nativos de cada SO:
+- Chaves privadas Ed25519 locais e registros de pares confiáveis (`device_id`, `spki_sha256`, apelido, conjunto de permissões concedidas, timestamps de criação/uso, `auth_revision` e flag de revogação) são protegidos pelos cofres nativos de cada SO:
   - **Windows:** DPAPI (`CryptProtectData` com entropia de aplicação vinculada ao usuário) / Credential Manager e arquivo ACL restrito ao usuário atual.
-  - **Linux:** Secret Service (`org.freedesktop.secrets` / `libsecret` integrado ao GNOME Keyring/KWallet), com fallback explícito para arquivo local `0600` cifrado com chave derivada por Argon2id quando em ambiente headless sem keyring.
+  - **Linux:** Secret Service (`org.freedesktop.secrets` / `libsecret` integrado ao GNOME Keyring/KWallet), com fallback explícito para arquivo local `0600` cifrado com chave derivada por Argon2id (`RFC 9106`) condicionado à existência de segredo de desbloqueio adequado, salt único e parâmetros documentados quando em ambiente headless sem keyring.
   - **Android:** Android Keystore (protegido por TEE/StrongBox quando presente) cifrando armazenamento privado do aplicativo (`EncryptedSharedPreferences` / DataStore cifrado).
+  - *(Nota de escopo `M1.3`: o crate `lumabridge-security` define as interfaces/contratos desses cofres nativos e um backend explícito em memória apenas para testes/desenvolvimento; a implementação e qualificação nos cofres reais do SO acompanham a integração operacional em `M3+`.)*
 
 ### 2.4 Autenticação mútua nas conexões posteriores
 
-- Todas as conexões subsequentes utilizam ALPN `"lumabridge/1"` com TLS 1.3 mútuo (`mTLS`), onde tanto cliente quanto servidor apresentam certificado contendo sua chave Ed25519 e assinam o *CertificateVerify* do TLS 1.3.
-- O verificador de certificados customizado consulta exclusivamente o Trust Store de pares autorizados (sem confiar em CAs públicas genéricas), garantindo rejeição imediata de desconhecidos na camada TLS.
+- Todas as conexões subsequentes utilizam ALPN `"lumabridge/1"` com TLS 1.3 mútuo (`mTLS`, `RFC 9846`), com TLS 1.2, `0-RTT` (*early data*) e *session resumption* TLS por tickets/PSK **desabilitados**, onde tanto cliente quanto servidor apresentam certificado X.509 v3 Ed25519 válido e assinam o *CertificateVerify* do TLS 1.3.
+- O verificador de certificados customizado consulta exclusivamente o Trust Store de pares autorizados (sem confiar em CAs públicas genéricas), garantindo rejeição imediata de desconhecidos ou revogados na camada TLS.
 
 ### 2.5 Revogação, anti-replay, anti-brute-force e permissões separadas
 
-- **Revogação:** ao revogar um dispositivo na UI/CLI local, sua entrada é marcada/removida do Trust Store e quaisquer sessões ativas associadas àquele `device_id` são terminadas imediatamente (`SessionClose` + fechamento do transporte).
+- **Revogação:** ao revogar um dispositivo na UI/CLI local, sua entrada é marcada/removida do Trust Store, seus tokens de retomada (`ResumeToken` de `32 B` armazenados apenas em digest `SHA-256`) são invalidados e são emitidas ações tipadas para encerramento imediato das sessões ativas associadas (`SessionClose` + fechamento do transporte em `M1.4`/`M1.5`).
 - **Proteção contra tentativas excessivas (brute-force):**
-  - Limite máximo de 3 tentativas inválidas por PIN gerado; ao atingir o limite, o PIN é destruído imediatamente e novas tentativas do mesmo endpoint sofrem backoff exponencial.
+  - Limite máximo de 3 tentativas inválidas por PIN gerado; ao atingir o limite, o PIN é destruído imediatamente e novas tentativas sofrem backoff exponencial e orçamento global da janela de pareamento entre todos os endpoints concorrentes.
   - Endpoint de pareamento fechado por padrão fora de janela explícita iniciada pelo usuário.
 - **Proteção contra repetição (anti-replay):**
-  - Toda sessão TLS 1.3/QUIC já garante proteção AEAD contra replay de pacotes na conexão.
-  - Tokens QR, desafios SPAKE2 e `session_id` (64 bits CSPRNG) têm validade estrita de uso único por tentativa/sessão; mensagens de controle e mudança de permissão carregam números de sequência monotônicos validados por sessão.
+  - Toda sessão TLS 1.3 (`RFC 9846`)/QUIC já garante proteção AEAD contra replay de pacotes na conexão.
+  - Tokens QR, desafios SPAKE2 e `session_id` (`64 bits` CSPRNG não zero com detecção de colisão) têm validade estrita de uso único por tentativa/sessão; mensagens de controle e mudança de permissão carregam números de sequência monotônicos validados por sessão, e tokens de retomada operacionais exigem mTLS válido sem jamais restaurar permissões revogadas.
 - **Autorização granular (`Deny-by-Default`):**
   - Permissões armazenadas e negociadas de forma ortogonal:
     - `VIEW_MIRROR` (ver espelhamento)
