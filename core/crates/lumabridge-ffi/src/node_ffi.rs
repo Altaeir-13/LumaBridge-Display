@@ -1461,6 +1461,52 @@ pub unsafe extern "C" fn lb_node_receiver_start(
             };
 
             let start = Instant::now();
+            let push_media_event = |ev: NodeMediaEvent, session_id: u64, now_us: u64| match ev {
+                NodeMediaEvent::Frame(f) => {
+                    let mut vflags = 0u32;
+                    if f.flags.contains(VideoFlags::KEYFRAME) {
+                        vflags |= 0x01;
+                    }
+                    if f.flags.contains(VideoFlags::MIRROR_SOURCE) {
+                        vflags |= 0x04;
+                    }
+                    push_rx_event(
+                        &queue_bg,
+                        QueuedRxItem {
+                            kind: LbReceiverEventKind::VideoFrame,
+                            display_id: f.display_id,
+                            gop_id: f.gop_id,
+                            frame_id: f.frame_id,
+                            video_flags: vflags,
+                            capture_ts_us: f.capture_ts_us,
+                            encode_done_ts_us: f.encode_done_ts_us,
+                            session_id: f.session_id,
+                            payload: f.payload,
+                            force_idr_requested: false,
+                        },
+                    );
+                }
+                NodeMediaEvent::ProtectedBlank(b) => {
+                    push_rx_event(
+                        &queue_bg,
+                        QueuedRxItem {
+                            kind: LbReceiverEventKind::ProtectedBlank,
+                            display_id: b.display_id,
+                            gop_id: 0,
+                            frame_id: b.frame_id,
+                            video_flags: VideoFlags::PROTECTED_BLANK.raw().into(),
+                            capture_ts_us: now_us,
+                            encode_done_ts_us: now_us,
+                            session_id,
+                            payload: Vec::new(),
+                            force_idr_requested: false,
+                        },
+                    );
+                }
+                NodeMediaEvent::ForceIdrRequested(_)
+                | NodeMediaEvent::DroppedDependentFrames(_)
+                | NodeMediaEvent::SessionRenewalRequired => {}
+            };
             loop {
                 if *stop_rx.borrow() {
                     break;
@@ -1473,6 +1519,22 @@ pub unsafe extern "C" fn lb_node_receiver_start(
                 match session.try_recv_control().await {
                     Ok(Some(ControlMessage::SessionClose(_)))
                     | Err(NodeError::Transport(TransportError::ConnectionClosed(_))) => {
+                        for _ in 0..16 {
+                            let drain_us =
+                                u64::try_from(start.elapsed().as_micros()).unwrap_or(0);
+                            match session
+                                .poll_media_event(Duration::from_millis(2), drain_us)
+                                .await
+                            {
+                                Ok(Some(ev)) => {
+                                    push_media_event(ev, session.session_id(), drain_us);
+                                }
+                                Ok(None) | Err(_) => break,
+                            }
+                        }
+                        if let Ok(mut g) = queue_bg.0.lock() {
+                            g.telemetry = Some(session.telemetry_summary());
+                        }
                         push_rx_event(
                             &queue_bg,
                             QueuedRxItem {
@@ -1505,48 +1567,8 @@ pub unsafe extern "C" fn lb_node_receiver_start(
                     .poll_media_event(Duration::from_millis(8), now_us)
                     .await
                 {
-                    Ok(Some(NodeMediaEvent::Frame(f))) => {
-                        let mut vflags = 0u32;
-                        if f.flags.contains(VideoFlags::KEYFRAME) {
-                            vflags |= 0x01;
-                        }
-                        if f.flags.contains(VideoFlags::MIRROR_SOURCE) {
-                            vflags |= 0x04;
-                        }
-                        push_rx_event(
-                            &queue_bg,
-                            QueuedRxItem {
-                                kind: LbReceiverEventKind::VideoFrame,
-                                display_id: f.display_id,
-                                gop_id: f.gop_id,
-                                frame_id: f.frame_id,
-                                video_flags: vflags,
-                                capture_ts_us: f.capture_ts_us,
-                                encode_done_ts_us: f.encode_done_ts_us,
-                                session_id: f.session_id,
-                                payload: f.payload,
-                                force_idr_requested: false,
-                            },
-                        );
-                    }
-                    Ok(Some(NodeMediaEvent::ProtectedBlank(b))) => {
-                        push_rx_event(
-                            &queue_bg,
-                            QueuedRxItem {
-                                kind: LbReceiverEventKind::ProtectedBlank,
-                                display_id: b.display_id,
-                                gop_id: 0,
-                                frame_id: b.frame_id,
-                                video_flags: VideoFlags::PROTECTED_BLANK.raw().into(),
-                                capture_ts_us: now_us,
-                                encode_done_ts_us: now_us,
-                                session_id: session.session_id(),
-                                payload: Vec::new(),
-                                force_idr_requested: false,
-                            },
-                        );
-                    }
-                    Ok(Some(NodeMediaEvent::ForceIdrRequested(_) | _) | None) => {}
+                    Ok(Some(ev)) => push_media_event(ev, session.session_id(), now_us),
+                    Ok(None) => {}
                     Err(NodeError::Transport(TransportError::ConnectionClosed(_))) => {
                         push_rx_event(
                             &queue_bg,

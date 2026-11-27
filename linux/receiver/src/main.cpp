@@ -176,6 +176,7 @@ int main(int argc, char** argv) {
     }
 
     bool quitRequested = false;
+    uint64_t processedVideoFrames = 0ULL;
     while (!g_StopRequested.load(std::memory_order_acquire) && !quitRequested) {
         LbReceiverMediaEvent evt{};
         evt.abi = MakeAbiHeader<LbReceiverMediaEvent>();
@@ -214,12 +215,13 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "[LB-LINUX-RX] PresentProtectedBlank error: %s\n", presErr.c_str());
                 break;
             }
-            if (cfg.maxFrames > 0ULL && tel.frames_delivered >= cfg.maxFrames) {
+            if (cfg.maxFrames > 0ULL && processedVideoFrames >= cfg.maxFrames) {
                 break;
             }
             continue;
         }
         if (evt.kind == static_cast<uint32_t>(LB_RECEIVER_EVENT_KIND_VIDEO_FRAME)) {
+            ++processedVideoFrames;
             std::vector<uint8_t> annexb{};
             if (evt.payload.data != nullptr && evt.payload.len > 0U) {
                 annexb.assign(evt.payload.data, evt.payload.data + evt.payload.len);
@@ -253,17 +255,31 @@ int main(int argc, char** argv) {
             }
 
             if (cfg.maxFrames > 0ULL &&
-                tel.frames_delivered >= cfg.maxFrames &&
+                processedVideoFrames >= cfg.maxFrames &&
                 decoder.GetStats().framesDecoded > 0ULL) {
-                // Keep polling briefly up to 200ms in case ProtectedBlank follows immediately.
-                LbReceiverMediaEvent tailEvt{};
-                tailEvt.abi = MakeAbiHeader<LbReceiverMediaEvent>();
-                if (lb_node_receiver_poll_event(rxSess, 150U, &tailEvt) == LB_STATUS_OK &&
-                    tailEvt.kind == static_cast<uint32_t>(LB_RECEIVER_EVENT_KIND_PROTECTED_BLANK)) {
-                    std::string presErr{};
-                    (void)renderer.PresentProtectedBlank(hud, quitRequested, presErr);
-                } else if (tailEvt.payload.release != nullptr) {
-                    (void)lb_core_release_buffer(&tailEvt.payload);
+                // Bounded tail wait so trailing ProtectedBlank / SessionClose is not lost on exit.
+                const auto tailDeadline =
+                    std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+                while (!g_StopRequested.load(std::memory_order_acquire) &&
+                       !quitRequested &&
+                       std::chrono::steady_clock::now() < tailDeadline) {
+                    LbReceiverMediaEvent tailEvt{};
+                    tailEvt.abi = MakeAbiHeader<LbReceiverMediaEvent>();
+                    if (lb_node_receiver_poll_event(rxSess, 25U, &tailEvt) != LB_STATUS_OK) {
+                        break;
+                    }
+                    if (tailEvt.kind == static_cast<uint32_t>(LB_RECEIVER_EVENT_KIND_PROTECTED_BLANK)) {
+                        std::string presErr{};
+                        (void)renderer.PresentProtectedBlank(hud, quitRequested, presErr);
+                        break;
+                    }
+                    if (tailEvt.kind == static_cast<uint32_t>(LB_RECEIVER_EVENT_KIND_SESSION_CLOSED)) {
+                        break;
+                    }
+                    if (tailEvt.payload.release != nullptr) {
+                        (void)lb_core_release_buffer(&tailEvt.payload);
+                    }
+                    (void)renderer.PumpEvents(quitRequested);
                 }
                 break;
             }
