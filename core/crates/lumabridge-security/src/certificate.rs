@@ -5,6 +5,7 @@
 
 use crate::error::SecurityError;
 use crate::identity::{DeviceId, IdentityKeyPair, PublicIdentity};
+use core::fmt;
 use der::{asn1::ObjectIdentifier, Decode, Encode};
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair,
@@ -20,13 +21,25 @@ const ID_ED25519_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.101.1
 /// Default certificate validity window (365 days in seconds).
 pub const DEFAULT_CERT_VALIDITY_SECS: u64 = 365 * 24 * 60 * 60;
 
-/// Generated X.509 v3 DER certificate and matching PKCS#8 private key material.
+/// Generated X.509 v3 DER certificate and matching zeroized PKCS#8 private key material.
 pub struct GeneratedDeviceCertificate {
     pub cert_der: Vec<u8>,
     pub pkcs8_der: zeroize::Zeroizing<Vec<u8>>,
     pub device_id: DeviceId,
     pub not_before_unix: u64,
     pub not_after_unix: u64,
+}
+
+impl fmt::Debug for GeneratedDeviceCertificate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GeneratedDeviceCertificate")
+            .field("device_id", &self.device_id)
+            .field("cert_der_len", &self.cert_der.len())
+            .field("pkcs8_der", &"[REDACTED]")
+            .field("not_before_unix", &self.not_before_unix)
+            .field("not_after_unix", &self.not_after_unix)
+            .finish()
+    }
 }
 
 /// Verified peer certificate attributes extracted after strict DER + signature checks.

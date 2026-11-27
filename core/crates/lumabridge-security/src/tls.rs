@@ -3,21 +3,30 @@
 
 //! RFC 9846 TLS 1.3-only mTLS configuration, custom Ed25519 self-signed certificate
 //! verifiers, and RFC 9266 channel binding extraction.
+//!
+//! Security policy enforced on every TLS configuration:
+//! - TLS 1.3 only (`TLS 1.2` disabled).
+//! - TLS session resumption (tickets/PSK) and 0-RTT (`early_data`) explicitly disabled.
+//! - Key logging (`SSLKEYLOGFILE` / `KeyLog`) explicitly disabled via `NoKeyLog`.
+//! - Mutual authentication mandatory on both client and server.
+//! - Every operational policy (`Trusted` and `PinnedPeer`) verifies live `TrustStore` state.
 
 use crate::certificate::{
     verify_self_signed_ed25519_cert, GeneratedDeviceCertificate, VerifiedDeviceCertificate,
 };
 use crate::channel_binding::{extract_tls13_channel_binding, ChannelBinding};
 use crate::error::SecurityError;
-use crate::identity::{DeviceId, PeerRole};
+use crate::identity::{DeviceId, PeerRole, PublicIdentity};
 use crate::trust_store::TrustStore;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::Resumption;
 use rustls::crypto::{verify_tls13_signature, CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::server::NoServerSessionStorage;
 use rustls::{
     ClientConfig, ClientConnection, ConnectionCommon, DigitallySignedStruct, DistinguishedName,
-    Error as RustlsError, ServerConfig, ServerConnection, SignatureScheme,
+    Error as RustlsError, HandshakeKind, NoKeyLog, ServerConfig, ServerConnection, SignatureScheme,
 };
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -34,19 +43,22 @@ pub const LUMABRIDGE_PAIR_ALPN_V1: &[u8] = ALPN_PAIRING_V1.as_bytes();
 #[derive(Clone)]
 pub enum TlsPeerTrustPolicy {
     /// Initial pairing channel: requires valid self-signed Ed25519 X.509 v3 cert,
-    /// rejects revoked devices if a trust store is attached, and leaves final peer
+    /// rejects any revoked device via `trust_store`, and leaves final peer
     /// authentication to channel-bound SPAKE2 or QR token verification.
-    Pairing {
-        trust_store: Option<Arc<dyn TrustStore>>,
-    },
+    Pairing { trust_store: Arc<dyn TrustStore> },
     /// Operational session channel: requires peer `DeviceId` to be explicitly trusted
     /// with `expected_role` and not revoked in `trust_store`.
     Trusted {
         trust_store: Arc<dyn TrustStore>,
         expected_role: PeerRole,
     },
-    /// Pinned peer: accepts only the exact pre-known `expected_device_id`.
-    PinnedPeer { expected_device_id: DeviceId },
+    /// Pinned operational peer: requires BOTH exact `expected_device_id` match AND live
+    /// non-revoked membership with `expected_role` in `trust_store`.
+    PinnedPeer {
+        trust_store: Arc<dyn TrustStore>,
+        expected_role: PeerRole,
+        expected_device_id: DeviceId,
+    },
 }
 
 impl TlsPeerTrustPolicy {
@@ -61,14 +73,89 @@ impl TlsPeerTrustPolicy {
 }
 
 /// Authenticated TLS 1.3 session metadata bound to peer certificate and RFC 9266 exporter.
+///
+/// Fields are private so application code cannot forge provenance or spoof `ChannelBinding`
+/// outside [`extract_authenticated_session_with_alpn`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedTlsSession {
-    pub peer_cert: VerifiedDeviceCertificate,
-    pub channel_binding: ChannelBinding,
-    pub negotiated_alpn: Vec<u8>,
+    peer_cert: VerifiedDeviceCertificate,
+    channel_binding: ChannelBinding,
+    negotiated_alpn: Vec<u8>,
 }
 
-/// Build a `rustls::ClientConfig` enforcing TLS 1.3-only mTLS (`lumabridge/1` or `lumabridge-pair/1`) with `ring`.
+impl AuthenticatedTlsSession {
+    /// Construct a synthetic authenticated session strictly for unit tests and fuzz targets.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn synthetic_for_testing(
+        peer_cert: VerifiedDeviceCertificate,
+        channel_binding: ChannelBinding,
+        negotiated_alpn: Vec<u8>,
+    ) -> Self {
+        Self {
+            peer_cert,
+            channel_binding,
+            negotiated_alpn,
+        }
+    }
+
+    /// Validated peer X.509 certificate metadata.
+    #[must_use]
+    pub const fn peer_cert(&self) -> &VerifiedDeviceCertificate {
+        &self.peer_cert
+    }
+
+    /// Validated canonical Ed25519 peer identity extracted from mTLS `CertificateVerify`.
+    #[must_use]
+    pub const fn peer_identity(&self) -> &PublicIdentity {
+        &self.peer_cert.public_identity
+    }
+
+    /// RFC 9266 `EXPORTER-Channel-Binding` tied to this completed TLS 1.3 handshake.
+    #[must_use]
+    pub const fn channel_binding(&self) -> &ChannelBinding {
+        &self.channel_binding
+    }
+
+    /// Negotiated TLS ALPN identifier.
+    #[must_use]
+    pub fn negotiated_alpn(&self) -> &[u8] {
+        &self.negotiated_alpn
+    }
+
+    /// Returns `true` if the session negotiated the operational `"lumabridge/1"` ALPN.
+    #[must_use]
+    pub fn is_operational(&self) -> bool {
+        self.negotiated_alpn.as_slice() == LUMABRIDGE_ALPN_V1
+    }
+
+    /// Returns `true` if the session negotiated the pairing `"lumabridge-pair/1"` ALPN.
+    #[must_use]
+    pub fn is_pairing(&self) -> bool {
+        self.negotiated_alpn.as_slice() == LUMABRIDGE_PAIR_ALPN_V1
+    }
+
+    /// Ensure this session negotiated the operational `"lumabridge/1"` ALPN.
+    pub fn require_operational_alpn(&self) -> Result<(), SecurityError> {
+        if self.is_operational() {
+            Ok(())
+        } else {
+            Err(SecurityError::AlpnMismatch)
+        }
+    }
+
+    /// Ensure this session negotiated the pairing `"lumabridge-pair/1"` ALPN.
+    pub fn require_pairing_alpn(&self) -> Result<(), SecurityError> {
+        if self.is_pairing() {
+            Ok(())
+        } else {
+            Err(SecurityError::AlpnMismatch)
+        }
+    }
+}
+
+/// Build a `rustls::ClientConfig` enforcing TLS 1.3-only mTLS (`lumabridge/1` or `lumabridge-pair/1`),
+/// disabling TLS session resumption, 0-RTT early data, and `KeyLog`.
 pub fn build_tls13_client_config(
     local_cert: &GeneratedDeviceCertificate,
     peer_policy: TlsPeerTrustPolicy,
@@ -91,10 +178,14 @@ pub fn build_tls13_client_config(
         .map_err(|_| SecurityError::TlsConfiguration("failed to configure client mTLS cert"))?;
 
     cfg.alpn_protocols = vec![alpn];
+    cfg.resumption = Resumption::disabled();
+    cfg.enable_early_data = false;
+    cfg.key_log = Arc::new(NoKeyLog {});
     Ok(Arc::new(cfg))
 }
 
-/// Build a `rustls::ServerConfig` enforcing mandatory TLS 1.3-only mTLS (`lumabridge/1` or `lumabridge-pair/1`) with `ring`.
+/// Build a `rustls::ServerConfig` enforcing mandatory TLS 1.3-only mTLS (`lumabridge/1` or `lumabridge-pair/1`),
+/// disabling TLS session tickets/PSK resumption, 0-RTT early data, and `KeyLog`.
 pub fn build_tls13_server_config(
     local_cert: &GeneratedDeviceCertificate,
     peer_policy: TlsPeerTrustPolicy,
@@ -116,11 +207,15 @@ pub fn build_tls13_server_config(
         .map_err(|_| SecurityError::TlsConfiguration("failed to configure server mTLS cert"))?;
 
     cfg.alpn_protocols = vec![alpn];
+    cfg.send_tls13_tickets = 0;
+    cfg.max_early_data_size = 0;
+    cfg.session_storage = Arc::new(NoServerSessionStorage {});
+    cfg.key_log = Arc::new(NoKeyLog {});
     Ok(Arc::new(cfg))
 }
 
-/// Inspect a completed TLS 1.3 connection, verify ALPN (`lumabridge/1` or `lumabridge-pair/1`),
-/// verify peer cert, and export RFC 9266 channel binding.
+/// Inspect a completed TLS 1.3 connection, verify ALPN (`lumabridge/1`),
+/// verify peer cert, reject any resumed session, and export RFC 9266 channel binding.
 pub fn extract_authenticated_session<D>(
     conn: &ConnectionCommon<D>,
     now_unix_secs: u64,
@@ -128,7 +223,8 @@ pub fn extract_authenticated_session<D>(
     extract_authenticated_session_with_alpn(conn, LUMABRIDGE_ALPN_V1, now_unix_secs)
 }
 
-/// Inspect a completed TLS 1.3 connection requiring `expected_alpn` (`lumabridge-pair/1` or `lumabridge/1`).
+/// Inspect a completed TLS 1.3 connection requiring `expected_alpn` (`lumabridge-pair/1` or `lumabridge/1`),
+/// rejecting incomplete or resumed handshakes.
 pub fn extract_authenticated_session_with_alpn<D>(
     conn: &ConnectionCommon<D>,
     expected_alpn: &[u8],
@@ -136,6 +232,14 @@ pub fn extract_authenticated_session_with_alpn<D>(
 ) -> Result<AuthenticatedTlsSession, SecurityError> {
     if conn.is_handshaking() {
         return Err(SecurityError::TlsHandshakeFailed("handshake incomplete"));
+    }
+    if !matches!(
+        conn.handshake_kind(),
+        Some(HandshakeKind::Full | HandshakeKind::FullWithHelloRetryRequest)
+    ) {
+        return Err(SecurityError::TlsHandshakeFailed(
+            "TLS session must complete a full non-resumed handshake",
+        ));
     }
     let Some(alpn) = conn.alpn_protocol() else {
         return Err(SecurityError::AlpnMismatch);
@@ -225,7 +329,7 @@ pub fn drive_in_memory_handshake(
         }
     }
 
-    // Flush any post-handshake server NewSessionTicket or client Finished ACK packets.
+    // Flush any remaining post-handshake TLS control records (e.g., Finished ACK).
     for _ in 0..2 {
         while client.wants_write() {
             client
@@ -306,16 +410,21 @@ struct LumaBridgeCertVerifier {
 impl std::fmt::Debug for TlsPeerTrustPolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Pairing { trust_store } => f
+            Self::Pairing { .. } => f
                 .debug_struct("Pairing")
-                .field("has_trust_store", &trust_store.is_some())
+                .field("has_trust_store", &true)
                 .finish(),
             Self::Trusted { expected_role, .. } => f
                 .debug_struct("Trusted")
                 .field("expected_role", expected_role)
                 .finish(),
-            Self::PinnedPeer { expected_device_id } => f
+            Self::PinnedPeer {
+                expected_role,
+                expected_device_id,
+                ..
+            } => f
                 .debug_struct("PinnedPeer")
+                .field("expected_role", expected_role)
                 .field("expected_device_id", expected_device_id)
                 .finish(),
         }
@@ -347,10 +456,10 @@ impl LumaBridgeCertVerifier {
 
         match &self.policy {
             TlsPeerTrustPolicy::Pairing { trust_store } => {
-                if let Some(store) = trust_store {
-                    if store.is_revoked(verified.public_identity.device_id()) {
-                        return Err(RustlsError::General("peer device is revoked".into()));
-                    }
+                if trust_store.is_revoked(verified.public_identity.device_id()) {
+                    return Err(RustlsError::InvalidCertificate(
+                        rustls::CertificateError::Revoked,
+                    ));
                 }
                 Ok(())
             }
@@ -363,7 +472,11 @@ impl LumaBridgeCertVerifier {
                     .map_err(|err| map_sec_to_rustls(&err))?;
                 Ok(())
             }
-            TlsPeerTrustPolicy::PinnedPeer { expected_device_id } => {
+            TlsPeerTrustPolicy::PinnedPeer {
+                trust_store,
+                expected_role,
+                expected_device_id,
+            } => {
                 if !verified
                     .public_identity
                     .device_id()
@@ -373,6 +486,9 @@ impl LumaBridgeCertVerifier {
                         "peer certificate device_id does not match pinned device_id".into(),
                     ));
                 }
+                trust_store
+                    .verify_trusted_peer(&verified.public_identity, *expected_role)
+                    .map_err(|err| map_sec_to_rustls(&err))?;
                 Ok(())
             }
         }

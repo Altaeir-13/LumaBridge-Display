@@ -1,17 +1,20 @@
 // Copyright 2026 LumaBridge Display Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bounded single-use challenge replay guards, timestamp skew checks, and sequence tracking.
+//! Bounded fail-closed single-use challenge replay guards, timestamp skew checks, and sequence tracking.
 
 use crate::error::SecurityError;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
-/// Maximum number of tracked challenge digests before deterministic FIFO eviction of expired/oldest entries.
+/// Maximum number of unexpired challenge digests tracked concurrently.
+///
+/// When saturated with unexpired entries, inserts fail closed (`ResourceExhausted`) rather than
+/// evicting active unexpired challenges (preventing replay-cache eviction attacks).
 pub const MAX_TRACKED_CHALLENGES: usize = 4096;
 
-/// Bounded single-use challenge / pairing-attempt anti-replay cache with expiry tracking.
+/// Bounded fail-closed single-use challenge / pairing-attempt anti-replay cache with expiry tracking.
 #[derive(Default)]
 pub struct BoundedChallengeCache {
     state: Mutex<ChallengeCacheInner>,
@@ -19,18 +22,21 @@ pub struct BoundedChallengeCache {
 
 #[derive(Default)]
 struct ChallengeCacheInner {
-    order: VecDeque<[u8; 32]>,
+    by_expiry: BTreeSet<(u64, [u8; 32])>,
     entries: BTreeMap<[u8; 32], u64>,
 }
 
 impl BoundedChallengeCache {
-    /// Create a bounded replay cache.
+    /// Create a bounded fail-closed replay cache.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Verify timestamp bounds `[now - max_past_skew, now + max_future_skew]` and check/record challenge once.
+    ///
+    /// Purges all expired entries first; if `MAX_TRACKED_CHALLENGES` unexpired entries remain,
+    /// rejects new inserts with [`SecurityError::ResourceExhausted`] rather than evicting valid anti-replay state.
     pub fn check_and_insert_unique(
         &self,
         context_tag: &[u8],
@@ -49,8 +55,11 @@ impl BoundedChallengeCache {
         }
 
         let mut hasher = Sha256::new();
+        let tag_len = u32::try_from(context_tag.len()).unwrap_or(u32::MAX);
+        hasher.update(tag_len.to_be_bytes());
         hasher.update(context_tag);
-        hasher.update([0u8]);
+        let chall_len = u32::try_from(challenge_bytes.len()).unwrap_or(u32::MAX);
+        hasher.update(chall_len.to_be_bytes());
         hasher.update(challenge_bytes);
         let digest: [u8; 32] = hasher.finalize().into();
 
@@ -60,12 +69,11 @@ impl BoundedChallengeCache {
             .lock()
             .map_err(|_| SecurityError::AuthorizationDenied("replay cache lock poisoned"))?;
 
-        // Evict expired head entries first while keeping FIFO invariants intact.
-        while let Some(&front) = guard.order.front() {
-            let expired = guard.entries.get(&front).is_none_or(|&exp| exp < now_unix);
-            if expired {
-                let _ = guard.order.pop_front();
-                guard.entries.remove(&front);
+        // Purge expired entries strictly ordered by expiry timestamp.
+        while let Some(&(exp, old_digest)) = guard.by_expiry.first() {
+            if exp < now_unix {
+                guard.by_expiry.remove(&(exp, old_digest));
+                guard.entries.remove(&old_digest);
             } else {
                 break;
             }
@@ -75,16 +83,14 @@ impl BoundedChallengeCache {
             return Err(SecurityError::ReplayDetected);
         }
 
-        while guard.entries.len() >= MAX_TRACKED_CHALLENGES {
-            if let Some(oldest) = guard.order.pop_front() {
-                guard.entries.remove(&oldest);
-            } else {
-                break;
-            }
+        if guard.entries.len() >= MAX_TRACKED_CHALLENGES {
+            return Err(SecurityError::ResourceExhausted(
+                "anti-replay cache saturated with unexpired challenges",
+            ));
         }
 
         guard.entries.insert(digest, expires_at);
-        guard.order.push_back(digest);
+        guard.by_expiry.insert((expires_at, digest));
         Ok(())
     }
 

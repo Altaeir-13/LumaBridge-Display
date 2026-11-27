@@ -1,16 +1,40 @@
 // Copyright 2026 LumaBridge Display Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use lumabridge_protocol::control::ED25519_SPKI_DER_PREFIX;
+use lumabridge_protocol::cbor::{
+    CborDecodeMode, CborDecodeOptions, CborReader, UnknownFieldPolicy,
+};
+use lumabridge_protocol::control::{AuthMode, Permissions, ED25519_SPKI_DER_PREFIX};
+use lumabridge_protocol::limits::CborLimits;
+use lumabridge_protocol::version::{ALPN_PAIRING_V1, LBWP_PROTOCOL_MAJOR, LBWP_PROTOCOL_MINOR};
 use lumabridge_security::certificate::{
     generate_self_signed_device_cert, verify_self_signed_ed25519_cert,
 };
+use lumabridge_security::channel_binding::ChannelBinding;
 use lumabridge_security::error::SecurityError;
-use lumabridge_security::identity::{DeviceId, IdentityKeyPair, PublicIdentity};
+use lumabridge_security::identity::{DeviceId, IdentityKeyPair, PeerRole, PublicIdentity};
+use lumabridge_security::secret::{CheckedOsCryptoRng, PinSecret, ResumeTokenSecret};
+use lumabridge_security::tls::{
+    build_tls13_client_config, build_tls13_server_config, canonical_server_name_for_device,
+    drive_in_memory_handshake, extract_authenticated_session_with_alpn, TlsPeerTrustPolicy,
+    LUMABRIDGE_PAIR_ALPN_V1,
+};
+use lumabridge_security::transcript::{
+    build_pair_confirm_signing_message, build_qr_auth_signing_message, build_spake2_aad,
+    derive_resume_channel_proof, derive_resume_token_digest, derive_session_access_token_digest,
+    derive_spake2_wide_secret, spake_endpoint_identities, PairConfirmTranscriptContext,
+    QrAuthTranscriptContext, Spake2AadContext, PAIR_AAD_DOMAIN, PAIR_CONFIRM_SIG_DOMAIN,
+    PAIR_QR_SIG_DOMAIN,
+};
+use lumabridge_security::trust_store::InMemoryTrustStore;
 use pakery_core::crypto::CpaceGroup;
 use pakery_crypto::{P256Group, Spake2P256};
 use pakery_spake2::{PartyA, PartyB};
 use proptest::prelude::*;
+use rustls::{ClientConnection, ServerConnection};
+use sha2::{Digest, Sha256};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn decode_hex(hex: &str) -> Vec<u8> {
     assert_eq!(hex.len() % 2, 0, "odd hex length");
@@ -31,6 +55,42 @@ fn scalar_from_rfc9382_be32(hex: &str) -> <P256Group as CpaceGroup>::Scalar {
     let be = decode_32(hex);
     wide[32..].copy_from_slice(&be);
     P256Group::scalar_from_wide_bytes(&wide).expect("RFC 9382 P-256 scalar")
+}
+
+fn obtain_real_channel_binding() -> (ChannelBinding, IdentityKeyPair, IdentityKeyPair) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    let host_kp = IdentityKeyPair::from_seed([0x15; 32]).expect("host kp");
+    let ctrl_kp = IdentityKeyPair::from_seed([0x25; 32]).expect("ctrl kp");
+    let host_cert =
+        generate_self_signed_device_cert(&host_kp, now - 60, now + 3600).expect("host cert");
+    let ctrl_cert =
+        generate_self_signed_device_cert(&ctrl_kp, now - 60, now + 3600).expect("ctrl cert");
+    let store = Arc::new(InMemoryTrustStore::new());
+    let cli_cfg = build_tls13_client_config(
+        &ctrl_cert,
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: store.clone(),
+        },
+    )
+    .expect("cli cfg");
+    let srv_cfg = build_tls13_server_config(
+        &host_cert,
+        TlsPeerTrustPolicy::Pairing { trust_store: store },
+    )
+    .expect("srv cfg");
+    let mut cli = ClientConnection::new(
+        cli_cfg,
+        canonical_server_name_for_device(host_kp.device_id()).expect("sni"),
+    )
+    .expect("cli");
+    let mut srv = ServerConnection::new(srv_cfg).expect("srv");
+    drive_in_memory_handshake(&mut cli, &mut srv).expect("handshake");
+    let sess =
+        extract_authenticated_session_with_alpn(&cli, LUMABRIDGE_PAIR_ALPN_V1, now).expect("sess");
+    (sess.channel_binding().clone(), ctrl_kp, host_kp)
 }
 
 #[test]
@@ -201,6 +261,176 @@ fn rfc9382_appendix_b_p256_sha256_hkdf_hmac_all_three_vectors() {
             "vector {idx} Ke B mismatch"
         );
     }
+}
+
+#[test]
+fn canonical_lbwp_cbor_transcripts_and_token_domains_are_strict_and_collision_free() {
+    let (cb, ctrl_kp, host_kp) = obtain_real_channel_binding();
+    let strict_opts = CborDecodeOptions {
+        limits: CborLimits::default(),
+        mode: CborDecodeMode::StrictDeterministic,
+        unknown_fields: UnknownFieldPolicy::Reject,
+    };
+
+    // 1. Endpoint identities match normative LB-INIT: / LB-ACC: prefixes
+    let (id_a, id_b) = spake_endpoint_identities(ctrl_kp.device_id(), host_kp.device_id());
+    assert!(id_a.starts_with(b"LB-INIT:"));
+    assert!(id_b.starts_with(b"LB-ACC:"));
+    assert_eq!(&id_a[8..], ctrl_kp.device_id().as_bytes());
+    assert_eq!(&id_b[7..], host_kp.device_id().as_bytes());
+
+    // 2. PIN -> w derivation sensitivity (leading zero PIN vs altered attempt/IDs)
+    let pin = PinSecret::new("04928173").expect("8-digit leading zero pin");
+    let w1 =
+        derive_spake2_wide_secret(&pin, 77, ctrl_kp.device_id(), host_kp.device_id()).expect("w1");
+    let w2 =
+        derive_spake2_wide_secret(&pin, 78, ctrl_kp.device_id(), host_kp.device_id()).expect("w2");
+    assert_ne!(w1.as_slice(), w2.as_slice());
+
+    // 3. SPAKE2 AAD is strict RFC 8949 §4.2.1 deterministic CBOR with keys 1..=13
+    let aad = build_spake2_aad(Spake2AadContext {
+        channel_binding: &cb,
+        pairing_attempt_id: 77,
+        protocol_major: LBWP_PROTOCOL_MAJOR,
+        protocol_minor: LBWP_PROTOCOL_MINOR,
+        initiator_id: ctrl_kp.device_id(),
+        initiator_spki: ctrl_kp.public_identity().spki_der(),
+        initiator_role: PeerRole::Controller,
+        acceptor_id: host_kp.device_id(),
+        acceptor_spki: host_kp.public_identity().spki_der(),
+        acceptor_role: PeerRole::Host,
+    })
+    .expect("aad");
+
+    let mut reader = CborReader::new(&aad, strict_opts).expect("reader");
+    let mut keys_seen = Vec::new();
+    reader
+        .read_map(0, |r, k| {
+            keys_seen.push(k);
+            match k {
+                1 => assert_eq!(r.read_text(64, "domain")?, PAIR_AAD_DOMAIN),
+                2 => assert_eq!(r.read_u64("major")?, u64::from(LBWP_PROTOCOL_MAJOR)),
+                3 => assert_eq!(r.read_u64("minor")?, u64::from(LBWP_PROTOCOL_MINOR)),
+                4 => assert_eq!(r.read_u64("auth_mode")?, 1),
+                5 => assert_eq!(r.read_text(32, "alpn")?, ALPN_PAIRING_V1),
+                6 => assert_eq!(r.read_u64("attempt")?, 77),
+                7 => assert_eq!(r.read_bytes(32, "init_id")?, ctrl_kp.device_id().as_bytes()),
+                8 => assert_eq!(
+                    r.read_bytes(44, "init_spki")?,
+                    ctrl_kp.public_identity().spki_der()
+                ),
+                9 => assert_eq!(r.read_text(16, "init_role")?, "controller"),
+                10 => assert_eq!(r.read_bytes(32, "acc_id")?, host_kp.device_id().as_bytes()),
+                11 => assert_eq!(
+                    r.read_bytes(44, "acc_spki")?,
+                    host_kp.public_identity().spki_der()
+                ),
+                12 => assert_eq!(r.read_text(16, "acc_role")?, "host"),
+                13 => assert_eq!(r.read_bytes(32, "cb")?, cb.as_bytes()),
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })
+        .expect("strict deterministic AAD CBOR");
+    reader.finish_exact().expect("exact AAD");
+    assert_eq!(keys_seen, (1..=13).collect::<Vec<_>>());
+
+    // 4. QR Auth signing transcript embeds SHA-256(token), NOT raw token, in strict CBOR
+    let qr_token = [0xAB; 32];
+    let qr_msg = build_qr_auth_signing_message(QrAuthTranscriptContext {
+        channel_binding: &cb,
+        pairing_attempt_id: 99,
+        protocol_major: LBWP_PROTOCOL_MAJOR,
+        protocol_minor: LBWP_PROTOCOL_MINOR,
+        initiator_id: ctrl_kp.device_id(),
+        initiator_spki: ctrl_kp.public_identity().spki_der(),
+        acceptor_id: host_kp.device_id(),
+        acceptor_spki: host_kp.public_identity().spki_der(),
+        one_time_pairing_token: &qr_token,
+    })
+    .expect("qr msg");
+    assert!(!qr_msg.windows(32).any(|w| w == qr_token));
+    let token_hash: [u8; 32] = Sha256::digest(qr_token).into();
+    assert!(qr_msg.windows(32).any(|w| w == token_hash));
+
+    let mut qr_reader = CborReader::new(&qr_msg, strict_opts).expect("qr reader");
+    let mut qr_keys = Vec::new();
+    qr_reader
+        .read_map(0, |r, k| {
+            qr_keys.push(k);
+            match k {
+                1 => assert_eq!(r.read_text(64, "domain")?, PAIR_QR_SIG_DOMAIN),
+                2..=4 | 6 => {
+                    let _ = r.read_u64("u64")?;
+                }
+                5 => assert_eq!(r.read_text(32, "alpn")?, ALPN_PAIRING_V1),
+                7..=12 => {
+                    let _ = r.read_bytes(44, "bytes")?;
+                }
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })
+        .expect("strict deterministic QR CBOR");
+    qr_reader.finish_exact().expect("exact QR");
+    assert_eq!(qr_keys, (1..=12).collect::<Vec<_>>());
+
+    // 5. PairConfirm signing transcript is strict deterministic CBOR with keys 1..=10
+    let confirm_msg = build_pair_confirm_signing_message(PairConfirmTranscriptContext {
+        channel_binding: &cb,
+        pairing_attempt_id: 99,
+        auth_mode: AuthMode::PinSpake2,
+        accepted: true,
+        granted_base_perms: Permissions::VIEW_MIRROR,
+        initiator_id: ctrl_kp.device_id(),
+        initiator_spki: ctrl_kp.public_identity().spki_der(),
+        acceptor_id: host_kp.device_id(),
+        acceptor_spki: host_kp.public_identity().spki_der(),
+    })
+    .expect("confirm msg");
+    let mut c_reader = CborReader::new(&confirm_msg, strict_opts).expect("confirm reader");
+    let mut c_keys = Vec::new();
+    c_reader
+        .read_map(0, |r, k| {
+            c_keys.push(k);
+            match k {
+                1 => assert_eq!(r.read_text(64, "domain")?, PAIR_CONFIRM_SIG_DOMAIN),
+                2 | 3 | 5 => {
+                    let _ = r.read_u64("u64")?;
+                }
+                4 => assert!(r.read_bool("accepted")?),
+                6..=10 => {
+                    let _ = r.read_bytes(44, "bytes")?;
+                }
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })
+        .expect("strict deterministic PairConfirm CBOR");
+    c_reader.finish_exact().expect("exact PairConfirm");
+    assert_eq!(c_keys, (1..=10).collect::<Vec<_>>());
+
+    // 6. Access token and resume token digests are domain-separated even for identical inputs
+    let raw = [0x42u8; 32];
+    let access_d = derive_session_access_token_digest(&raw, ctrl_kp.device_id(), 555, 1);
+    let resume_d = derive_resume_token_digest(&raw, ctrl_kp.device_id(), 555, 1);
+    assert_ne!(access_d, resume_d);
+    assert_ne!(
+        resume_d,
+        derive_resume_token_digest(&raw, ctrl_kp.device_id(), 556, 1)
+    );
+    assert_ne!(
+        resume_d,
+        derive_resume_token_digest(&raw, ctrl_kp.device_id(), 555, 2)
+    );
+
+    let mut rng = CheckedOsCryptoRng::preflight().expect("rng");
+    let res_secret = ResumeTokenSecret::generate(&mut rng).expect("secret");
+    let p1 =
+        derive_resume_channel_proof(&res_secret, &cb, ctrl_kp.device_id(), 555, 1).expect("p1");
+    let p2 =
+        derive_resume_channel_proof(&res_secret, &cb, ctrl_kp.device_id(), 555, 2).expect("p2");
+    assert_ne!(p1.as_ref(), p2.as_ref());
 }
 
 #[test]

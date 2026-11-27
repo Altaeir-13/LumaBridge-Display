@@ -10,23 +10,37 @@ use crate::secret::{CheckedOsCryptoRng, PinSecret, QrTokenSecret};
 use crate::tls::AuthenticatedTlsSession;
 use crate::transcript::{
     build_pair_confirm_signing_message, build_qr_auth_signing_message, build_spake2_aad,
-    derive_spake2_wide_secret, spake_endpoint_identities, Spake2AadContext,
+    derive_spake2_wide_secret, spake_endpoint_identities, PairConfirmTranscriptContext,
+    QrAuthTranscriptContext, Spake2AadContext,
 };
 use core::fmt;
 use lumabridge_protocol::control::{
     AuthMode, PairConfirm, PairHello, PairQrAuth, PairSpakeMsg, Permissions, SpakeStep,
     OPAQUE_TOKEN_LEN, SPAKE2_CONFIRM_MAC_LEN, SPAKE2_P256_PUBLIC_SHARE_LEN,
 };
-use lumabridge_protocol::version::{ALPN_PAIRING_V1, LBWP_PROTOCOL_MAJOR};
+use lumabridge_protocol::version::{LBWP_PROTOCOL_MAJOR, LBWP_PROTOCOL_MINOR};
 use pakery_core::crypto::CpaceGroup;
 use pakery_crypto::{P256Group, Spake2P256};
 use pakery_spake2::{PartyA, PartyAState, PartyB, Spake2Output};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use zeroize::{Zeroize, Zeroizing};
 
 /// Maximum permitted lifetime of a single-use QR pairing token (seconds).
 pub const MAX_QR_TOKEN_TTL_SECS: u64 = 300;
+
+/// Normative PIN pairing window lifetime (seconds).
+pub const PIN_TTL_SECS: u64 = 90;
+
+/// Maximum invalid PIN attempts before the active PIN is destroyed atomically.
+pub const MAX_PIN_FAILED_ATTEMPTS: u32 = 3;
+
+/// Hard upper bound on active QR pairing tokens stored concurrently.
+pub const MAX_ACTIVE_QR_TOKENS: usize = 64;
+
+/// Hard upper bound on active pairing attempts tracked in one PIN window.
+pub const MAX_ACTIVE_PAIRING_ATTEMPTS: usize = 16;
 
 /// Explicit 5-stage semantic pairing lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,13 +57,239 @@ pub enum PairingStage {
     Failed,
 }
 
-/// Explicit port for local human consent before trusting a newly paired peer.
+/// Sanitized human-consent prompt metadata rendered to the local operator.
+///
+/// Explicitly marks `untrusted_friendly_name` as untrusted peer-supplied text alongside
+/// the cryptographically verified `peer_device_id` and `peer_fingerprint`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingApprovalPrompt {
+    pub pairing_attempt_id: u64,
+    pub peer_device_id: DeviceId,
+    pub peer_fingerprint: String,
+    pub untrusted_friendly_name: String,
+    pub auth_mode: AuthMode,
+    pub offered_base_perms: Option<Permissions>,
+}
+
+/// Explicit port for local human consent bound to a specific attempt ID and peer `DeviceId`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HumanApprovalDecision {
-    /// Local user explicitly approves pairing with `granted_base_perms` (no remote input perms).
-    Approve { granted_base_perms: Permissions },
-    /// Local user denies pairing.
-    Reject,
+    /// Local user explicitly approves pairing this exact peer/attempt with `granted_base_perms` (no input).
+    Approve {
+        pairing_attempt_id: u64,
+        peer_device_id: DeviceId,
+        granted_base_perms: Permissions,
+    },
+    /// Local user denies pairing for this peer/attempt.
+    Reject {
+        pairing_attempt_id: u64,
+        peer_device_id: DeviceId,
+    },
+}
+
+/// Proven local pairing commit produced ONLY after cryptographic verification + local human approval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovedPairingCommit {
+    pub pairing_attempt_id: u64,
+    pub peer_identity: PublicIdentity,
+    pub peer_role: PeerRole,
+    pub friendly_name: String,
+    pub granted_base_perms: Permissions,
+}
+
+#[derive(Debug)]
+struct ActivePinState {
+    pin: PinSecret,
+    pin_generation: u64,
+    expires_at_unix: u64,
+    failed_attempts: u32,
+    in_flight_attempts: u32,
+}
+
+#[derive(Debug, Default)]
+struct PinWindowInner {
+    active: Option<ActivePinState>,
+    next_pin_generation: u64,
+    active_attempts: usize,
+}
+
+/// Thread-safe PIN pairing window enforcing an atomic 3-attempt budget across all concurrent peers,
+/// 90-second expiration, and immediate zeroization upon success, exhaustion, expiry, or close.
+#[derive(Debug, Clone, Default)]
+pub struct PinPairingWindow {
+    inner: Arc<Mutex<PinWindowInner>>,
+}
+
+impl PinPairingWindow {
+    /// Create a closed PIN pairing window.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Open (or rotate) the pairing window with a fresh CSPRNG 8-digit PIN valid for 90 seconds.
+    pub fn open_with_new_pin(
+        &self,
+        rng: &mut CheckedOsCryptoRng,
+        now_unix: u64,
+    ) -> Result<PinSecret, SecurityError> {
+        let pin = PinSecret::generate_numeric(rng)?;
+        let expires_at_unix = now_unix
+            .checked_add(PIN_TTL_SECS)
+            .ok_or(SecurityError::InvalidTimestamp("PIN expiry overflow"))?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| SecurityError::AuthorizationDenied("PIN window lock poisoned"))?;
+        guard.next_pin_generation = guard.next_pin_generation.saturating_add(1);
+        let gen = guard.next_pin_generation;
+        guard.active = Some(ActivePinState {
+            pin: pin.clone(),
+            pin_generation: gen,
+            expires_at_unix,
+            failed_attempts: 0,
+            in_flight_attempts: 0,
+        });
+        Ok(pin)
+    }
+
+    /// Close the pairing window immediately and zeroize any active PIN.
+    pub fn close(&self) -> Result<(), SecurityError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| SecurityError::AuthorizationDenied("PIN window lock poisoned"))?;
+        guard.active = None;
+        Ok(())
+    }
+
+    /// Remaining attempts before PIN destruction (`0` if closed, expired, or exhausted).
+    ///
+    /// Clears and zeroizes expired PIN material if observed past `expires_at_unix`.
+    #[must_use]
+    pub fn remaining_attempts(&self, now_unix: u64) -> u32 {
+        let Ok(mut guard) = self.inner.lock() else {
+            return 0;
+        };
+        let Some(ref st) = guard.active else {
+            return 0;
+        };
+        if now_unix > st.expires_at_unix {
+            guard.active = None;
+            return 0;
+        }
+        MAX_PIN_FAILED_ATTEMPTS
+            .saturating_sub(st.failed_attempts.saturating_add(st.in_flight_attempts))
+    }
+
+    /// Atomically reserve one PIN attempt slot under the 3-attempt budget across concurrent callers.
+    pub fn begin_attempt(&self, now_unix: u64) -> Result<PinAttemptLease, SecurityError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| SecurityError::AuthorizationDenied("PIN window lock poisoned"))?;
+        if guard.active_attempts >= MAX_ACTIVE_PAIRING_ATTEMPTS {
+            return Err(SecurityError::ResourceExhausted(
+                "maximum concurrent pairing attempts reached",
+            ));
+        }
+        let Some(ref mut st) = guard.active else {
+            return Err(SecurityError::PairingWindowClosed);
+        };
+        if now_unix > st.expires_at_unix {
+            guard.active = None;
+            return Err(SecurityError::PairingWindowClosed);
+        }
+        if st.failed_attempts.saturating_add(st.in_flight_attempts) >= MAX_PIN_FAILED_ATTEMPTS {
+            if st.failed_attempts >= MAX_PIN_FAILED_ATTEMPTS {
+                guard.active = None;
+            }
+            return Err(SecurityError::PinAttemptsExhausted);
+        }
+        st.in_flight_attempts = st.in_flight_attempts.saturating_add(1);
+        let pin_copy = st.pin.clone();
+        let pin_generation = st.pin_generation;
+        guard.active_attempts = guard.active_attempts.saturating_add(1);
+
+        Ok(PinAttemptLease {
+            inner: Arc::clone(&self.inner),
+            pin_generation,
+            pin: Some(pin_copy),
+            resolved: false,
+        })
+    }
+}
+
+/// RAII lease over a single PIN pairing attempt; dropping without `finish_success` counts as failure
+/// and automatically destroys the active PIN if the 3rd failure is reached for the same generation.
+pub struct PinAttemptLease {
+    inner: Arc<Mutex<PinWindowInner>>,
+    pin_generation: u64,
+    pin: Option<PinSecret>,
+    resolved: bool,
+}
+
+impl PinAttemptLease {
+    fn pin(&self) -> Result<&PinSecret, SecurityError> {
+        self.pin.as_ref().ok_or(SecurityError::PairingState(
+            "PIN attempt lease already resolved",
+        ))
+    }
+
+    /// Consume and destroy the active PIN upon cryptographic verification success (if same generation).
+    pub fn finish_success(mut self) {
+        self.resolved = true;
+        self.pin = None;
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.active_attempts = guard.active_attempts.saturating_sub(1);
+            let same_gen = guard
+                .active
+                .as_ref()
+                .is_some_and(|st| st.pin_generation == self.pin_generation);
+            if same_gen {
+                if let Some(ref mut st) = guard.active {
+                    st.in_flight_attempts = st.in_flight_attempts.saturating_sub(1);
+                }
+                guard.active = None;
+            }
+        }
+    }
+
+    /// Record a failed verification and destroy the active PIN if 3 failures have occurred.
+    pub fn finish_failure(mut self) {
+        self.record_failure_inner();
+    }
+
+    fn record_failure_inner(&mut self) {
+        if self.resolved {
+            return;
+        }
+        self.resolved = true;
+        self.pin = None;
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.active_attempts = guard.active_attempts.saturating_sub(1);
+            let should_destroy = if let Some(ref mut st) = guard.active {
+                if st.pin_generation == self.pin_generation {
+                    st.in_flight_attempts = st.in_flight_attempts.saturating_sub(1);
+                    st.failed_attempts = st.failed_attempts.saturating_add(1);
+                    st.failed_attempts >= MAX_PIN_FAILED_ATTEMPTS
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if should_destroy {
+                guard.active = None;
+            }
+        }
+    }
+}
+
+impl Drop for PinAttemptLease {
+    fn drop(&mut self) {
+        self.record_failure_inner();
+    }
 }
 
 /// Out-of-band QR pairing token metadata shown by the pairing host.
@@ -83,7 +323,7 @@ struct StoredQrRecord {
     consumed: bool,
 }
 
-/// Atomic single-use QR pairing token store (stores SHA-256 digests only, never raw tokens).
+/// Bounded atomic single-use QR pairing token store (stores SHA-256 digests only, never raw tokens).
 #[derive(Default)]
 pub struct QrTokenStore {
     records: Mutex<BTreeMap<[u8; 32], StoredQrRecord>>,
@@ -120,8 +360,12 @@ impl QrTokenStore {
             .records
             .lock()
             .map_err(|_| SecurityError::AuthorizationDenied("QR store lock poisoned"))?;
-        // Opportunistically prune expired consumed records to keep store bounded.
-        guard.retain(|_, rec| rec.expires_at_unix >= now_unix);
+        guard.retain(|_, rec| !rec.consumed && rec.expires_at_unix >= now_unix);
+        if guard.len() >= MAX_ACTIVE_QR_TOKENS {
+            return Err(SecurityError::ResourceExhausted(
+                "active QR pairing token limit reached",
+            ));
+        }
         guard.insert(
             digest,
             StoredQrRecord {
@@ -149,10 +393,11 @@ impl QrTokenStore {
         expected_acceptor_id: DeviceId,
         now_unix: u64,
     ) -> Result<(), SecurityError> {
-        let token_arr: [u8; OPAQUE_TOKEN_LEN] = raw_token
-            .try_into()
-            .map_err(|_| SecurityError::QrPairingInvalid("QR token must be 32 bytes"))?;
-        let digest: [u8; 32] = Sha256::digest(token_arr).into();
+        let token_arr = Zeroizing::new(
+            <[u8; OPAQUE_TOKEN_LEN]>::try_from(raw_token)
+                .map_err(|_| SecurityError::QrPairingInvalid("QR token must be 32 bytes"))?,
+        );
+        let digest: [u8; 32] = Sha256::digest(token_arr.as_slice()).into();
 
         let mut guard = self
             .records
@@ -177,14 +422,12 @@ impl QrTokenStore {
     }
 }
 
-/// Bind a validated `PairHello` against an active TLS 1.3 mTLS session.
+/// Bind a validated `PairHello` byte-for-byte against an active TLS 1.3 mTLS session.
 pub fn validate_pair_hello_against_tls(
     hello: &PairHello,
     tls_peer: &AuthenticatedTlsSession,
 ) -> Result<PublicIdentity, SecurityError> {
-    if tls_peer.negotiated_alpn.as_slice() != ALPN_PAIRING_V1.as_bytes() {
-        return Err(SecurityError::AlpnMismatch);
-    }
+    tls_peer.require_pairing_alpn()?;
     if hello.protocol_major != LBWP_PROTOCOL_MAJOR {
         return Err(SecurityError::ProtocolViolation(
             "unsupported PairHello major version",
@@ -196,9 +439,9 @@ pub fn validate_pair_hello_against_tls(
             "PairHello device_id does not equal SHA-256(spki_ed25519)",
         ));
     }
-    if claimed.device_id() != tls_peer.peer_cert.public_identity.device_id() {
+    if claimed.spki_der() != tls_peer.peer_identity().spki_der() {
         return Err(SecurityError::IdentityMismatch(
-            "PairHello identity does not match authenticated mTLS peer certificate",
+            "PairHello SPKI does not match authenticated mTLS peer certificate",
         ));
     }
     Ok(claimed)
@@ -208,16 +451,19 @@ pub fn validate_pair_hello_against_tls(
 pub struct PairingInitiator {
     stage: PairingStage,
     pairing_attempt_id: u64,
+    local_identity: PublicIdentity,
     local_role: PeerRole,
     peer_role: PeerRole,
     peer_identity: PublicIdentity,
+    peer_friendly_name: String,
     channel_binding: ChannelBinding,
     auth_mode: AuthMode,
     protocol_major: u16,
-    protocol_minor: u16,
+    effective_minor: u16,
     spake_state: Option<PartyAState<Spake2P256>>,
     spake_output: Option<Spake2Output>,
     peer_confirmed: bool,
+    remote_offered_perms: Option<Permissions>,
     granted_base_perms: Option<Permissions>,
 }
 
@@ -231,6 +477,12 @@ impl PairingInitiator {
         tls_peer: &AuthenticatedTlsSession,
         auth_mode: AuthMode,
     ) -> Result<Self, SecurityError> {
+        if pairing_attempt_id == 0 {
+            return Err(SecurityError::ProtocolViolation(
+                "pairing_attempt_id cannot be zero",
+            ));
+        }
+        validate_pairing_friendly_name(&peer_hello.friendly_name)?;
         let peer_identity = validate_pair_hello_against_tls(peer_hello, tls_peer)?;
         if local_identity.device_id() == peer_identity.device_id() {
             return Err(SecurityError::IdentityMismatch(
@@ -245,18 +497,28 @@ impl PairingInitiator {
         Ok(Self {
             stage: PairingStage::Init,
             pairing_attempt_id,
+            local_identity: local_identity.public_identity().clone(),
             local_role,
             peer_role: local_role.opposite(),
             peer_identity,
-            channel_binding: tls_peer.channel_binding,
+            peer_friendly_name: peer_hello.friendly_name.clone(),
+            channel_binding: tls_peer.channel_binding().clone(),
             auth_mode,
-            protocol_major: peer_hello.protocol_major,
-            protocol_minor: peer_hello.protocol_minor,
+            protocol_major: LBWP_PROTOCOL_MAJOR,
+            effective_minor: negotiate_minor(peer_hello.protocol_minor),
             spake_state: None,
             spake_output: None,
             peer_confirmed: false,
+            remote_offered_perms: None,
             granted_base_perms: None,
         })
+    }
+
+    fn fail(&mut self) {
+        self.stage = PairingStage::Failed;
+        self.spake_state = None;
+        self.spake_output = None;
+        self.remote_offered_perms = None;
     }
 
     /// Current 5-stage pairing state.
@@ -273,25 +535,41 @@ impl PairingInitiator {
 
     /// Active RFC 9266 TLS 1.3 channel binding.
     #[must_use]
-    pub const fn channel_binding(&self) -> ChannelBinding {
-        self.channel_binding
+    pub const fn channel_binding(&self) -> &ChannelBinding {
+        &self.channel_binding
     }
 
-    /// Base display permissions confirmed by peer upon completion.
+    /// Base display permissions finalized upon local approval.
     #[must_use]
     pub const fn granted_base_perms(&self) -> Option<Permissions> {
         self.granted_base_perms
     }
 
+    /// Render sanitized prompt details for local human confirmation on the Initiator.
+    pub fn approval_prompt(&self) -> Result<PairingApprovalPrompt, SecurityError> {
+        if self.stage != PairingStage::AwaitingApproval || self.remote_offered_perms.is_none() {
+            return Err(SecurityError::PairingState(
+                "approval prompt requires verified PairConfirm before local consent",
+            ));
+        }
+        Ok(PairingApprovalPrompt {
+            pairing_attempt_id: self.pairing_attempt_id,
+            peer_device_id: self.peer_identity.device_id(),
+            peer_fingerprint: self.peer_identity.device_id().fingerprint_display(),
+            untrusted_friendly_name: self.peer_friendly_name.clone(),
+            auth_mode: self.auth_mode,
+            offered_base_perms: self.remote_offered_perms,
+        })
+    }
+
     /// Begin RFC 9382 SPAKE2-P256 exchange and emit the initial `KeyExchange` message (`pA`).
     pub fn begin_spake2(
         &mut self,
-        local_id: DeviceId,
         pin: &PinSecret,
         rng: &mut CheckedOsCryptoRng,
     ) -> Result<PairSpakeMsg, SecurityError> {
         if self.stage != PairingStage::Init || self.auth_mode != AuthMode::PinSpake2 {
-            self.stage = PairingStage::Failed;
+            self.fail();
             return Err(SecurityError::PairingState(
                 "SPAKE2 start requires Init stage and PinSpake2 mode",
             ));
@@ -299,29 +577,41 @@ impl PairingInitiator {
 
         let wide = derive_spake2_wide_secret(
             pin,
-            &self.channel_binding,
             self.pairing_attempt_id,
-            local_id,
+            self.local_identity.device_id(),
             self.peer_identity.device_id(),
-        )?;
-        let w = P256Group::scalar_from_wide_bytes(wide.as_slice())
-            .map_err(|_| SecurityError::Spake2Failed)?;
-        let (id_a, id_b) = spake_endpoint_identities(local_id, self.peer_identity.device_id());
+        )
+        .inspect_err(|_| self.fail())?;
+        let w = P256Group::scalar_from_wide_bytes(wide.as_slice()).map_err(|_| {
+            self.fail();
+            SecurityError::Spake2Failed
+        })?;
+        let (id_a, id_b) = spake_endpoint_identities(
+            self.local_identity.device_id(),
+            self.peer_identity.device_id(),
+        );
         let aad = build_spake2_aad(Spake2AadContext {
             channel_binding: &self.channel_binding,
             pairing_attempt_id: self.pairing_attempt_id,
             protocol_major: self.protocol_major,
-            protocol_minor: self.protocol_minor,
-            initiator_id: local_id,
+            protocol_minor: self.effective_minor,
+            initiator_id: self.local_identity.device_id(),
+            initiator_spki: self.local_identity.spki_der(),
             initiator_role: self.local_role,
             acceptor_id: self.peer_identity.device_id(),
+            acceptor_spki: self.peer_identity.spki_der(),
             acceptor_role: self.peer_role,
-        });
+        })
+        .inspect_err(|_| self.fail())?;
 
-        let mut spake_rng = rng.prefetch_spake_entropy()?;
+        let mut spake_rng = rng.prefetch_spake_entropy().inspect_err(|_| self.fail())?;
         let (p_a, state) = PartyA::<Spake2P256>::start(&w, &id_a, &id_b, &aad, &mut spake_rng)
-            .map_err(|_| SecurityError::Spake2Failed)?;
-        validate_uncompressed_p256_share(&p_a)?;
+            .map_err(|_| {
+                self.fail();
+                SecurityError::Spake2Failed
+            })?;
+        spake_rng.ensure_healthy().inspect_err(|_| self.fail())?;
+        validate_uncompressed_p256_share(&p_a).inspect_err(|_| self.fail())?;
 
         self.spake_state = Some(state);
         self.stage = PairingStage::AuthExchanging;
@@ -339,7 +629,7 @@ impl PairingInitiator {
         peer_msg: &PairSpakeMsg,
     ) -> Result<PairSpakeMsg, SecurityError> {
         if self.stage != PairingStage::AuthExchanging || self.auth_mode != AuthMode::PinSpake2 {
-            self.stage = PairingStage::Failed;
+            self.fail();
             return Err(SecurityError::PairingState(
                 "unexpected SPAKE2 peer message state",
             ));
@@ -348,25 +638,25 @@ impl PairingInitiator {
             || peer_msg.step != SpakeStep::KeyExchange
             || peer_msg.key_confirmation.is_some()
         {
-            self.stage = PairingStage::Failed;
+            self.fail();
             return Err(SecurityError::PairingState(
                 "expected KeyExchange message matching pairing_attempt_id",
             ));
         }
-        validate_uncompressed_p256_share(&peer_msg.spake_payload)?;
+        validate_uncompressed_p256_share(&peer_msg.spake_payload).inspect_err(|_| self.fail())?;
 
         let Some(state) = self.spake_state.take() else {
-            self.stage = PairingStage::Failed;
+            self.fail();
             return Err(SecurityError::PairingState(
                 "missing SPAKE2 initiator state",
             ));
         };
         let output = state.finish(&peer_msg.spake_payload).map_err(|_| {
-            self.stage = PairingStage::Failed;
+            self.fail();
             SecurityError::Spake2Failed
         })?;
         if output.confirmation_mac.len() != SPAKE2_CONFIRM_MAC_LEN {
-            self.stage = PairingStage::Failed;
+            self.fail();
             return Err(SecurityError::Spake2Failed);
         }
         let mac = output.confirmation_mac.clone();
@@ -386,7 +676,7 @@ impl PairingInitiator {
         peer_msg: &PairSpakeMsg,
     ) -> Result<(), SecurityError> {
         if self.stage != PairingStage::AuthExchanging || self.auth_mode != AuthMode::PinSpake2 {
-            self.stage = PairingStage::Failed;
+            self.fail();
             return Err(SecurityError::PairingState(
                 "unexpected SPAKE2 confirmation state",
             ));
@@ -395,30 +685,29 @@ impl PairingInitiator {
             || peer_msg.step != SpakeStep::KeyConfirmation
             || !peer_msg.spake_payload.is_empty()
         {
-            self.stage = PairingStage::Failed;
+            self.fail();
             return Err(SecurityError::PairingState(
                 "expected KeyConfirmation message matching pairing_attempt_id",
             ));
         }
         let Some(ref peer_mac) = peer_msg.key_confirmation else {
-            self.stage = PairingStage::Failed;
+            self.fail();
             return Err(SecurityError::Spake2Failed);
         };
         if peer_mac.len() != SPAKE2_CONFIRM_MAC_LEN {
-            self.stage = PairingStage::Failed;
+            self.fail();
             return Err(SecurityError::Spake2Failed);
         }
         let Some(output) = self.spake_output.take() else {
-            self.stage = PairingStage::Failed;
+            self.fail();
             return Err(SecurityError::PairingState(
                 "missing SPAKE2 initiator output",
             ));
         };
         output.verify_peer_confirmation(peer_mac).map_err(|_| {
-            self.stage = PairingStage::Failed;
+            self.fail();
             SecurityError::Spake2Failed
         })?;
-        // Consume derived session key explicitly after key confirmation succeeds.
         drop(output.into_session_key());
         self.peer_confirmed = true;
         self.stage = PairingStage::AwaitingApproval;
@@ -433,29 +722,44 @@ impl PairingInitiator {
         now_unix: u64,
     ) -> Result<PairQrAuth, SecurityError> {
         if self.stage != PairingStage::Init || self.auth_mode != AuthMode::QrOutOfBand {
-            self.stage = PairingStage::Failed;
+            self.fail();
             return Err(SecurityError::PairingState(
                 "QR pairing requires Init stage and QrOutOfBand mode",
             ));
         }
+        if local_identity.device_id() != self.local_identity.device_id() {
+            self.fail();
+            return Err(SecurityError::IdentityMismatch(
+                "signing keypair does not match initiator session identity",
+            ));
+        }
         if ticket.acceptor_device_id != self.peer_identity.device_id() {
-            self.stage = PairingStage::Failed;
+            self.fail();
             return Err(SecurityError::IdentityMismatch(
                 "QR ticket acceptor does not match connected TLS peer",
             ));
         }
+        if ticket.acceptor_role != self.peer_role {
+            self.fail();
+            return Err(SecurityError::RoleConfusion);
+        }
         if now_unix > ticket.expires_at_unix {
-            self.stage = PairingStage::Failed;
+            self.fail();
             return Err(SecurityError::QrPairingInvalid("QR ticket already expired"));
         }
 
-        let signing_msg = build_qr_auth_signing_message(
-            &self.channel_binding,
-            self.pairing_attempt_id,
-            local_identity.device_id(),
-            self.peer_identity.device_id(),
-            ticket.token.expose_secret(),
-        );
+        let signing_msg = build_qr_auth_signing_message(QrAuthTranscriptContext {
+            channel_binding: &self.channel_binding,
+            pairing_attempt_id: self.pairing_attempt_id,
+            protocol_major: self.protocol_major,
+            protocol_minor: self.effective_minor,
+            initiator_id: self.local_identity.device_id(),
+            initiator_spki: self.local_identity.spki_der(),
+            acceptor_id: self.peer_identity.device_id(),
+            acceptor_spki: self.peer_identity.spki_der(),
+            one_time_pairing_token: ticket.token.expose_secret(),
+        })
+        .inspect_err(|_| self.fail())?;
         let signature = local_identity.sign(&signing_msg);
         self.peer_confirmed = true;
         self.stage = PairingStage::AwaitingApproval;
@@ -467,53 +771,132 @@ impl PairingInitiator {
         })
     }
 
-    /// Verify `PairConfirm` signature, reject any input permission escalation, and reach `Confirmed`.
-    pub fn accept_pair_confirm(
+    /// Verify peer's network `PairConfirm` signature and non-input permissions, WITHOUT promoting
+    /// to `Confirmed`. Local human approval via [`Self::apply_local_approval`] remains mandatory.
+    pub fn verify_pair_confirm(
         &mut self,
-        local_id: DeviceId,
         confirm: &PairConfirm,
     ) -> Result<Permissions, SecurityError> {
-        if self.stage != PairingStage::AwaitingApproval || !self.peer_confirmed {
-            self.stage = PairingStage::Failed;
+        if self.stage != PairingStage::AwaitingApproval
+            || !self.peer_confirmed
+            || self.remote_offered_perms.is_some()
+        {
+            self.fail();
             return Err(SecurityError::PairingState(
-                "PairConfirm received before authentication completed",
+                "PairConfirm received in invalid pairing state",
             ));
         }
         if confirm.pairing_attempt_id != self.pairing_attempt_id {
-            self.stage = PairingStage::Failed;
+            self.fail();
             return Err(SecurityError::PairingState(
                 "PairConfirm attempt id mismatch",
             ));
         }
         if !confirm.accepted {
-            self.stage = PairingStage::Failed;
+            self.fail();
             return Err(SecurityError::ApprovalRequired);
         }
         if confirm.granted_base_perms.has_any_input() {
-            self.stage = PairingStage::Failed;
+            self.fail();
             return Err(SecurityError::AuthorizationDenied(
                 "PairConfirm cannot grant remote input permissions",
             ));
         }
         let Some(ref sig) = confirm.confirm_signature else {
-            self.stage = PairingStage::Failed;
+            self.fail();
             return Err(SecurityError::InvalidSignature);
         };
-        let msg = build_pair_confirm_signing_message(
-            &self.channel_binding,
-            self.pairing_attempt_id,
-            local_id,
-            self.peer_identity.device_id(),
-            confirm.granted_base_perms,
-        );
+        let msg = build_pair_confirm_signing_message(PairConfirmTranscriptContext {
+            channel_binding: &self.channel_binding,
+            pairing_attempt_id: self.pairing_attempt_id,
+            auth_mode: self.auth_mode,
+            accepted: confirm.accepted,
+            granted_base_perms: confirm.granted_base_perms,
+            initiator_id: self.local_identity.device_id(),
+            initiator_spki: self.local_identity.spki_der(),
+            acceptor_id: self.peer_identity.device_id(),
+            acceptor_spki: self.peer_identity.spki_der(),
+        })
+        .inspect_err(|_| self.fail())?;
         self.peer_identity
             .verify_strict(&msg, sig)
-            .inspect_err(|_| {
-                self.stage = PairingStage::Failed;
-            })?;
-        self.granted_base_perms = Some(confirm.granted_base_perms);
-        self.stage = PairingStage::Confirmed;
+            .inspect_err(|_| self.fail())?;
+        self.remote_offered_perms = Some(confirm.granted_base_perms);
         Ok(confirm.granted_base_perms)
+    }
+
+    /// Finalize initiator trust ONLY after explicit local human consent matching peer & attempt ID.
+    pub fn apply_local_approval(
+        &mut self,
+        decision: HumanApprovalDecision,
+    ) -> Result<ApprovedPairingCommit, SecurityError> {
+        if self.stage != PairingStage::AwaitingApproval || !self.peer_confirmed {
+            self.fail();
+            return Err(SecurityError::PairingState(
+                "local approval requires AwaitingApproval after peer authentication",
+            ));
+        }
+        let Some(remote_offered) = self.remote_offered_perms else {
+            self.fail();
+            return Err(SecurityError::PairingState(
+                "cannot approve locally before verifying peer PairConfirm",
+            ));
+        };
+
+        match decision {
+            HumanApprovalDecision::Reject {
+                pairing_attempt_id,
+                peer_device_id,
+            } => {
+                if pairing_attempt_id != self.pairing_attempt_id
+                    || peer_device_id != self.peer_identity.device_id()
+                {
+                    self.fail();
+                    return Err(SecurityError::IdentityMismatch(
+                        "approval decision does not match active peer/attempt",
+                    ));
+                }
+                self.fail();
+                Err(SecurityError::ApprovalRequired)
+            }
+            HumanApprovalDecision::Approve {
+                pairing_attempt_id,
+                peer_device_id,
+                granted_base_perms,
+            } => {
+                if pairing_attempt_id != self.pairing_attempt_id
+                    || peer_device_id != self.peer_identity.device_id()
+                {
+                    self.fail();
+                    return Err(SecurityError::IdentityMismatch(
+                        "approval decision does not match active peer/attempt",
+                    ));
+                }
+                if granted_base_perms.has_any_input() {
+                    self.fail();
+                    return Err(SecurityError::AuthorizationDenied(
+                        "initial pairing cannot grant remote input permissions",
+                    ));
+                }
+                let effective = remote_offered.intersection(granted_base_perms);
+                self.granted_base_perms = Some(effective);
+                self.stage = PairingStage::Confirmed;
+                Ok(ApprovedPairingCommit {
+                    pairing_attempt_id: self.pairing_attempt_id,
+                    peer_identity: self.peer_identity.clone(),
+                    peer_role: self.peer_role,
+                    friendly_name: self.peer_friendly_name.clone(),
+                    granted_base_perms: effective,
+                })
+            }
+        }
+    }
+}
+
+impl Drop for PairingInitiator {
+    fn drop(&mut self) {
+        self.fail();
+        self.channel_binding.zeroize();
     }
 }
 
@@ -521,14 +904,17 @@ impl PairingInitiator {
 pub struct PairingAcceptor {
     stage: PairingStage,
     pairing_attempt_id: u64,
+    local_identity: PublicIdentity,
     local_role: PeerRole,
     peer_role: PeerRole,
     peer_identity: PublicIdentity,
+    peer_friendly_name: String,
     channel_binding: ChannelBinding,
     auth_mode: AuthMode,
     protocol_major: u16,
-    protocol_minor: u16,
+    effective_minor: u16,
     spake_output: Option<Spake2Output>,
+    pin_lease: Option<PinAttemptLease>,
     spake_consumed: bool,
     qr_consumed: bool,
     granted_base_perms: Option<Permissions>,
@@ -543,6 +929,12 @@ impl PairingAcceptor {
         peer_hello: &PairHello,
         tls_peer: &AuthenticatedTlsSession,
     ) -> Result<Self, SecurityError> {
+        if pairing_attempt_id == 0 {
+            return Err(SecurityError::ProtocolViolation(
+                "pairing_attempt_id cannot be zero",
+            ));
+        }
+        validate_pairing_friendly_name(&peer_hello.friendly_name)?;
         let peer_identity = validate_pair_hello_against_tls(peer_hello, tls_peer)?;
         if local_identity.device_id() == peer_identity.device_id() {
             return Err(SecurityError::IdentityMismatch(
@@ -552,18 +944,29 @@ impl PairingAcceptor {
         Ok(Self {
             stage: PairingStage::Init,
             pairing_attempt_id,
+            local_identity: local_identity.public_identity().clone(),
             local_role,
             peer_role: local_role.opposite(),
             peer_identity,
-            channel_binding: tls_peer.channel_binding,
+            peer_friendly_name: peer_hello.friendly_name.clone(),
+            channel_binding: tls_peer.channel_binding().clone(),
             auth_mode: peer_hello.auth_mode,
-            protocol_major: peer_hello.protocol_major,
-            protocol_minor: peer_hello.protocol_minor,
+            protocol_major: LBWP_PROTOCOL_MAJOR,
+            effective_minor: negotiate_minor(peer_hello.protocol_minor),
             spake_output: None,
+            pin_lease: None,
             spake_consumed: false,
             qr_consumed: false,
             granted_base_perms: None,
         })
+    }
+
+    fn fail(&mut self) {
+        self.stage = PairingStage::Failed;
+        self.spake_output = None;
+        if let Some(lease) = self.pin_lease.take() {
+            lease.finish_failure();
+        }
     }
 
     /// Current 5-stage pairing state.
@@ -580,23 +983,60 @@ impl PairingAcceptor {
 
     /// Active RFC 9266 TLS 1.3 channel binding.
     #[must_use]
-    pub const fn channel_binding(&self) -> ChannelBinding {
-        self.channel_binding
+    pub const fn channel_binding(&self) -> &ChannelBinding {
+        &self.channel_binding
     }
 
-    /// Process initiator's `KeyExchange` (`pA`) at most once per connection and return acceptor `pB`.
+    /// Render sanitized prompt details for local human confirmation on the Acceptor.
+    pub fn approval_prompt(&self) -> Result<PairingApprovalPrompt, SecurityError> {
+        if self.stage != PairingStage::AwaitingApproval {
+            return Err(SecurityError::PairingState(
+                "approval prompt requires AwaitingApproval stage",
+            ));
+        }
+        Ok(PairingApprovalPrompt {
+            pairing_attempt_id: self.pairing_attempt_id,
+            peer_device_id: self.peer_identity.device_id(),
+            peer_fingerprint: self.peer_identity.device_id().fingerprint_display(),
+            untrusted_friendly_name: self.peer_friendly_name.clone(),
+            auth_mode: self.auth_mode,
+            offered_base_perms: None,
+        })
+    }
+
+    /// Produce an [`ApprovedPairingCommit`] once local approval is confirmed.
+    pub fn approved_commit(&self) -> Result<ApprovedPairingCommit, SecurityError> {
+        if self.stage != PairingStage::Confirmed {
+            return Err(SecurityError::PairingState(
+                "approved commit requires Confirmed stage",
+            ));
+        }
+        let perms = self
+            .granted_base_perms
+            .ok_or(SecurityError::PairingState("missing granted permissions"))?;
+        Ok(ApprovedPairingCommit {
+            pairing_attempt_id: self.pairing_attempt_id,
+            peer_identity: self.peer_identity.clone(),
+            peer_role: self.peer_role,
+            friendly_name: self.peer_friendly_name.clone(),
+            granted_base_perms: perms,
+        })
+    }
+
+    /// Atomically reserve a slot in `pin_window`'s 3-attempt budget, process initiator's
+    /// `KeyExchange` (`pA`) at most once per connection, and return acceptor `pB`.
     pub fn handle_spake2_exchange(
         &mut self,
-        local_id: DeviceId,
-        pin: &PinSecret,
+        pin_window: &PinPairingWindow,
         peer_msg: &PairSpakeMsg,
+        now_unix: u64,
         rng: &mut CheckedOsCryptoRng,
     ) -> Result<PairSpakeMsg, SecurityError> {
         if self.stage != PairingStage::Init
             || self.auth_mode != AuthMode::PinSpake2
             || self.spake_consumed
         {
-            self.stage = PairingStage::Failed;
+            self.fail();
             return Err(SecurityError::PairingState(
                 "SPAKE2 exchange permitted once per pairing connection",
             ));
@@ -607,44 +1047,72 @@ impl PairingAcceptor {
             || peer_msg.step != SpakeStep::KeyExchange
             || peer_msg.key_confirmation.is_some()
         {
-            self.stage = PairingStage::Failed;
+            self.fail();
             return Err(SecurityError::PairingState(
                 "expected KeyExchange message matching pairing_attempt_id",
             ));
         }
-        validate_uncompressed_p256_share(&peer_msg.spake_payload)?;
+        validate_uncompressed_p256_share(&peer_msg.spake_payload).inspect_err(|_| self.fail())?;
+
+        let lease = pin_window.begin_attempt(now_unix).inspect_err(|_| {
+            self.stage = PairingStage::Failed;
+        })?;
+        let pin = lease.pin()?;
 
         let wide = derive_spake2_wide_secret(
             pin,
-            &self.channel_binding,
             self.pairing_attempt_id,
             self.peer_identity.device_id(),
-            local_id,
-        )?;
-        let w = P256Group::scalar_from_wide_bytes(wide.as_slice())
-            .map_err(|_| SecurityError::Spake2Failed)?;
-        let (id_a, id_b) = spake_endpoint_identities(self.peer_identity.device_id(), local_id);
+            self.local_identity.device_id(),
+        )
+        .inspect_err(|_| {
+            self.stage = PairingStage::Failed;
+        })?;
+        let w = P256Group::scalar_from_wide_bytes(wide.as_slice()).map_err(|_| {
+            self.stage = PairingStage::Failed;
+            SecurityError::Spake2Failed
+        })?;
+        let (id_a, id_b) = spake_endpoint_identities(
+            self.peer_identity.device_id(),
+            self.local_identity.device_id(),
+        );
         let aad = build_spake2_aad(Spake2AadContext {
             channel_binding: &self.channel_binding,
             pairing_attempt_id: self.pairing_attempt_id,
             protocol_major: self.protocol_major,
-            protocol_minor: self.protocol_minor,
+            protocol_minor: self.effective_minor,
             initiator_id: self.peer_identity.device_id(),
+            initiator_spki: self.peer_identity.spki_der(),
             initiator_role: self.peer_role,
-            acceptor_id: local_id,
+            acceptor_id: self.local_identity.device_id(),
+            acceptor_spki: self.local_identity.spki_der(),
             acceptor_role: self.local_role,
-        });
+        })
+        .inspect_err(|_| {
+            self.stage = PairingStage::Failed;
+        })?;
 
-        let mut spake_rng = rng.prefetch_spake_entropy()?;
+        let mut spake_rng = rng.prefetch_spake_entropy().inspect_err(|_| {
+            self.stage = PairingStage::Failed;
+        })?;
         let (p_b, state_b) = PartyB::<Spake2P256>::start(&w, &id_a, &id_b, &aad, &mut spake_rng)
-            .map_err(|_| SecurityError::Spake2Failed)?;
-        validate_uncompressed_p256_share(&p_b)?;
+            .map_err(|_| {
+                self.stage = PairingStage::Failed;
+                SecurityError::Spake2Failed
+            })?;
+        spake_rng.ensure_healthy().inspect_err(|_| {
+            self.stage = PairingStage::Failed;
+        })?;
+        validate_uncompressed_p256_share(&p_b).inspect_err(|_| {
+            self.stage = PairingStage::Failed;
+        })?;
 
         let output = state_b.finish(&peer_msg.spake_payload).map_err(|_| {
             self.stage = PairingStage::Failed;
             SecurityError::Spake2Failed
         })?;
         self.spake_output = Some(output);
+        self.pin_lease = Some(lease);
         self.stage = PairingStage::AuthExchanging;
 
         Ok(PairSpakeMsg {
@@ -656,13 +1124,14 @@ impl PairingAcceptor {
     }
 
     /// Verify initiator's `KeyConfirmation` (`cA`), emit acceptor `KeyConfirmation` (`cB`),
+    /// consume/destroy the PIN on success or count against the 3-attempt budget on failure,
     /// and advance to `AwaitingApproval`.
     pub fn verify_spake2_confirmation_and_reply(
         &mut self,
         peer_msg: &PairSpakeMsg,
     ) -> Result<PairSpakeMsg, SecurityError> {
         if self.stage != PairingStage::AuthExchanging || self.auth_mode != AuthMode::PinSpake2 {
-            self.stage = PairingStage::Failed;
+            self.fail();
             return Err(SecurityError::PairingState(
                 "unexpected SPAKE2 confirmation state",
             ));
@@ -671,35 +1140,39 @@ impl PairingAcceptor {
             || peer_msg.step != SpakeStep::KeyConfirmation
             || !peer_msg.spake_payload.is_empty()
         {
-            self.stage = PairingStage::Failed;
+            self.fail();
             return Err(SecurityError::PairingState(
                 "expected KeyConfirmation message matching pairing_attempt_id",
             ));
         }
         let Some(ref peer_mac) = peer_msg.key_confirmation else {
-            self.stage = PairingStage::Failed;
+            self.fail();
             return Err(SecurityError::Spake2Failed);
         };
         if peer_mac.len() != SPAKE2_CONFIRM_MAC_LEN {
-            self.stage = PairingStage::Failed;
+            self.fail();
             return Err(SecurityError::Spake2Failed);
         }
         let Some(output) = self.spake_output.take() else {
-            self.stage = PairingStage::Failed;
+            self.fail();
             return Err(SecurityError::PairingState(
                 "missing SPAKE2 acceptor output",
             ));
         };
-        output.verify_peer_confirmation(peer_mac).map_err(|_| {
-            self.stage = PairingStage::Failed;
-            SecurityError::Spake2Failed
-        })?;
+        if output.verify_peer_confirmation(peer_mac).is_err() {
+            self.fail();
+            return Err(SecurityError::Spake2Failed);
+        }
         if output.confirmation_mac.len() != SPAKE2_CONFIRM_MAC_LEN {
-            self.stage = PairingStage::Failed;
+            self.fail();
             return Err(SecurityError::Spake2Failed);
         }
         let reply_mac = output.confirmation_mac.clone();
         drop(output.into_session_key());
+
+        if let Some(lease) = self.pin_lease.take() {
+            lease.finish_success();
+        }
         self.stage = PairingStage::AwaitingApproval;
 
         Ok(PairSpakeMsg {
@@ -713,7 +1186,6 @@ impl PairingAcceptor {
     /// Verify channel-bound `PairQrAuth`, atomically consume single-use QR token, and move to `AwaitingApproval`.
     pub fn verify_qr_auth(
         &mut self,
-        local_id: DeviceId,
         qr_store: &QrTokenStore,
         qr_auth: &PairQrAuth,
         now_unix: u64,
@@ -722,65 +1194,84 @@ impl PairingAcceptor {
             || self.auth_mode != AuthMode::QrOutOfBand
             || self.qr_consumed
         {
-            self.stage = PairingStage::Failed;
+            self.fail();
             return Err(SecurityError::PairingState(
                 "QR pairing permitted once in Init/QrOutOfBand state",
             ));
         }
         self.qr_consumed = true;
         if qr_auth.pairing_attempt_id != self.pairing_attempt_id {
-            self.stage = PairingStage::Failed;
+            self.fail();
             return Err(SecurityError::PairingState(
                 "PairQrAuth attempt id mismatch",
             ));
         }
-        let token_arr: [u8; OPAQUE_TOKEN_LEN] = qr_auth
-            .one_time_pairing_token
-            .as_slice()
-            .try_into()
-            .map_err(|_| {
-                self.stage = PairingStage::Failed;
-                SecurityError::QrPairingInvalid("QR token length must be 32 bytes")
-            })?;
-
-        let signing_msg = build_qr_auth_signing_message(
-            &self.channel_binding,
-            self.pairing_attempt_id,
-            self.peer_identity.device_id(),
-            local_id,
-            &token_arr,
+        let token_arr = Zeroizing::new(
+            <[u8; OPAQUE_TOKEN_LEN]>::try_from(qr_auth.one_time_pairing_token.as_slice()).map_err(
+                |_| {
+                    self.fail();
+                    SecurityError::QrPairingInvalid("QR token length must be 32 bytes")
+                },
+            )?,
         );
+
+        let signing_msg = build_qr_auth_signing_message(QrAuthTranscriptContext {
+            channel_binding: &self.channel_binding,
+            pairing_attempt_id: self.pairing_attempt_id,
+            protocol_major: self.protocol_major,
+            protocol_minor: self.effective_minor,
+            initiator_id: self.peer_identity.device_id(),
+            initiator_spki: self.peer_identity.spki_der(),
+            acceptor_id: self.local_identity.device_id(),
+            acceptor_spki: self.local_identity.spki_der(),
+            one_time_pairing_token: &token_arr,
+        })
+        .inspect_err(|_| self.fail())?;
         self.peer_identity
             .verify_strict(&signing_msg, &qr_auth.initiator_signature)
-            .inspect_err(|_| {
-                self.stage = PairingStage::Failed;
-            })?;
+            .inspect_err(|_| self.fail())?;
 
         qr_store
-            .consume_once(&token_arr, local_id, now_unix)
-            .inspect_err(|_| {
-                self.stage = PairingStage::Failed;
-            })?;
+            .consume_once(&*token_arr, self.local_identity.device_id(), now_unix)
+            .inspect_err(|_| self.fail())?;
 
         self.stage = PairingStage::AwaitingApproval;
         Ok(())
     }
 
-    /// Finalize pairing ONLY after explicit [`HumanApprovalDecision`]; rejects input perms cleanly.
+    /// Finalize pairing ONLY after explicit [`HumanApprovalDecision`] bound to this peer & attempt;
+    /// rejects input perms cleanly.
     pub fn apply_human_approval(
         &mut self,
         local_identity: &IdentityKeyPair,
         decision: HumanApprovalDecision,
     ) -> Result<PairConfirm, SecurityError> {
         if self.stage != PairingStage::AwaitingApproval {
-            self.stage = PairingStage::Failed;
+            self.fail();
             return Err(SecurityError::PairingState(
                 "human approval requires AwaitingApproval stage",
             ));
         }
+        if local_identity.device_id() != self.local_identity.device_id() {
+            self.fail();
+            return Err(SecurityError::IdentityMismatch(
+                "signing keypair does not match acceptor session identity",
+            ));
+        }
         match decision {
-            HumanApprovalDecision::Reject => {
-                self.stage = PairingStage::Failed;
+            HumanApprovalDecision::Reject {
+                pairing_attempt_id,
+                peer_device_id,
+            } => {
+                if pairing_attempt_id != self.pairing_attempt_id
+                    || peer_device_id != self.peer_identity.device_id()
+                {
+                    self.fail();
+                    return Err(SecurityError::IdentityMismatch(
+                        "approval decision does not match active peer/attempt",
+                    ));
+                }
+                self.fail();
                 Ok(PairConfirm {
                     pairing_attempt_id: self.pairing_attempt_id,
                     accepted: false,
@@ -788,20 +1279,37 @@ impl PairingAcceptor {
                     confirm_signature: None,
                 })
             }
-            HumanApprovalDecision::Approve { granted_base_perms } => {
+            HumanApprovalDecision::Approve {
+                pairing_attempt_id,
+                peer_device_id,
+                granted_base_perms,
+            } => {
+                if pairing_attempt_id != self.pairing_attempt_id
+                    || peer_device_id != self.peer_identity.device_id()
+                {
+                    self.fail();
+                    return Err(SecurityError::IdentityMismatch(
+                        "approval decision does not match active peer/attempt",
+                    ));
+                }
                 if granted_base_perms.has_any_input() {
-                    self.stage = PairingStage::Failed;
+                    self.fail();
                     return Err(SecurityError::AuthorizationDenied(
                         "initial pairing cannot grant remote input permissions",
                     ));
                 }
-                let msg = build_pair_confirm_signing_message(
-                    &self.channel_binding,
-                    self.pairing_attempt_id,
-                    self.peer_identity.device_id(),
-                    local_identity.device_id(),
+                let msg = build_pair_confirm_signing_message(PairConfirmTranscriptContext {
+                    channel_binding: &self.channel_binding,
+                    pairing_attempt_id: self.pairing_attempt_id,
+                    auth_mode: self.auth_mode,
+                    accepted: true,
                     granted_base_perms,
-                );
+                    initiator_id: self.peer_identity.device_id(),
+                    initiator_spki: self.peer_identity.spki_der(),
+                    acceptor_id: self.local_identity.device_id(),
+                    acceptor_spki: self.local_identity.spki_der(),
+                })
+                .inspect_err(|_| self.fail())?;
                 let sig = local_identity.sign(&msg);
                 self.granted_base_perms = Some(granted_base_perms);
                 self.stage = PairingStage::Confirmed;
@@ -817,9 +1325,38 @@ impl PairingAcceptor {
     }
 }
 
+impl Drop for PairingAcceptor {
+    fn drop(&mut self) {
+        self.fail();
+        self.channel_binding.zeroize();
+    }
+}
+
 fn validate_uncompressed_p256_share(share: &[u8]) -> Result<(), SecurityError> {
     if share.len() != SPAKE2_P256_PUBLIC_SHARE_LEN || share[0] != 0x04 {
         return Err(SecurityError::Spake2Failed);
+    }
+    Ok(())
+}
+
+const fn negotiate_minor(peer_minor: u16) -> u16 {
+    if LBWP_PROTOCOL_MINOR < peer_minor {
+        LBWP_PROTOCOL_MINOR
+    } else {
+        peer_minor
+    }
+}
+
+fn validate_pairing_friendly_name(name: &str) -> Result<(), SecurityError> {
+    if name.is_empty() || name.len() > 48 {
+        return Err(SecurityError::ProtocolViolation(
+            "PairHello friendly_name length must be within 1..=48 bytes",
+        ));
+    }
+    if name.bytes().any(|b| b == 0 || b.is_ascii_control()) {
+        return Err(SecurityError::ProtocolViolation(
+            "PairHello friendly_name must not contain NUL or control characters",
+        ));
     }
     Ok(())
 }

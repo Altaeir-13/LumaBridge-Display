@@ -5,19 +5,40 @@
 
 use libfuzzer_sys::fuzz_target;
 use lumabridge_protocol::control::Permissions;
+use lumabridge_protocol::version::ALPN_OPERATIONAL_V1;
 use lumabridge_security::anti_replay::{BoundedChallengeCache, MonotonicSeqGuard};
-use lumabridge_security::authorization::{authorize_action, authorize_session_open};
+use lumabridge_security::authorization::{
+    authorize_action, authorize_session_open, AuthorizationPolicyContext,
+};
+use lumabridge_security::certificate::{
+    generate_self_signed_device_cert, verify_self_signed_ed25519_cert,
+};
 use lumabridge_security::channel_binding::ChannelBinding;
 use lumabridge_security::identity::{DeviceId, IdentityKeyPair, PeerRole};
 use lumabridge_security::rate_limit::{AuthRateLimiter, RateLimitConfig};
 use lumabridge_security::secret::CheckedOsCryptoRng;
 use lumabridge_security::session_token::SessionTokenManager;
+use lumabridge_security::tls::AuthenticatedTlsSession;
 use lumabridge_security::trust_store::InMemoryTrustStore;
 
 fuzz_target!(|data: &[u8]| {
     let Ok(ctrl_kp) = IdentityKeyPair::from_seed([0x41; 32]) else {
         return;
     };
+    let Ok(ctrl_cert) = generate_self_signed_device_cert(&ctrl_kp, 1_700_000_000, 1_800_000_000)
+    else {
+        return;
+    };
+    let Ok(peer_cert) = verify_self_signed_ed25519_cert(&ctrl_cert.cert_der, 1_700_000_100)
+    else {
+        return;
+    };
+    let tls_sess = AuthenticatedTlsSession::synthetic_for_testing(
+        peer_cert,
+        ChannelBinding::synthetic_for_testing([0x11; 32]),
+        ALPN_OPERATIONAL_V1.as_bytes().to_vec(),
+    );
+
     let store = InMemoryTrustStore::new();
     let _ = store.insert_newly_paired(
         ctrl_kp.public_identity(),
@@ -34,19 +55,22 @@ fuzz_target!(|data: &[u8]| {
     } else {
         1
     };
+    let policy_ctx = AuthorizationPolicyContext::allow_all_v1();
 
     if let Ok(grant) = authorize_session_open(
         &store,
-        ctrl_kp.public_identity(),
+        &tls_sess,
         PeerRole::Controller,
         req_perms,
+        policy_ctx,
         session_id,
         2_000,
     ) {
         let _ = authorize_action(
             &store,
-            ctrl_kp.public_identity(),
+            &tls_sess,
             &grant,
+            policy_ctx,
             Permissions::VIEW_MIRROR,
             1_500,
         );
@@ -55,24 +79,22 @@ fuzz_target!(|data: &[u8]| {
     let mgr = SessionTokenManager::new();
     let _ = mgr.validate_session_token(
         &store,
-        ctrl_kp.public_identity(),
+        &tls_sess,
         PeerRole::Controller,
         session_id,
         data,
         1_500,
     );
     if let Ok(mut rng) = CheckedOsCryptoRng::preflight() {
-        let cb = ChannelBinding::from_bytes([0x11; 32]);
         let proof = [0x22; 32];
         let _ = mgr.consume_and_rotate_resume_token(
             &mut rng,
             &store,
-            ctrl_kp.public_identity(),
+            &tls_sess,
             PeerRole::Controller,
             session_id,
             data,
-            Some(&cb),
-            Some(&proof),
+            &proof,
             1_500,
             60,
         );

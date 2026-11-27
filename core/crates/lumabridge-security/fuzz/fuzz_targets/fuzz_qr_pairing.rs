@@ -30,11 +30,11 @@ fuzz_target!(|data: &[u8]| {
     else {
         return;
     };
-    let tls_sess = AuthenticatedTlsSession {
+    let tls_sess = AuthenticatedTlsSession::synthetic_for_testing(
         peer_cert,
-        channel_binding: ChannelBinding::from_bytes([0x66; 32]),
-        negotiated_alpn: ALPN_PAIRING_V1.as_bytes().to_vec(),
-    };
+        ChannelBinding::synthetic_for_testing([0x66; 32]),
+        ALPN_PAIRING_V1.as_bytes().to_vec(),
+    );
     let hello = PairHello {
         protocol_major: LBWP_PROTOCOL_MAJOR,
         protocol_minor: LBWP_PROTOCOL_MINOR,
@@ -53,7 +53,7 @@ fuzz_target!(|data: &[u8]| {
         ControlMessage::decode_cbor(MsgType::PairQrAuth, data, CborDecodeOptions::default())
     {
         if let ControlMessage::PairQrAuth(qr) = msg {
-            let _ = acc.verify_qr_auth(host_kp.device_id(), &qr_store, &qr, 1_700_000_100);
+            let _ = acc.verify_qr_auth(&qr_store, &qr, 1_700_000_100);
         }
     } else if data.len() >= 96 {
         let qr = PairQrAuth {
@@ -61,7 +61,7 @@ fuzz_target!(|data: &[u8]| {
             one_time_pairing_token: data[..32].to_vec(),
             initiator_signature: data[32..96].to_vec(),
         };
-        let _ = acc.verify_qr_auth(host_kp.device_id(), &qr_store, &qr, 1_700_000_100);
+        let _ = acc.verify_qr_auth(&qr_store, &qr, 1_700_000_100);
     } else {
         let _ = qr_store.consume_once(data, host_kp.device_id(), 1_700_000_100);
     }

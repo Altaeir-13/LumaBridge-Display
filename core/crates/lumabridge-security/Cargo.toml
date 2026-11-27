@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 description = "Cryptographic identity, channel-bound pairing, trust store, and authorization policy for LumaBridge."
 
+[features]
+test-utils = []
+
 [dependencies]
 der = { version = "0.8", features = ["alloc", "derive", "oid"] }
 ed25519-dalek = { version = "3.0.0", default-features = false, features = ["fast", "zeroize"] }

@@ -9,8 +9,8 @@ use lumabridge_protocol::error::ErrorCode;
 /// Typed errors returned by `lumabridge-security`.
 ///
 /// `Display` and `Debug` representations are intentionally sanitized so PINs,
-/// private keys, pairing secrets, raw session tokens, and QR tokens are never
-/// formatted into logs or diagnostics.
+/// private keys, pairing secrets, raw session tokens, channel bindings, and QR tokens
+/// are never formatted into logs or diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SecurityError {
     /// OS cryptographic randomness failed or returned an error.
@@ -41,10 +41,14 @@ pub enum SecurityError {
     TlsConfiguration(&'static str),
     /// TLS 1.3 mTLS handshake or peer authentication failed.
     TlsHandshakeFailed(&'static str),
-    /// Negotiated ALPN did not match `lumabridge/1`.
+    /// Negotiated ALPN did not match `lumabridge/1` or `lumabridge-pair/1`.
     AlpnMismatch,
     /// Invalid pairing state transition or mismatched pairing attempt context.
     PairingState(&'static str),
+    /// Pairing window is closed or the active pairing PIN has expired.
+    PairingWindowClosed,
+    /// Active PIN exhausted its 3-attempt budget and was destroyed.
+    PinAttemptsExhausted,
     /// Supplied pairing PIN was empty, malformed, or out of policy bounds.
     InvalidPinFormat(&'static str),
     /// SPAKE2 key exchange or key confirmation failed.
@@ -65,6 +69,8 @@ pub enum SecurityError {
     ReplayDetected,
     /// Pairing or authentication attempts exceeded rate-limiting thresholds.
     RateLimited { retry_after_ms: u64 },
+    /// Bounded security state capacity was reached; fail closed.
+    ResourceExhausted(&'static str),
     /// Input timestamp or validity window was invalid.
     InvalidTimestamp(&'static str),
     /// Underlying wire protocol rejected the frame or payload.
@@ -87,8 +93,9 @@ impl SecurityError {
             | Self::ChannelBindingMismatch
             | Self::InvalidSignature
             | Self::InvalidSpki(_) => ErrorCode::UnauthorizedPeer,
-            Self::PairingState(_) => ErrorCode::PairingClosed,
+            Self::PairingState(_) | Self::PairingWindowClosed => ErrorCode::PairingClosed,
             Self::InvalidPinFormat(_)
+            | Self::PinAttemptsExhausted
             | Self::Spake2Failed
             | Self::QrPairingInvalid(_)
             | Self::QrTokenReusedOrUnknown
@@ -97,7 +104,7 @@ impl SecurityError {
             Self::SessionTokenInvalid(_) | Self::SessionTokenReused | Self::ReplayDetected => {
                 ErrorCode::SessionNotFound
             }
-            Self::RateLimited { .. } => ErrorCode::RateLimited,
+            Self::RateLimited { .. } | Self::ResourceExhausted(_) => ErrorCode::RateLimited,
             Self::RngUnavailable
             | Self::InvalidKeyMaterial(_)
             | Self::CertificateGeneration(_)
@@ -129,6 +136,10 @@ impl fmt::Display for SecurityError {
             Self::TlsHandshakeFailed(msg) => write!(f, "TLS 1.3 handshake failed: {msg}"),
             Self::AlpnMismatch => f.write_str("ALPN protocol mismatch"),
             Self::PairingState(msg) => write!(f, "invalid pairing state: {msg}"),
+            Self::PairingWindowClosed => f.write_str("pairing window is closed or PIN expired"),
+            Self::PinAttemptsExhausted => {
+                f.write_str("pairing PIN invalidated after 3 failed attempts")
+            }
             Self::InvalidPinFormat(msg) => write!(f, "invalid pairing PIN format: {msg}"),
             Self::Spake2Failed => f.write_str("SPAKE2 authentication or confirmation failed"),
             Self::QrPairingInvalid(msg) => write!(f, "QR pairing verification failed: {msg}"),
@@ -143,6 +154,7 @@ impl fmt::Display for SecurityError {
             Self::RateLimited { retry_after_ms } => {
                 write!(f, "rate limited; retry after {retry_after_ms} ms")
             }
+            Self::ResourceExhausted(msg) => write!(f, "security state capacity reached: {msg}"),
             Self::InvalidTimestamp(msg) => write!(f, "invalid timestamp: {msg}"),
             Self::ProtocolViolation(msg) => write!(f, "wire protocol constraint violated: {msg}"),
         }

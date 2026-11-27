@@ -1,24 +1,37 @@
 // Copyright 2026 LumaBridge Display Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cryptographically bound session tokens and single-use rotating resume tokens.
+//! Cryptographically bound session tokens, single-use rotating resume tokens bound to TLS 1.3
+//! channel bindings, and coordinated atomic peer+session revocation.
 
 use crate::channel_binding::ChannelBinding;
 use crate::error::SecurityError;
-use crate::identity::{DeviceId, PeerRole, PublicIdentity};
+use crate::identity::{DeviceId, PeerRole};
 use crate::secret::{constant_time_eq, CheckedOsCryptoRng, ResumeTokenSecret, SessionTokenSecret};
-use crate::transcript::{derive_resume_channel_proof, derive_token_digest};
-use crate::trust_store::TrustStore;
+use crate::tls::AuthenticatedTlsSession;
+use crate::transcript::{
+    derive_resume_channel_proof, derive_resume_token_digest, derive_session_access_token_digest,
+};
+use crate::trust_store::{
+    InMemoryTrustStore, RevocationReason, RevocationRecord, SecurityAction, TrustStore,
+};
 use core::fmt;
 use lumabridge_protocol::control::{Permissions, OPAQUE_TOKEN_LEN};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+use zeroize::Zeroizing;
 
 /// Maximum permitted lifetime for a session credential (24 hours).
 pub const MAX_SESSION_TTL_SECS: u64 = 86_400;
 
 /// Maximum permitted lifetime for a single-use resume credential (15 minutes).
 pub const MAX_RESUME_TTL_SECS: u64 = 900;
+
+/// Hard cap on simultaneously tracked active sessions.
+pub const MAX_ACTIVE_SESSIONS: usize = 256;
+
+/// Hard cap on simultaneously tracked resume token digests.
+pub const MAX_ACTIVE_RESUME_TOKENS: usize = 512;
 
 /// Newly issued credentials returned to the caller on `SessionOpen`.
 pub struct IssuedSessionCredentials {
@@ -72,7 +85,15 @@ impl fmt::Debug for ValidatedResumeResult {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Coordinated outcome returned by [`revoke_peer_and_sessions`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevocationOutcome {
+    pub record: RevocationRecord,
+    pub invalidated_sessions: usize,
+    pub actions: Vec<SecurityAction>,
+}
+
+#[derive(Clone)]
 struct ActiveSessionEntry {
     session_id: u64,
     peer_device_id: DeviceId,
@@ -80,6 +101,7 @@ struct ActiveSessionEntry {
     trust_epoch: u64,
     session_granted_perms: Permissions,
     session_token_digest: [u8; 32],
+    bound_channel_binding: ChannelBinding,
     session_expires_at_unix: u64,
     revoked: bool,
 }
@@ -99,7 +121,10 @@ struct SessionStoreInner {
     resume_by_digest: BTreeMap<[u8; 32], ResumeEntry>,
 }
 
-/// Thread-safe session & single-use resume token authority storing HMAC-SHA256 digests only.
+/// Thread-safe session & single-use resume token authority storing domain-separated SHA-256 digests only.
+///
+/// Lock-ordering invariant: when both locks are needed, [`Self::inner`] is ALWAYS acquired
+/// BEFORE calling into [`TrustStore`] read checks, preventing lock inversion.
 #[derive(Default)]
 pub struct SessionTokenManager {
     inner: Mutex<SessionStoreInner>,
@@ -112,19 +137,20 @@ impl SessionTokenManager {
         Self::default()
     }
 
-    /// Issue a fresh session and single-use resume token for a trusted peer.
+    /// Issue a fresh session and single-use resume token bound to `tls_session`.
     #[allow(clippy::too_many_arguments)]
     pub fn issue_session(
         &self,
         rng: &mut CheckedOsCryptoRng,
         trust_store: &dyn TrustStore,
-        peer_identity: &PublicIdentity,
+        tls_session: &AuthenticatedTlsSession,
         expected_role: PeerRole,
         requested_perms: Permissions,
         now_unix: u64,
         session_ttl_secs: u64,
         resume_ttl_secs: u64,
     ) -> Result<IssuedSessionCredentials, SecurityError> {
+        tls_session.require_operational_alpn()?;
         if session_ttl_secs == 0 || session_ttl_secs > MAX_SESSION_TTL_SECS {
             return Err(SecurityError::InvalidTimestamp(
                 "session_ttl_secs must be within 1..=86400",
@@ -135,9 +161,6 @@ impl SessionTokenManager {
                 "resume_ttl_secs must be within 1..=900",
             ));
         }
-
-        let record = trust_store.verify_trusted_peer(peer_identity, expected_role)?;
-        let effective = record.base_permissions.intersection(requested_perms);
 
         let session_expires_at_unix = now_unix
             .checked_add(session_ttl_secs)
@@ -155,31 +178,49 @@ impl SessionTokenManager {
         let session_token = SessionTokenSecret::generate(rng)?;
         let resume_token = ResumeTokenSecret::generate(rng)?;
 
-        let session_digest = derive_token_digest(
-            session_token.expose_secret(),
-            record.device_id,
-            record.trust_epoch,
-        );
-        let resume_digest = derive_token_digest(
-            resume_token.expose_secret(),
-            record.device_id,
-            record.trust_epoch,
-        );
-
         let mut guard = self
             .inner
             .lock()
             .map_err(|_| SecurityError::AuthorizationDenied("session store lock poisoned"))?;
-        while guard.sessions.contains_key(&session_id) || session_id == 0 {
-            session_id = session_id.wrapping_add(1);
-        }
-        // Opportunistically prune expired records to bound memory.
+
+        // Re-verify live trust under session lock so concurrent revocation cannot race cleanly past issuance.
+        let record = trust_store.verify_trusted_peer(tls_session.peer_identity(), expected_role)?;
+        let effective = record.base_permissions.intersection(requested_perms);
+
         guard
             .sessions
             .retain(|_, s| !s.revoked && s.session_expires_at_unix >= now_unix);
         guard
             .resume_by_digest
             .retain(|_, r| r.expires_at_unix >= now_unix);
+
+        if guard.sessions.len() >= MAX_ACTIVE_SESSIONS {
+            return Err(SecurityError::ResourceExhausted(
+                "active session limit reached",
+            ));
+        }
+        if guard.resume_by_digest.len() >= MAX_ACTIVE_RESUME_TOKENS {
+            return Err(SecurityError::ResourceExhausted(
+                "active resume token limit reached",
+            ));
+        }
+
+        while guard.sessions.contains_key(&session_id) || session_id == 0 {
+            session_id = session_id.wrapping_add(1);
+        }
+
+        let session_digest = derive_session_access_token_digest(
+            session_token.expose_secret(),
+            record.device_id,
+            session_id,
+            record.trust_epoch,
+        );
+        let resume_digest = derive_resume_token_digest(
+            resume_token.expose_secret(),
+            record.device_id,
+            session_id,
+            record.trust_epoch,
+        );
 
         guard.sessions.insert(
             session_id,
@@ -190,6 +231,7 @@ impl SessionTokenManager {
                 trust_epoch: record.trust_epoch,
                 session_granted_perms: effective,
                 session_token_digest: session_digest,
+                bound_channel_binding: tls_session.channel_binding().clone(),
                 session_expires_at_unix,
                 revoked: false,
             },
@@ -218,27 +260,35 @@ impl SessionTokenManager {
         })
     }
 
-    /// Validate a session token against live `TrustStore` state and return live effective perms.
+    /// Validate a session token against `tls_session` (mTLS + bound channel binding) and live `TrustStore`.
     pub fn validate_session_token(
         &self,
         trust_store: &dyn TrustStore,
-        peer_identity: &PublicIdentity,
+        tls_session: &AuthenticatedTlsSession,
         expected_role: PeerRole,
         session_id: u64,
         raw_session_token: &[u8],
         now_unix: u64,
     ) -> Result<Permissions, SecurityError> {
-        let token_arr: [u8; OPAQUE_TOKEN_LEN] = raw_session_token
-            .try_into()
-            .map_err(|_| SecurityError::SessionTokenInvalid("session token must be 32 bytes"))?;
-        let record = trust_store.verify_trusted_peer(peer_identity, expected_role)?;
-        let candidate_digest =
-            derive_token_digest(&token_arr, record.device_id, record.trust_epoch);
+        tls_session.require_operational_alpn()?;
+        let token_arr = Zeroizing::new(
+            <[u8; OPAQUE_TOKEN_LEN]>::try_from(raw_session_token).map_err(|_| {
+                SecurityError::SessionTokenInvalid("session token must be 32 bytes")
+            })?,
+        );
 
         let guard = self
             .inner
             .lock()
             .map_err(|_| SecurityError::AuthorizationDenied("session store lock poisoned"))?;
+        let record = trust_store.verify_trusted_peer(tls_session.peer_identity(), expected_role)?;
+        let candidate_digest = derive_session_access_token_digest(
+            &token_arr,
+            record.device_id,
+            session_id,
+            record.trust_epoch,
+        );
+
         let entry = guard
             .sessions
             .get(&session_id)
@@ -250,6 +300,9 @@ impl SessionTokenManager {
             return Err(SecurityError::IdentityMismatch(
                 "session token owner or role mismatch",
             ));
+        }
+        if entry.bound_channel_binding != *tls_session.channel_binding() {
+            return Err(SecurityError::ChannelBindingMismatch);
         }
         if !constant_time_eq(&entry.session_token_digest, &candidate_digest) {
             return Err(SecurityError::SessionTokenInvalid(
@@ -265,22 +318,22 @@ impl SessionTokenManager {
             .intersection(entry.session_granted_perms))
     }
 
-    /// Atomically consume a single-use resume token (optionally enforcing channel-bound proof)
-    /// and rotate it to a fresh `ResumeTokenSecret`.
+    /// Atomically consume a single-use resume token with mandatory TLS 1.3 channel-binding proof,
+    /// re-bind the session to the new `tls_session`, and rotate to a fresh `ResumeTokenSecret`.
     #[allow(clippy::too_many_arguments)]
     pub fn consume_and_rotate_resume_token(
         &self,
         rng: &mut CheckedOsCryptoRng,
         trust_store: &dyn TrustStore,
-        peer_identity: &PublicIdentity,
+        tls_session: &AuthenticatedTlsSession,
         expected_role: PeerRole,
         session_id: u64,
         raw_resume_token: &[u8],
-        channel_binding: Option<&ChannelBinding>,
-        presented_channel_proof: Option<&[u8; 32]>,
+        presented_channel_proof: &[u8; 32],
         now_unix: u64,
         new_resume_ttl_secs: u64,
     ) -> Result<ValidatedResumeResult, SecurityError> {
+        tls_session.require_operational_alpn()?;
         if new_resume_ttl_secs == 0 || new_resume_ttl_secs > MAX_RESUME_TTL_SECS {
             return Err(SecurityError::InvalidTimestamp(
                 "new_resume_ttl_secs must be within 1..=900",
@@ -288,25 +341,7 @@ impl SessionTokenManager {
         }
         let token = ResumeTokenSecret::from_slice(raw_resume_token)
             .map_err(|_| SecurityError::SessionTokenInvalid("resume token must be 32 bytes"))?;
-        let record = trust_store.verify_trusted_peer(peer_identity, expected_role)?;
-
-        if let (Some(cb), Some(expected_proof)) = (channel_binding, presented_channel_proof) {
-            let computed = derive_resume_channel_proof(&token, cb, record.device_id, session_id)?;
-            if !constant_time_eq(&computed, expected_proof) {
-                return Err(SecurityError::ChannelBindingMismatch);
-            }
-        } else if channel_binding.is_some() ^ presented_channel_proof.is_some() {
-            return Err(SecurityError::ChannelBindingMismatch);
-        }
-
-        let digest =
-            derive_token_digest(token.expose_secret(), record.device_id, record.trust_epoch);
         let next_resume = ResumeTokenSecret::generate(rng)?;
-        let next_digest = derive_token_digest(
-            next_resume.expose_secret(),
-            record.device_id,
-            record.trust_epoch,
-        );
         let next_resume_expires_at = now_unix
             .checked_add(new_resume_ttl_secs)
             .ok_or(SecurityError::InvalidTimestamp("resume expiry overflow"))?;
@@ -316,52 +351,65 @@ impl SessionTokenManager {
             .lock()
             .map_err(|_| SecurityError::AuthorizationDenied("session store lock poisoned"))?;
 
-        let (consumed, resume_expired, entry_session_id, entry_device, entry_epoch) = {
-            let r_entry = guard
-                .resume_by_digest
-                .get_mut(&digest)
-                .ok_or(SecurityError::SessionTokenInvalid("unknown resume token"))?;
-            let was_consumed = r_entry.consumed;
-            r_entry.consumed = true;
-            (
-                was_consumed,
-                now_unix > r_entry.expires_at_unix,
-                r_entry.session_id,
-                r_entry.peer_device_id,
-                r_entry.trust_epoch,
-            )
-        };
+        // Re-verify live trust under session lock before inspecting or mutating resume entries.
+        let record = trust_store.verify_trusted_peer(tls_session.peer_identity(), expected_role)?;
 
-        if consumed {
-            return Err(SecurityError::SessionTokenReused);
+        let computed_proof = derive_resume_channel_proof(
+            &token,
+            tls_session.channel_binding(),
+            record.device_id,
+            session_id,
+            record.trust_epoch,
+        )?;
+        if !constant_time_eq(computed_proof.as_ref(), presented_channel_proof) {
+            return Err(SecurityError::ChannelBindingMismatch);
         }
-        if entry_session_id != session_id || entry_device != record.device_id {
-            return Err(SecurityError::IdentityMismatch(
-                "resume token bound to different session or peer",
+
+        let digest = derive_resume_token_digest(
+            token.expose_secret(),
+            record.device_id,
+            session_id,
+            record.trust_epoch,
+        );
+        let next_digest = derive_resume_token_digest(
+            next_resume.expose_secret(),
+            record.device_id,
+            session_id,
+            record.trust_epoch,
+        );
+
+        let s_entry = validate_resume_lookup(
+            &guard,
+            digest,
+            session_id,
+            record.device_id,
+            record.trust_epoch,
+            expected_role,
+            tls_session.channel_binding(),
+            now_unix,
+        )?;
+
+        // Prune expired resume entries only after validating the live lookup, then check cap before mutating.
+        let unpruned_non_expired = guard
+            .resume_by_digest
+            .iter()
+            .filter(|(k, r)| **k == digest || r.expires_at_unix >= now_unix)
+            .count();
+        if unpruned_non_expired >= MAX_ACTIVE_RESUME_TOKENS {
+            return Err(SecurityError::ResourceExhausted(
+                "active resume token limit reached",
             ));
         }
-        if entry_epoch != record.trust_epoch {
-            return Err(SecurityError::RevokedDevice);
-        }
-        if resume_expired {
-            return Err(SecurityError::SessionTokenInvalid("resume token expired"));
-        }
+        guard
+            .resume_by_digest
+            .retain(|k, r| *k == digest || r.expires_at_unix >= now_unix);
 
-        let s_entry =
-            guard
-                .sessions
-                .get(&session_id)
-                .copied()
-                .ok_or(SecurityError::SessionTokenInvalid(
-                    "session no longer active",
-                ))?;
-        if s_entry.revoked || s_entry.trust_epoch != record.trust_epoch {
-            return Err(SecurityError::RevokedDevice);
+        if let Some(entry_mut) = guard.resume_by_digest.get_mut(&digest) {
+            entry_mut.consumed = true;
         }
-        if now_unix > s_entry.session_expires_at_unix {
-            return Err(SecurityError::SessionTokenInvalid("parent session expired"));
+        if let Some(sess_mut) = guard.sessions.get_mut(&session_id) {
+            sess_mut.bound_channel_binding = tls_session.channel_binding().clone();
         }
-
         guard.resume_by_digest.insert(
             next_digest,
             ResumeEntry {
@@ -401,6 +449,9 @@ impl SessionTokenManager {
             .sessions
             .get_mut(&session_id)
             .ok_or(SecurityError::SessionTokenInvalid("unknown session_id"))?;
+        if entry.revoked {
+            return Err(SecurityError::RevokedDevice);
+        }
         entry.session_granted_perms = new_session_perms;
         Ok(())
     }
@@ -423,4 +474,82 @@ impl SessionTokenManager {
             .retain(|_, resume| resume.peer_device_id != device_id);
         Ok(revoked_count)
     }
+}
+
+/// Atomically revoke `device_id` in `trust_store`, invalidate all active sessions & resume tokens in
+/// `session_mgr`, and return typed [`SecurityAction`]s for transport teardown.
+pub fn revoke_peer_and_sessions(
+    trust_store: &InMemoryTrustStore,
+    session_mgr: &SessionTokenManager,
+    device_id: DeviceId,
+    reason: RevocationReason,
+    now_unix: u64,
+) -> Result<RevocationOutcome, SecurityError> {
+    let record = trust_store.revoke(device_id, reason, now_unix)?;
+    let invalidated_sessions = session_mgr.revoke_device_sessions(device_id)?;
+    Ok(RevocationOutcome {
+        record,
+        invalidated_sessions,
+        actions: vec![SecurityAction::DisconnectPeerSessions {
+            device_id,
+            reason,
+            revoked_epoch: record.revoked_epoch,
+        }],
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_resume_lookup(
+    guard: &SessionStoreInner,
+    digest: [u8; 32],
+    session_id: u64,
+    device_id: DeviceId,
+    trust_epoch: u64,
+    expected_role: PeerRole,
+    channel_binding: &ChannelBinding,
+    now_unix: u64,
+) -> Result<ActiveSessionEntry, SecurityError> {
+    let r_entry = guard
+        .resume_by_digest
+        .get(&digest)
+        .copied()
+        .ok_or(SecurityError::SessionTokenInvalid("unknown resume token"))?;
+    if r_entry.consumed {
+        return Err(SecurityError::SessionTokenReused);
+    }
+    if r_entry.session_id != session_id || r_entry.peer_device_id != device_id {
+        return Err(SecurityError::IdentityMismatch(
+            "resume token bound to different session or peer",
+        ));
+    }
+    if r_entry.trust_epoch != trust_epoch {
+        return Err(SecurityError::RevokedDevice);
+    }
+    if now_unix > r_entry.expires_at_unix {
+        return Err(SecurityError::SessionTokenInvalid("resume token expired"));
+    }
+
+    let s_entry =
+        guard
+            .sessions
+            .get(&session_id)
+            .cloned()
+            .ok_or(SecurityError::SessionTokenInvalid(
+                "session no longer active",
+            ))?;
+    if s_entry.revoked || s_entry.trust_epoch != trust_epoch {
+        return Err(SecurityError::RevokedDevice);
+    }
+    if s_entry.expected_role != expected_role || s_entry.peer_device_id != device_id {
+        return Err(SecurityError::IdentityMismatch(
+            "session owner or role mismatch",
+        ));
+    }
+    if now_unix > s_entry.session_expires_at_unix {
+        return Err(SecurityError::SessionTokenInvalid("parent session expired"));
+    }
+    if s_entry.bound_channel_binding == *channel_binding {
+        return Err(SecurityError::ReplayDetected);
+    }
+    Ok(s_entry)
 }

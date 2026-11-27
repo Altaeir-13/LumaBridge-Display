@@ -8,20 +8,22 @@
 
 use lumabridge_protocol::control::{AuthMode, PairHello, Permissions};
 use lumabridge_protocol::version::{LBWP_PROTOCOL_MAJOR, LBWP_PROTOCOL_MINOR};
-use lumabridge_security::authorization::{authorize_action, authorize_session_open};
+use lumabridge_security::authorization::{
+    authorize_action, authorize_session_open, AuthorizationPolicyContext,
+};
 use lumabridge_security::certificate::{
     generate_self_signed_device_cert, verify_self_signed_ed25519_cert,
 };
 use lumabridge_security::identity::{IdentityKeyPair, PeerRole};
 use lumabridge_security::pairing::{
-    HumanApprovalDecision, PairingAcceptor, PairingInitiator, QrTokenStore,
+    HumanApprovalDecision, PairingAcceptor, PairingInitiator, PinPairingWindow, QrTokenStore,
 };
-use lumabridge_security::secret::{CheckedOsCryptoRng, PinSecret};
+use lumabridge_security::secret::CheckedOsCryptoRng;
 use lumabridge_security::session_token::SessionTokenManager;
 use lumabridge_security::tls::{
     build_tls13_client_config, build_tls13_server_config, canonical_server_name_for_device,
     drive_in_memory_handshake, extract_authenticated_session_with_alpn, TlsPeerTrustPolicy,
-    LUMABRIDGE_ALPN_V1,
+    LUMABRIDGE_ALPN_V1, LUMABRIDGE_PAIR_ALPN_V1,
 };
 use lumabridge_security::trust_store::InMemoryTrustStore;
 use rustls::{ClientConnection, ServerConnection};
@@ -138,7 +140,7 @@ fn main() {
     let client_cfg = build_tls13_client_config(
         &ctrl_cert,
         TlsPeerTrustPolicy::Trusted {
-            trust_store: ctrl_store,
+            trust_store: Arc::clone(&ctrl_store) as _,
             expected_role: PeerRole::Host,
         },
     )
@@ -146,7 +148,7 @@ fn main() {
     let server_cfg = build_tls13_server_config(
         &host_cert,
         TlsPeerTrustPolicy::Trusted {
-            trust_store: host_store.clone(),
+            trust_store: Arc::clone(&host_store) as _,
             expected_role: PeerRole::Controller,
         },
     )
@@ -166,36 +168,33 @@ fn main() {
         last_tls_pair = Some((cs, ss));
     });
     print_summary("tls13_mtls_handshake_plus_rfc9266", &s_tls);
+    let (_, op_server_tls) = last_tls_pair.expect("tls pair");
 
     // Setup pairing TLS contexts for steps 5 & 6
     let p_cli_cfg = build_tls13_client_config(
         &ctrl_cert,
-        TlsPeerTrustPolicy::Pairing { trust_store: None },
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: ctrl_store,
+        },
     )
     .expect("p_cli");
     let p_srv_cfg = build_tls13_server_config(
         &host_cert,
-        TlsPeerTrustPolicy::Pairing { trust_store: None },
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: Arc::clone(&host_store) as _,
+        },
     )
     .expect("p_srv");
     let mut p_cli = ClientConnection::new(p_cli_cfg, sni).expect("cli");
     let mut p_srv = ServerConnection::new(p_srv_cfg).expect("srv");
     drive_in_memory_handshake(&mut p_cli, &mut p_srv).expect("handshake");
-    let c_pair_tls = extract_authenticated_session_with_alpn(
-        &p_cli,
-        lumabridge_security::tls::LUMABRIDGE_PAIR_ALPN_V1,
-        now,
-    )
-    .expect("cs");
-    let s_pair_tls = extract_authenticated_session_with_alpn(
-        &p_srv,
-        lumabridge_security::tls::LUMABRIDGE_PAIR_ALPN_V1,
-        now,
-    )
-    .expect("ss");
+    let c_pair_tls =
+        extract_authenticated_session_with_alpn(&p_cli, LUMABRIDGE_PAIR_ALPN_V1, now).expect("cs");
+    let s_pair_tls =
+        extract_authenticated_session_with_alpn(&p_srv, LUMABRIDGE_PAIR_ALPN_V1, now).expect("ss");
 
-    let pin = PinSecret::new("492817").expect("pin");
     let mut rng = CheckedOsCryptoRng::preflight().expect("rng");
+    let pin_window = PinPairingWindow::new();
 
     let init_spake_hello = PairHello {
         protocol_major: LBWP_PROTOCOL_MAJOR,
@@ -214,9 +213,10 @@ fn main() {
         spki_ed25519: host_kp.public_identity().spki_der().to_vec(),
     };
 
-    // 5. Full channel-bound SPAKE2-P256 exchange + confirm
+    // 5. Full channel-bound SPAKE2-P256 exchange + confirm + local consent
     let s_spake = measure(10, 60, |i| {
         let attempt = u64::try_from(i + 1).expect("idx");
+        let pin = pin_window.open_with_new_pin(&mut rng, now).expect("pin");
         let mut init = PairingInitiator::start(
             attempt,
             &ctrl_kp,
@@ -234,11 +234,9 @@ fn main() {
             &s_pair_tls,
         )
         .expect("acc");
-        let m1 = init
-            .begin_spake2(ctrl_kp.device_id(), &pin, &mut rng)
-            .expect("m1");
+        let m1 = init.begin_spake2(&pin, &mut rng).expect("m1");
         let m2 = acc
-            .handle_spake2_exchange(host_kp.device_id(), &pin, &m1, &mut rng)
+            .handle_spake2_exchange(&pin_window, &m1, now, &mut rng)
             .expect("m2");
         let m3 = init.finish_spake2_and_emit_confirmation(&m2).expect("m3");
         let m4 = acc.verify_spake2_confirmation_and_reply(&m3).expect("m4");
@@ -247,18 +245,25 @@ fn main() {
             .apply_human_approval(
                 &host_kp,
                 HumanApprovalDecision::Approve {
+                    pairing_attempt_id: attempt,
+                    peer_device_id: ctrl_kp.device_id(),
                     granted_base_perms: Permissions::VIEW_MIRROR,
                 },
             )
             .expect("approve");
-        let p = init
-            .accept_pair_confirm(ctrl_kp.device_id(), &c)
-            .expect("confirm");
-        black_box(p);
+        init.verify_pair_confirm(&c).expect("verify confirm");
+        let commit = init
+            .apply_local_approval(HumanApprovalDecision::Approve {
+                pairing_attempt_id: attempt,
+                peer_device_id: host_kp.device_id(),
+                granted_base_perms: Permissions::VIEW_MIRROR,
+            })
+            .expect("local confirm");
+        black_box(commit);
     });
     print_summary("spake2_p256_channel_bound_full", &s_spake);
 
-    // 6. Full channel-bound QR issue + sign + verify + consume
+    // 6. Full channel-bound QR issue + sign + verify + consume + local consent
     let qr_store = QrTokenStore::new();
     let init_qr_hello = PairHello {
         auth_mode: AuthMode::QrOutOfBand,
@@ -291,30 +296,37 @@ fn main() {
         )
         .expect("acc");
         let auth = init.create_qr_auth(&ctrl_kp, &ticket, now).expect("auth");
-        acc.verify_qr_auth(host_kp.device_id(), &qr_store, &auth, now)
+        acc.verify_qr_auth(&qr_store, &auth, now)
             .expect("verify qr");
         let c = acc
             .apply_human_approval(
                 &host_kp,
                 HumanApprovalDecision::Approve {
+                    pairing_attempt_id: attempt,
+                    peer_device_id: ctrl_kp.device_id(),
                     granted_base_perms: Permissions::VIEW_MIRROR,
                 },
             )
             .expect("approve");
-        let p = init
-            .accept_pair_confirm(ctrl_kp.device_id(), &c)
-            .expect("confirm");
-        black_box(p);
+        init.verify_pair_confirm(&c).expect("verify confirm");
+        let commit = init
+            .apply_local_approval(HumanApprovalDecision::Approve {
+                pairing_attempt_id: attempt,
+                peer_device_id: host_kp.device_id(),
+                granted_base_perms: Permissions::VIEW_MIRROR,
+            })
+            .expect("local confirm");
+        black_box(commit);
     });
     print_summary("qr_channel_bound_full", &s_qr);
 
-    // 7. Session token validate + live TrustStore action authorization
+    // 7. Session token validate + live 5-factor TrustStore action authorization
     let tok_mgr = SessionTokenManager::new();
     let creds = tok_mgr
         .issue_session(
             &mut rng,
             &*host_store,
-            ctrl_kp.public_identity(),
+            &op_server_tls,
             PeerRole::Controller,
             Permissions::VIEW_MIRROR,
             now,
@@ -322,11 +334,13 @@ fn main() {
             120,
         )
         .expect("creds");
+    let policy_ctx = AuthorizationPolicyContext::allow_all_v1();
     let grant = authorize_session_open(
         &*host_store,
-        ctrl_kp.public_identity(),
+        &op_server_tls,
         PeerRole::Controller,
         Permissions::VIEW_MIRROR,
+        policy_ctx,
         creds.session_id,
         now + 600,
     )
@@ -335,7 +349,7 @@ fn main() {
         let perms = tok_mgr
             .validate_session_token(
                 &*host_store,
-                ctrl_kp.public_identity(),
+                &op_server_tls,
                 PeerRole::Controller,
                 creds.session_id,
                 creds.session_token.expose_secret(),
@@ -344,8 +358,9 @@ fn main() {
             .expect("token ok");
         let authz = authorize_action(
             &*host_store,
-            ctrl_kp.public_identity(),
+            &op_server_tls,
             &grant,
+            policy_ctx,
             Permissions::VIEW_MIRROR,
             now + 5,
         )

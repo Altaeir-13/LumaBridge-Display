@@ -11,6 +11,9 @@ use std::sync::Mutex;
 /// Maximum tracked peer backoff buckets to bound attacker-induced memory allocation.
 pub const MAX_TRACKED_PEER_BUCKETS: usize = 2048;
 
+/// Maximum global failure timestamps retained in the sliding window queue.
+pub const MAX_GLOBAL_FAILURE_EVENTS: usize = 4096;
+
 /// Policy parameters governing per-peer and global brute-force protection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RateLimitConfig {
@@ -68,9 +71,11 @@ impl Default for AuthRateLimiter {
 }
 
 impl AuthRateLimiter {
-    /// Construct a limiter with explicit policy thresholds.
+    /// Construct a limiter with explicit policy thresholds (clamping zero caps safely to `1`).
     #[must_use]
-    pub fn new(config: RateLimitConfig) -> Self {
+    pub fn new(mut config: RateLimitConfig) -> Self {
+        config.lockout_threshold = config.lockout_threshold.max(1);
+        config.max_global_failures_in_window = config.max_global_failures_in_window.max(1);
         Self {
             config,
             inner: Mutex::new(RateLimitInner::default()),
@@ -132,6 +137,9 @@ impl AuthRateLimiter {
             entry.blocked_until_ms.saturating_sub(now_ms)
         };
 
+        if guard.global_failures_ms.len() >= MAX_GLOBAL_FAILURE_EVENTS {
+            let _ = guard.global_failures_ms.pop_front();
+        }
         guard.global_failures_ms.push_back(now_ms);
         if guard.global_failures_ms.len()
             >= usize::try_from(self.config.max_global_failures_in_window).unwrap_or(usize::MAX)
@@ -155,6 +163,12 @@ impl AuthRateLimiter {
             .map_err(|_| SecurityError::AuthorizationDenied("rate limiter lock poisoned"))?;
         guard.peers.remove(&peer_id);
         Ok(())
+    }
+
+    /// Number of retained global failure timestamps (bounded by [`MAX_GLOBAL_FAILURE_EVENTS`]).
+    #[must_use]
+    pub fn global_window_len(&self) -> usize {
+        self.inner.lock().map_or(0, |g| g.global_failures_ms.len())
     }
 
     fn prune_global_window(&self, guard: &mut RateLimitInner, now_ms: u64) {

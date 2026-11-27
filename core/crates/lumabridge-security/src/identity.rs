@@ -12,7 +12,7 @@ use lumabridge_protocol::control::{
 };
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Logical role of a peer device in `LumaBridge`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -72,10 +72,23 @@ impl DeviceId {
         encode_hex_lower(&self.0)
     }
 
-    /// Short 16-hex-char fingerprint for sanitized diagnostic metadata.
+    /// Short 16-hex-char fingerprint for sanitized diagnostic metadata and human consent UI.
     #[must_use]
     pub fn short_hex(&self) -> String {
         encode_hex_lower(&self.0[..8])
+    }
+
+    /// Formatted cryptographic fingerprint for local human pairing confirmation.
+    #[must_use]
+    pub fn fingerprint_display(&self) -> String {
+        let hex = self.short_hex();
+        format!(
+            "{}-{}-{}-{}",
+            &hex[0..4],
+            &hex[4..8],
+            &hex[8..12],
+            &hex[12..16]
+        )
     }
 
     /// Constant-time comparison against another `DeviceId`.
@@ -173,15 +186,14 @@ pub struct IdentityKeyPair {
 }
 
 impl IdentityKeyPair {
-    /// Generate a fresh long-term Ed25519 identity using `CheckedOsCryptoRng`.
+    /// Generate a fresh long-term Ed25519 identity using `CheckedOsCryptoRng` without stack copies.
     pub fn generate(rng: &mut CheckedOsCryptoRng) -> Result<Self, SecurityError> {
-        let seed = Zeroizing::new(rng.random_array::<32>()?);
-        Self::from_seed(*seed)
+        let seed = rng.random_zeroizing::<32>()?;
+        Self::from_seed_zeroizing(seed)
     }
 
-    /// Reconstruct an `IdentityKeyPair` deterministically from a 32-byte Ed25519 seed.
-    pub fn from_seed(seed: [u8; 32]) -> Result<Self, SecurityError> {
-        let seed = Zeroizing::new(seed);
+    /// Reconstruct an `IdentityKeyPair` deterministically from a `Zeroizing<[u8; 32]>` seed.
+    pub fn from_seed_zeroizing(seed: Zeroizing<[u8; 32]>) -> Result<Self, SecurityError> {
         let signing_key = SigningKey::from_bytes(&seed);
         let pk_bytes = signing_key.verifying_key().to_bytes();
         let mut spki_der = [0u8; ED25519_SPKI_DER_LEN];
@@ -193,6 +205,14 @@ impl IdentityKeyPair {
             signing_key,
             public,
         })
+    }
+
+    /// Reconstruct an `IdentityKeyPair` deterministically from a 32-byte Ed25519 seed,
+    /// zeroizing the caller-passed stack copy before returning.
+    pub fn from_seed(mut seed: [u8; 32]) -> Result<Self, SecurityError> {
+        let wrapped = Zeroizing::new(seed);
+        seed.zeroize();
+        Self::from_seed_zeroizing(wrapped)
     }
 
     /// Borrow the public identity portion.

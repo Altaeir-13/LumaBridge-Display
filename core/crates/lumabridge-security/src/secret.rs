@@ -1,4 +1,4 @@
-﻿// Copyright 2026 LumaBridge Display Contributors
+// Copyright 2026 LumaBridge Display Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! Redacted secret wrappers, constant-time comparisons, and OS CSPRNG wrapper.
@@ -17,9 +17,8 @@ pub struct CheckedOsCryptoRng;
 impl CheckedOsCryptoRng {
     /// Verify the OS CSPRNG can supply entropy cleanly.
     pub fn preflight() -> Result<Self, SecurityError> {
-        let mut probe = [0u8; 32];
-        getrandom::fill(&mut probe).map_err(|_| SecurityError::RngUnavailable)?;
-        probe.zeroize();
+        let mut probe = Zeroizing::new([0u8; 32]);
+        getrandom::fill(probe.as_mut()).map_err(|_| SecurityError::RngUnavailable)?;
         Ok(Self)
     }
 
@@ -31,8 +30,33 @@ impl CheckedOsCryptoRng {
     /// Generate a fixed-size array of cryptographic OS randomness.
     pub fn random_array<const N: usize>(&mut self) -> Result<[u8; N], SecurityError> {
         let mut buf = [0u8; N];
-        getrandom::fill(&mut buf).map_err(|_| SecurityError::RngUnavailable)?;
+        if getrandom::fill(&mut buf).is_err() {
+            buf.zeroize();
+            return Err(SecurityError::RngUnavailable);
+        }
         Ok(buf)
+    }
+
+    /// Generate a zeroized fixed-size secret array directly into `Zeroizing<[u8; N]>`.
+    pub fn random_zeroizing<const N: usize>(
+        &mut self,
+    ) -> Result<Zeroizing<[u8; N]>, SecurityError> {
+        let mut buf = Zeroizing::new([0u8; N]);
+        getrandom::fill(buf.as_mut()).map_err(|_| SecurityError::RngUnavailable)?;
+        Ok(buf)
+    }
+
+    /// Fetch 1024 bytes of checked OS entropy upfront for single-shot SPAKE2 ephemeral draws.
+    pub fn prefetch_spake_entropy(&mut self) -> Result<PrefetchedCryptoRng, SecurityError> {
+        let mut bytes = Zeroizing::new(vec![0u8; 1024]);
+        self.fill_bytes(&mut bytes)?;
+        Ok(PrefetchedCryptoRng {
+            bytes,
+            offset: 0,
+            rng_failed: false,
+            #[cfg(test)]
+            fail_on_refill: false,
+        })
     }
 }
 
@@ -41,14 +65,24 @@ impl rand_core::TryRng for CheckedOsCryptoRng {
 
     fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
         let mut buf = [0u8; 4];
-        getrandom::fill(&mut buf)?;
-        Ok(u32::from_le_bytes(buf))
+        if let Err(err) = getrandom::fill(&mut buf) {
+            buf.zeroize();
+            return Err(err);
+        }
+        let out = u32::from_le_bytes(buf);
+        buf.zeroize();
+        Ok(out)
     }
 
     fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
         let mut buf = [0u8; 8];
-        getrandom::fill(&mut buf)?;
-        Ok(u64::from_le_bytes(buf))
+        if let Err(err) = getrandom::fill(&mut buf) {
+            buf.zeroize();
+            return Err(err);
+        }
+        let out = u64::from_le_bytes(buf);
+        buf.zeroize();
+        Ok(out)
     }
 
     fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
@@ -60,43 +94,33 @@ impl rand_core::TryCryptoRng for CheckedOsCryptoRng {}
 
 /// Pre-fetched OS CSPRNG buffer supplying infallible `CryptoRng` for algorithms like `pakery-spake2`.
 ///
-/// Entropy is pulled upfront via [`CheckedOsCryptoRng`] with full error propagation (`Result`),
-/// ensuring OS RNG failures are never panicked or silently swallowed before handoff.
+/// Entropy is pulled upfront via [`CheckedOsCryptoRng`] with full error propagation (`Result`).
+/// Any unexpected refill error records `rng_failed = true` and zeroizes the output buffer so
+/// callers enforcing [`PrefetchedCryptoRng::ensure_healthy`] fail closed and never accept weak/zeroed draws.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct PrefetchedCryptoRng {
     bytes: Zeroizing<Vec<u8>>,
     offset: usize,
+    rng_failed: bool,
+    #[cfg(test)]
+    fail_on_refill: bool,
 }
 
-impl CheckedOsCryptoRng {
-    /// Fetch 512 bytes of checked OS entropy upfront for single-shot SPAKE2 ephemeral draws.
-    pub fn prefetch_spake_entropy(&mut self) -> Result<PrefetchedCryptoRng, SecurityError> {
-        let mut bytes = Zeroizing::new(vec![0u8; 512]);
-        self.fill_bytes(&mut bytes)?;
-        Ok(PrefetchedCryptoRng { bytes, offset: 0 })
-    }
-}
-
-impl rand_core::TryRng for PrefetchedCryptoRng {
-    type Error = core::convert::Infallible;
-
-    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
-        let mut buf = [0u8; 4];
-        let _ = self.try_fill_bytes(&mut buf);
-        let val = u32::from_le_bytes(buf);
-        buf.zeroize();
-        Ok(val)
+impl PrefetchedCryptoRng {
+    /// Verify that no OS CSPRNG refill failure occurred during scalar generation.
+    pub const fn ensure_healthy(&self) -> Result<(), SecurityError> {
+        if self.rng_failed {
+            Err(SecurityError::RngUnavailable)
+        } else {
+            Ok(())
+        }
     }
 
-    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
-        let mut buf = [0u8; 8];
-        let _ = self.try_fill_bytes(&mut buf);
-        let val = u64::from_le_bytes(buf);
-        buf.zeroize();
-        Ok(val)
-    }
-
-    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+    fn fill_internal(&mut self, dst: &mut [u8]) {
+        if self.rng_failed {
+            dst.zeroize();
+            return;
+        }
         let avail = self.bytes.len().saturating_sub(self.offset);
         let take = avail.min(dst.len());
         if take > 0 {
@@ -105,9 +129,41 @@ impl rand_core::TryRng for PrefetchedCryptoRng {
             self.offset += take;
         }
         if take < dst.len() {
-            // Unlikely rejection-sampling spillover after 512 bytes of P-256 candidates.
-            let _ = getrandom::fill(&mut dst[take..]);
+            #[cfg(test)]
+            if self.fail_on_refill {
+                self.rng_failed = true;
+                dst.zeroize();
+                return;
+            }
+            if getrandom::fill(&mut dst[take..]).is_err() {
+                self.rng_failed = true;
+                dst.zeroize();
+            }
         }
+    }
+}
+
+impl rand_core::TryRng for PrefetchedCryptoRng {
+    type Error = core::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        let mut buf = [0u8; 4];
+        self.fill_internal(&mut buf);
+        let val = u32::from_le_bytes(buf);
+        buf.zeroize();
+        Ok(val)
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        let mut buf = [0u8; 8];
+        self.fill_internal(&mut buf);
+        let val = u64::from_le_bytes(buf);
+        buf.zeroize();
+        Ok(val)
+    }
+
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        self.fill_internal(dst);
         Ok(())
     }
 }
@@ -135,7 +191,8 @@ impl<const N: usize> SecretBytes<N> {
 
     /// Generate random secret bytes via `CheckedOsCryptoRng`.
     pub fn generate(rng: &mut CheckedOsCryptoRng) -> Result<Self, SecurityError> {
-        Ok(Self(rng.random_array::<N>()?))
+        let bytes = rng.random_zeroizing::<N>()?;
+        Ok(Self(*bytes))
     }
 
     /// Borrow the underlying secret bytes explicitly.
@@ -159,54 +216,50 @@ impl<const N: usize> fmt::Debug for SecretBytes<N> {
     }
 }
 
-/// Redacted, zeroized pairing PIN wrapper.
+/// Redacted, zeroized pairing PIN wrapper enforcing the normative 8-digit CSPRNG policy.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct PinSecret(String);
 
 impl PinSecret {
-    /// Minimum PIN length in UTF-8 bytes when explicit format policy applies.
-    pub const MIN_LEN: usize = 6;
-    /// Maximum PIN length in UTF-8 bytes to bound memory and PBKDF/HKDF inputs.
-    pub const MAX_LEN: usize = 64;
+    /// Normative pairing PIN length: exactly 8 ASCII decimal digits (`00000000..=99999999`).
+    pub const PAIRING_PIN_DIGITS: usize = 8;
 
-    /// Construct a validated PIN secret (6..=64 ASCII/UTF-8 bytes, no NUL or control chars).
+    /// Construct a validated 8-digit ASCII numeric pairing PIN (`00000000..=99999999`),
+    /// preserving leading zeros and zeroizing rejected inputs.
     pub fn new(pin: impl Into<String>) -> Result<Self, SecurityError> {
         let mut pin = pin.into();
-        if pin.len() < Self::MIN_LEN || pin.len() > Self::MAX_LEN {
+        if pin.len() != Self::PAIRING_PIN_DIGITS {
             pin.zeroize();
             return Err(SecurityError::InvalidPinFormat(
-                "PIN length must be within 6..=64 bytes",
+                "pairing PIN must be exactly 8 ASCII digits",
             ));
         }
-        if pin.bytes().any(|b| b == 0 || b.is_ascii_control()) {
+        if !pin.bytes().all(|b| b.is_ascii_digit()) {
             pin.zeroize();
             return Err(SecurityError::InvalidPinFormat(
-                "PIN must not contain NUL or control characters",
+                "pairing PIN must contain ASCII digits 0-9 only",
             ));
         }
         Ok(Self(pin))
     }
 
-    /// Generate a cryptographic numeric PIN of `digits` digits (`6..=12`).
-    pub fn generate_numeric(
-        rng: &mut CheckedOsCryptoRng,
-        digits: usize,
-    ) -> Result<Self, SecurityError> {
-        if !(Self::MIN_LEN..=12).contains(&digits) {
-            return Err(SecurityError::InvalidPinFormat(
-                "numeric PIN digit count must be within 6..=12",
-            ));
-        }
-        let mut out = String::with_capacity(digits);
-        while out.len() < digits {
+    /// Generate a cryptographic 8-digit numeric PIN (`00000000..=99999999`, preserving leading zeros)
+    /// using unbiased rejection sampling over `CheckedOsCryptoRng`.
+    pub fn generate_numeric(rng: &mut CheckedOsCryptoRng) -> Result<Self, SecurityError> {
+        let mut out = String::with_capacity(Self::PAIRING_PIN_DIGITS);
+        while out.len() < Self::PAIRING_PIN_DIGITS {
             let mut sample = [0u8; 16];
-            rng.fill_bytes(&mut sample)?;
+            if let Err(err) = rng.fill_bytes(&mut sample) {
+                sample.zeroize();
+                out.zeroize();
+                return Err(err);
+            }
             for byte in sample {
                 // Rejection sampling avoids modulo bias across 0..250 -> 0..9.
                 if byte < 250 {
                     let digit = b'0' + (byte % 10);
                     out.push(char::from(digit));
-                    if out.len() == digits {
+                    if out.len() == Self::PAIRING_PIN_DIGITS {
                         break;
                     }
                 }
@@ -249,3 +302,45 @@ pub fn constant_time_eq(lhs: &[u8], rhs: &[u8]) -> bool {
 
 /// Zeroizing dynamic byte container alias.
 pub type ZeroizingVec = Zeroizing<Vec<u8>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand_core::TryRng;
+
+    #[test]
+    fn prefetched_rng_failure_is_recorded_zeroizes_output_and_never_succeeds_silently() {
+        let mut rng = CheckedOsCryptoRng::preflight().expect("preflight");
+        let mut prefetched = rng.prefetch_spake_entropy().expect("prefetch");
+        prefetched.fail_on_refill = true;
+
+        // Drain the 1024-byte prefetch buffer cleanly.
+        let mut drain = [0u8; 1024];
+        prefetched.try_fill_bytes(&mut drain).expect("infallible");
+        assert!(prefetched.ensure_healthy().is_ok());
+
+        // Subsequent draw forces refill -> simulated CSPRNG failure -> zeroizes buffer & flags error.
+        let mut spillover = [0xAAu8; 32];
+        prefetched
+            .try_fill_bytes(&mut spillover)
+            .expect("infallible");
+        assert_eq!(spillover, [0u8; 32]);
+        assert_eq!(
+            prefetched.ensure_healthy(),
+            Err(SecurityError::RngUnavailable)
+        );
+    }
+
+    #[test]
+    fn pin_secret_enforces_exact_8_ascii_digits_with_leading_zeros() {
+        assert!(PinSecret::new("00000001").is_ok());
+        assert!(PinSecret::new("123456").is_err());
+        assert!(PinSecret::new("123456789").is_err());
+        assert!(PinSecret::new("1234567a").is_err());
+
+        let mut rng = CheckedOsCryptoRng::preflight().expect("rng");
+        let generated = PinSecret::generate_numeric(&mut rng).expect("gen");
+        assert_eq!(generated.expose_bytes().len(), 8);
+        assert!(generated.expose_bytes().iter().all(u8::is_ascii_digit));
+    }
+}

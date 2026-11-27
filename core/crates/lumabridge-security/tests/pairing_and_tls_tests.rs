@@ -6,10 +6,12 @@ use lumabridge_protocol::version::{LBWP_PROTOCOL_MAJOR, LBWP_PROTOCOL_MINOR};
 use lumabridge_security::certificate::{
     generate_self_signed_device_cert, GeneratedDeviceCertificate,
 };
+use lumabridge_security::channel_binding::ChannelBindingSource;
 use lumabridge_security::error::SecurityError;
 use lumabridge_security::identity::{IdentityKeyPair, PeerRole};
 use lumabridge_security::pairing::{
-    HumanApprovalDecision, PairingAcceptor, PairingInitiator, PairingStage, QrTokenStore,
+    HumanApprovalDecision, PairingAcceptor, PairingInitiator, PairingStage, PinPairingWindow,
+    QrTokenStore, MAX_PIN_FAILED_ATTEMPTS, PIN_TTL_SECS,
 };
 use lumabridge_security::secret::{CheckedOsCryptoRng, PinSecret};
 use lumabridge_security::tls::{
@@ -19,8 +21,9 @@ use lumabridge_security::tls::{
     LUMABRIDGE_PAIR_ALPN_V1,
 };
 use lumabridge_security::trust_store::{InMemoryTrustStore, RevocationReason};
+use rustls::client::Resumption;
 use rustls::pki_types::CertificateDer;
-use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConnection};
+use rustls::{ClientConfig, ClientConnection, HandshakeKind, RootCertStore, ServerConnection};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
@@ -69,20 +72,22 @@ fn handshake_pair(
         .map_err(|_| SecurityError::TlsHandshakeFailed("server init failed"))?;
 
     drive_in_memory_handshake(&mut client, &mut server)?;
+    assert_ne!(client.handshake_kind(), Some(HandshakeKind::Resumed));
+    assert_ne!(server.handshake_kind(), Some(HandshakeKind::Resumed));
     let client_sess = extract_authenticated_session_with_alpn(&client, &expected_alpn, now_unix)?;
     let server_sess = extract_authenticated_session_with_alpn(&server, &expected_alpn, now_unix)?;
     Ok((client_sess, server_sess, client, server))
 }
 
 #[test]
-fn real_tls13_mtls_nine_normative_cases() {
+fn real_tls13_mtls_normative_cases_pinned_store_and_resumption_disabled() {
     let now = current_unix_time();
     let valid_start = now - 3600;
     let valid_end = now + 86_400;
 
     let (host_kp, host_cert) = make_identity_and_cert(0x10, valid_start, valid_end);
     let (ctrl_kp, ctrl_cert) = make_identity_and_cert(0x20, valid_start, valid_end);
-    let (_stranger_kp, stranger_cert) = make_identity_and_cert(0x30, valid_start, valid_end);
+    let (stranger_kp, stranger_cert) = make_identity_and_cert(0x30, valid_start, valid_end);
     let (_expired_kp, expired_cert) = make_identity_and_cert(0x40, now - 7200, now - 60);
     let (_future_kp, future_cert) = make_identity_and_cert(0x50, now + 3600, now + 7200);
 
@@ -123,58 +128,126 @@ fn real_tls13_mtls_nine_normative_cases() {
         now,
     )
     .expect("Case 1 valid mTLS handshake");
-    assert_eq!(c_sess.channel_binding, s_sess.channel_binding);
-    assert_eq!(c_sess.negotiated_alpn, LUMABRIDGE_ALPN_V1);
+    assert_eq!(c_sess.channel_binding(), s_sess.channel_binding());
     assert_eq!(
-        c_sess.peer_cert.public_identity.device_id(),
-        host_kp.device_id()
+        c_sess.channel_binding().source(),
+        ChannelBindingSource::Tls13Exporter
     );
-    assert_eq!(
-        s_sess.peer_cert.public_identity.device_id(),
-        ctrl_kp.device_id()
-    );
+    assert_eq!(c_sess.negotiated_alpn(), LUMABRIDGE_ALPN_V1);
+    assert_eq!(c_sess.peer_identity().device_id(), host_kp.device_id());
+    assert_eq!(s_sess.peer_identity().device_id(), ctrl_kp.device_id());
     let received = transfer_encrypted_app_data(&mut client, &mut server, b"hello-lumabridge-tls13")
         .expect("encrypted transfer");
     assert_eq!(received, b"hello-lumabridge-tls13");
 
+    // TLS resumption & 0-RTT explicitly disabled even when client enables in-memory session cache
+    let server_cfg_no_resume = build_tls13_server_config(
+        &host_cert,
+        TlsPeerTrustPolicy::Trusted {
+            trust_store: host_store.clone(),
+            expected_role: PeerRole::Controller,
+        },
+    )
+    .expect("srv cfg");
+    assert_eq!(server_cfg_no_resume.send_tls13_tickets, 0);
+    assert_eq!(server_cfg_no_resume.max_early_data_size, 0);
+
+    let mut greedy_client_cfg = (*build_tls13_client_config(
+        &ctrl_cert,
+        TlsPeerTrustPolicy::Trusted {
+            trust_store: ctrl_store.clone(),
+            expected_role: PeerRole::Host,
+        },
+    )
+    .expect("cli cfg"))
+    .clone();
+    greedy_client_cfg.resumption = Resumption::in_memory_sessions(16);
+    greedy_client_cfg.enable_early_data = true;
+    let greedy_client_cfg = Arc::new(greedy_client_cfg);
+    let sni = canonical_server_name_for_device(host_kp.device_id()).expect("sni");
+
+    for _ in 0..2 {
+        let mut c = ClientConnection::new(Arc::clone(&greedy_client_cfg), sni.clone()).expect("c");
+        let mut s = ServerConnection::new(Arc::clone(&server_cfg_no_resume)).expect("s");
+        drive_in_memory_handshake(&mut c, &mut s).expect("full handshake");
+        assert_eq!(c.handshake_kind(), Some(HandshakeKind::Full));
+        assert_eq!(s.handshake_kind(), Some(HandshakeKind::Full));
+        assert!(!c.is_early_data_accepted());
+    }
+
+    // PinnedPeer MUST enforce TrustStore membership & role, rejecting untrusted or wrong-role pinned IDs
+    let empty_store = Arc::new(InMemoryTrustStore::new());
+    assert!(handshake_pair(
+        &stranger_cert,
+        TlsPeerTrustPolicy::Trusted {
+            trust_store: ctrl_store.clone(),
+            expected_role: PeerRole::Host,
+        },
+        &host_cert,
+        TlsPeerTrustPolicy::PinnedPeer {
+            trust_store: empty_store,
+            expected_role: PeerRole::Controller,
+            expected_device_id: stranger_kp.device_id(),
+        },
+        now,
+    )
+    .is_err());
+
+    // PinnedPeer succeeds when peer is both pinned AND trusted with matching role
+    assert!(handshake_pair(
+        &ctrl_cert,
+        TlsPeerTrustPolicy::PinnedPeer {
+            trust_store: ctrl_store.clone(),
+            expected_role: PeerRole::Host,
+            expected_device_id: host_kp.device_id(),
+        },
+        &host_cert,
+        TlsPeerTrustPolicy::PinnedPeer {
+            trust_store: host_store.clone(),
+            expected_role: PeerRole::Controller,
+            expected_device_id: ctrl_kp.device_id(),
+        },
+        now,
+    )
+    .is_ok());
+
     // Case 2: Valid mutual TLS 1.3 pairing handshake (lumabridge-pair/1)
     let (p_c_sess, p_s_sess, _, _) = handshake_pair(
         &ctrl_cert,
-        TlsPeerTrustPolicy::Pairing { trust_store: None },
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: ctrl_store.clone(),
+        },
         &host_cert,
         TlsPeerTrustPolicy::Pairing {
-            trust_store: Some(host_store.clone()),
+            trust_store: host_store.clone(),
         },
         now,
     )
     .expect("Case 2 valid pairing mTLS handshake");
-    assert_eq!(p_c_sess.channel_binding, p_s_sess.channel_binding);
-    assert_eq!(p_c_sess.negotiated_alpn, LUMABRIDGE_PAIR_ALPN_V1);
-    // Distinct handshakes produce distinct RFC 9266 channel bindings.
-    assert_ne!(c_sess.channel_binding, p_c_sess.channel_binding);
+    assert_eq!(p_c_sess.channel_binding(), p_s_sess.channel_binding());
+    assert_eq!(p_c_sess.negotiated_alpn(), LUMABRIDGE_PAIR_ALPN_V1);
+    assert_ne!(c_sess.channel_binding(), p_c_sess.channel_binding());
 
     // Case 3: Raw TLS 1.2 ClientHello wire record rejected by TLS 1.3-only server
     let server_cfg = build_tls13_server_config(
         &host_cert,
-        TlsPeerTrustPolicy::Pairing { trust_store: None },
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: host_store.clone(),
+        },
     )
     .expect("server cfg");
     let mut tls13_srv = ServerConnection::new(server_cfg).expect("srv");
-    // Minimal RFC 5246 TLS 1.2 ClientHello without TLS 1.3 supported_versions extension (50 bytes).
     let mut tls12_client_hello = Vec::with_capacity(50);
-    tls12_client_hello.extend_from_slice(&[0x16, 0x03, 0x01, 0x00, 45]); // TLS Record header
-    tls12_client_hello.extend_from_slice(&[0x01, 0x00, 0x00, 41]); // Handshake ClientHello header
-    tls12_client_hello.extend_from_slice(&[0x03, 0x03]); // Legacy client_version TLS 1.2
-    tls12_client_hello.extend_from_slice(&[0xAA; 32]); // Random
-    tls12_client_hello.push(0x00); // Session ID length = 0
-    tls12_client_hello.extend_from_slice(&[0x00, 0x02, 0xc0, 0x2f]); // ECDHE_RSA_AES128_GCM_SHA256
-    tls12_client_hello.extend_from_slice(&[0x01, 0x00]); // Compression = null
+    tls12_client_hello.extend_from_slice(&[0x16, 0x03, 0x01, 0x00, 45]);
+    tls12_client_hello.extend_from_slice(&[0x01, 0x00, 0x00, 41]);
+    tls12_client_hello.extend_from_slice(&[0x03, 0x03]);
+    tls12_client_hello.extend_from_slice(&[0xAA; 32]);
+    tls12_client_hello.push(0x00);
+    tls12_client_hello.extend_from_slice(&[0x00, 0x02, 0xc0, 0x2f]);
+    tls12_client_hello.extend_from_slice(&[0x01, 0x00]);
     let mut slice = tls12_client_hello.as_slice();
     tls13_srv.read_tls(&mut slice).expect("read tls12 record");
-    assert!(
-        tls13_srv.process_new_packets().is_err(),
-        "TLS 1.3-only server must reject TLS 1.2 ClientHello"
-    );
+    assert!(tls13_srv.process_new_packets().is_err());
 
     // Case 4: Client without mTLS certificate rejected cleanly
     let mut roots2 = RootCertStore::empty();
@@ -190,7 +263,9 @@ fn real_tls13_mtls_nine_normative_cases() {
     );
     let server_cfg2 = build_tls13_server_config(
         &host_cert,
-        TlsPeerTrustPolicy::Pairing { trust_store: None },
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: host_store.clone(),
+        },
     )
     .expect("server cfg");
     let mut no_cert_cli = ClientConnection::new(
@@ -204,7 +279,9 @@ fn real_tls13_mtls_nine_normative_cases() {
     // Case 5: Untrusted device rejected in operational mode
     assert!(handshake_pair(
         &stranger_cert,
-        TlsPeerTrustPolicy::Pairing { trust_store: None },
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: ctrl_store.clone(),
+        },
         &host_cert,
         TlsPeerTrustPolicy::Trusted {
             trust_store: host_store.clone(),
@@ -214,10 +291,12 @@ fn real_tls13_mtls_nine_normative_cases() {
     )
     .is_err());
 
-    // Case 6: Wrong role rejected (stored Controller presenting as expected Host)
+    // Case 6: Wrong role rejected
     assert!(handshake_pair(
         &ctrl_cert,
-        TlsPeerTrustPolicy::Pairing { trust_store: None },
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: ctrl_store.clone(),
+        },
         &host_cert,
         TlsPeerTrustPolicy::Trusted {
             trust_store: host_store.clone(),
@@ -230,22 +309,53 @@ fn real_tls13_mtls_nine_normative_cases() {
     // Case 7: Expired and not-yet-valid certificates rejected
     assert!(handshake_pair(
         &expired_cert,
-        TlsPeerTrustPolicy::Pairing { trust_store: None },
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: ctrl_store.clone(),
+        },
         &host_cert,
-        TlsPeerTrustPolicy::Pairing { trust_store: None },
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: host_store.clone(),
+        },
         now,
     )
     .is_err());
     assert!(handshake_pair(
         &future_cert,
-        TlsPeerTrustPolicy::Pairing { trust_store: None },
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: ctrl_store.clone(),
+        },
         &host_cert,
-        TlsPeerTrustPolicy::Pairing { trust_store: None },
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: host_store.clone(),
+        },
         now,
     )
     .is_err());
 
-    // Case 8: Revoked peer rejected in BOTH operational AND pairing modes
+    // Case 9: ALPN mismatch fails cleanly on an unrevoked peer + extractor enforces expected ALPN
+    let alpn_res = handshake_pair(
+        &ctrl_cert,
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: ctrl_store.clone(),
+        },
+        &host_cert,
+        TlsPeerTrustPolicy::PinnedPeer {
+            trust_store: host_store.clone(),
+            expected_role: PeerRole::Controller,
+            expected_device_id: ctrl_kp.device_id(),
+        },
+        now,
+    );
+    assert!(matches!(
+        alpn_res,
+        Err(SecurityError::TlsHandshakeFailed(_) | SecurityError::AlpnMismatch)
+    ));
+    assert_eq!(
+        extract_authenticated_session_with_alpn(&client, LUMABRIDGE_PAIR_ALPN_V1, now),
+        Err(SecurityError::AlpnMismatch)
+    );
+
+    // Case 8: Revoked peer rejected in BOTH operational (Trusted & PinnedPeer) AND pairing modes
     host_store
         .revoke(
             ctrl_kp.device_id(),
@@ -255,7 +365,9 @@ fn real_tls13_mtls_nine_normative_cases() {
         .expect("revoke");
     assert!(handshake_pair(
         &ctrl_cert,
-        TlsPeerTrustPolicy::Pairing { trust_store: None },
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: ctrl_store.clone(),
+        },
         &host_cert,
         TlsPeerTrustPolicy::Trusted {
             trust_store: host_store.clone(),
@@ -266,44 +378,51 @@ fn real_tls13_mtls_nine_normative_cases() {
     .is_err());
     assert!(handshake_pair(
         &ctrl_cert,
-        TlsPeerTrustPolicy::Pairing { trust_store: None },
-        &host_cert,
         TlsPeerTrustPolicy::Pairing {
-            trust_store: Some(host_store.clone()),
+            trust_store: ctrl_store.clone(),
+        },
+        &host_cert,
+        TlsPeerTrustPolicy::PinnedPeer {
+            trust_store: host_store.clone(),
+            expected_role: PeerRole::Controller,
+            expected_device_id: ctrl_kp.device_id(),
         },
         now,
     )
     .is_err());
-
-    // Case 9: ALPN mismatch between client (`lumabridge-pair/1`) and server (`lumabridge/1`) fails cleanly
-    let alpn_res = handshake_pair(
+    assert!(handshake_pair(
         &ctrl_cert,
-        TlsPeerTrustPolicy::Pairing { trust_store: None },
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: ctrl_store,
+        },
         &host_cert,
-        TlsPeerTrustPolicy::PinnedPeer {
-            expected_device_id: ctrl_kp.device_id(),
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: host_store,
         },
         now,
-    );
-    assert!(matches!(
-        alpn_res,
-        Err(SecurityError::TlsHandshakeFailed(_) | SecurityError::AlpnMismatch)
-    ));
+    )
+    .is_err());
 }
 
 #[test]
-fn channel_bound_spake2_end_to_end_and_real_mitm_failure() {
+fn channel_bound_spake2_local_consent_pin_budget_and_real_mitm_failure() {
     let now = current_unix_time();
     let (host_kp, host_cert) = make_identity_and_cert(0x31, now - 60, now + 3600);
     let (ctrl_kp, ctrl_cert) = make_identity_and_cert(0x32, now - 60, now + 3600);
     let (mitm_kp, mitm_cert) = make_identity_and_cert(0x33, now - 60, now + 3600);
 
-    // Legitimate pairing over matching TLS 1.3 channel binding
+    let host_store = Arc::new(InMemoryTrustStore::new());
+    let ctrl_store = Arc::new(InMemoryTrustStore::new());
+
     let (c_tls, s_tls, _, _) = handshake_pair(
         &ctrl_cert,
-        TlsPeerTrustPolicy::Pairing { trust_store: None },
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: ctrl_store.clone(),
+        },
         &host_cert,
-        TlsPeerTrustPolicy::Pairing { trust_store: None },
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: host_store.clone(),
+        },
         now,
     )
     .expect("tls");
@@ -325,8 +444,10 @@ fn channel_bound_spake2_end_to_end_and_real_mitm_failure() {
         spki_ed25519: host_kp.public_identity().spki_der().to_vec(),
     };
 
-    let pin = PinSecret::new("492817").expect("pin");
     let mut rng = CheckedOsCryptoRng::preflight().expect("rng");
+    let pin_window = PinPairingWindow::new();
+    let pin = pin_window.open_with_new_pin(&mut rng, now).expect("pin");
+    assert_eq!(pin_window.remaining_attempts(now), MAX_PIN_FAILED_ATTEMPTS);
 
     let mut initiator = PairingInitiator::start(
         77,
@@ -340,12 +461,10 @@ fn channel_bound_spake2_end_to_end_and_real_mitm_failure() {
     let mut acceptor =
         PairingAcceptor::start(77, &host_kp, PeerRole::Host, &init_hello, &s_tls).expect("acc");
 
-    let m1 = initiator
-        .begin_spake2(ctrl_kp.device_id(), &pin, &mut rng)
-        .expect("m1");
+    let m1 = initiator.begin_spake2(&pin, &mut rng).expect("m1");
     assert_eq!(initiator.stage(), PairingStage::AuthExchanging);
     let m2 = acceptor
-        .handle_spake2_exchange(host_kp.device_id(), &pin, &m1, &mut rng)
+        .handle_spake2_exchange(&pin_window, &m1, now, &mut rng)
         .expect("m2");
     let m3 = initiator
         .finish_spake2_and_emit_confirmation(&m2)
@@ -357,6 +476,8 @@ fn channel_bound_spake2_end_to_end_and_real_mitm_failure() {
         .verify_spake2_peer_confirmation(&m4)
         .expect("init confirmed mac");
 
+    // Successful PIN verification consumes & destroys the single-use PIN immediately.
+    assert_eq!(pin_window.remaining_attempts(now), 0);
     assert_eq!(initiator.stage(), PairingStage::AwaitingApproval);
     assert_eq!(acceptor.stage(), PairingStage::AwaitingApproval);
 
@@ -365,19 +486,25 @@ fn channel_bound_spake2_end_to_end_and_real_mitm_failure() {
         acceptor.apply_human_approval(
             &host_kp,
             HumanApprovalDecision::Approve {
+                pairing_attempt_id: 77,
+                peer_device_id: ctrl_kp.device_id(),
                 granted_base_perms: Permissions::VIEW_MIRROR.union(Permissions::INPUT_POINTER),
             }
         ),
         Err(SecurityError::AuthorizationDenied(_))
     ));
 
-    // Re-run cleanly with base-only permissions after failed stage cannot proceed without new conn;
-    // so run fresh handshake and test HumanApprovalDecision::Approve + Confirm signature.
+    // Fresh handshake + PinPairingWindow with explicit local approval on BOTH Acceptor & Initiator
+    let pin2 = pin_window.open_with_new_pin(&mut rng, now).expect("pin2");
     let (c_tls2, s_tls2, _, _) = handshake_pair(
         &ctrl_cert,
-        TlsPeerTrustPolicy::Pairing { trust_store: None },
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: ctrl_store.clone(),
+        },
         &host_cert,
-        TlsPeerTrustPolicy::Pairing { trust_store: None },
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: host_store.clone(),
+        },
         now,
     )
     .expect("tls2");
@@ -392,79 +519,98 @@ fn channel_bound_spake2_end_to_end_and_real_mitm_failure() {
     .expect("init2");
     let mut acc2 =
         PairingAcceptor::start(78, &host_kp, PeerRole::Host, &init_hello, &s_tls2).expect("acc2");
-    let m1 = init2
-        .begin_spake2(ctrl_kp.device_id(), &pin, &mut rng)
-        .expect("m1");
+    let m1 = init2.begin_spake2(&pin2, &mut rng).expect("m1");
     let m2 = acc2
-        .handle_spake2_exchange(host_kp.device_id(), &pin, &m1, &mut rng)
+        .handle_spake2_exchange(&pin_window, &m1, now, &mut rng)
         .expect("m2");
     let m3 = init2.finish_spake2_and_emit_confirmation(&m2).expect("m3");
     let m4 = acc2.verify_spake2_confirmation_and_reply(&m3).expect("m4");
     init2.verify_spake2_peer_confirmation(&m4).expect("mac2");
 
+    // Wrong-peer HumanApprovalDecision rejected cleanly
+    let prompt_acc = acc2.approval_prompt().expect("prompt acc");
+    assert_eq!(prompt_acc.peer_device_id, ctrl_kp.device_id());
+    assert_eq!(prompt_acc.untrusted_friendly_name, "Tablet");
+
     let confirm = acc2
         .apply_human_approval(
             &host_kp,
             HumanApprovalDecision::Approve {
+                pairing_attempt_id: 78,
+                peer_device_id: ctrl_kp.device_id(),
                 granted_base_perms: Permissions::VIEW_MIRROR.union(Permissions::EXTEND_DISPLAY),
             },
         )
         .expect("approve");
-    let perms = init2
-        .accept_pair_confirm(ctrl_kp.device_id(), &confirm)
-        .expect("confirm");
+    let acc_commit = acc2.approved_commit().expect("acc commit");
+    host_store
+        .insert_approved_pairing(&acc_commit, now)
+        .expect("persist host trust");
+
+    // Network PairConfirm NEVER promotes initiator to Confirmed without local human approval!
+    let offered = init2.verify_pair_confirm(&confirm).expect("verify confirm");
     assert_eq!(
-        perms,
+        offered,
         Permissions::VIEW_MIRROR.union(Permissions::EXTEND_DISPLAY)
     );
+    assert_eq!(init2.stage(), PairingStage::AwaitingApproval);
+    assert!(init2.granted_base_perms().is_none());
 
-    // Tampered certificate rejected during real TLS 1.3 handshake
-    let mut tampered_cert = GeneratedDeviceCertificate {
-        cert_der: ctrl_cert.cert_der.clone(),
-        pkcs8_der: zeroize::Zeroizing::new(ctrl_cert.pkcs8_der.to_vec()),
-        device_id: ctrl_cert.device_id,
-        not_before_unix: ctrl_cert.not_before_unix,
-        not_after_unix: ctrl_cert.not_after_unix,
-    };
-    if let Some(last) = tampered_cert.cert_der.last_mut() {
-        *last ^= 0x55;
-    }
-    assert!(handshake_pair(
-        &tampered_cert,
-        TlsPeerTrustPolicy::Pairing { trust_store: None },
-        &host_cert,
-        TlsPeerTrustPolicy::Pairing { trust_store: None },
-        now,
-    )
-    .is_err());
-    assert_eq!(acc2.stage(), PairingStage::Confirmed);
+    let prompt_init = init2.approval_prompt().expect("prompt init");
+    assert_eq!(prompt_init.offered_base_perms, Some(offered));
+    let init_commit = init2
+        .apply_local_approval(HumanApprovalDecision::Approve {
+            pairing_attempt_id: 78,
+            peer_device_id: host_kp.device_id(),
+            granted_base_perms: Permissions::VIEW_MIRROR.union(Permissions::EXTEND_DISPLAY),
+        })
+        .expect("local initiator approval");
     assert_eq!(init2.stage(), PairingStage::Confirmed);
+    assert_eq!(
+        init_commit.granted_base_perms,
+        Permissions::VIEW_MIRROR.union(Permissions::EXTEND_DISPLAY)
+    );
+    ctrl_store
+        .insert_approved_pairing(&init_commit, now)
+        .expect("persist ctrl trust");
 
-    // Attempting replay / second SPAKE2 on confirmed or active connection is blocked
+    // Attempting replay / second SPAKE2 on confirmed connection is blocked
     assert!(matches!(
-        init2.begin_spake2(ctrl_kp.device_id(), &pin, &mut rng),
+        init2.begin_spake2(&pin2, &mut rng),
         Err(SecurityError::PairingState(_))
     ));
 
     // Real 2-connection active MITM: Client <-> MITM <-> Host (distinct TLS channel bindings!)
+    let mitm_store = Arc::new(InMemoryTrustStore::new());
     let (cli_mitm_tls, mitm_from_cli_tls, _, _) = handshake_pair(
         &ctrl_cert,
-        TlsPeerTrustPolicy::Pairing { trust_store: None },
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: ctrl_store.clone(),
+        },
         &mitm_cert,
-        TlsPeerTrustPolicy::Pairing { trust_store: None },
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: mitm_store.clone(),
+        },
         now,
     )
     .expect("cli-mitm tls");
     let (mitm_to_srv_tls, srv_mitm_tls, _, _) = handshake_pair(
         &mitm_cert,
-        TlsPeerTrustPolicy::Pairing { trust_store: None },
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: mitm_store,
+        },
         &host_cert,
-        TlsPeerTrustPolicy::Pairing { trust_store: None },
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: host_store.clone(),
+        },
         now,
     )
     .expect("mitm-srv tls");
 
-    assert_ne!(cli_mitm_tls.channel_binding, srv_mitm_tls.channel_binding);
+    assert_ne!(
+        cli_mitm_tls.channel_binding(),
+        srv_mitm_tls.channel_binding()
+    );
     let mitm_hello = PairHello {
         protocol_major: LBWP_PROTOCOL_MAJOR,
         protocol_minor: LBWP_PROTOCOL_MINOR,
@@ -473,6 +619,7 @@ fn channel_bound_spake2_end_to_end_and_real_mitm_failure() {
         auth_mode: AuthMode::PinSpake2,
         spki_ed25519: mitm_kp.public_identity().spki_der().to_vec(),
     };
+    let pin3 = pin_window.open_with_new_pin(&mut rng, now).expect("pin3");
     let mut victim_init = PairingInitiator::start(
         99,
         &ctrl_kp,
@@ -487,11 +634,10 @@ fn channel_bound_spake2_end_to_end_and_real_mitm_failure() {
             .expect("victim acc");
 
     let forwarded_m1 = victim_init
-        .begin_spake2(ctrl_kp.device_id(), &pin, &mut rng)
+        .begin_spake2(&pin3, &mut rng)
         .expect("forwarded m1");
-    // Host computes pB under (mitm_id, host_id, srv_mitm_cb) while client uses (ctrl_id, mitm_id, cli_mitm_cb).
     let forwarded_m2 = victim_acc
-        .handle_spake2_exchange(host_kp.device_id(), &pin, &forwarded_m1, &mut rng)
+        .handle_spake2_exchange(&pin_window, &forwarded_m1, now, &mut rng)
         .expect("forwarded m2");
     let forwarded_m3 = victim_init
         .finish_spake2_and_emit_confirmation(&forwarded_m2)
@@ -502,13 +648,208 @@ fn channel_bound_spake2_end_to_end_and_real_mitm_failure() {
     );
     let _ = (mitm_from_cli_tls, mitm_to_srv_tls);
 
-    // PairConfirm with forged input permission fails client-side verification too
-    let _ = PairConfirm {
-        pairing_attempt_id: 1,
+    // PairConfirm with forged input permission is rejected by initiator verify_pair_confirm
+    let (c_tls3, s_tls3, _, _) = handshake_pair(
+        &ctrl_cert,
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: ctrl_store,
+        },
+        &host_cert,
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: host_store,
+        },
+        now,
+    )
+    .expect("tls3");
+    let pin4 = pin_window.open_with_new_pin(&mut rng, now).expect("pin4");
+    let mut init3 = PairingInitiator::start(
+        101,
+        &ctrl_kp,
+        PeerRole::Controller,
+        &acc_hello,
+        &c_tls3,
+        AuthMode::PinSpake2,
+    )
+    .expect("init3");
+    let mut acc3 =
+        PairingAcceptor::start(101, &host_kp, PeerRole::Host, &init_hello, &s_tls3).expect("acc3");
+    let m1_3 = init3.begin_spake2(&pin4, &mut rng).expect("m1_3");
+    let m2_3 = acc3
+        .handle_spake2_exchange(&pin_window, &m1_3, now, &mut rng)
+        .expect("m2_3");
+    let m3_3 = init3
+        .finish_spake2_and_emit_confirmation(&m2_3)
+        .expect("m3_3");
+    let m4_3 = acc3
+        .verify_spake2_confirmation_and_reply(&m3_3)
+        .expect("m4_3");
+    init3.verify_spake2_peer_confirmation(&m4_3).expect("mac3");
+
+    let forged_confirm = PairConfirm {
+        pairing_attempt_id: 101,
         accepted: true,
         granted_base_perms: Permissions::INPUT_KEYBOARD,
         confirm_signature: Some(vec![0u8; 64]),
     };
+    assert!(matches!(
+        init3.verify_pair_confirm(&forged_confirm),
+        Err(SecurityError::AuthorizationDenied(_))
+    ));
+    assert_eq!(init3.stage(), PairingStage::Failed);
+
+    // Zero pairing_attempt_id and control-char friendly_name rejected at start()
+    assert!(matches!(
+        PairingInitiator::start(
+            0,
+            &ctrl_kp,
+            PeerRole::Controller,
+            &acc_hello,
+            &c_tls3,
+            AuthMode::PinSpake2,
+        ),
+        Err(SecurityError::ProtocolViolation(_))
+    ));
+    let bad_hello = PairHello {
+        friendly_name: "Bad\nName".into(),
+        ..init_hello
+    };
+    assert!(matches!(
+        PairingAcceptor::start(102, &host_kp, PeerRole::Host, &bad_hello, &s_tls3),
+        Err(SecurityError::ProtocolViolation(_))
+    ));
+}
+
+#[test]
+fn atomic_three_attempt_pin_budget_concurrency_and_expiry_destroy_pin() {
+    let now = current_unix_time();
+    let (host_kp, host_cert) = make_identity_and_cert(0x71, now - 60, now + 3600);
+    let (ctrl_kp, ctrl_cert) = make_identity_and_cert(0x72, now - 60, now + 3600);
+    let store = Arc::new(InMemoryTrustStore::new());
+    let (c_tls, s_tls, _, _) = handshake_pair(
+        &ctrl_cert,
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: store.clone(),
+        },
+        &host_cert,
+        TlsPeerTrustPolicy::Pairing { trust_store: store },
+        now,
+    )
+    .expect("tls");
+
+    let init_hello = PairHello {
+        protocol_major: LBWP_PROTOCOL_MAJOR,
+        protocol_minor: LBWP_PROTOCOL_MINOR,
+        device_id: *ctrl_kp.device_id().as_bytes(),
+        friendly_name: "Tablet".into(),
+        auth_mode: AuthMode::PinSpake2,
+        spki_ed25519: ctrl_kp.public_identity().spki_der().to_vec(),
+    };
+    let acc_hello = PairHello {
+        protocol_major: LBWP_PROTOCOL_MAJOR,
+        protocol_minor: LBWP_PROTOCOL_MINOR,
+        device_id: *host_kp.device_id().as_bytes(),
+        friendly_name: "Host".into(),
+        auth_mode: AuthMode::PinSpake2,
+        spki_ed25519: host_kp.public_identity().spki_der().to_vec(),
+    };
+
+    let mut rng = CheckedOsCryptoRng::preflight().expect("rng");
+    let window = PinPairingWindow::new();
+    let real_pin = window.open_with_new_pin(&mut rng, now).expect("pin");
+    let wrong_pin = if real_pin.expose_bytes() == b"00000000" {
+        PinSecret::new("11111111").expect("wrong pin")
+    } else {
+        PinSecret::new("00000000").expect("wrong pin")
+    };
+
+    // Three failed attempts exhaust and immediately destroy the PIN!
+    for attempt in 1u64..=3u64 {
+        let mut init = PairingInitiator::start(
+            attempt,
+            &ctrl_kp,
+            PeerRole::Controller,
+            &acc_hello,
+            &c_tls,
+            AuthMode::PinSpake2,
+        )
+        .expect("init");
+        let mut acc =
+            PairingAcceptor::start(attempt, &host_kp, PeerRole::Host, &init_hello, &s_tls)
+                .expect("acc");
+        let m1 = init.begin_spake2(&wrong_pin, &mut rng).expect("m1");
+        let m2 = acc
+            .handle_spake2_exchange(&window, &m1, now, &mut rng)
+            .expect("m2");
+        let m3 = init.finish_spake2_and_emit_confirmation(&m2).expect("m3");
+        assert_eq!(
+            acc.verify_spake2_confirmation_and_reply(&m3),
+            Err(SecurityError::Spake2Failed)
+        );
+    }
+
+    // Even with the CORRECT PIN, attempt 4 MUST fail closed!
+    assert_eq!(window.remaining_attempts(now), 0);
+    let mut init4 = PairingInitiator::start(
+        4,
+        &ctrl_kp,
+        PeerRole::Controller,
+        &acc_hello,
+        &c_tls,
+        AuthMode::PinSpake2,
+    )
+    .expect("init4");
+    let mut acc4 =
+        PairingAcceptor::start(4, &host_kp, PeerRole::Host, &init_hello, &s_tls).expect("acc4");
+    let m1_4 = init4.begin_spake2(&real_pin, &mut rng).expect("m1_4");
+    assert_eq!(
+        acc4.handle_spake2_exchange(&window, &m1_4, now, &mut rng),
+        Err(SecurityError::PairingWindowClosed)
+    );
+
+    // 90s expiry destroys the PIN cleanly even when queried via remaining_attempts
+    let _exp_pin = window.open_with_new_pin(&mut rng, now).expect("exp pin");
+    assert_eq!(window.remaining_attempts(now + PIN_TTL_SECS + 1), 0);
+    assert_eq!(
+        window.begin_attempt(now + PIN_TTL_SECS + 1).err(),
+        Some(SecurityError::PairingWindowClosed)
+    );
+
+    // Cross-generation lease safety: stale leases from PIN_1 failing/succeeding after PIN_2 rotation
+    // MUST NOT poison or destroy PIN_2!
+    let _pin_gen1 = window.open_with_new_pin(&mut rng, now).expect("gen1");
+    let stale_fail_lease = window.begin_attempt(now).expect("stale fail lease");
+    let stale_succ_lease = window.begin_attempt(now).expect("stale succ lease");
+    let _pin_gen2 = window.open_with_new_pin(&mut rng, now).expect("gen2");
+    stale_fail_lease.finish_failure();
+    stale_succ_lease.finish_success();
+    assert_eq!(window.remaining_attempts(now), MAX_PIN_FAILED_ATTEMPTS);
+    let fresh_gen2_lease = window.begin_attempt(now).expect("gen2 still active");
+    fresh_gen2_lease.finish_success();
+
+    // 16-thread concurrent race on one PinPairingWindow: strictly <= 3 leases ever granted!
+    let _race_pin = window.open_with_new_pin(&mut rng, now).expect("race pin");
+    let barrier = Arc::new(Barrier::new(16));
+    let mut handles = Vec::with_capacity(16);
+    for _ in 0..16 {
+        let w = window.clone();
+        let b = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            b.wait();
+            match w.begin_attempt(now) {
+                Ok(lease) => {
+                    lease.finish_failure();
+                    true
+                }
+                Err(_) => false,
+            }
+        }));
+    }
+    let granted: usize = handles
+        .into_iter()
+        .map(|h| usize::from(h.join().expect("join")))
+        .sum();
+    assert_eq!(granted, MAX_PIN_FAILED_ATTEMPTS as usize);
+    assert_eq!(window.remaining_attempts(now), 0);
 }
 
 #[test]
@@ -530,11 +871,16 @@ fn qr_pairing_mitm_rejection_and_concurrent_single_use_race() {
         )
         .expect("issue ticket");
 
+    let trust_store = Arc::new(InMemoryTrustStore::new());
     let (c_tls, s_tls, _, _) = handshake_pair(
         &ctrl_cert,
-        TlsPeerTrustPolicy::Pairing { trust_store: None },
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: trust_store.clone(),
+        },
         &host_cert,
-        TlsPeerTrustPolicy::Pairing { trust_store: None },
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: trust_store.clone(),
+        },
         now,
     )
     .expect("qr tls");
@@ -568,6 +914,30 @@ fn qr_pairing_mitm_rejection_and_concurrent_single_use_race() {
     let mut acc =
         PairingAcceptor::start(500, &host_kp, PeerRole::Host, &init_hello, &s_tls).expect("acc");
 
+    // Role-mismatched QR ticket (Controller vs expected Host) rejected with RoleConfusion
+    let wrong_role_ticket = qr_store
+        .issue(
+            &mut rng,
+            host_kp.device_id(),
+            PeerRole::Controller,
+            BASE_TIME,
+            120,
+        )
+        .expect("wrong role ticket");
+    let mut bad_role_init = PairingInitiator::start(
+        501,
+        &ctrl_kp,
+        PeerRole::Controller,
+        &acc_hello,
+        &c_tls,
+        AuthMode::QrOutOfBand,
+    )
+    .expect("bad role init");
+    assert_eq!(
+        bad_role_init.create_qr_auth(&ctrl_kp, &wrong_role_ticket, BASE_TIME + 5),
+        Err(SecurityError::RoleConfusion)
+    );
+
     let qr_auth = init
         .create_qr_auth(&ctrl_kp, &ticket, BASE_TIME + 5)
         .expect("qr auth");
@@ -575,9 +945,13 @@ fn qr_pairing_mitm_rejection_and_concurrent_single_use_race() {
     // Active MITM trying to relay PairQrAuth onto another TLS channel fails signature check BEFORE consuming!
     let (_cli_mitm, srv_mitm, _, _) = handshake_pair(
         &ctrl_cert,
-        TlsPeerTrustPolicy::Pairing { trust_store: None },
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: trust_store.clone(),
+        },
         &mitm_cert,
-        TlsPeerTrustPolicy::Pairing { trust_store: None },
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: trust_store.clone(),
+        },
         now,
     )
     .expect("mitm tls");
@@ -593,25 +967,32 @@ fn qr_pairing_mitm_rejection_and_concurrent_single_use_race() {
         PairingAcceptor::start(500, &mitm_kp, PeerRole::Host, &mitm_hello, &srv_mitm)
             .expect("mitm acc");
     assert_eq!(
-        mitm_acc.verify_qr_auth(mitm_kp.device_id(), &qr_store, &qr_auth, BASE_TIME + 5),
+        mitm_acc.verify_qr_auth(&qr_store, &qr_auth, BASE_TIME + 5),
         Err(SecurityError::InvalidSignature)
     );
 
     // Legitimate host still succeeds and consumes ticket once
-    acc.verify_qr_auth(host_kp.device_id(), &qr_store, &qr_auth, BASE_TIME + 5)
+    acc.verify_qr_auth(&qr_store, &qr_auth, BASE_TIME + 5)
         .expect("legit host qr");
     let confirm = acc
         .apply_human_approval(
             &host_kp,
             HumanApprovalDecision::Approve {
+                pairing_attempt_id: 500,
+                peer_device_id: ctrl_kp.device_id(),
                 granted_base_perms: Permissions::VIEW_MIRROR,
             },
         )
         .expect("approve");
-    let perms = init
-        .accept_pair_confirm(ctrl_kp.device_id(), &confirm)
-        .expect("confirm");
-    assert_eq!(perms, Permissions::VIEW_MIRROR);
+    init.verify_pair_confirm(&confirm).expect("verify confirm");
+    let commit = init
+        .apply_local_approval(HumanApprovalDecision::Approve {
+            pairing_attempt_id: 500,
+            peer_device_id: host_kp.device_id(),
+            granted_base_perms: Permissions::VIEW_MIRROR,
+        })
+        .expect("local confirm");
+    assert_eq!(commit.granted_base_perms, Permissions::VIEW_MIRROR);
 
     // 16-thread race on one fresh QR ticket: strictly 1 winner, 15 rejections!
     let race_ticket = qr_store
