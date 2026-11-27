@@ -50,10 +50,10 @@
 - **Perfil de Certificado X.509 (`RFC 5280` / `RFC 8410`):** X.509 **v3**, chave pública `Ed25519` (`1.3.101.112`, `44 B` DER canônico), assinatura própria `Ed25519` válida sobre `TBSCertificate` e janela temporal válida (`notBefore <= now <= notAfter`). CAs públicas genéricas são proibidas.
 - **TLS 1.3 (`RFC 9846`) e Separação de ALPN:**
   - **`"lumabridge-pair/1"`:** canal restrito de pareamento sob janela explícita local; valida `CertificateVerify` e estrutura X.509 Ed25519, mas mantém o peer em **`UnverifiedPeer`** (jamais aprova assinatura às cegas e jamais promove para `TrustedPeer` só pelo certificado). Vincula obrigatoriamente `PairHello.spki_ed25519` ao SPKI autenticado no handshake TLS.
-  - **`"lumabridge/1"`:** mTLS estrito mútuo contra `TrustStore` local (peer presente e não revogado; correspondência exata de SPKI e, quando conhecido, do `device_id` esperado). `Resumption` TLS (tickets/PSK) e `0-RTT` (`early_data`) **permanecem desabilitados**.
+  - **`"lumabridge/1"`:** mTLS estrito mútuo contra `TrustStore` local tanto em modo `Trusted` quanto em modo `PinnedPeer` (peer presente e não revogado; correspondência exata de SPKI, papel esperado e `device_id`). `Resumption` TLS (tickets/PSK), `0-RTT` (`early_data`) e `KeyLog` **permanecem desabilitados**.
 - **Channel Binding (`RFC 9266`):**
   - Rótulo ASCII exato **`"EXPORTER-Channel-Binding"`** (sem `NUL`), **contexto vazio (`b""`)**, saída de **`32 bytes`**, extraído **somente após handshake TLS 1.3 completo** (jamais *early exporter* nem chave de cifragem direta).
-  - Abstração tipada `TlsChannelBinding` distingue `ChannelBindingSource::Tls13Exporter` (obtido de conexão TLS real autenticada) de `ChannelBindingSource::SyntheticTest` (restrito a testes). **Nunca** aceita valor enviado pelo peer como `tls-exporter` local. Um único fluxo de pareamento por conexão TLS; conclusão ou erro terminal encerra o canal.
+  - Abstração tipada `ChannelBinding` distingue `ChannelBindingSource::Tls13Exporter` (obtido de conexão TLS real autenticada) de `ChannelBindingSource::SyntheticTest` (restrito a testes). **Nunca** aceita valor enviado pelo peer como `tls-exporter` local. Um único fluxo de pareamento por conexão TLS; conclusão ou erro terminal encerra o canal.
 
 ---
 
@@ -61,10 +61,10 @@
 
 ### 4.1 Contexto Determinístico da Aplicação (`LBWP-CBOR-v1`) e Separação de Domínio
 Toda prova criptográfica da aplicação usa codificação CBOR determinística (`LBWP-CBOR-v1` / RFC 8949 §4.2.1) prefixada por etiqueta ASCII de domínio estrita — eliminando concatenações ambíguas de campos de tamanho variável:
-- `"lumabridge.pair.spake2.aad.v1"` — `AAD` passado à programação de chaves do `RFC 9382`: vincula `{ 1: major, 2: minor, 3: auth_mode=1, 4: alpn="lumabridge-pair/1", 5: attempt_id, 6: init_id, 7: init_spki, 8: acc_id, 9: acc_spki, 10: tls_channel_binding_32B }`.
+- `"lumabridge.pair.spake2.aad.v1"` — `AAD` passado à programação de chaves do `RFC 9382`: vincula `{ 1: domain, 2: major, 3: minor, 4: auth_mode=1, 5: alpn="lumabridge-pair/1", 6: attempt_id, 7: init_id, 8: init_spki, 9: init_role, 10: acc_id, 11: acc_spki, 12: acc_role, 13: tls_channel_binding_32B }`.
 - `"lumabridge.pair.qr.auth.v1"` — payload assinado por Ed25519 em `PairQrAuth.initiator_signature`: `{ 1: domain, 2: major, 3: minor, 4: auth_mode=2, 5: alpn, 6: attempt_id, 7: init_id, 8: init_spki, 9: acc_id, 10: acc_spki, 11: tls_cb_32B, 12: sha256(one_time_pairing_token) }`.
 - `"lumabridge.pair.confirm.v1"` — payload assinado por Ed25519 em `PairConfirm.confirm_signature`: `{ 1: domain, 2: attempt_id, 3: auth_mode, 4: accepted, 5: granted_base_perms, 6: init_id, 7: init_spki, 8: acc_id, 9: acc_spki, 10: tls_cb_32B }`.
-- `"lumabridge.session.resume.token.v1"` — domínio de hash de armazenamento do token de retomada opaco (`SHA-256(domain || raw_token_32B)`).
+- `"lumabridge.session.access.token.v1"` / `"lumabridge.session.resume.token.v1"` — domínios separados de hash de armazenamento em repouso (`SHA-256(domain || 0x00 || device_id || session_id_be64 || trust_epoch_be64 || raw_token_32B)`), complementados por `"lumabridge.session.resume.proof.v1"` (`HKDF-SHA256` sobre `tls_cb_32B` para prova vinculada ao canal na retomada).
 
 ### 4.2 Pareamento PIN via `SPAKE2` (`RFC 9382`)
 - **Ciphersuite:** **`P256-SHA256-HKDF-HMAC`** (grupo NIST P-256, codificação SEC1 não comprimida de **`65 bytes`** `0x04 || x || y`, constantes oficiais `M`/`N` da RFC 9382 §4, hash SHA-256, HKDF-SHA256 e HMAC-SHA256, `NH = 32`). Rejeita pontos inválidos, ponto identidade e codificações comprimidas/compactas não canônicas na fronteira `PairSpakeMsg`.
@@ -85,7 +85,7 @@ Toda prova criptográfica da aplicação usa codificação CBOR determinística 
 
 1. **Separação explícita de estados de pareamento:**
    `UnverifiedPeer` -> `CryptographicallyVerifiedPeer` -> `LocallyApprovedPeer` -> `TrustedPeer` -> `AuthenticatedSession` (via mTLS posterior).
-2. **Invariante de aprovação humana (`HumanApprovalDecision`):** uma mensagem `PairConfirm` vinda da rede jamais simula consentimento local; a promoção para `LocallyApprovedPeer`/`TrustedPeer` exige entrada exclusiva por porta de aplicação local exibindo `friendly_name` não confiável claramente rotulado + `DeviceFingerprint` criptográfico.
+2. **Invariante de aprovação humana (`HumanApprovalDecision`):** uma mensagem `PairConfirm` vinda da rede jamais simula consentimento local nem promove o Iniciador para `Confirmed`/`TrustedPeer` sem aprovação local explícita; ambos os nós exigem entrada exclusiva por porta de aplicação local vinculada a `(pairing_attempt_id, peer_device_id)` exibindo `friendly_name` não confiável claramente rotulado + `DeviceFingerprint` criptográfico.
 3. **Consistência entre dois nós independentes:** pareamento não promete atomicidade distribuída impossível; o Aceitador persiste confiança apenas após aprovação local e antes/durante emissão de `PairConfirm`; se `PairConfirm` se perder na rede após aceitação local, o Iniciador não promove unilateralmente e uma nova tentativa/repareamento ou confirmação explícita reconcilia com segurança.
 4. **Trust Store e Cofres Nativos:** `TrustStoreBackend` suporta inserção, consulta, atualização de revisão e revogação sem sobrescrita silenciosa de SPKI para o mesmo `device_id`. A `M1.3` entrega `InMemoryTrustStore` (explícito para testes/desenvolvimento) e interfaces/descritores para cofres nativos (**Windows DPAPI/Credential Manager**, **Linux Secret Service** com critério documentado de fallback headless Argon2id exigindo segredo de desbloqueio + salt `16 B` + parâmetros `RFC 9106`, e **Android Keystore**), sem declarar cofres nativos reais qualificados antes da integração de plataforma (`M3+`).
 5. **Autorização (`Permissions`) e Revogação:**
