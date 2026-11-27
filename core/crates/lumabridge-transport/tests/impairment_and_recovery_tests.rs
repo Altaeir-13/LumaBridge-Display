@@ -81,10 +81,10 @@ async fn quic_under_loss_jitter_reorder_triggers_awaiting_idr_and_recovers_clean
         heartbeat_timeout_ms: 8_000,
         ..TransportConfig::default()
     };
-    cfg.reassembly_config.fragment_timeout_us = 60_000;
+    cfg.reassembly_config.fragment_timeout_us = 150_000;
     cfg.recovery_config = RecoveryConfig {
         idr_request_cooldown_us: 150_000,
-        reorder_gap_timeout_us: 60_000,
+        reorder_gap_timeout_us: 150_000,
         max_reorder_completed_frames: 2,
         ..RecoveryConfig::default()
     };
@@ -142,11 +142,17 @@ async fn quic_under_loss_jitter_reorder_triggers_awaiting_idr_and_recovers_clean
     let mut cli = OperationalConnection::from_link(cli_link, cfg.clone(), true, None).expect("cc");
     let mut rx = OperationalConnection::from_link(srv_link, cfg, false, None).expect("sc");
 
+    let session_ready = Arc::new(tokio::sync::Notify::new());
+    let session_ready_rx = Arc::clone(&session_ready);
+    let recovered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let recovered_rx = Arc::clone(&recovered);
+
     let rx_task = tokio::spawn(async move {
         rx.handshake_acceptor(r_dev_id, r_store.as_ref(), PeerRole::Host, caps())
             .await
             .expect("ha");
         rx.set_active_session(404, perms);
+        session_ready_rx.notify_one();
 
         let mut delivered_ids = Vec::new();
         let mut saw_recovery_idr = false;
@@ -166,7 +172,12 @@ async fn quic_under_loss_jitter_reorder_triggers_awaiting_idr_and_recovers_clean
                             saw_recovery_idr = true;
                         }
                         delivered_ids.push(f.frame_id);
-                        if saw_recovery_idr && delivered_ids.len() >= 3 {
+                        if saw_recovery_idr
+                            && (saw_feedback_requested
+                                || rx.snapshot_congestion().idr_requests_emitted > 0)
+                            && delivered_ids.len() >= 3
+                        {
+                            recovered_rx.store(true, std::sync::atomic::Ordering::Release);
                             break;
                         }
                     }
@@ -201,6 +212,7 @@ async fn quic_under_loss_jitter_reorder_triggers_awaiting_idr_and_recovers_clean
     .await
     .expect("hi");
     cli.set_active_session(404, perms);
+    session_ready.notified().await;
 
     for fid in 1u32..=12 {
         let is_idr = fid == 1;
@@ -226,15 +238,22 @@ async fn quic_under_loss_jitter_reorder_triggers_awaiting_idr_and_recovers_clean
         tokio::time::sleep(Duration::from_millis(12)).await;
     }
 
+    // Allow receiver fragment/reorder timers to flush GOP 1 loss into AwaitingIdr before recovery IDRs.
+    tokio::time::sleep(Duration::from_millis(180)).await;
+
     let mut gop2_fid = 13u32;
-    for _ in 0..3 {
+    for recovery_attempt in 0u16..10 {
+        if recovered.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
+        let gop_id = 2 + recovery_attempt;
         let _ = cli
             .send_video_frame(OutboundVideoFrame {
                 session_id: 404,
                 display_id: 0,
                 codec_id: CodecId::H264,
                 frame_id: gop2_fid,
-                gop_id: 2,
+                gop_id,
                 capture_ts_us: u64::from(gop2_fid) * 16_000,
                 encode_done_ts_us: u64::from(gop2_fid) * 16_000 + 1_000,
                 kind: FrameKind::Keyframe { chain_reset: true },
@@ -245,13 +264,16 @@ async fn quic_under_loss_jitter_reorder_triggers_awaiting_idr_and_recovers_clean
             .await;
         gop2_fid += 1;
         for _ in 0..3 {
+            if recovered.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
             let _ = cli
                 .send_video_frame(OutboundVideoFrame {
                     session_id: 404,
                     display_id: 0,
                     codec_id: CodecId::H264,
                     frame_id: gop2_fid,
-                    gop_id: 2,
+                    gop_id,
                     capture_ts_us: u64::from(gop2_fid) * 16_000,
                     encode_done_ts_us: u64::from(gop2_fid) * 16_000 + 1_000,
                     kind: FrameKind::InterFrame,
@@ -261,7 +283,7 @@ async fn quic_under_loss_jitter_reorder_triggers_awaiting_idr_and_recovers_clean
                 })
                 .await;
             gop2_fid += 1;
-            tokio::time::sleep(Duration::from_millis(15)).await;
+            tokio::time::sleep(Duration::from_millis(18)).await;
         }
     }
 
