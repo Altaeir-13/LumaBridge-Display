@@ -48,16 +48,68 @@ impl CheckedOsCryptoRng {
 
     /// Fetch 1024 bytes of checked OS entropy upfront for single-shot SPAKE2 ephemeral draws.
     pub fn prefetch_spake_entropy(&mut self) -> Result<PrefetchedCryptoRng, SecurityError> {
+        #[cfg(test)]
+        {
+            if test_hooks::take_prefetch_fail() {
+                return Err(SecurityError::RngUnavailable);
+            }
+            if test_hooks::take_refill_fail() {
+                return Ok(PrefetchedCryptoRng {
+                    bytes: Zeroizing::new(Vec::new()),
+                    offset: 0,
+                    rng_failed: false,
+                    failed_draws: 0,
+                    fail_on_refill: true,
+                });
+            }
+        }
         let mut bytes = Zeroizing::new(vec![0u8; 1024]);
         self.fill_bytes(&mut bytes)?;
         Ok(PrefetchedCryptoRng {
             bytes,
             offset: 0,
             rng_failed: false,
+            failed_draws: 0,
             #[cfg(test)]
             fail_on_refill: false,
         })
     }
+}
+
+#[cfg(test)]
+mod test_hooks {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static PREFETCH_FAIL: Cell<bool> = const { Cell::new(false) };
+        static REFILL_FAIL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn set_next_prefetch_fail(val: bool) {
+        PREFETCH_FAIL.with(|c| c.set(val));
+    }
+
+    pub(crate) fn take_prefetch_fail() -> bool {
+        PREFETCH_FAIL.with(|c| c.replace(false))
+    }
+
+    pub(crate) fn set_next_refill_fail(val: bool) {
+        REFILL_FAIL.with(|c| c.set(val));
+    }
+
+    pub(crate) fn take_refill_fail() -> bool {
+        REFILL_FAIL.with(|c| c.replace(false))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_next_spake_prefetch_fail_for_test() {
+    test_hooks::set_next_prefetch_fail(true);
+}
+
+#[cfg(test)]
+pub(crate) fn set_next_spake_refill_fail_for_test() {
+    test_hooks::set_next_refill_fail(true);
 }
 
 impl rand_core::TryRng for CheckedOsCryptoRng {
@@ -95,13 +147,16 @@ impl rand_core::TryCryptoRng for CheckedOsCryptoRng {}
 /// Pre-fetched OS CSPRNG buffer supplying infallible `CryptoRng` for algorithms like `pakery-spake2`.
 ///
 /// Entropy is pulled upfront via [`CheckedOsCryptoRng`] with full error propagation (`Result`).
-/// Any unexpected refill error records `rng_failed = true` and zeroizes the output buffer so
-/// callers enforcing [`PrefetchedCryptoRng::ensure_healthy`] fail closed and never accept weak/zeroed draws.
+/// Any unexpected refill error records `rng_failed = true`, zeroizes remaining prefetched entropy,
+/// and fills `dst` with a deterministic non-zero canonical abort pattern (`0x01`) so any external
+/// non-zero scalar rejection loop terminates in a single bounded draw rather than spinning forever.
+/// Callers MUST enforce [`PrefetchedCryptoRng::ensure_healthy`] and zeroize/discard all outputs on error.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct PrefetchedCryptoRng {
     bytes: Zeroizing<Vec<u8>>,
     offset: usize,
     rng_failed: bool,
+    failed_draws: u32,
     #[cfg(test)]
     fail_on_refill: bool,
 }
@@ -116,9 +171,24 @@ impl PrefetchedCryptoRng {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) const fn failed_draws(&self) -> u32 {
+        self.failed_draws
+    }
+
+    fn record_failure_and_abort_fill(&mut self, dst: &mut [u8]) {
+        self.rng_failed = true;
+        self.failed_draws = self.failed_draws.saturating_add(1);
+        self.bytes.zeroize();
+        self.offset = self.bytes.len();
+        // Non-zero canonical abort pattern (0x0101..01 < P-256 order n, != 0) guarantees
+        // any rejection sampler exits on the first draw; output MUST be discarded via ensure_healthy().
+        dst.fill(0x01);
+    }
+
     fn fill_internal(&mut self, dst: &mut [u8]) {
         if self.rng_failed {
-            dst.zeroize();
+            self.record_failure_and_abort_fill(dst);
             return;
         }
         let avail = self.bytes.len().saturating_sub(self.offset);
@@ -131,13 +201,11 @@ impl PrefetchedCryptoRng {
         if take < dst.len() {
             #[cfg(test)]
             if self.fail_on_refill {
-                self.rng_failed = true;
-                dst.zeroize();
+                self.record_failure_and_abort_fill(dst);
                 return;
             }
             if getrandom::fill(&mut dst[take..]).is_err() {
-                self.rng_failed = true;
-                dst.zeroize();
+                self.record_failure_and_abort_fill(dst);
             }
         }
     }
@@ -319,12 +387,31 @@ mod tests {
         prefetched.try_fill_bytes(&mut drain).expect("infallible");
         assert!(prefetched.ensure_healthy().is_ok());
 
-        // Subsequent draw forces refill -> simulated CSPRNG failure -> zeroizes buffer & flags error.
+        // Subsequent draw forces refill -> simulated CSPRNG failure -> flags error & returns bounded abort fill.
         let mut spillover = [0xAAu8; 32];
         prefetched
             .try_fill_bytes(&mut spillover)
             .expect("infallible");
-        assert_eq!(spillover, [0u8; 32]);
+        assert_eq!(spillover, [0x01u8; 32]);
+        assert_eq!(prefetched.failed_draws(), 1);
+        assert_eq!(
+            prefetched.ensure_healthy(),
+            Err(SecurityError::RngUnavailable)
+        );
+
+        // Non-zero rejection loop (e.g., OPRF/EC scalar sampler rejecting all-zero) terminates on 1st draw.
+        let mut draws = 0u32;
+        loop {
+            draws += 1;
+            let mut candidate = [0u8; 32];
+            prefetched
+                .try_fill_bytes(&mut candidate)
+                .expect("infallible");
+            if candidate.iter().any(|&b| b != 0) || draws >= 16 {
+                break;
+            }
+        }
+        assert_eq!(draws, 1);
         assert_eq!(
             prefetched.ensure_healthy(),
             Err(SecurityError::RngUnavailable)

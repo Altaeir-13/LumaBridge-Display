@@ -88,19 +88,63 @@ pub enum HumanApprovalDecision {
 }
 
 /// Proven local pairing commit produced ONLY after cryptographic verification + local human approval.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Fields are private and the type is non-`Clone` so external callers cannot forge or duplicate
+/// pairing provenance before persisting into [`crate::trust_store::InMemoryTrustStore`].
+#[derive(Debug, PartialEq, Eq)]
 pub struct ApprovedPairingCommit {
-    pub pairing_attempt_id: u64,
-    pub peer_identity: PublicIdentity,
-    pub peer_role: PeerRole,
-    pub friendly_name: String,
-    pub granted_base_perms: Permissions,
+    pairing_attempt_id: u64,
+    peer_identity: PublicIdentity,
+    peer_role: PeerRole,
+    friendly_name: String,
+    granted_base_perms: Permissions,
+    channel_binding_digest: [u8; 32],
+    expected_peer_epoch: u64,
+    _sealed: (),
+}
+
+impl ApprovedPairingCommit {
+    #[must_use]
+    pub const fn pairing_attempt_id(&self) -> u64 {
+        self.pairing_attempt_id
+    }
+
+    #[must_use]
+    pub const fn peer_identity(&self) -> &PublicIdentity {
+        &self.peer_identity
+    }
+
+    #[must_use]
+    pub const fn peer_role(&self) -> PeerRole {
+        self.peer_role
+    }
+
+    #[must_use]
+    pub fn friendly_name(&self) -> &str {
+        &self.friendly_name
+    }
+
+    #[must_use]
+    pub const fn granted_base_perms(&self) -> Permissions {
+        self.granted_base_perms
+    }
+
+    #[must_use]
+    pub const fn expected_peer_epoch(&self) -> u64 {
+        self.expected_peer_epoch
+    }
+
+    #[must_use]
+    pub(crate) const fn channel_binding_digest(&self) -> [u8; 32] {
+        self.channel_binding_digest
+    }
 }
 
 #[derive(Debug)]
 struct ActivePinState {
     pin: PinSecret,
     pin_generation: u64,
+    opened_at_secs: u64,
     expires_at_unix: u64,
     failed_attempts: u32,
     in_flight_attempts: u32,
@@ -146,6 +190,7 @@ impl PinPairingWindow {
         guard.active = Some(ActivePinState {
             pin: pin.clone(),
             pin_generation: gen,
+            opened_at_secs: now_unix,
             expires_at_unix,
             failed_attempts: 0,
             in_flight_attempts: 0,
@@ -196,6 +241,11 @@ impl PinPairingWindow {
         let Some(ref mut st) = guard.active else {
             return Err(SecurityError::PairingWindowClosed);
         };
+        if now_unix < st.opened_at_secs {
+            return Err(SecurityError::InvalidTimestamp(
+                "attempt reservation precedes PIN window opening",
+            ));
+        }
         if now_unix > st.expires_at_unix {
             guard.active = None;
             return Err(SecurityError::PairingWindowClosed);
@@ -214,6 +264,7 @@ impl PinPairingWindow {
         Ok(PinAttemptLease {
             inner: Arc::clone(&self.inner),
             pin_generation,
+            reserved_at_secs: now_unix,
             pin: Some(pin_copy),
             resolved: false,
         })
@@ -225,6 +276,7 @@ impl PinPairingWindow {
 pub struct PinAttemptLease {
     inner: Arc<Mutex<PinWindowInner>>,
     pin_generation: u64,
+    reserved_at_secs: u64,
     pin: Option<PinSecret>,
     resolved: bool,
 }
@@ -236,23 +288,38 @@ impl PinAttemptLease {
         ))
     }
 
-    /// Consume and destroy the active PIN upon cryptographic verification success (if same generation).
-    pub fn finish_success(mut self) {
+    /// Atomically consume and destroy the active PIN upon cryptographic verification success,
+    /// rejecting closed, expired, rotated, or concurrently consumed windows.
+    pub fn finish_success(mut self, now_unix: u64) -> Result<(), SecurityError> {
         self.resolved = true;
         self.pin = None;
-        if let Ok(mut guard) = self.inner.lock() {
-            guard.active_attempts = guard.active_attempts.saturating_sub(1);
-            let same_gen = guard
-                .active
-                .as_ref()
-                .is_some_and(|st| st.pin_generation == self.pin_generation);
-            if same_gen {
-                if let Some(ref mut st) = guard.active {
-                    st.in_flight_attempts = st.in_flight_attempts.saturating_sub(1);
-                }
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| SecurityError::AuthorizationDenied("PIN window lock poisoned"))?;
+        guard.active_attempts = guard.active_attempts.saturating_sub(1);
+        let Some(ref mut st) = guard.active else {
+            return Err(SecurityError::PairingWindowClosed);
+        };
+        if st.pin_generation != self.pin_generation {
+            return Err(SecurityError::PairingWindowClosed);
+        }
+        st.in_flight_attempts = st.in_flight_attempts.saturating_sub(1);
+        if now_unix < self.reserved_at_secs || now_unix < st.opened_at_secs {
+            st.failed_attempts = st.failed_attempts.saturating_add(1);
+            if st.failed_attempts >= MAX_PIN_FAILED_ATTEMPTS {
                 guard.active = None;
             }
+            return Err(SecurityError::InvalidTimestamp(
+                "confirmation timestamp precedes attempt reservation",
+            ));
         }
+        if now_unix > st.expires_at_unix {
+            guard.active = None;
+            return Err(SecurityError::PairingWindowClosed);
+        }
+        guard.active = None;
+        Ok(())
     }
 
     /// Record a failed verification and destroy the active PIN if 3 failures have occurred.
@@ -451,6 +518,7 @@ pub fn validate_pair_hello_against_tls(
 pub struct PairingInitiator {
     stage: PairingStage,
     pairing_attempt_id: u64,
+    expected_peer_epoch: u64,
     local_identity: PublicIdentity,
     local_role: PeerRole,
     peer_role: PeerRole,
@@ -468,7 +536,8 @@ pub struct PairingInitiator {
 }
 
 impl PairingInitiator {
-    /// Start an initiator pairing session over an already-completed TLS 1.3 mTLS connection.
+    /// Start an initiator pairing session over an already-completed TLS 1.3 mTLS connection
+    /// for a brand-new peer (`expected_peer_epoch == 0`).
     pub fn start(
         pairing_attempt_id: u64,
         local_identity: &IdentityKeyPair,
@@ -476,6 +545,28 @@ impl PairingInitiator {
         peer_hello: &PairHello,
         tls_peer: &AuthenticatedTlsSession,
         auth_mode: AuthMode,
+    ) -> Result<Self, SecurityError> {
+        Self::start_with_expected_peer_epoch(
+            pairing_attempt_id,
+            local_identity,
+            local_role,
+            peer_hello,
+            tls_peer,
+            auth_mode,
+            0,
+        )
+    }
+
+    /// Start an initiator pairing session explicitly pinned to the peer's trust epoch observed
+    /// in `TrustStore` before pairing began (`0` for new peers, `revoked_epoch` for re-pairing).
+    pub fn start_with_expected_peer_epoch(
+        pairing_attempt_id: u64,
+        local_identity: &IdentityKeyPair,
+        local_role: PeerRole,
+        peer_hello: &PairHello,
+        tls_peer: &AuthenticatedTlsSession,
+        auth_mode: AuthMode,
+        expected_peer_epoch: u64,
     ) -> Result<Self, SecurityError> {
         if pairing_attempt_id == 0 {
             return Err(SecurityError::ProtocolViolation(
@@ -497,6 +588,7 @@ impl PairingInitiator {
         Ok(Self {
             stage: PairingStage::Init,
             pairing_attempt_id,
+            expected_peer_epoch,
             local_identity: local_identity.public_identity().clone(),
             local_role,
             peer_role: local_role.opposite(),
@@ -605,12 +697,17 @@ impl PairingInitiator {
         .inspect_err(|_| self.fail())?;
 
         let mut spake_rng = rng.prefetch_spake_entropy().inspect_err(|_| self.fail())?;
-        let (p_a, state) = PartyA::<Spake2P256>::start(&w, &id_a, &id_b, &aad, &mut spake_rng)
+        let (mut p_a, state) = PartyA::<Spake2P256>::start(&w, &id_a, &id_b, &aad, &mut spake_rng)
             .map_err(|_| {
                 self.fail();
                 SecurityError::Spake2Failed
             })?;
-        spake_rng.ensure_healthy().inspect_err(|_| self.fail())?;
+        if let Err(err) = spake_rng.ensure_healthy() {
+            p_a.zeroize();
+            drop(state);
+            self.fail();
+            return Err(err);
+        }
         validate_uncompressed_p256_share(&p_a).inspect_err(|_| self.fail())?;
 
         self.spake_state = Some(state);
@@ -881,12 +978,16 @@ impl PairingInitiator {
                 let effective = remote_offered.intersection(granted_base_perms);
                 self.granted_base_perms = Some(effective);
                 self.stage = PairingStage::Confirmed;
+                let cb_digest: [u8; 32] = Sha256::digest(self.channel_binding.as_bytes()).into();
                 Ok(ApprovedPairingCommit {
                     pairing_attempt_id: self.pairing_attempt_id,
                     peer_identity: self.peer_identity.clone(),
                     peer_role: self.peer_role,
                     friendly_name: self.peer_friendly_name.clone(),
                     granted_base_perms: effective,
+                    channel_binding_digest: cb_digest,
+                    expected_peer_epoch: self.expected_peer_epoch,
+                    _sealed: (),
                 })
             }
         }
@@ -904,6 +1005,7 @@ impl Drop for PairingInitiator {
 pub struct PairingAcceptor {
     stage: PairingStage,
     pairing_attempt_id: u64,
+    expected_peer_epoch: u64,
     local_identity: PublicIdentity,
     local_role: PeerRole,
     peer_role: PeerRole,
@@ -917,17 +1019,39 @@ pub struct PairingAcceptor {
     pin_lease: Option<PinAttemptLease>,
     spake_consumed: bool,
     qr_consumed: bool,
+    commit_taken: bool,
     granted_base_perms: Option<Permissions>,
 }
 
 impl PairingAcceptor {
-    /// Start an acceptor pairing session bound to TLS 1.3 peer cert and channel binding.
+    /// Start an acceptor pairing session bound to TLS 1.3 peer cert and channel binding
+    /// for a brand-new peer (`expected_peer_epoch == 0`).
     pub fn start(
         pairing_attempt_id: u64,
         local_identity: &IdentityKeyPair,
         local_role: PeerRole,
         peer_hello: &PairHello,
         tls_peer: &AuthenticatedTlsSession,
+    ) -> Result<Self, SecurityError> {
+        Self::start_with_expected_peer_epoch(
+            pairing_attempt_id,
+            local_identity,
+            local_role,
+            peer_hello,
+            tls_peer,
+            0,
+        )
+    }
+
+    /// Start an acceptor pairing session explicitly pinned to the peer's trust epoch observed
+    /// in `TrustStore` before pairing began (`0` for new peers, `revoked_epoch` for re-pairing).
+    pub fn start_with_expected_peer_epoch(
+        pairing_attempt_id: u64,
+        local_identity: &IdentityKeyPair,
+        local_role: PeerRole,
+        peer_hello: &PairHello,
+        tls_peer: &AuthenticatedTlsSession,
+        expected_peer_epoch: u64,
     ) -> Result<Self, SecurityError> {
         if pairing_attempt_id == 0 {
             return Err(SecurityError::ProtocolViolation(
@@ -944,6 +1068,7 @@ impl PairingAcceptor {
         Ok(Self {
             stage: PairingStage::Init,
             pairing_attempt_id,
+            expected_peer_epoch,
             local_identity: local_identity.public_identity().clone(),
             local_role,
             peer_role: local_role.opposite(),
@@ -957,6 +1082,7 @@ impl PairingAcceptor {
             pin_lease: None,
             spake_consumed: false,
             qr_consumed: false,
+            commit_taken: false,
             granted_base_perms: None,
         })
     }
@@ -1004,22 +1130,32 @@ impl PairingAcceptor {
         })
     }
 
-    /// Produce an [`ApprovedPairingCommit`] once local approval is confirmed.
-    pub fn approved_commit(&self) -> Result<ApprovedPairingCommit, SecurityError> {
+    /// Produce a single-use [`ApprovedPairingCommit`] once local approval is confirmed.
+    pub fn approved_commit(&mut self) -> Result<ApprovedPairingCommit, SecurityError> {
         if self.stage != PairingStage::Confirmed {
             return Err(SecurityError::PairingState(
                 "approved commit requires Confirmed stage",
             ));
         }
+        if self.commit_taken {
+            return Err(SecurityError::PairingState(
+                "approved pairing commit already consumed",
+            ));
+        }
         let perms = self
             .granted_base_perms
             .ok_or(SecurityError::PairingState("missing granted permissions"))?;
+        self.commit_taken = true;
+        let cb_digest: [u8; 32] = Sha256::digest(self.channel_binding.as_bytes()).into();
         Ok(ApprovedPairingCommit {
             pairing_attempt_id: self.pairing_attempt_id,
             peer_identity: self.peer_identity.clone(),
             peer_role: self.peer_role,
             friendly_name: self.peer_friendly_name.clone(),
             granted_base_perms: perms,
+            channel_binding_digest: cb_digest,
+            expected_peer_epoch: self.expected_peer_epoch,
+            _sealed: (),
         })
     }
 
@@ -1095,14 +1231,17 @@ impl PairingAcceptor {
         let mut spake_rng = rng.prefetch_spake_entropy().inspect_err(|_| {
             self.stage = PairingStage::Failed;
         })?;
-        let (p_b, state_b) = PartyB::<Spake2P256>::start(&w, &id_a, &id_b, &aad, &mut spake_rng)
-            .map_err(|_| {
+        let (mut p_b, state_b) =
+            PartyB::<Spake2P256>::start(&w, &id_a, &id_b, &aad, &mut spake_rng).map_err(|_| {
                 self.stage = PairingStage::Failed;
                 SecurityError::Spake2Failed
             })?;
-        spake_rng.ensure_healthy().inspect_err(|_| {
+        if let Err(err) = spake_rng.ensure_healthy() {
+            p_b.zeroize();
+            drop(state_b);
             self.stage = PairingStage::Failed;
-        })?;
+            return Err(err);
+        }
         validate_uncompressed_p256_share(&p_b).inspect_err(|_| {
             self.stage = PairingStage::Failed;
         })?;
@@ -1124,11 +1263,12 @@ impl PairingAcceptor {
     }
 
     /// Verify initiator's `KeyConfirmation` (`cA`), emit acceptor `KeyConfirmation` (`cB`),
-    /// consume/destroy the PIN on success or count against the 3-attempt budget on failure,
-    /// and advance to `AwaitingApproval`.
+    /// atomically consume/destroy the PIN at confirmation time `now_unix` (failing if expired,
+    /// closed, rotated, or consumed concurrently), and advance to `AwaitingApproval`.
     pub fn verify_spake2_confirmation_and_reply(
         &mut self,
         peer_msg: &PairSpakeMsg,
+        now_unix: u64,
     ) -> Result<PairSpakeMsg, SecurityError> {
         if self.stage != PairingStage::AuthExchanging || self.auth_mode != AuthMode::PinSpake2 {
             self.fail();
@@ -1170,8 +1310,13 @@ impl PairingAcceptor {
         let reply_mac = output.confirmation_mac.clone();
         drop(output.into_session_key());
 
-        if let Some(lease) = self.pin_lease.take() {
-            lease.finish_success();
+        let Some(lease) = self.pin_lease.take() else {
+            self.fail();
+            return Err(SecurityError::PairingState("missing PIN attempt lease"));
+        };
+        if let Err(err) = lease.finish_success(now_unix) {
+            self.fail();
+            return Err(err);
         }
         self.stage = PairingStage::AwaitingApproval;
 
@@ -1359,4 +1504,118 @@ fn validate_pairing_friendly_name(name: &str) -> Result<(), SecurityError> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::certificate::{generate_self_signed_device_cert, verify_self_signed_ed25519_cert};
+    use crate::secret::{
+        set_next_spake_prefetch_fail_for_test, set_next_spake_refill_fail_for_test,
+    };
+    use lumabridge_protocol::version::{ALPN_PAIRING_V1, LBWP_PROTOCOL_MAJOR, LBWP_PROTOCOL_MINOR};
+    use std::time::Instant;
+
+    #[test]
+    fn spake2_entropy_failure_terminates_boundedly_and_emits_no_proof() {
+        let now = 1_700_000_100u64;
+        let host_kp = IdentityKeyPair::from_seed([0x11; 32]).expect("host");
+        let ctrl_kp = IdentityKeyPair::from_seed([0x22; 32]).expect("ctrl");
+        let host_cert =
+            generate_self_signed_device_cert(&host_kp, now - 60, now + 3600).expect("host cert");
+        let ctrl_cert =
+            generate_self_signed_device_cert(&ctrl_kp, now - 60, now + 3600).expect("ctrl cert");
+        let host_verified = verify_self_signed_ed25519_cert(&host_cert.cert_der, now).expect("hv");
+        let ctrl_verified = verify_self_signed_ed25519_cert(&ctrl_cert.cert_der, now).expect("cv");
+
+        let c_tls = AuthenticatedTlsSession::synthetic_for_testing(
+            host_verified,
+            ChannelBinding::synthetic_for_testing([0x55; 32]),
+            ALPN_PAIRING_V1.as_bytes().to_vec(),
+        );
+        let s_tls = AuthenticatedTlsSession::synthetic_for_testing(
+            ctrl_verified,
+            ChannelBinding::synthetic_for_testing([0x55; 32]),
+            ALPN_PAIRING_V1.as_bytes().to_vec(),
+        );
+        let init_hello = PairHello {
+            protocol_major: LBWP_PROTOCOL_MAJOR,
+            protocol_minor: LBWP_PROTOCOL_MINOR,
+            device_id: *ctrl_kp.device_id().as_bytes(),
+            friendly_name: "Init".into(),
+            auth_mode: AuthMode::PinSpake2,
+            spki_ed25519: ctrl_kp.public_identity().spki_der().to_vec(),
+        };
+        let acc_hello = PairHello {
+            protocol_major: LBWP_PROTOCOL_MAJOR,
+            protocol_minor: LBWP_PROTOCOL_MINOR,
+            device_id: *host_kp.device_id().as_bytes(),
+            friendly_name: "Host".into(),
+            auth_mode: AuthMode::PinSpake2,
+            spki_ed25519: host_kp.public_identity().spki_der().to_vec(),
+        };
+        let mut rng = CheckedOsCryptoRng::preflight().expect("rng");
+        let pin = PinSecret::new("12345678").expect("pin");
+
+        // 1. Prefetch failure inside begin_spake2
+        let mut init1 = PairingInitiator::start(
+            1,
+            &ctrl_kp,
+            PeerRole::Controller,
+            &acc_hello,
+            &c_tls,
+            AuthMode::PinSpake2,
+        )
+        .expect("init1");
+        set_next_spake_prefetch_fail_for_test();
+        assert_eq!(
+            init1.begin_spake2(&pin, &mut rng),
+            Err(SecurityError::RngUnavailable)
+        );
+        assert_eq!(init1.stage(), PairingStage::Failed);
+
+        // 2. Mid-SPAKE2 refill failure inside begin_spake2 completes in bounded time and emits no proof
+        let mut init2 = PairingInitiator::start(
+            2,
+            &ctrl_kp,
+            PeerRole::Controller,
+            &acc_hello,
+            &c_tls,
+            AuthMode::PinSpake2,
+        )
+        .expect("init2");
+        set_next_spake_refill_fail_for_test();
+        let t0 = Instant::now();
+        assert_eq!(
+            init2.begin_spake2(&pin, &mut rng),
+            Err(SecurityError::RngUnavailable)
+        );
+        assert!(t0.elapsed().as_millis() < 500);
+        assert_eq!(init2.stage(), PairingStage::Failed);
+
+        // 3. Valid initiator p_a -> Mid-SPAKE2 refill failure inside handle_spake2_exchange
+        let mut good_init = PairingInitiator::start(
+            3,
+            &ctrl_kp,
+            PeerRole::Controller,
+            &acc_hello,
+            &c_tls,
+            AuthMode::PinSpake2,
+        )
+        .expect("good init");
+        let valid_pa = good_init.begin_spake2(&pin, &mut rng).expect("valid pa");
+
+        let window = PinPairingWindow::new();
+        let _wpin = window.open_with_new_pin(&mut rng, now).expect("wpin");
+        let mut acc =
+            PairingAcceptor::start(3, &host_kp, PeerRole::Host, &init_hello, &s_tls).expect("acc");
+        set_next_spake_refill_fail_for_test();
+        let t1 = Instant::now();
+        assert_eq!(
+            acc.handle_spake2_exchange(&window, &valid_pa, now, &mut rng),
+            Err(SecurityError::RngUnavailable)
+        );
+        assert!(t1.elapsed().as_millis() < 500);
+        assert_eq!(acc.stage(), PairingStage::Failed);
+    }
 }

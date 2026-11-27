@@ -64,7 +64,7 @@ Todos os gates abaixo foram executados após a versão final dos arquivos:
 
 - `cargo fmt --all --check` & verificação sem drift de `cbindgen` (`core/crates/lumabridge-ffi/include/lumabridge_ffi.h`) -> **`PASS`**.
 - `cargo clippy --locked --workspace --all-targets -- -D warnings` (`default`, `--features poc-fault-injection`, `--features uniffi`) -> **`PASS`** (`0` warnings).
-- `cargo test --locked --workspace` (`default`, `--features poc-fault-injection`, `--features uniffi`) -> **`PASS`** (suítes unitárias, propriedades `proptest`, golden vectors, recuperação sob perda/reordenação QUIC, integração `M1.5` de 5 testes e FFI com injeção de pânico).
+- `cargo test --locked --workspace` (`default`, `--features poc-fault-injection`, `--features uniffi`) -> **`PASS`** (suítes unitárias, propriedades `proptest`, golden vectors, recuperação sob perda/reordenação QUIC, integração `M1.5` de 6 testes e FFI com injeção de pânico).
 - Qualificação nativa MSVC (`scripts/ci/Invoke-LumaBridgeFfiPocCi.ps1`): compatibilidade C11 (`LumaBridgeFfiCCompat.c`), harness C++20 `Debug`/`Release` (`12` blocos incluindo `TestNodeFfiAbiAndLoopbackSmoke` e `TestPanicContainmentAndDefaultDllIsolation`), self-test do host PoC em `Release` e inspeção `DUMPBIN` confirmando os `19` exports (`13` `lb_core_*` + `6` `lb_node_*`) -> **`PASS`**.
 - `cargo deny --locked check advisories licenses bans sources` em `core/`, `core/crates/lumabridge-protocol/fuzz` e `core/crates/lumabridge-security/fuzz` -> **`PASS`**.
 - Cross-build Android ARM64 (`aarch64-linux-android`, API `29`) via `cargo ndk -t arm64-v8a -P 29` para `lumabridge-protocol`, `lumabridge-security`, `lumabridge-transport`, `lumabridge-core` e `lumabridge-ffi --features uniffi` -> **`PASS`**.
@@ -72,8 +72,10 @@ Todos os gates abaixo foram executados após a versão final dos arquivos:
 
 ---
 
-## 4. Evolução Normativa e Fronteira com a `M2`
+## 4. Estado Normativo, Fronteira com a `M2` e Distinção de Qualificação
 
-- [`ADR-0005`](ADR-0005-transport-and-security-architecture.md) promovida de `Proposed` para **`Accepted`** (sujeita apenas à confirmação final no gate de merge em `dev` e validação de rede física / `tc netem` na `M2`).
-- [`wire-protocol-v1.md`](../protocol/wire-protocol-v1.md) promovida de `Draft` para **`v1.0`**.
+- **Núcleo implementado (em branches empilhadas):** `lumabridge-protocol`, `lumabridge-security`, `lumabridge-transport`, `lumabridge-core` e `lumabridge-ffi` estão implementados e testados localmente.
+- **Núcleo integrado em `dev`:** **NÃO concluído** — os PRs `#41`, `#43` e `#44` seguem abertos aguardando revisão humana externa e merge sequencial em `dev`.
+- **Núcleo operacionalmente qualificado:** **PARCIAL** — seguem pendentes a comparação simétrica de perda TCP vs QUIC via `tc netem` em Linux (`BLOCKED_BY_ENVIRONMENT` em sandbox Windows), cofres nativos persistentes por SO (DPAPI/Secret Service/Keystore planejados para `M3+`; hoje apenas `InMemoryTrustStore`) e o aceite físico `Windows -> Linux` da `M2`.
+- [`ADR-0005`](ADR-0005-transport-and-security-architecture.md) permanece em **`Proposed`** (candidata à aceitação) e [`wire-protocol-v1.md`](../protocol/wire-protocol-v1.md) permanece em **`Draft` (`v1.0-rc` — não congelado)** até o cumprimento desses gates.
 - **Fora do escopo de `M1.5` (endereçado na `M2` e posteriores):** captura DXGI/IDD real e NVENC no host Windows, receiver Linux real (Wayland/KMS, VA-API, `evdev` condicional), descoberta mDNS ponta-a-ponta entre duas máquinas físicas na LAN e qualificação com `tc netem`.

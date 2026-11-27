@@ -3,12 +3,12 @@
 ## Metadados
 
 - **ID:** ADR-0005
-- **Status:** Accepted *(qualificada empiricamente em M1.3.1, M1.4 e M1.5; sujeita ao gate de aprovação humana externa dos PRs empilhados #41/#43/#44 em `dev` e validação adicional em LAN real / `tc netem` na `M2`)*
-- **Data:** 2026-11-23 *(atualizada em 2026-11-27 para fechamento da M1)*
+- **Status:** Proposed *(candidata à aceitação após qualificação local de `M1.3.1`–`M1.5`; promoção para `Accepted` depende da aprovação humana e integração em `dev` dos PRs `#41`, `#43` e `#44`, da comparação L3 equivalente via `tc netem` / LAN física e da implementação real de cofres nativos por SO em `M3+`)*
+- **Data:** 2026-11-23 *(revisada em 2026-11-27)*
 - **Relações:**
   - Materializa os requisitos de conectividade e segurança da [ADR-0003 - Visão oficial da plataforma universal](./ADR-0003-universal-platform-vision.md).
   - Opera sobre a fronteira definida na [ADR-0004 - Linguagem do núcleo e fronteiras nativas](./ADR-0004-core-language-and-native-boundaries.md).
-  - Especificação detalhada de mensagens em [wire-protocol-v1.md](../protocol/wire-protocol-v1.md) (`v1.0`).
+  - Especificação detalhada de mensagens em [wire-protocol-v1.md](../protocol/wire-protocol-v1.md) (`Draft / v1.0-rc`).
   - Relatórios experimentais em [m1-4-transport-report.md](../transport/m1-4-transport-report.md) e [m1-5-integration-report.md](./m1-5-integration-report.md).
 
 ## Contexto
@@ -32,7 +32,7 @@ Duas falhas arquiteturais comuns precisam ser evitadas explicitamente desde o pr
   - Destinado a ambientes corporativos/acadêmicos que bloqueiam tráfego UDP e a transportes estritamente orientados a fluxo TCP, como túneis de desenvolvimento `adb reverse` / `adb forward`.
   - Mantém exatamente o mesmo contrato lógico de mensagens e proteção TLS 1.3 do protocolo, mas exige política ainda mais agressiva de descarte **antes da escrita no socket** quando a janela TCP congestionar.
 
-> **Status experimental:** A escolha híbrida com `QUIC / TLS 1.3` (datagramas RFC 9221 + streams confiáveis de controle/feedback/`ProtectedBlank`) e fallback `TCP / TLS 1.3` foi qualificada empiricamente nos benchmarks e testes da `M1.4` e `M1.5` ([m1-4-transport-report.md](../transport/m1-4-transport-report.md) e [m1-5-integration-report.md](./m1-5-integration-report.md)), promovendo esta ADR para `Accepted`; medições complementares em LAN física (`tc netem` 0,5%–5%) seguem no escopo da `M2`.
+> **Status experimental (`Proposed` — candidata à aceitação, ainda NÃO `Accepted`):** Os testes parciais da `M1.4` e `M1.5` em loopback e perfil sintético `1080p60` ([m1-4-transport-report.md](../transport/m1-4-transport-report.md) e [m1-5-integration-report.md](./m1-5-integration-report.md)) qualificaram o núcleo em memória/loopback, mas deixaram gates materiais abertos: **(1)** integração aprovada em `dev` dos PRs `#41`, `#43` e `#44`; **(2)** comparação simétrica de perda TCP vs QUIC em kernel Linux (`tc netem`) e LAN física (`BLOCKED_BY_ENVIRONMENT` em sandbox Windows); e **(3)** acoplamento do encoder + cofres nativos de chaves por SO (`M3+`). Enquanto esses critérios originais não forem comprovados, esta ADR permanece `Proposed`.
 
 ### 1.2 Framing, MTU, fragmentação e remontagem
 

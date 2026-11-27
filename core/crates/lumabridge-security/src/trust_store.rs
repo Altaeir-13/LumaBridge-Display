@@ -12,7 +12,7 @@ use crate::error::SecurityError;
 use crate::identity::{DeviceId, PeerRole, PublicIdentity};
 use crate::pairing::ApprovedPairingCommit;
 use lumabridge_protocol::control::Permissions;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::RwLock;
 
 /// Maximum number of paired trusted peers persisted in [`InMemoryTrustStore`].
@@ -21,8 +21,27 @@ pub const MAX_TRUSTED_PEERS: usize = 256;
 /// Maximum number of revocation tombstones persisted in [`InMemoryTrustStore`].
 pub const MAX_REVOKED_PEERS: usize = 1024;
 
+/// Maximum number of consumed pairing commit channel-binding digests retained for replay rejection.
+pub const MAX_CONSUMED_PAIRING_COMMITS: usize = 1024;
+
 /// Maximum UTF-8 byte length permitted for stored peer friendly names (`LBWP` `PairHello` limit).
 pub const MAX_FRIENDLY_NAME_BYTES: usize = 48;
+
+/// Explicit administrative / vault-hydration record separated from ordinary live pairing commits.
+///
+/// MUST ONLY be used by administrative import or persistent OS keystore hydration paths, never
+/// to bypass cryptographic pairing + local human approval on a live pairing connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminTrustImportRecord {
+    pub identity: PublicIdentity,
+    pub role: PeerRole,
+    pub friendly_name: String,
+    pub base_permissions: Permissions,
+    pub paired_at_unix: u64,
+    pub last_seen_unix: u64,
+    pub trust_epoch: u64,
+    pub perm_epoch: u64,
+}
 
 /// Reason recorded when revoking a trusted device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,12 +99,40 @@ pub trait TrustStore: Send + Sync {
 
     /// Lookup trusted peer metadata without mutating store state.
     fn get_peer(&self, device_id: DeviceId) -> Option<TrustedPeerRecord>;
+
+    /// Return the highest known trust/revocation epoch observed for `device_id` (`0` if unknown).
+    fn peer_epoch(&self, device_id: DeviceId) -> u64;
 }
 
 #[derive(Default)]
 struct StoreInner {
     trusted: BTreeMap<DeviceId, TrustedPeerRecord>,
     revoked: BTreeMap<DeviceId, RevocationRecord>,
+    consumed_commits: BTreeSet<[u8; 32]>,
+    consumed_commits_order: VecDeque<[u8; 32]>,
+}
+
+impl StoreInner {
+    fn current_peer_epoch(&self, device_id: DeviceId) -> u64 {
+        self.revoked
+            .get(&device_id)
+            .map(|r| r.revoked_epoch)
+            .into_iter()
+            .chain(self.trusted.get(&device_id).map(|p| p.trust_epoch))
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn record_consumed_commit(&mut self, digest: [u8; 32]) {
+        if self.consumed_commits.insert(digest) {
+            if self.consumed_commits_order.len() >= MAX_CONSUMED_PAIRING_COMMITS {
+                if let Some(oldest) = self.consumed_commits_order.pop_front() {
+                    self.consumed_commits.remove(&oldest);
+                }
+            }
+            self.consumed_commits_order.push_back(digest);
+        }
+    }
 }
 
 /// Thread-safe in-memory reference [`TrustStore`].
@@ -102,25 +149,205 @@ impl InMemoryTrustStore {
     }
 
     /// Persist a proven [`ApprovedPairingCommit`] produced after cryptographic auth + local human approval.
+    ///
+    /// Consumes `commit` by value, rejects `INPUT_*` permissions, rejects revoked peers (use
+    /// [`Self::re_trust_after_approved_pairing`]), rejects replayed commits, and rejects commits whose
+    /// `expected_peer_epoch` no longer matches the live store generation.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn insert_approved_pairing(
         &self,
-        commit: &ApprovedPairingCommit,
+        commit: ApprovedPairingCommit,
         now_unix: u64,
     ) -> Result<TrustedPeerRecord, SecurityError> {
-        self.insert_newly_paired(
-            &commit.peer_identity,
-            commit.peer_role,
-            &commit.friendly_name,
-            commit.granted_base_perms,
-            now_unix,
-        )
+        if commit.granted_base_perms().has_any_input() {
+            return Err(SecurityError::AuthorizationDenied(
+                "initial pairing cannot persist remote input permissions",
+            ));
+        }
+        let friendly_name = validate_friendly_name(commit.friendly_name().to_owned())?;
+        let identity = commit.peer_identity();
+        let digest = commit.channel_binding_digest();
+
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| SecurityError::AuthorizationDenied("trust store lock poisoned"))?;
+        let device_id = identity.device_id();
+        if guard.consumed_commits.contains(&digest) {
+            return Err(SecurityError::ReplayDetected);
+        }
+        if guard.revoked.contains_key(&device_id) {
+            return Err(SecurityError::RevokedDevice);
+        }
+        let current_epoch = guard.current_peer_epoch(device_id);
+        if current_epoch != commit.expected_peer_epoch() {
+            return Err(SecurityError::PairingState(
+                "stale pairing commit: peer trust epoch changed",
+            ));
+        }
+        if let Some(prev) = guard.trusted.get(&device_id) {
+            if prev.spki_der != *identity.spki_der() {
+                return Err(SecurityError::IdentityMismatch(
+                    "refusing silent SPKI overwrite for existing DeviceId",
+                ));
+            }
+        } else if guard.trusted.len() >= MAX_TRUSTED_PEERS {
+            return Err(SecurityError::ResourceExhausted(
+                "trusted peer store capacity reached",
+            ));
+        }
+        let next_epoch = current_epoch
+            .checked_add(1)
+            .ok_or(SecurityError::ResourceExhausted("trust epoch overflow"))?;
+        guard.record_consumed_commit(digest);
+        let record = TrustedPeerRecord {
+            device_id,
+            spki_der: *identity.spki_der(),
+            role: commit.peer_role(),
+            friendly_name,
+            base_permissions: commit.granted_base_perms(),
+            paired_at_unix: now_unix,
+            last_seen_unix: now_unix,
+            trust_epoch: next_epoch,
+            perm_epoch: 1,
+        };
+        guard.trusted.insert(device_id, record.clone());
+        Ok(record)
     }
 
-    /// Persist a newly paired device after authenticated pairing and local approval.
+    /// Re-pair a previously revoked (or previously trusted) device using a fresh [`ApprovedPairingCommit`]
+    /// bound to the peer's current trust/revocation epoch (`expected_peer_epoch`).
     ///
-    /// Rejects `INPUT_*` permissions on initial pairing, rejects silent SPKI overwrites,
-    /// rejects previously revoked peers (use [`Self::re_trust_after_pairing`]), and enforces [`MAX_TRUSTED_PEERS`].
-    pub fn insert_newly_paired(
+    /// Consumes `commit` by value, advances `trust_epoch` strictly past the revoked epoch, and
+    /// rejects stale commits produced prior to a newer revocation or trust-epoch update.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn re_trust_after_approved_pairing(
+        &self,
+        commit: ApprovedPairingCommit,
+        now_unix: u64,
+    ) -> Result<TrustedPeerRecord, SecurityError> {
+        if commit.granted_base_perms().has_any_input() {
+            return Err(SecurityError::AuthorizationDenied(
+                "re-pairing cannot persist remote input permissions",
+            ));
+        }
+        let friendly_name = validate_friendly_name(commit.friendly_name().to_owned())?;
+        let identity = commit.peer_identity();
+        let digest = commit.channel_binding_digest();
+
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| SecurityError::AuthorizationDenied("trust store lock poisoned"))?;
+        let device_id = identity.device_id();
+        if guard.consumed_commits.contains(&digest) {
+            return Err(SecurityError::ReplayDetected);
+        }
+        let current_epoch = guard.current_peer_epoch(device_id);
+        if current_epoch == 0 {
+            return Err(SecurityError::PairingState(
+                "re_trust_after_approved_pairing requires prior trust or revocation history",
+            ));
+        }
+        if current_epoch != commit.expected_peer_epoch() {
+            return Err(SecurityError::PairingState(
+                "stale re-pairing commit: peer trust epoch changed",
+            ));
+        }
+        if let Some(prev) = guard.trusted.get(&device_id) {
+            if prev.spki_der != *identity.spki_der() {
+                return Err(SecurityError::IdentityMismatch(
+                    "refusing silent SPKI overwrite for existing DeviceId",
+                ));
+            }
+        } else if guard.trusted.len() >= MAX_TRUSTED_PEERS {
+            return Err(SecurityError::ResourceExhausted(
+                "trusted peer store capacity reached",
+            ));
+        }
+        guard.revoked.remove(&device_id);
+        let next_epoch = current_epoch
+            .checked_add(1)
+            .ok_or(SecurityError::ResourceExhausted("trust epoch overflow"))?;
+        guard.record_consumed_commit(digest);
+        let record = TrustedPeerRecord {
+            device_id,
+            spki_der: *identity.spki_der(),
+            role: commit.peer_role(),
+            friendly_name,
+            base_permissions: commit.granted_base_perms(),
+            paired_at_unix: now_unix,
+            last_seen_unix: now_unix,
+            trust_epoch: next_epoch,
+            perm_epoch: 1,
+        };
+        guard.trusted.insert(device_id, record.clone());
+        Ok(record)
+    }
+
+    /// Explicitly import a pre-persisted peer record from an administrative vault/restore source.
+    ///
+    /// Separated from ordinary pairing APIs; enforces monotonic epoch ordering against revocations
+    /// and rejects silent SPKI overwrites.
+    pub fn import_trusted_peer_admin(
+        &self,
+        import: AdminTrustImportRecord,
+    ) -> Result<TrustedPeerRecord, SecurityError> {
+        if import.trust_epoch == 0
+            || import.perm_epoch == 0
+            || import.trust_epoch == u64::MAX
+            || import.perm_epoch == u64::MAX
+        {
+            return Err(SecurityError::InvalidTimestamp(
+                "administrative trust import requires trust_epoch and perm_epoch in 1..u64::MAX",
+            ));
+        }
+        let friendly_name = validate_friendly_name(import.friendly_name)?;
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| SecurityError::AuthorizationDenied("trust store lock poisoned"))?;
+        let device_id = import.identity.device_id();
+        if let Some(rev) = guard.revoked.get(&device_id) {
+            if rev.revoked_epoch >= import.trust_epoch {
+                return Err(SecurityError::RevokedDevice);
+            }
+        }
+        if let Some(prev) = guard.trusted.get(&device_id) {
+            if prev.spki_der != *import.identity.spki_der() {
+                return Err(SecurityError::IdentityMismatch(
+                    "refusing silent SPKI overwrite for existing DeviceId",
+                ));
+            }
+            if prev.trust_epoch >= import.trust_epoch {
+                return Err(SecurityError::PairingState(
+                    "cannot import stale administrative trust epoch",
+                ));
+            }
+        } else if guard.trusted.len() >= MAX_TRUSTED_PEERS {
+            return Err(SecurityError::ResourceExhausted(
+                "trusted peer store capacity reached",
+            ));
+        }
+        guard.revoked.remove(&device_id);
+        let record = TrustedPeerRecord {
+            device_id,
+            spki_der: *import.identity.spki_der(),
+            role: import.role,
+            friendly_name,
+            base_permissions: import.base_permissions,
+            paired_at_unix: import.paired_at_unix,
+            last_seen_unix: import.last_seen_unix,
+            trust_epoch: import.trust_epoch,
+            perm_epoch: import.perm_epoch,
+        };
+        guard.trusted.insert(device_id, record.clone());
+        Ok(record)
+    }
+
+    /// Test-only helper to seed a trusted peer fixture without running a full pairing handshake.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn insert_trusted_peer_for_testing(
         &self,
         identity: &PublicIdentity,
         role: PeerRole,
@@ -134,7 +361,6 @@ impl InMemoryTrustStore {
             ));
         }
         let friendly_name = validate_friendly_name(friendly_name.into())?;
-
         let mut guard = self
             .inner
             .write()
@@ -154,10 +380,7 @@ impl InMemoryTrustStore {
                 "trusted peer store capacity reached",
             ));
         }
-        let next_epoch = guard
-            .trusted
-            .get(&device_id)
-            .map_or(1, |prev| prev.trust_epoch.saturating_add(1));
+        let next_epoch = guard.current_peer_epoch(device_id).saturating_add(1);
         let record = TrustedPeerRecord {
             device_id,
             spki_der: *identity.spki_der(),
@@ -173,10 +396,9 @@ impl InMemoryTrustStore {
         Ok(record)
     }
 
-    /// Re-pair a previously revoked device after a fresh out-of-band pairing flow.
-    ///
-    /// Advances `trust_epoch` strictly past the revoked epoch so tokens bound to older epochs stay invalid.
-    pub fn re_trust_after_pairing(
+    /// Test-only helper to re-trust a previously revoked peer fixture without running full pairing.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn re_trust_peer_for_testing(
         &self,
         identity: &PublicIdentity,
         role: PeerRole,
@@ -190,7 +412,6 @@ impl InMemoryTrustStore {
             ));
         }
         let friendly_name = validate_friendly_name(friendly_name.into())?;
-
         let mut guard = self
             .inner
             .write()
@@ -201,14 +422,8 @@ impl InMemoryTrustStore {
                 "trusted peer store capacity reached",
             ));
         }
-        let prev_epoch = guard
-            .revoked
-            .remove(&device_id)
-            .map(|r| r.revoked_epoch)
-            .into_iter()
-            .chain(guard.trusted.get(&device_id).map(|p| p.trust_epoch))
-            .max()
-            .unwrap_or(0);
+        let prev_epoch = guard.current_peer_epoch(device_id);
+        guard.revoked.remove(&device_id);
         let record = TrustedPeerRecord {
             device_id,
             spki_der: *identity.spki_der(),
@@ -384,6 +599,12 @@ impl TrustStore for InMemoryTrustStore {
             .read()
             .ok()
             .and_then(|g| g.trusted.get(&device_id).cloned())
+    }
+
+    fn peer_epoch(&self, device_id: DeviceId) -> u64 {
+        self.inner
+            .read()
+            .map_or(0, |g| g.current_peer_epoch(device_id))
     }
 }
 

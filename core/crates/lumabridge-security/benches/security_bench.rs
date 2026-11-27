@@ -25,7 +25,7 @@ use lumabridge_security::tls::{
     drive_in_memory_handshake, extract_authenticated_session_with_alpn, TlsPeerTrustPolicy,
     LUMABRIDGE_ALPN_V1, LUMABRIDGE_PAIR_ALPN_V1,
 };
-use lumabridge_security::trust_store::InMemoryTrustStore;
+use lumabridge_security::trust_store::{AdminTrustImportRecord, InMemoryTrustStore};
 use rustls::{ClientConnection, ServerConnection};
 use std::hint::black_box;
 use std::sync::Arc;
@@ -118,23 +118,29 @@ fn main() {
     // 4. Real TLS 1.3 mTLS handshake + RFC 9266 channel binding export
     let host_store = Arc::new(InMemoryTrustStore::new());
     host_store
-        .insert_newly_paired(
-            ctrl_kp.public_identity(),
-            PeerRole::Controller,
-            "Tablet",
-            Permissions::VIEW_MIRROR,
-            now,
-        )
+        .import_trusted_peer_admin(AdminTrustImportRecord {
+            identity: ctrl_kp.public_identity().clone(),
+            role: PeerRole::Controller,
+            friendly_name: "Tablet".into(),
+            base_permissions: Permissions::VIEW_MIRROR,
+            paired_at_unix: now,
+            last_seen_unix: now,
+            trust_epoch: 1,
+            perm_epoch: 1,
+        })
         .expect("insert");
     let ctrl_store = Arc::new(InMemoryTrustStore::new());
     ctrl_store
-        .insert_newly_paired(
-            host_kp.public_identity(),
-            PeerRole::Host,
-            "Host",
-            Permissions::VIEW_MIRROR,
-            now,
-        )
+        .import_trusted_peer_admin(AdminTrustImportRecord {
+            identity: host_kp.public_identity().clone(),
+            role: PeerRole::Host,
+            friendly_name: "Host".into(),
+            base_permissions: Permissions::VIEW_MIRROR,
+            paired_at_unix: now,
+            last_seen_unix: now,
+            trust_epoch: 1,
+            perm_epoch: 1,
+        })
         .expect("insert");
 
     let client_cfg = build_tls13_client_config(
@@ -239,7 +245,9 @@ fn main() {
             .handle_spake2_exchange(&pin_window, &m1, now, &mut rng)
             .expect("m2");
         let m3 = init.finish_spake2_and_emit_confirmation(&m2).expect("m3");
-        let m4 = acc.verify_spake2_confirmation_and_reply(&m3).expect("m4");
+        let m4 = acc
+            .verify_spake2_confirmation_and_reply(&m3, now)
+            .expect("m4");
         init.verify_spake2_peer_confirmation(&m4).expect("verify");
         let c = acc
             .apply_human_approval(

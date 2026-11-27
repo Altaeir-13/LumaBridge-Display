@@ -30,8 +30,11 @@
 11. **Bounded Security State (`pairing.rs`, `trust_store.rs`, `session_token.rs`, `rate_limit.rs`):** Hard caps on `MAX_ACTIVE_PAIRING_ATTEMPTS = 16`, `MAX_ACTIVE_QR_TOKENS = 64`, `MAX_TRUSTED_PEERS = 256`, `MAX_REVOKED_PEERS = 1024`, `MAX_ACTIVE_SESSIONS = 256`, `MAX_ACTIVE_RESUME_TOKENS = 512`, and `MAX_GLOBAL_FAILURE_EVENTS = 4096`.
 12. **ChannelBinding & Key Privacy (`channel_binding.rs`, `certificate.rs`):** `ChannelBinding` redacts all bytes (`ChannelBinding([REDACTED])`) and `GeneratedDeviceCertificate` redacts `pkcs8_der`.
 13. **Secret Lifecycle (`secret.rs`, `channel_binding.rs`, `identity.rs`, `pairing.rs`):** `Zeroize`/`ZeroizeOnDrop` across `ChannelBinding`, `IdentityKeyPair::from_seed_zeroizing`, `PairingInitiator`/`PairingAcceptor` `Drop`, and `PinAttemptLease`.
-14. **Adversarial Review Resolutions (`M1.3.1`):**
+14. **Adversarial Review Resolutions (`M1.3.1` & External Review Remediation):**
     - Added monotonic `pin_generation` tracking in `PinPairingWindow`/`PinAttemptLease` so stale leases after PIN rotation cannot poison or destroy the new PIN (`pairing.rs`).
+    - Hardened `PinAttemptLease::finish_success(now_unix)` and `PairingAcceptor::verify_spake2_confirmation_and_reply(&peer_msg, now_unix)` to differentiate attempt reservation time (`reserved_at_secs`) from confirmation time (`now_unix`), fail atomically with `SecurityError::PairingWindowClosed` / `InvalidTimestamp` on expiry, close, PIN rotation, backwards clock, or concurrent winner consumption, and enter `PairingStage::Failed` (`pairing.rs`).
+    - Hardened trust provenance: sealed `ApprovedPairingCommit` (private fields, non-`Clone`, `channel_binding_digest`, `expected_peer_epoch`), made `PairingAcceptor::approved_commit(&mut self)` single-use, removed ordinary bypass APIs (`insert_newly_paired` / `re_trust_after_pairing`), separated ordinary pairing (`insert_approved_pairing` / `re_trust_after_approved_pairing` consuming `ApprovedPairingCommit` by value and enforcing `expected_peer_epoch` + replay rejection) from explicit administrative import (`import_trusted_peer_admin` / `AdminTrustImportRecord`) and `#[cfg(any(test, feature = "test-utils"))]` fixtures (`insert_trusted_peer_for_testing` / `re_trust_peer_for_testing`) (`pairing.rs`, `trust_store.rs`).
+    - Bounded `PrefetchedCryptoRng` CSPRNG failure recovery: refill/post-failure draws zeroize remaining prefetched bytes, increment `failed_draws`, emit a deterministic canonical non-zero abort pattern (`0x01`) so any external scalar rejection loop terminates in 1 bounded draw, and `begin_spake2` / `handle_spake2_exchange` enforce `ensure_healthy()` immediately while zeroizing/dropping ephemeral shares/states (`secret.rs`, `pairing.rs`).
     - Made `PendingPermissionUpgrade` single-use (non-`Copy`/`Clone`, consumed by value) and enforced `perm_epoch` monotonicity across `InMemoryTrustStore::update_base_permissions` and `elevate_permissions_atomic` (`trust_store.rs`, `authorization.rs`).
     - Enforced `ticket.acceptor_role == self.peer_role` in `PairingInitiator::create_qr_auth`, rejected `pairing_attempt_id == 0` and control-char `friendly_name` in `start()`, and zeroized expired PIN state on `remaining_attempts` (`pairing.rs`).
     - Tightened handshake completion checks to `HandshakeKind::Full | HandshakeKind::FullWithHelloRetryRequest`, rejected `update_session_permissions` on revoked sessions, and activated real negative `PairConfirm` / ALPN mismatch tests (`tls.rs`, `channel_binding.rs`, `session_token.rs`, `pairing_and_tls_tests.rs`).
@@ -52,21 +55,23 @@
 
 ## 4. Normative Standards & Threat Test Results
 
-- **Workspace Suites (`cargo test --locked --workspace` across default, `poc-fault-injection`, `uniffi`):** `62` passed (`lumabridge-core` 7, `lumabridge-ffi` 5 default / 7 fault-injection, `lumabridge-protocol` 33, `lumabridge-security` 17).
-- **`lumabridge-security` unit tests (`2/2` PASS):**
-  - `PrefetchedCryptoRng` refill failure detection (`ensure_healthy()` returns `RngUnavailable` and zeroizes output).
+- **Workspace Suites (`cargo test --locked --workspace` across default, `poc-fault-injection`, `uniffi`):** `65` passed (`lumabridge-core` 7, `lumabridge-ffi` 5 default / 7 fault-injection, `lumabridge-protocol` 33, `lumabridge-security` 20).
+- **`lumabridge-security` unit tests (`3/3` PASS):**
+  - `PrefetchedCryptoRng` refill failure detection (`ensure_healthy()` returns `RngUnavailable` and terminates non-zero rejection loops in 1 bounded draw).
+  - Bounded CSPRNG prefetch & mid-SPAKE2 refill failure directly inside `PairingInitiator::begin_spake2` and `PairingAcceptor::handle_spake2_exchange` (terminates cleanly in `PairingStage::Failed` without emitting proof).
   - Exact 8-digit ASCII PIN validation preserving leading zeros (`00000001`) and unbiased CSPRNG generation.
 - **`rfc_vectors_and_identity` (`5/5` PASS):**
   - RFC 8032 §7.1 TEST 1 & TEST 2 byte-for-byte match, strict malleability/tamper rejection, small-order weak Ed25519 public key rejection.
   - All 3 official RFC 9382 Appendix B P-256/SHA-256/HKDF/HMAC vectors matched byte-for-byte on `pA`, `pB`, `Ke`, `cA`, and `cB`.
   - Strict deterministic CBOR (`LBWP-CBOR-v1`) transcript verification (`build_spake2_aad` keys `1..=13`, `build_qr_auth_signing_message` keys `1..=12`, `build_pair_confirm_signing_message` keys `1..=10`), `LB-INIT:`/`LB-ACC:` endpoint IDs, and separated access/resume token digest domains.
   - X.509 expiry/not-before/trailing-DER/wrong-OID/signature tampering checks + `proptest` identity & fuzz rejection properties.
-- **`pairing_and_tls_tests` (`4/4` PASS):**
+- **`pairing_and_tls_tests` (`5/5` PASS):**
   - Real TLS 1.3 mTLS operational & pairing handshakes (`ChannelBindingSource::Tls13Exporter`), TLS resumption/0-RTT rejection even against resumption-enabled clients (`HandshakeKind::Full`), `PinnedPeer` enforcing live `TrustStore` & role, TLS 1.2 rejection, missing cert rejection, untrusted/wrong-role/expired/future/revoked rejection, ALPN mismatch rejection.
   - Channel-bound SPAKE2-P256 & QR flows with mutual local human consent on Acceptor & Initiator, `PairConfirm` non-bypassability, and real 2-connection active MITM rejection.
-  - Atomic 3-attempt PIN budget destruction (single-thread 3 wrong guesses + 16-thread concurrency race + 90 s expiry) and 16-thread QR `consume_once` race (`1` winner, `15` rejections).
-- **`trust_authz_revocation_tests` (`6/6` PASS):**
+  - Atomic 3-attempt PIN budget destruction (single-thread 3 wrong guesses + 16-thread concurrency race + 90 s expiry), deterministic monotonic-clock expiry/close/rotation/backwards-clock rejection on `verify_spake2_confirmation_and_reply`, deterministic `Barrier` 3-thread confirmation race (`1` winner, `2` `PairingWindowClosed`), and 16-thread QR `consume_once` race (`1` winner, `15` rejections).
+- **`trust_authz_revocation_tests` (`7/7` PASS):**
   - 5-factor authorization (`local_policy`, `persisted_peer_perms`, `session_grant`, `requested_operation`, `negotiated_caps`), `PendingPermissionUpgrade` binding, atomic input elevation, and live `TrustStore` downgrade.
+  - Single-use `ApprovedPairingCommit` provenance, epoch-bound `insert_approved_pairing` / `re_trust_after_approved_pairing` stale-commit rejection after pairing/revocation, and explicit separation of `import_trusted_peer_admin` (`AdminTrustImportRecord`).
   - Channel-bound session tokens, mandatory channel-bound resume rotation, same-channel resume replay rejection, coordinated `revoke_peer_and_sessions` (`DisconnectPeerSessions`), and 16-thread concurrent issuance vs revocation stress test.
   - Fail-closed saturated `BoundedChallengeCache` (`MAX_TRACKED_CHALLENGES = 4096`), bounded `QrTokenStore` (`MAX_ACTIVE_QR_TOKENS = 64`), bounded `AuthRateLimiter` (`MAX_GLOBAL_FAILURE_EVENTS = 4096`), full `ChannelBinding` + `GeneratedDeviceCertificate` privacy redaction sentinels, and fuzz corpus replay.
 
@@ -84,13 +89,21 @@
 
 ## 6. AddressSanitizer Fuzzing Campaigns (`nightly-2026-04-01`, Windows MSVC)
 
-### M1.3.1 Re-qualification of Affected Security Targets
+### M1.3.1 Final Re-qualification (`>= 60 s` per Affected Target on Hardened Code)
+| Target | Duration | Executions | Throughput (exec/s) | Peak RSS (MB) | Crashes / Sanitizer Errors |
+|---|---|---:|---:|---:|---:|
+| `fuzz_spake2_messages` (`lumabridge-security`) | 62 s (`-max_total_time=61`) | 27,738 | 447 | 382 | 0 |
+| `fuzz_qr_pairing` (`lumabridge-security`) | 62 s (`-max_total_time=61`) | 27,278 | 439 | 369 | 0 |
+| `fuzz_session_authz` (`lumabridge-security`) | 62 s (`-max_total_time=61`) | 31,474 | 507 | 452 | 0 |
+| **Total Final M1.3.1 Security Fuzzing** | **3 × 62 s** | **86,490** | — | **452 max** | **0** |
+
+### M1.3.1 Earlier Intermediate Campaign (Preserved Historical Evidence)
 | Target | Duration | Executions | Throughput (exec/s) | Peak RSS (MB) | Crashes / Sanitizer Errors |
 |---|---|---:|---:|---:|---:|
 | `fuzz_spake2_messages` (`lumabridge-security`) | 31 s | 13,400 | 432 | 212 | 0 |
 | `fuzz_qr_pairing` (`lumabridge-security`) | 31 s | 14,096 | 454 | 216 | 0 |
 | `fuzz_session_authz` (`lumabridge-security`) | 31 s | 16,030 | 517 | 301 | 0 |
-| **Total M1.3.1 Security Fuzzing** | **3 x 31 s** | **43,526** | — | **301 max** | **0** |
+| **Total Intermediate M1.3.1 Fuzzing** | **3 × 31 s** | **43,526** | — | **301 max** | **0** |
 
 *(Historical M1.3 baseline also covered `fuzz_spki_identity`, `fuzz_x509_cert`, `fuzz_cbor_control`, and `fuzz_contextual_validation` over `7 x 61 s` / `7,644,551` executions with `0` crashes.)*
 

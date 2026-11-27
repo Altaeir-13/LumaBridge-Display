@@ -768,7 +768,7 @@ async fn lossy_network_closed_loop_awaiting_idr_and_force_idr_recovery() {
     .expect("rx");
 
     host.trust_store()
-        .insert_newly_paired(
+        .insert_trusted_peer_for_testing(
             rx.public_identity(),
             PeerRole::Controller,
             "LossRx",
@@ -777,7 +777,7 @@ async fn lossy_network_closed_loop_awaiting_idr_and_force_idr_recovery() {
         )
         .expect("pair1");
     rx.trust_store()
-        .insert_newly_paired(
+        .insert_trusted_peer_for_testing(
             host.public_identity(),
             PeerRole::Host,
             "LossHost",
@@ -1096,4 +1096,144 @@ fn two_process_1080p60_synthetic_stream_quic_and_tcp() {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+#[tokio::test]
+async fn pin_window_close_between_reservation_and_confirmation_fails_closed() {
+    use lumabridge_protocol::control::{AuthMode, ControlMessage, PairHello};
+    use lumabridge_protocol::version::{LBWP_PROTOCOL_MAJOR, LBWP_PROTOCOL_MINOR};
+    use lumabridge_security::certificate::generate_self_signed_device_cert;
+    use lumabridge_security::identity::IdentityKeyPair;
+    use lumabridge_security::pairing::PairingInitiator;
+    use lumabridge_security::tls::TlsPeerTrustPolicy;
+    use lumabridge_transport::connection::{connect_client_link, PairingConnection};
+
+    let mut rng = CheckedOsCryptoRng::preflight().expect("rng");
+    let now = now_unix();
+    let rx = Arc::new(make_node(
+        "PinCloseRx",
+        PeerRole::Controller,
+        TransportKind::TcpTls,
+    ));
+    let pin_win = Arc::new(PinPairingWindow::new());
+    let pin = pin_win.open_with_new_pin(&mut rng, now).expect("open pin");
+
+    let pair_srv = rx
+        .bind_server(
+            TransportKind::TcpTls,
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            true,
+        )
+        .await
+        .expect("pair bind");
+    let pair_addr = pair_srv.local_addr().expect("pair addr");
+
+    let rx_task_node = rx.clone();
+    let rx_pin_win = pin_win.clone();
+    let acc_task = tokio::spawn(async move {
+        let link = pair_srv
+            .accept_link(LUMABRIDGE_PAIR_ALPN_V1, now)
+            .await
+            .expect("accept");
+        let res = rx_task_node
+            .accept_pairing_over_link(link, Some(&rx_pin_win), None, now, 1_000, |p| {
+                HumanApprovalDecision::Approve {
+                    pairing_attempt_id: p.pairing_attempt_id,
+                    peer_device_id: p.peer_device_id,
+                    granted_base_perms: Permissions::EXTEND_DISPLAY,
+                }
+            })
+            .await;
+        pair_srv.close();
+        res
+    });
+
+    let init_kp = IdentityKeyPair::generate(&mut rng).expect("init kp");
+    let init_cert = generate_self_signed_device_cert(&init_kp, now, now + 3600).expect("init cert");
+    use lumabridge_security::trust_store::InMemoryTrustStore;
+
+    let init_store: Arc<dyn TrustStore> = Arc::new(InMemoryTrustStore::new());
+    let link = connect_client_link(
+        TransportKind::TcpTls,
+        pair_addr,
+        &init_cert,
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: init_store,
+        },
+        rx.device_id(),
+        LUMABRIDGE_PAIR_ALPN_V1,
+        now,
+        &TransportConfig {
+            kind: TransportKind::TcpTls,
+            heartbeat_timeout_ms: 8_000,
+            ..TransportConfig::default()
+        },
+    )
+    .await
+    .expect("connect");
+    let conn = PairingConnection::from_link(link, TransportConfig::default(), true).expect("conn");
+
+    let hello = ControlMessage::PairHello(PairHello {
+        protocol_major: LBWP_PROTOCOL_MAJOR,
+        protocol_minor: LBWP_PROTOCOL_MINOR,
+        auth_mode: AuthMode::PinSpake2,
+        device_id: *init_kp.device_id().as_bytes(),
+        spki_ed25519: init_kp.public_identity().spki_der().to_vec(),
+        friendly_name: String::from("DelayedHost"),
+    });
+    conn.send_pairing_message(&hello).await.expect("send hello");
+    let ControlMessage::PairHello(peer_hello) = conn.recv_pairing_message().await.expect("hello")
+    else {
+        panic!("expected PairHello");
+    };
+
+    let mut init = PairingInitiator::start_with_expected_peer_epoch(
+        77,
+        &init_kp,
+        PeerRole::Host,
+        &peer_hello,
+        conn.tls_session(),
+        AuthMode::PinSpake2,
+        0,
+    )
+    .expect("start init");
+    let p_a = init.begin_spake2(&pin, &mut rng).expect("p_a");
+    conn.send_pairing_message(&ControlMessage::PairSpakeMsg(p_a))
+        .await
+        .expect("send p_a");
+
+    let ControlMessage::PairSpakeMsg(p_b) = conn.recv_pairing_message().await.expect("recv p_b")
+    else {
+        panic!("expected p_b");
+    };
+    let c_a = init
+        .finish_spake2_and_emit_confirmation(&p_b)
+        .expect("finish spake2");
+
+    // Close the PIN window AFTER handle_spake2_exchange reserved the attempt,
+    // BEFORE sending KeyConfirmation c_a to verify_spake2_confirmation_and_reply.
+    pin_win.close().expect("close pin window");
+
+    conn.send_pairing_message(&ControlMessage::PairSpakeMsg(c_a))
+        .await
+        .expect("send c_a");
+
+    let acc_res = acc_task.await.expect("join acc");
+    assert!(
+        matches!(
+            acc_res,
+            Err(NodeError::Security(SecurityError::PairingWindowClosed))
+        ),
+        "expected PairingWindowClosed after mid-attempt close, got {acc_res:?}"
+    );
+    assert_eq!(rx.trust_store().peer_epoch(init_kp.device_id()), 0);
+    assert!(
+        matches!(
+            rx.trust_store()
+                .verify_trusted_peer(init_kp.public_identity(), PeerRole::Host),
+            Err(SecurityError::UntrustedDevice)
+        ),
+        "peer must NOT be trusted after closed-window confirmation"
+    );
+    conn.close();
 }
