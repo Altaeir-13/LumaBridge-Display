@@ -70,10 +70,10 @@ async fn quic_under_loss_jitter_reorder_triggers_awaiting_idr_and_recovers_clean
     let r_store = Arc::new(InMemoryTrustStore::new());
     let perms = Permissions::EXTEND_DISPLAY;
     s_store
-        .insert_newly_paired(&r_id, PeerRole::Controller, "Rx", perms, now)
+        .insert_trusted_peer_for_testing(&r_id, PeerRole::Controller, "Rx", perms, now)
         .expect("s");
     r_store
-        .insert_newly_paired(&s_id, PeerRole::Host, "Tx", perms, now)
+        .insert_trusted_peer_for_testing(&s_id, PeerRole::Host, "Tx", perms, now)
         .expect("r");
 
     let mut cfg = TransportConfig {
@@ -309,10 +309,10 @@ async fn reliable_protected_blank_precedes_and_suppresses_stale_p_frames_under_l
     let r_store = Arc::new(InMemoryTrustStore::new());
     let perms = Permissions::EXTEND_DISPLAY;
     s_store
-        .insert_newly_paired(&r_id, PeerRole::Controller, "Rx", perms, now)
+        .insert_trusted_peer_for_testing(&r_id, PeerRole::Controller, "Rx", perms, now)
         .expect("s");
     r_store
-        .insert_newly_paired(&s_id, PeerRole::Host, "Tx", perms, now)
+        .insert_trusted_peer_for_testing(&s_id, PeerRole::Host, "Tx", perms, now)
         .expect("r");
 
     let cfg = TransportConfig {
@@ -534,10 +534,10 @@ async fn tx_scheduler_saturation_and_tcp_capacity_change_preserve_control_and_go
     let r_store = Arc::new(InMemoryTrustStore::new());
     let perms = Permissions::EXTEND_DISPLAY;
     s_store
-        .insert_newly_paired(&r_id, PeerRole::Controller, "Rx", perms, now)
+        .insert_trusted_peer_for_testing(&r_id, PeerRole::Controller, "Rx", perms, now)
         .expect("s");
     r_store
-        .insert_newly_paired(&s_id, PeerRole::Host, "Tx", perms, now)
+        .insert_trusted_peer_for_testing(&s_id, PeerRole::Host, "Tx", perms, now)
         .expect("r");
 
     let cfg = TransportConfig {

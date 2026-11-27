@@ -61,7 +61,7 @@ fuzz_target!(|data: &[u8]| {
     {
         if let ControlMessage::PairSpakeMsg(spake) = msg {
             let _ = acc.handle_spake2_exchange(&window, &spake, 1_700_000_100, &mut rng);
-            let _ = acc.verify_spake2_confirmation_and_reply(&spake);
+            let _ = acc.verify_spake2_confirmation_and_reply(&spake, 1_700_000_100);
         }
     } else {
         let raw_msg = lumabridge_protocol::control::PairSpakeMsg {

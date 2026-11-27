@@ -103,10 +103,10 @@ async fn run_one(kind: TransportKind, scenario: &Scenario) -> BenchRow {
     let r_store = Arc::new(InMemoryTrustStore::new());
     let perms = Permissions::EXTEND_DISPLAY;
     s_store
-        .insert_newly_paired(&r_id, PeerRole::Controller, "Rx", perms, now)
+        .insert_trusted_peer_for_testing(&r_id, PeerRole::Controller, "Rx", perms, now)
         .expect("s");
     r_store
-        .insert_newly_paired(&s_id, PeerRole::Host, "Tx", perms, now)
+        .insert_trusted_peer_for_testing(&s_id, PeerRole::Host, "Tx", perms, now)
         .expect("r");
 
     let mut cfg = TransportConfig {

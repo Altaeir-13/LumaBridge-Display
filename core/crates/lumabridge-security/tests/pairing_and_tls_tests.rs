@@ -20,7 +20,9 @@ use lumabridge_security::tls::{
     transfer_encrypted_app_data, AuthenticatedTlsSession, TlsPeerTrustPolicy, LUMABRIDGE_ALPN_V1,
     LUMABRIDGE_PAIR_ALPN_V1,
 };
-use lumabridge_security::trust_store::{InMemoryTrustStore, RevocationReason};
+use lumabridge_security::trust_store::{
+    AdminTrustImportRecord, InMemoryTrustStore, RevocationReason,
+};
 use rustls::client::Resumption;
 use rustls::pki_types::CertificateDer;
 use rustls::{ClientConfig, ClientConnection, HandshakeKind, RootCertStore, ServerConnection};
@@ -93,24 +95,30 @@ fn real_tls13_mtls_normative_cases_pinned_store_and_resumption_disabled() {
 
     let host_store = Arc::new(InMemoryTrustStore::new());
     host_store
-        .insert_newly_paired(
-            ctrl_kp.public_identity(),
-            PeerRole::Controller,
-            "Galaxy Tab",
-            Permissions::VIEW_MIRROR,
-            now,
-        )
+        .import_trusted_peer_admin(AdminTrustImportRecord {
+            identity: ctrl_kp.public_identity().clone(),
+            role: PeerRole::Controller,
+            friendly_name: "Galaxy Tab".into(),
+            base_permissions: Permissions::VIEW_MIRROR,
+            paired_at_unix: now,
+            last_seen_unix: now,
+            trust_epoch: 1,
+            perm_epoch: 1,
+        })
         .expect("insert ctrl");
 
     let ctrl_store = Arc::new(InMemoryTrustStore::new());
     ctrl_store
-        .insert_newly_paired(
-            host_kp.public_identity(),
-            PeerRole::Host,
-            "Desktop PC",
-            Permissions::VIEW_MIRROR,
-            now,
-        )
+        .import_trusted_peer_admin(AdminTrustImportRecord {
+            identity: host_kp.public_identity().clone(),
+            role: PeerRole::Host,
+            friendly_name: "Desktop PC".into(),
+            base_permissions: Permissions::VIEW_MIRROR,
+            paired_at_unix: now,
+            last_seen_unix: now,
+            trust_epoch: 1,
+            perm_epoch: 1,
+        })
         .expect("insert host");
 
     // Case 1: Valid mutual TLS 1.3 operational handshake + RFC 9266 CB equality + encrypted app data
@@ -470,7 +478,7 @@ fn channel_bound_spake2_local_consent_pin_budget_and_real_mitm_failure() {
         .finish_spake2_and_emit_confirmation(&m2)
         .expect("m3");
     let m4 = acceptor
-        .verify_spake2_confirmation_and_reply(&m3)
+        .verify_spake2_confirmation_and_reply(&m3, now)
         .expect("m4");
     initiator
         .verify_spake2_peer_confirmation(&m4)
@@ -524,7 +532,9 @@ fn channel_bound_spake2_local_consent_pin_budget_and_real_mitm_failure() {
         .handle_spake2_exchange(&pin_window, &m1, now, &mut rng)
         .expect("m2");
     let m3 = init2.finish_spake2_and_emit_confirmation(&m2).expect("m3");
-    let m4 = acc2.verify_spake2_confirmation_and_reply(&m3).expect("m4");
+    let m4 = acc2
+        .verify_spake2_confirmation_and_reply(&m3, now)
+        .expect("m4");
     init2.verify_spake2_peer_confirmation(&m4).expect("mac2");
 
     // Wrong-peer HumanApprovalDecision rejected cleanly
@@ -543,8 +553,13 @@ fn channel_bound_spake2_local_consent_pin_budget_and_real_mitm_failure() {
         )
         .expect("approve");
     let acc_commit = acc2.approved_commit().expect("acc commit");
+    // Single-use ApprovedPairingCommit extraction: second call MUST fail
+    assert!(matches!(
+        acc2.approved_commit(),
+        Err(SecurityError::PairingState(_))
+    ));
     host_store
-        .insert_approved_pairing(&acc_commit, now)
+        .insert_approved_pairing(acc_commit, now)
         .expect("persist host trust");
 
     // Network PairConfirm NEVER promotes initiator to Confirmed without local human approval!
@@ -567,11 +582,11 @@ fn channel_bound_spake2_local_consent_pin_budget_and_real_mitm_failure() {
         .expect("local initiator approval");
     assert_eq!(init2.stage(), PairingStage::Confirmed);
     assert_eq!(
-        init_commit.granted_base_perms,
+        init_commit.granted_base_perms(),
         Permissions::VIEW_MIRROR.union(Permissions::EXTEND_DISPLAY)
     );
     ctrl_store
-        .insert_approved_pairing(&init_commit, now)
+        .insert_approved_pairing(init_commit, now)
         .expect("persist ctrl trust");
 
     // Attempting replay / second SPAKE2 on confirmed connection is blocked
@@ -643,7 +658,7 @@ fn channel_bound_spake2_local_consent_pin_budget_and_real_mitm_failure() {
         .finish_spake2_and_emit_confirmation(&forwarded_m2)
         .expect("forwarded m3");
     assert_eq!(
-        victim_acc.verify_spake2_confirmation_and_reply(&forwarded_m3),
+        victim_acc.verify_spake2_confirmation_and_reply(&forwarded_m3, now),
         Err(SecurityError::Spake2Failed)
     );
     let _ = (mitm_from_cli_tls, mitm_to_srv_tls);
@@ -681,7 +696,7 @@ fn channel_bound_spake2_local_consent_pin_budget_and_real_mitm_failure() {
         .finish_spake2_and_emit_confirmation(&m2_3)
         .expect("m3_3");
     let m4_3 = acc3
-        .verify_spake2_confirmation_and_reply(&m3_3)
+        .verify_spake2_confirmation_and_reply(&m3_3, now)
         .expect("m4_3");
     init3.verify_spake2_peer_confirmation(&m4_3).expect("mac3");
 
@@ -782,7 +797,7 @@ fn atomic_three_attempt_pin_budget_concurrency_and_expiry_destroy_pin() {
             .expect("m2");
         let m3 = init.finish_spake2_and_emit_confirmation(&m2).expect("m3");
         assert_eq!(
-            acc.verify_spake2_confirmation_and_reply(&m3),
+            acc.verify_spake2_confirmation_and_reply(&m3, now),
             Err(SecurityError::Spake2Failed)
         );
     }
@@ -815,16 +830,19 @@ fn atomic_three_attempt_pin_budget_concurrency_and_expiry_destroy_pin() {
     );
 
     // Cross-generation lease safety: stale leases from PIN_1 failing/succeeding after PIN_2 rotation
-    // MUST NOT poison or destroy PIN_2!
+    // MUST return PairingWindowClosed AND MUST NOT poison or destroy PIN_2!
     let _pin_gen1 = window.open_with_new_pin(&mut rng, now).expect("gen1");
     let stale_fail_lease = window.begin_attempt(now).expect("stale fail lease");
     let stale_succ_lease = window.begin_attempt(now).expect("stale succ lease");
     let _pin_gen2 = window.open_with_new_pin(&mut rng, now).expect("gen2");
     stale_fail_lease.finish_failure();
-    stale_succ_lease.finish_success();
+    assert_eq!(
+        stale_succ_lease.finish_success(now),
+        Err(SecurityError::PairingWindowClosed)
+    );
     assert_eq!(window.remaining_attempts(now), MAX_PIN_FAILED_ATTEMPTS);
     let fresh_gen2_lease = window.begin_attempt(now).expect("gen2 still active");
-    fresh_gen2_lease.finish_success();
+    assert_eq!(fresh_gen2_lease.finish_success(now), Ok(()));
 
     // 16-thread concurrent race on one PinPairingWindow: strictly <= 3 leases ever granted!
     let _race_pin = window.open_with_new_pin(&mut rng, now).expect("race pin");
@@ -992,7 +1010,7 @@ fn qr_pairing_mitm_rejection_and_concurrent_single_use_race() {
             granted_base_perms: Permissions::VIEW_MIRROR,
         })
         .expect("local confirm");
-    assert_eq!(commit.granted_base_perms, Permissions::VIEW_MIRROR);
+    assert_eq!(commit.granted_base_perms(), Permissions::VIEW_MIRROR);
 
     // 16-thread race on one fresh QR ticket: strictly 1 winner, 15 rejections!
     let race_ticket = qr_store
@@ -1027,4 +1045,229 @@ fn qr_pairing_mitm_rejection_and_concurrent_single_use_race() {
         .count();
     assert_eq!(ok_count, 1);
     assert_eq!(reused_count, 15);
+}
+
+#[test]
+fn pin_confirmation_rejects_expiry_close_rotation_and_concurrent_winner_deterministically() {
+    let base_t = current_unix_time();
+    let (host_kp, host_cert) = make_identity_and_cert(0x81, base_t - 60, base_t + 3600);
+    let (ctrl_kp, ctrl_cert) = make_identity_and_cert(0x82, base_t - 60, base_t + 3600);
+    let store = Arc::new(InMemoryTrustStore::new());
+    let (c_tls, s_tls, _, _) = handshake_pair(
+        &ctrl_cert,
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: store.clone(),
+        },
+        &host_cert,
+        TlsPeerTrustPolicy::Pairing { trust_store: store },
+        base_t,
+    )
+    .expect("tls");
+
+    let init_hello = PairHello {
+        protocol_major: LBWP_PROTOCOL_MAJOR,
+        protocol_minor: LBWP_PROTOCOL_MINOR,
+        device_id: *ctrl_kp.device_id().as_bytes(),
+        friendly_name: "Tablet".into(),
+        auth_mode: AuthMode::PinSpake2,
+        spki_ed25519: ctrl_kp.public_identity().spki_der().to_vec(),
+    };
+    let acc_hello = PairHello {
+        protocol_major: LBWP_PROTOCOL_MAJOR,
+        protocol_minor: LBWP_PROTOCOL_MINOR,
+        device_id: *host_kp.device_id().as_bytes(),
+        friendly_name: "Host".into(),
+        auth_mode: AuthMode::PinSpake2,
+        spki_ed25519: host_kp.public_identity().spki_der().to_vec(),
+    };
+
+    let mut rng = CheckedOsCryptoRng::preflight().expect("rng");
+    let window = PinPairingWindow::new();
+
+    // 1. Reservation at base_t, confirmation past 90s TTL (base_t + PIN_TTL_SECS + 1) MUST fail
+    let pin_exp = window.open_with_new_pin(&mut rng, base_t).expect("pin exp");
+    let mut init_exp = PairingInitiator::start(
+        9001,
+        &ctrl_kp,
+        PeerRole::Controller,
+        &acc_hello,
+        &c_tls,
+        AuthMode::PinSpake2,
+    )
+    .expect("init exp");
+    let mut acc_exp = PairingAcceptor::start(9001, &host_kp, PeerRole::Host, &init_hello, &s_tls)
+        .expect("acc exp");
+    let m1 = init_exp.begin_spake2(&pin_exp, &mut rng).expect("m1");
+    let m2 = acc_exp
+        .handle_spake2_exchange(&window, &m1, base_t + 10, &mut rng)
+        .expect("m2");
+    let m3 = init_exp
+        .finish_spake2_and_emit_confirmation(&m2)
+        .expect("m3");
+    assert_eq!(
+        acc_exp.verify_spake2_confirmation_and_reply(&m3, base_t + PIN_TTL_SECS + 1),
+        Err(SecurityError::PairingWindowClosed)
+    );
+    assert_eq!(acc_exp.stage(), PairingStage::Failed);
+
+    // Exact boundary base_t + PIN_TTL_SECS succeeds
+    let pin_bnd = window.open_with_new_pin(&mut rng, base_t).expect("pin bnd");
+    let mut init_bnd = PairingInitiator::start(
+        9002,
+        &ctrl_kp,
+        PeerRole::Controller,
+        &acc_hello,
+        &c_tls,
+        AuthMode::PinSpake2,
+    )
+    .expect("init bnd");
+    let mut acc_bnd = PairingAcceptor::start(9002, &host_kp, PeerRole::Host, &init_hello, &s_tls)
+        .expect("acc bnd");
+    let m1 = init_bnd.begin_spake2(&pin_bnd, &mut rng).expect("m1");
+    let m2 = acc_bnd
+        .handle_spake2_exchange(&window, &m1, base_t + 10, &mut rng)
+        .expect("m2");
+    let m3 = init_bnd
+        .finish_spake2_and_emit_confirmation(&m2)
+        .expect("m3");
+    assert!(acc_bnd
+        .verify_spake2_confirmation_and_reply(&m3, base_t + PIN_TTL_SECS)
+        .is_ok());
+
+    // 2. Reservation before close(), confirmation after close() MUST fail
+    let pin_cls = window.open_with_new_pin(&mut rng, base_t).expect("pin cls");
+    let mut init_cls = PairingInitiator::start(
+        9003,
+        &ctrl_kp,
+        PeerRole::Controller,
+        &acc_hello,
+        &c_tls,
+        AuthMode::PinSpake2,
+    )
+    .expect("init cls");
+    let mut acc_cls = PairingAcceptor::start(9003, &host_kp, PeerRole::Host, &init_hello, &s_tls)
+        .expect("acc cls");
+    let m1 = init_cls.begin_spake2(&pin_cls, &mut rng).expect("m1");
+    let m2 = acc_cls
+        .handle_spake2_exchange(&window, &m1, base_t + 1, &mut rng)
+        .expect("m2");
+    let m3 = init_cls
+        .finish_spake2_and_emit_confirmation(&m2)
+        .expect("m3");
+    window.close().expect("close");
+    assert_eq!(
+        acc_cls.verify_spake2_confirmation_and_reply(&m3, base_t + 2),
+        Err(SecurityError::PairingWindowClosed)
+    );
+    assert_eq!(acc_cls.stage(), PairingStage::Failed);
+
+    // 3. Reservation on gen 1, PIN rotation to gen 2, confirmation on gen 1 MUST fail WITHOUT disturbing gen 2
+    let pin_g1 = window.open_with_new_pin(&mut rng, base_t).expect("pin g1");
+    let mut init_g1 = PairingInitiator::start(
+        9004,
+        &ctrl_kp,
+        PeerRole::Controller,
+        &acc_hello,
+        &c_tls,
+        AuthMode::PinSpake2,
+    )
+    .expect("init g1");
+    let mut acc_g1 = PairingAcceptor::start(9004, &host_kp, PeerRole::Host, &init_hello, &s_tls)
+        .expect("acc g1");
+    let m1 = init_g1.begin_spake2(&pin_g1, &mut rng).expect("m1");
+    let m2 = acc_g1
+        .handle_spake2_exchange(&window, &m1, base_t + 5, &mut rng)
+        .expect("m2");
+    let m3 = init_g1
+        .finish_spake2_and_emit_confirmation(&m2)
+        .expect("m3");
+    let pin_g2 = window
+        .open_with_new_pin(&mut rng, base_t + 6)
+        .expect("pin g2");
+    assert_eq!(
+        acc_g1.verify_spake2_confirmation_and_reply(&m3, base_t + 7),
+        Err(SecurityError::PairingWindowClosed)
+    );
+    assert_eq!(acc_g1.stage(), PairingStage::Failed);
+    assert_eq!(
+        window.remaining_attempts(base_t + 7),
+        MAX_PIN_FAILED_ATTEMPTS
+    );
+
+    // Backwards confirmation clock before reservation timestamp MUST fail cleanly
+    let mut init_back = PairingInitiator::start(
+        9005,
+        &ctrl_kp,
+        PeerRole::Controller,
+        &acc_hello,
+        &c_tls,
+        AuthMode::PinSpake2,
+    )
+    .expect("init back");
+    let mut acc_back = PairingAcceptor::start(9005, &host_kp, PeerRole::Host, &init_hello, &s_tls)
+        .expect("acc back");
+    let m1 = init_back.begin_spake2(&pin_g2, &mut rng).expect("m1");
+    let m2 = acc_back
+        .handle_spake2_exchange(&window, &m1, base_t + 10, &mut rng)
+        .expect("m2");
+    let m3 = init_back
+        .finish_spake2_and_emit_confirmation(&m2)
+        .expect("m3");
+    assert!(matches!(
+        acc_back.verify_spake2_confirmation_and_reply(&m3, base_t + 9),
+        Err(SecurityError::InvalidTimestamp(_))
+    ));
+    assert_eq!(acc_back.stage(), PairingStage::Failed);
+
+    // 4. Deterministic barrier race: 3 concurrent attempts on ONE PIN race at confirmation -> strictly 1 winner!
+    let pin_conc = window
+        .open_with_new_pin(&mut rng, base_t + 20)
+        .expect("pin conc");
+    let barrier = Arc::new(Barrier::new(3));
+    let mut prepared = Vec::with_capacity(3);
+    for idx in 0..3u64 {
+        let mut init = PairingInitiator::start(
+            9100 + idx,
+            &ctrl_kp,
+            PeerRole::Controller,
+            &acc_hello,
+            &c_tls,
+            AuthMode::PinSpake2,
+        )
+        .expect("init conc");
+        let mut acc =
+            PairingAcceptor::start(9100 + idx, &host_kp, PeerRole::Host, &init_hello, &s_tls)
+                .expect("acc conc");
+        let m1 = init.begin_spake2(&pin_conc, &mut rng).expect("m1");
+        let m2 = acc
+            .handle_spake2_exchange(&window, &m1, base_t + 21, &mut rng)
+            .expect("m2");
+        let m3 = init.finish_spake2_and_emit_confirmation(&m2).expect("m3");
+        prepared.push((acc, m3));
+    }
+
+    let mut handles = Vec::with_capacity(3);
+    for (mut acc, m3) in prepared {
+        let b = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            b.wait();
+            let res = acc.verify_spake2_confirmation_and_reply(&m3, base_t + 25);
+            (res.is_ok(), res.err(), acc.stage())
+        }));
+    }
+    let outcomes: Vec<_> = handles
+        .into_iter()
+        .map(|h| h.join().expect("join"))
+        .collect();
+    let winners = outcomes.iter().filter(|(ok, _, _)| *ok).count();
+    let closed_losers = outcomes
+        .iter()
+        .filter(|(ok, err, st)| {
+            !*ok && matches!(err, Some(SecurityError::PairingWindowClosed))
+                && *st == PairingStage::Failed
+        })
+        .count();
+    assert_eq!(winners, 1);
+    assert_eq!(closed_losers, 2);
+    assert_eq!(window.remaining_attempts(base_t + 25), 0);
 }
