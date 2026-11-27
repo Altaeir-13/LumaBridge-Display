@@ -166,6 +166,16 @@ public:
         (void)sourceTexture;
         return S_OK;
     }
+
+    virtual NVENCSTATUS OnPreReconfigureEncoder(
+        uint32_t targetBitrateBps,
+        uint32_t maxBitrateBps
+        ) noexcept
+    {
+        (void)targetBitrateBps;
+        (void)maxBitrateBps;
+        return NV_ENC_SUCCESS;
+    }
 };
 
 /// Direct3D 11 -> NVIDIA NVENC H.264 encoder with GPU color conversion (ID3D11VideoProcessor BGRA8->NV12),
@@ -205,6 +215,12 @@ public:
 
     /// Forces the next submitted frame to encode as an IDR keyframe with inline SPS/PPS headers.
     void RequestForceIdrOnNextFrame() noexcept;
+
+    /// Dynamically reconfigures CBR target/max bitrate on an active NVENC session without full teardown.
+    HRESULT UpdateDynamicBitrate(
+        uint32_t targetBitrateBps,
+        uint32_t maxBitrateBps = 0U
+        ) noexcept;
 
     /// Encodes a GPU-resident D3D11 Texture2D frame, pushing the produced Annex-B H.264 packet into the queue.
     HRESULT EncodeGpuTexture(
@@ -267,6 +283,8 @@ private:
 
     NvencEncoderConfig m_config{};
     NvencCapabilitiesSnapshot m_capabilities{};
+    NV_ENC_INITIALIZE_PARAMS m_activeInitParams{};
+    NV_ENC_CONFIG m_activeEncodeConfig{};
     NV_ENC_BUFFER_FORMAT m_activeNvencInputFormat{NV_ENC_BUFFER_FORMAT_UNDEFINED};
     DXGI_FORMAT m_activeSourceFormat{DXGI_FORMAT_UNKNOWN};
     bool m_initialized{false};

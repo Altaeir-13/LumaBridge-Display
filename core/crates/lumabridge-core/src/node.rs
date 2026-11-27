@@ -1049,6 +1049,13 @@ impl ActiveNodeSession {
         self.telemetry.summary()
     }
 
+    /// Record platform-measured hardware decode + swapchain/display present durations (microseconds)
+    /// into receiver stage percentile histograms.
+    pub fn record_decode_present_latency(&mut self, decode_us: u64, present_us: u64) {
+        self.telemetry
+            .record_rx_decode_present(decode_us, present_us);
+    }
+
     /// Transmit an encoded frame, updating TX telemetry and signaling `EnqueueOutcome`.
     pub async fn send_encoded_frame(
         &mut self,
@@ -1109,7 +1116,7 @@ impl ActiveNodeSession {
                 let encode_us = f.encode_done_ts_us.saturating_sub(f.capture_ts_us);
                 let net_us = local_now_us.saturating_sub(f.encode_done_ts_us);
                 self.telemetry
-                    .record_stage_latencies(0, encode_us, net_us, 0, 0);
+                    .record_rx_transport_latencies(encode_us, net_us);
                 Ok(Some(NodeMediaEvent::Frame(f)))
             }
             Some(MediaRxEvent::ProtectedBlank(b)) => {

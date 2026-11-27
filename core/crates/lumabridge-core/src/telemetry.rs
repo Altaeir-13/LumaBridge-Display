@@ -316,6 +316,22 @@ impl LatencyPercentileTracker {
         self.end_to_end.push(e2e);
     }
 
+    /// Record receiver-observed upstream latencies before external hardware decode/present
+    /// timing is reported via [`Self::record_rx_decode_present`].
+    pub fn record_rx_transport_latencies(&mut self, encode_us: u64, network_us: u64) {
+        self.capture.push(0);
+        self.encode.push(encode_us);
+        self.network.push(network_us);
+        self.end_to_end.push(encode_us.saturating_add(network_us));
+    }
+
+    /// Record receiver-measured hardware decode and swapchain present durations without
+    /// inserting synthetic zero samples into `capture`/`encode`/`network`/`end_to_end`.
+    pub fn record_rx_decode_present(&mut self, decode_us: u64, present_us: u64) {
+        self.decode.push(decode_us);
+        self.present.push(present_us);
+    }
+
     #[must_use]
     pub fn summary(&self) -> SessionTelemetrySummary {
         SessionTelemetrySummary {

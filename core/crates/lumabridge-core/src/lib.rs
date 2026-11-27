@@ -7,6 +7,7 @@
 //! explicit owned-buffer release, cooperative shutdown without self-join,
 //! and panic containment boundaries (ADR-0004), plus M1.5 operational node orchestration.
 
+pub mod config;
 pub mod contracts;
 pub mod node;
 pub mod telemetry;

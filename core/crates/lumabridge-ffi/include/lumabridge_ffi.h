@@ -19,6 +19,8 @@
 
 #define LB_FFI_MAX_QUEUE_CAPACITY 256
 
+#define LB_MAX_RX_BUFFERED_EVENTS 8
+
 /**
  * Deterministic `uint32_t` return status across the C ABI.
  */
@@ -130,6 +132,27 @@ typedef uint32_t LbNodeTransportKind;
 #endif // __cplusplus
 
 /**
+ * Event discriminator for `LbReceiverMediaEvent::kind`.
+ */
+enum LbReceiverEventKind
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  LB_RECEIVER_EVENT_KIND_NONE = 0,
+  LB_RECEIVER_EVENT_KIND_VIDEO_FRAME = 1,
+  LB_RECEIVER_EVENT_KIND_PROTECTED_BLANK = 2,
+  LB_RECEIVER_EVENT_KIND_SESSION_CLOSED = 3,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum LbReceiverEventKind LbReceiverEventKind;
+#else
+typedef uint32_t LbReceiverEventKind;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
  * Opaque native handle owning a `CoreSession`.
  *
  * # Caller Contract & DLL/DSO Lifetime
@@ -142,12 +165,22 @@ typedef uint32_t LbNodeTransportKind;
 typedef struct LbCoreHandle LbCoreHandle;
 
 /**
+ * Opaque live streaming host session wrapping SPAKE2 + mTLS `ActiveNodeSession`.
+ */
+typedef struct LbHostSessionHandle LbHostSessionHandle;
+
+/**
  * Opaque native handle owning an isolated Tokio runtime and [`LumaBridgeNode`].
  *
  * # Caller Contract
  * - Destroyed strictly once via `lb_node_destroy`.
  */
 typedef struct LbNodeHandle LbNodeHandle;
+
+/**
+ * Opaque live receiver session accepting pairing, operational frames, clock sync, and telemetry.
+ */
+typedef struct LbReceiverSessionHandle LbReceiverSessionHandle;
 
 /**
  * Version and size header prefixed to all versioned C ABI structures.
@@ -316,6 +349,90 @@ typedef struct LbNodeTelemetry {
   uint64_t e2e_p95_us;
   uint64_t e2e_p99_us;
 } LbNodeTelemetry;
+
+/**
+ * Host connection configuration for `lb_node_host_connect` (M2 live LAN pipeline).
+ */
+typedef struct LbHostConnectConfig {
+  struct LbAbiHeader abi;
+  uint32_t transport_kind;
+  uint32_t reserved0;
+  uint8_t pair_addr_utf8[64];
+  uint8_t op_addr_utf8[64];
+  uint8_t pin_ascii[16];
+  uint8_t peer_device_id_hex[64];
+  uint32_t pair_addr_len;
+  uint32_t op_addr_len;
+  uint32_t pin_len;
+  uint32_t peer_device_id_len;
+  uint16_t width;
+  uint16_t height;
+  uint16_t fps_num;
+  uint16_t fps_den;
+  uint32_t initial_bitrate_bps;
+  uint32_t timeout_ms;
+} LbHostConnectConfig;
+
+/**
+ * Live network feedback signals exposed by `lb_node_host_get_telemetry`.
+ */
+typedef struct LbHostFeedback {
+  struct LbAbiHeader abi;
+  uint32_t recommended_bitrate_bps;
+  uint8_t force_idr_requested;
+  uint8_t session_closed;
+  uint16_t reserved0;
+} LbHostFeedback;
+
+/**
+ * Receiver listener startup configuration for `lb_node_receiver_start`.
+ */
+typedef struct LbReceiverStartConfig {
+  struct LbAbiHeader abi;
+  uint32_t transport_kind;
+  uint32_t bind_addr_len;
+  uint8_t bind_addr_utf8[64];
+  uint16_t width;
+  uint16_t height;
+  uint16_t fps_num;
+  uint16_t fps_den;
+  uint8_t enable_mdns;
+  uint8_t reserved0;
+  uint16_t reserved1;
+  uint32_t reserved2;
+} LbReceiverStartConfig;
+
+/**
+ * Bound listener endpoints and ephemeral pairing PIN emitted by `lb_node_receiver_get_endpoints`.
+ */
+typedef struct LbReceiverEndpoints {
+  struct LbAbiHeader abi;
+  uint8_t pair_addr_utf8[64];
+  uint8_t op_addr_utf8[64];
+  uint8_t device_id_hex[65];
+  uint8_t pin_ascii[17];
+  uint8_t reserved0[6];
+} LbReceiverEndpoints;
+
+/**
+ * Event delivered by `lb_node_receiver_poll_event`.
+ * When `kind == LB_RECEIVER_EVENT_KIND_VIDEO_FRAME`, caller MUST release `payload`
+ * exactly once via `lb_core_release_buffer(&evt.payload)`.
+ */
+typedef struct LbReceiverMediaEvent {
+  struct LbAbiHeader abi;
+  uint32_t kind;
+  uint16_t display_id;
+  uint16_t gop_id;
+  uint32_t frame_id;
+  uint32_t video_flags;
+  uint64_t capture_ts_us;
+  uint64_t encode_done_ts_us;
+  uint64_t session_id;
+  struct LbOwnedBuffer payload;
+  uint8_t force_idr_requested;
+  uint8_t padding_reserved[7];
+} LbReceiverMediaEvent;
 
 #ifdef __cplusplus
 extern "C" {
@@ -551,6 +668,129 @@ LbStatus lb_node_run_loopback_selftest(struct LbNodeHandle *host,
                                        uint32_t transport_kind,
                                        uint32_t frame_count,
                                        struct LbNodeTelemetry *out_telemetry);
+
+/**
+ * Pair via SPAKE2 and open a live Phase 2 mTLS operational streaming session as `Host`.
+ *
+ * # Safety
+ * - `node` must be a valid `Host` [`LbNodeHandle`].
+ * - `config` and `out_host` must be aligned, non-null pointers satisfying `LbAbiHeader`.
+ */
+LbStatus lb_node_host_connect(struct LbNodeHandle *node,
+                              const struct LbHostConnectConfig *config,
+                              struct LbHostSessionHandle **out_host);
+
+/**
+ * Submit one encoded H.264 Annex-B access unit from native Windows host over the live network session.
+ *
+ * `meta->flags & 0x01` marks IDR keyframe; `meta->flags & 0x02` marks `mirror_source`.
+ *
+ * # Safety
+ * - `host` must be a valid handle from [`lb_node_host_connect`].
+ * - `meta` must pass `LbAbiHeader` validation; `data` must be valid for `data_len` bytes.
+ */
+LbStatus lb_node_host_submit_h264(struct LbHostSessionHandle *host,
+                                  const struct LbEncodedFrameMeta *meta,
+                                  const uint8_t *data,
+                                  size_t data_len);
+
+/**
+ * Transmit reliable `ProtectedBlank` on `Channel 1` from native Windows host.
+ *
+ * # Safety
+ * `host` must be a valid handle from [`lb_node_host_connect`].
+ */
+LbStatus lb_node_host_send_protected_blank(struct LbHostSessionHandle *host,
+                                           uint16_t display_id,
+                                           uint32_t frame_id,
+                                           uint16_t gop_id,
+                                           uint64_t ts_us);
+
+/**
+ * Snapshot sanitized host telemetry and consume latched remote `ForceIdr` / bitrate feedback.
+ *
+ * # Safety
+ * `host` must be valid; `out_telemetry` and optional `out_feedback` must satisfy `LbAbiHeader`.
+ */
+LbStatus lb_node_host_get_telemetry(const struct LbHostSessionHandle *host,
+                                    struct LbNodeTelemetry *out_telemetry,
+                                    struct LbHostFeedback *out_feedback);
+
+/**
+ * Gracefully close and destroy an [`LbHostSessionHandle`].
+ *
+ * # Safety
+ * `host` must be null or a valid exclusive handle from [`lb_node_host_connect`].
+ */
+LbStatus lb_node_host_close(struct LbHostSessionHandle *host);
+
+/**
+ * Start a live background receiver accepting pairing + mTLS video stream frames into a bounded queue.
+ *
+ * # Safety
+ * - `node` must be a valid `Controller` [`LbNodeHandle`].
+ * - `config` and `out_rx` must be aligned, non-null, and satisfy `LbAbiHeader`.
+ */
+LbStatus lb_node_receiver_start(struct LbNodeHandle *node,
+                                const struct LbReceiverStartConfig *config,
+                                struct LbReceiverSessionHandle **out_rx);
+
+/**
+ * Copy bound endpoints, canonical device id hex, and ephemeral pairing PIN from [`LbReceiverSessionHandle`].
+ *
+ * # Safety
+ * `rx` and `out_endpoints` must be aligned non-null pointers satisfying `LbAbiHeader`.
+ */
+LbStatus lb_node_receiver_get_endpoints(const struct LbReceiverSessionHandle *rx,
+                                        struct LbReceiverEndpoints *out_endpoints);
+
+/**
+ * Poll the next decoded-ready compressed video frame, `ProtectedBlank`, or `SessionClosed` event.
+ *
+ * # Safety
+ * `rx` and `out_event` must be aligned non-null pointers satisfying `LbAbiHeader`.
+ */
+LbStatus lb_node_receiver_poll_event(struct LbReceiverSessionHandle *rx,
+                                     uint32_t timeout_ms,
+                                     struct LbReceiverMediaEvent *out_event);
+
+/**
+ * Record platform decode & display present latency microseconds into receiver telemetry histograms.
+ *
+ * # Safety
+ * `rx` must be a valid [`LbReceiverSessionHandle`].
+ */
+LbStatus lb_node_receiver_record_timing(struct LbReceiverSessionHandle *rx,
+                                        uint64_t decode_us,
+                                        uint64_t present_us);
+
+/**
+ * Snapshot sanitized telemetry counters/percentiles from [`LbReceiverSessionHandle`].
+ *
+ * # Safety
+ * `rx` and `out_telemetry` must be aligned non-null pointers satisfying `LbAbiHeader`.
+ */
+LbStatus lb_node_receiver_get_telemetry(const struct LbReceiverSessionHandle *rx,
+                                        struct LbNodeTelemetry *out_telemetry);
+
+/**
+ * Export privacy-sanitized JSON telemetry from [`LbReceiverSessionHandle`].
+ *
+ * # Safety
+ * `out_buf` must be writable for `out_cap` bytes; `out_written` must be aligned and writable.
+ */
+LbStatus lb_node_receiver_export_telemetry_json(const struct LbReceiverSessionHandle *rx,
+                                                uint8_t *out_buf,
+                                                size_t out_cap,
+                                                size_t *out_written);
+
+/**
+ * Stop and destroy an [`LbReceiverSessionHandle`], releasing any queued unread buffers cleanly.
+ *
+ * # Safety
+ * `rx` must be null or a valid exclusive handle from [`lb_node_receiver_start`].
+ */
+LbStatus lb_node_receiver_stop(struct LbReceiverSessionHandle *rx);
 
 #ifdef __cplusplus
 }  // extern "C"

@@ -1,0 +1,124 @@
+name: M2 Linux Receiver & Real H264 E2E CI
+
+on:
+  pull_request:
+    branches: [dev]
+  push:
+    branches: [dev, 'feature/m2-*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-m2-receiver:
+    name: Linux M2 C++20 Receiver Build, Unit Tests & Two-Process H264 E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install Linux M2 C++20, FFmpeg, SDL2, VA-API, and Xvfb dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build pkg-config g++ ffmpeg xvfb \
+            libavcodec-dev libavutil-dev libswscale-dev \
+            libsdl2-dev libva-dev libx11-dev libxext-dev
+
+      - name: Ensure pinned Rust toolchain 1.100.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install 1.100.0 --profile minimal --component rustfmt,clippy
+          rustup default 1.100.0
+          rustc --version
+          cargo --version
+
+      - name: Build release liblumabridge_ffi.so and lumabridge_node binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cd core
+          cargo build --locked --release -p lumabridge-ffi
+          cargo build --locked --release -p lumabridge-core --bin lumabridge_node
+
+      - name: Build linux/receiver C++20 (-Wall -Wextra -Werror) and run unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S linux/receiver -B "${RUNNER_TEMP}/rx-build" -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build "${RUNNER_TEMP}/rx-build"
+          "${RUNNER_TEMP}/rx-build/lumabridge-linux-receiver-tests"
+
+      - name: Run live two-process 1080p60 H.264 Annex-B E2E under Xvfb (QUIC & TCP+TLS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK_DIR="${RUNNER_TEMP}/m2-linux-e2e"
+          mkdir -p "$WORK_DIR"
+          SAMPLE_H264="${WORK_DIR}/sample_1080p60.h264"
+          ffmpeg -y -f lavfi -i testsrc2=size=1920x1080:rate=60 -t 0.6 \
+            -c:v libx264 -profile:v high -tune zerolatency -g 15 -bf 0 \
+            -pix_fmt yuv420p -f h264 "$SAMPLE_H264" >/dev/null 2>&1
+
+          RX_BIN="${RUNNER_TEMP}/rx-build/lumabridge-linux-receiver"
+          TX_BIN="core/target/release/lumabridge_node"
+
+          for TRANS in quic-datagram tcp-tls; do
+            RDV="${WORK_DIR}/rdv_${TRANS}.txt"
+            RX_JSON="${WORK_DIR}/rx_${TRANS}.json"
+            TX_JSON="${WORK_DIR}/tx_${TRANS}.json"
+            rm -f "$RDV" "$RX_JSON" "$TX_JSON"
+
+            xvfb-run -a -s "-screen 0 1920x1080x24" \
+              "$RX_BIN" --transport "$TRANS" --bind 127.0.0.1:0 --windowed --overlay \
+              --allow-sw-fallback --max-frames 30 --endpoint-out "$RDV" --json-report "$RX_JSON" &
+            RX_PID=$!
+
+            for _ in $(seq 1 80); do
+              if [ -s "$RDV" ] && [ "$(tr '|' '\n' < "$RDV" | wc -l)" -ge 4 ]; then
+                break
+              fi
+              sleep 0.1
+            done
+
+            "$TX_BIN" --mode host --transport "$TRANS" --rendezvous-in "$RDV" \
+              --h264-annexb-file "$SAMPLE_H264" --frames 30 --fps 60 --send-blank-end \
+              --json-report "$TX_JSON"
+
+            wait "$RX_PID"
+            cat "$RX_JSON"
+            python3 - "$RX_JSON" <<'PY'
+          import json, sys
+          with open(sys.argv[1], 'r', encoding='utf-8') as f:
+              data = json.load(f)
+          assert data['frames_decoded'] >= 20, f"expected >=20 decoded frames: {data}"
+          assert data['decode_errors'] == 0, f"decode_errors != 0: {data}"
+          assert data['protected_blanks_rendered'] >= 1, f"ProtectedBlank not rendered: {data}"
+          assert data['core_telemetry']['frames_delivered'] >= 25, f"low delivery: {data}"
+          assert data['core_telemetry']['protected_blanks'] >= 1, f"missing blank telemetry: {data}"
+          print("[PASS] Verified Linux Receiver E2E JSON telemetry.")
+          PY
+          done
+
+      - name: Upload Linux M2 E2E telemetry reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-m2-receiver-e2e-reports
+          path: ${{ runner.temp }}/m2-linux-e2e/*.json
+          if-no-files-found: ignore
+          retention-days: 14

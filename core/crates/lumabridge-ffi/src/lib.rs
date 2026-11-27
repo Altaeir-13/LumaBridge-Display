@@ -387,7 +387,7 @@ extern "C" fn lb_ffi_release_rust_vec(
     record_rust_buffer_released();
 }
 
-fn alloc_rust_owned_buffer(bytes: Vec<u8>) -> LbOwnedBuffer {
+pub(crate) fn alloc_rust_owned_buffer(bytes: Vec<u8>) -> LbOwnedBuffer {
     let data = bytes.as_ptr();
     let len = bytes.len();
     let capacity = bytes.capacity();

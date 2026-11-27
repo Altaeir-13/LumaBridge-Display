@@ -40,11 +40,15 @@ struct CliArgs {
     transport: TransportKind,
     bind_addr: SocketAddr,
     pair_port_out: Option<PathBuf>,
+    rendezvous_in: Option<PathBuf>,
     pair_endpoint: Option<SocketAddr>,
+    op_endpoint: Option<SocketAddr>,
     peer_device_hex: Option<String>,
     pin: String,
     frames: u32,
     fps: u32,
+    h264_annexb_file: Option<PathBuf>,
+    send_blank_end: bool,
     json_report: Option<PathBuf>,
 }
 
@@ -109,15 +113,23 @@ fn parse_args() -> Result<CliArgs, NodeError> {
     let mut transport = TransportKind::QuicDatagram;
     let mut bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("valid loopback literal");
     let mut pair_port_out = None;
+    let mut rendezvous_in = None;
     let mut pair_endpoint = None;
+    let mut op_endpoint = None;
     let mut peer_device_hex = None;
     let mut pin = String::from("04291738");
     let mut frames = 180u32;
     let mut fps = 60u32;
+    let mut h264_annexb_file = None;
+    let mut send_blank_end = false;
     let mut json_report = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
+        if flag == "--send-blank-end" {
+            send_blank_end = true;
+            continue;
+        }
         let val = it
             .next()
             .ok_or(NodeError::InvalidConfig("missing value for CLI flag"))?;
@@ -143,11 +155,18 @@ fn parse_args() -> Result<CliArgs, NodeError> {
                     .map_err(|_| NodeError::InvalidConfig("invalid --bind SocketAddr"))?;
             }
             "--endpoint-out" => pair_port_out = Some(PathBuf::from(val)),
+            "--rendezvous-in" => rendezvous_in = Some(PathBuf::from(val)),
             "--connect" => {
                 pair_endpoint = Some(
                     val.parse()
                         .map_err(|_| NodeError::InvalidConfig("invalid --connect SocketAddr"))?,
                 );
+            }
+            "--op-connect" => {
+                op_endpoint =
+                    Some(val.parse().map_err(|_| {
+                        NodeError::InvalidConfig("invalid --op-connect SocketAddr")
+                    })?);
             }
             "--peer-device-hex" => peer_device_hex = Some(val),
             "--pin" => pin = val,
@@ -161,6 +180,7 @@ fn parse_args() -> Result<CliArgs, NodeError> {
                     .parse()
                     .map_err(|_| NodeError::InvalidConfig("invalid --fps u32"))?;
             }
+            "--h264-annexb-file" => h264_annexb_file = Some(PathBuf::from(val)),
             "--json-report" => json_report = Some(PathBuf::from(val)),
             _ => return Err(NodeError::InvalidConfig("unknown CLI argument")),
         }
@@ -171,18 +191,22 @@ fn parse_args() -> Result<CliArgs, NodeError> {
         transport,
         bind_addr,
         pair_port_out,
+        rendezvous_in,
         pair_endpoint,
+        op_endpoint,
         peer_device_hex,
         pin,
         frames,
         fps: fps.max(1),
+        h264_annexb_file,
+        send_blank_end,
         json_report,
     })
 }
 
 #[allow(clippy::too_many_lines)]
 async fn run_receiver(args: CliArgs) -> Result<SessionTelemetrySummary, NodeError> {
-    let now = now_unix();
+    let startup_now = now_unix();
     let mut rng = CheckedOsCryptoRng::preflight()?;
     let node = LumaBridgeNode::generate(
         NodeConfig {
@@ -200,13 +224,13 @@ async fn run_receiver(args: CliArgs) -> Result<SessionTelemetrySummary, NodeErro
             max_connections: 8,
         },
         &mut rng,
-        now,
-        3600,
+        startup_now.saturating_sub(300),
+        7_200,
     )?;
 
     let pin_window = PinPairingWindow::new();
     let _ = PinSecret::new(&args.pin)?;
-    let generated_pin = pin_window.open_with_new_pin(&mut rng, now)?;
+    let generated_pin = pin_window.open_with_new_pin(&mut rng, now_unix())?;
     let pair_srv = node
         .bind_server(args.transport, args.bind_addr, true)
         .await?;
@@ -225,24 +249,57 @@ async fn run_receiver(args: CliArgs) -> Result<SessionTelemetrySummary, NodeErro
         let tmp_path = out_path.with_extension("tmp");
         std::fs::write(&tmp_path, ready_line.as_bytes())
             .map_err(|_| NodeError::InvalidConfig("failed writing --endpoint-out temp file"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
+        }
         std::fs::rename(&tmp_path, out_path)
             .map_err(|_| NodeError::InvalidConfig("failed finalizing --endpoint-out"))?;
     } else {
         println!("READY {ready_line}");
     }
 
-    let pair_link = pair_srv.accept_link(LUMABRIDGE_PAIR_ALPN_V1, now).await?;
-    node.accept_pairing_over_link(pair_link, Some(&pin_window), None, now, 1_000, |p| {
-        HumanApprovalDecision::Approve {
-            pairing_attempt_id: p.pairing_attempt_id,
-            peer_device_id: p.peer_device_id,
-            granted_base_perms: Permissions::EXTEND_DISPLAY,
+    let pair_clock = Instant::now();
+    loop {
+        if pin_window.remaining_attempts(now_unix()) == 0 {
+            return Err(NodeError::Security(
+                lumabridge_security::error::SecurityError::PairingState(
+                    "PIN pairing attempts exhausted",
+                ),
+            ));
         }
-    })
-    .await?;
+        let pair_now = now_unix();
+        let Ok(pair_link) = pair_srv
+            .accept_link(LUMABRIDGE_PAIR_ALPN_V1, pair_now)
+            .await
+        else {
+            continue;
+        };
+        let now_ms = u64::try_from(pair_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if node
+            .accept_pairing_over_link(
+                pair_link,
+                Some(&pin_window),
+                None,
+                now_unix(),
+                now_ms,
+                |p| HumanApprovalDecision::Approve {
+                    pairing_attempt_id: p.pairing_attempt_id,
+                    peer_device_id: p.peer_device_id,
+                    granted_base_perms: Permissions::EXTEND_DISPLAY,
+                },
+            )
+            .await
+            .is_ok()
+        {
+            break;
+        }
+    }
     pair_srv.close();
 
-    let op_link = op_srv.accept_link(LUMABRIDGE_ALPN_V1, now).await?;
+    let op_now = now_unix();
+    let op_link = op_srv.accept_link(LUMABRIDGE_ALPN_V1, op_now).await?;
     let mut session = node
         .accept_operational_session(
             op_link,
@@ -262,7 +319,7 @@ async fn run_receiver(args: CliArgs) -> Result<SessionTelemetrySummary, NodeErro
                     capture_mode: CaptureMode::WindowsIddVirtualMonitor,
                 }]
             },
-            now,
+            now_unix(),
         )
         .await?;
 
@@ -277,7 +334,7 @@ async fn run_receiver(args: CliArgs) -> Result<SessionTelemetrySummary, NodeErro
             Ok(Some(ControlMessage::SessionClose(_))) => break,
             Ok(Some(msg)) => {
                 let _ = session
-                    .handle_control_or_feedback(msg, ctrl_us, now)
+                    .handle_control_or_feedback(msg, ctrl_us, now_unix())
                     .await?;
             }
             Ok(None) => {}
@@ -309,7 +366,9 @@ async fn run_receiver(args: CliArgs) -> Result<SessionTelemetrySummary, NodeErro
             match session.try_recv_feedback().await {
                 Ok(Some(msg)) => {
                     let fb_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(0);
-                    let _ = session.handle_control_or_feedback(msg, fb_us, now).await?;
+                    let _ = session
+                        .handle_control_or_feedback(msg, fb_us, now_unix())
+                        .await?;
                 }
                 Ok(None) => break,
                 Err(NodeError::Transport(
@@ -327,7 +386,7 @@ async fn run_receiver(args: CliArgs) -> Result<SessionTelemetrySummary, NodeErro
 
 #[allow(clippy::too_many_lines)]
 async fn run_host(args: CliArgs) -> Result<SessionTelemetrySummary, NodeError> {
-    let now = now_unix();
+    let startup_now = now_unix();
     let mut rng = CheckedOsCryptoRng::preflight()?;
     let node = LumaBridgeNode::generate(
         NodeConfig {
@@ -345,16 +404,16 @@ async fn run_host(args: CliArgs) -> Result<SessionTelemetrySummary, NodeError> {
             max_connections: 8,
         },
         &mut rng,
-        now,
-        3600,
+        startup_now.saturating_sub(300),
+        7_200,
     )?;
 
-    let (pair_addr, op_addr, rx_device_id, pin_str) = if let Some(ref ep_path) = args.pair_port_out
-    {
+    let rdv_path = args.rendezvous_in.as_ref().or(args.pair_port_out.as_ref());
+    let (pair_addr, op_addr, rx_device_id, pin_str) = if let Some(ep_path) = rdv_path {
         let mut contents = String::new();
-        for _ in 0..100 {
+        for _ in 0..160 {
             if let Ok(raw) = std::fs::read_to_string(ep_path) {
-                if !raw.trim().is_empty() {
+                if raw.trim().split('|').count() == 4 {
                     contents = raw;
                     break;
                 }
@@ -377,35 +436,37 @@ async fn run_host(args: CliArgs) -> Result<SessionTelemetrySummary, NodeError> {
         )
     } else {
         let ep = args.pair_endpoint.ok_or(NodeError::InvalidConfig(
-            "--connect or --endpoint-out required",
+            "--connect, --rendezvous-in, or --endpoint-out required",
         ))?;
-        let hex = args
-            .peer_device_hex
-            .as_deref()
-            .ok_or(NodeError::InvalidConfig("--peer-device-hex required"))?;
-        (ep, ep, parse_device_id_hex(hex)?, args.pin.clone())
+        let op_ep = args.op_endpoint.unwrap_or(ep);
+        let hint_id = match args.peer_device_hex.as_deref() {
+            Some(hex) => parse_device_id_hex(hex)?,
+            None => DeviceId::from_bytes([0u8; 32]),
+        };
+        (ep, op_ep, hint_id, args.pin.clone())
     };
 
     let pin_secret = PinSecret::new(&pin_str)?;
-    node.pair_with_pin(
-        args.transport,
-        pair_addr,
-        rx_device_id,
-        &pin_secret,
-        now,
-        |p| HumanApprovalDecision::Approve {
-            pairing_attempt_id: p.pairing_attempt_id,
-            peer_device_id: p.peer_device_id,
-            granted_base_perms: Permissions::EXTEND_DISPLAY,
-        },
-    )
-    .await?;
+    let paired_rec = node
+        .pair_with_pin(
+            args.transport,
+            pair_addr,
+            rx_device_id,
+            &pin_secret,
+            now_unix(),
+            |p| HumanApprovalDecision::Approve {
+                pairing_attempt_id: p.pairing_attempt_id,
+                peer_device_id: p.peer_device_id,
+                granted_base_perms: Permissions::EXTEND_DISPLAY,
+            },
+        )
+        .await?;
 
     let mut session = node
         .connect_operational_session(
             args.transport,
             op_addr,
-            rx_device_id,
+            paired_rec.device_id,
             vec![DisplayRequest {
                 display_id: 0,
                 mode: DisplayMode::Extend,
@@ -420,9 +481,17 @@ async fn run_host(args: CliArgs) -> Result<SessionTelemetrySummary, NodeError> {
                 latency_profile: LatencyProfile::LowLatency,
             }],
             Permissions::EXTEND_DISPLAY,
-            now,
+            now_unix(),
         )
         .await?;
+
+    let annexb_access_units = if let Some(ref path) = args.h264_annexb_file {
+        let bytes = std::fs::read(path)
+            .map_err(|_| NodeError::InvalidConfig("failed reading --h264-annexb-file"))?;
+        split_annexb_access_units(&bytes)?
+    } else {
+        Vec::new()
+    };
 
     let start = Instant::now();
     let _ = session.send_clock_sync_ping(1, 0).await;
@@ -432,23 +501,29 @@ async fn run_host(args: CliArgs) -> Result<SessionTelemetrySummary, NodeError> {
     let mut force_idr = false;
 
     for fid in 1..=args.frames {
-        let is_idr = fid == 1 || fid % 60 == 1 || force_idr;
+        let (is_idr, payload) = if annexb_access_units.is_empty() {
+            let key = fid == 1 || fid % 60 == 1 || force_idr;
+            let mut buf = if key {
+                vec![0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x29]
+            } else {
+                vec![0x00, 0x00, 0x00, 0x01, 0x41, 0x9A]
+            };
+            buf.resize(
+                if key { 6_144 } else { 2_400 },
+                u8::try_from(fid & 0xFF).unwrap_or(0),
+            );
+            (key, buf)
+        } else {
+            let idx = usize::try_from(fid - 1).unwrap_or(0) % annexb_access_units.len();
+            let (au_key, ref au_bytes) = annexb_access_units[idx];
+            (au_key || fid == 1, au_bytes.clone())
+        };
         if is_idr && fid > 1 {
             gop_id = gop_id.saturating_add(1).max(1);
         }
         force_idr = false;
 
         let cap_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(0);
-        let mut payload = if is_idr {
-            vec![0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x29]
-        } else {
-            vec![0x00, 0x00, 0x00, 0x01, 0x41, 0x9A]
-        };
-        payload.resize(
-            if is_idr { 6_144 } else { 2_400 },
-            u8::try_from(fid & 0xFF).unwrap_or(0),
-        );
-
         let outcome = session
             .send_encoded_frame(OutboundVideoFrame {
                 session_id: session.session_id(),
@@ -473,7 +548,9 @@ async fn run_host(args: CliArgs) -> Result<SessionTelemetrySummary, NodeError> {
         }
         while let Some(msg) = session.try_recv_feedback().await? {
             let fb_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(0);
-            let _ = session.handle_control_or_feedback(msg, fb_us, now).await?;
+            let _ = session
+                .handle_control_or_feedback(msg, fb_us, now_unix())
+                .await?;
         }
         next_tick += interval;
         let now_i = Instant::now();
@@ -482,10 +559,90 @@ async fn run_host(args: CliArgs) -> Result<SessionTelemetrySummary, NodeError> {
         }
     }
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    if args.send_blank_end {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let blank_ts = u64::try_from(start.elapsed().as_micros()).unwrap_or(0);
+        let _ = session
+            .send_protected_blank(0, args.frames.saturating_add(1), gop_id, blank_ts)
+            .await;
+    }
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
     let summary = session.telemetry_summary();
     session.close(CloseReasonCode::UserRequested).await;
     Ok(summary)
+}
+
+fn find_nal_start(bytes: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut i = from;
+    while i + 3 < bytes.len() {
+        if bytes[i] == 0 && bytes[i + 1] == 0 {
+            if bytes[i + 2] == 1 {
+                return Some((i, 3));
+            }
+            if i + 4 < bytes.len() && bytes[i + 2] == 0 && bytes[i + 3] == 1 {
+                return Some((i, 4));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn split_annexb_access_units(bytes: &[u8]) -> Result<Vec<(bool, Vec<u8>)>, NodeError> {
+    if bytes.len() > 64 * 1024 * 1024 {
+        return Err(NodeError::InvalidConfig("h264 Annex-B file exceeds 64 MiB"));
+    }
+    let mut nal_offsets = Vec::new();
+    let mut pos = 0usize;
+    while let Some((offset, sc_len)) = find_nal_start(bytes, pos) {
+        nal_offsets.push((offset, sc_len));
+        pos = offset + sc_len;
+    }
+    if nal_offsets.is_empty() {
+        return Err(NodeError::InvalidConfig("no Annex-B NAL units found"));
+    }
+
+    let mut aus = Vec::new();
+    let mut current_au = Vec::new();
+    let mut current_key = false;
+    let mut has_vcl = false;
+
+    for idx in 0..nal_offsets.len() {
+        let (start, sc_len) = nal_offsets[idx];
+        let end = if idx + 1 < nal_offsets.len() {
+            nal_offsets[idx + 1].0
+        } else {
+            bytes.len()
+        };
+        if start + sc_len >= end {
+            continue;
+        }
+        let nal_type = bytes[start + sc_len] & 0x1F;
+        let is_vcl = (1..=5).contains(&nal_type);
+        let is_config_or_aud = matches!(nal_type, 6..=9);
+        if has_vcl && (is_vcl || is_config_or_aud) {
+            aus.push((current_key, core::mem::take(&mut current_au)));
+            current_key = false;
+            has_vcl = false;
+        }
+        if nal_type == 5 || nal_type == 7 {
+            current_key = true;
+        }
+        if is_vcl {
+            has_vcl = true;
+        }
+        current_au.extend_from_slice(&bytes[start..end]);
+    }
+    if !current_au.is_empty() {
+        aus.push((current_key, current_au));
+    }
+    if aus.is_empty() {
+        return Err(NodeError::InvalidConfig(
+            "no access units produced from Annex-B file",
+        ));
+    }
+    Ok(aus)
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
