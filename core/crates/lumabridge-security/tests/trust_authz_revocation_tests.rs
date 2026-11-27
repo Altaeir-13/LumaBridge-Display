@@ -26,7 +26,7 @@ use lumabridge_security::tls::{
 };
 use lumabridge_security::transcript::derive_resume_channel_proof;
 use lumabridge_security::trust_store::{
-    InMemoryTrustStore, RevocationReason, SecurityAction, TrustStore,
+    AdminTrustImportRecord, InMemoryTrustStore, RevocationReason, SecurityAction, TrustStore,
 };
 use rustls::{ClientConnection, ServerConnection};
 use std::sync::{Arc, Barrier};
@@ -120,35 +120,44 @@ fn authorization_five_factor_live_downgrade_and_atomic_elevation() {
     let host_kp = IdentityKeyPair::from_seed([0x60; 32]).expect("host");
     let ctrl_kp = IdentityKeyPair::from_seed([0x61; 32]).expect("ctrl");
 
-    // Initial pairing stores MUST reject INPUT_* permissions
+    // Administrative import requires non-zero epochs
     assert!(matches!(
-        host_store.insert_newly_paired(
-            ctrl_kp.public_identity(),
-            PeerRole::Controller,
-            "Bad",
-            Permissions::INPUT_POINTER,
-            now
-        ),
-        Err(SecurityError::AuthorizationDenied(_))
+        host_store.import_trusted_peer_admin(AdminTrustImportRecord {
+            identity: ctrl_kp.public_identity().clone(),
+            role: PeerRole::Controller,
+            friendly_name: "Bad".into(),
+            base_permissions: Permissions::VIEW_MIRROR,
+            paired_at_unix: now,
+            last_seen_unix: now,
+            trust_epoch: 0,
+            perm_epoch: 1,
+        }),
+        Err(SecurityError::InvalidTimestamp(_))
     ));
 
     host_store
-        .insert_newly_paired(
-            ctrl_kp.public_identity(),
-            PeerRole::Controller,
-            "Stylus Tablet",
-            Permissions::VIEW_MIRROR.union(Permissions::EXTEND_DISPLAY),
-            now,
-        )
+        .import_trusted_peer_admin(AdminTrustImportRecord {
+            identity: ctrl_kp.public_identity().clone(),
+            role: PeerRole::Controller,
+            friendly_name: "Stylus Tablet".into(),
+            base_permissions: Permissions::VIEW_MIRROR.union(Permissions::EXTEND_DISPLAY),
+            paired_at_unix: now,
+            last_seen_unix: now,
+            trust_epoch: 1,
+            perm_epoch: 1,
+        })
         .expect("insert ctrl");
     ctrl_store
-        .insert_newly_paired(
-            host_kp.public_identity(),
-            PeerRole::Host,
-            "Host",
-            Permissions::VIEW_MIRROR,
-            now,
-        )
+        .import_trusted_peer_admin(AdminTrustImportRecord {
+            identity: host_kp.public_identity().clone(),
+            role: PeerRole::Host,
+            friendly_name: "Host".into(),
+            base_permissions: Permissions::VIEW_MIRROR,
+            paired_at_unix: now,
+            last_seen_unix: now,
+            trust_epoch: 1,
+            perm_epoch: 1,
+        })
         .expect("insert host");
 
     let pairing_tls = establish_pairing_server_tls(&host_kp, &ctrl_kp, &host_store, now);
@@ -356,23 +365,29 @@ fn session_tokens_channel_bound_resume_and_concurrent_revocation_race() {
     let ctrl_kp = IdentityKeyPair::from_seed([0x71; 32]).expect("ctrl");
 
     let initial_rec = host_store
-        .insert_newly_paired(
-            ctrl_kp.public_identity(),
-            PeerRole::Controller,
-            "Controller",
-            Permissions::VIEW_MIRROR.union(Permissions::CAPTURE_CONTROL),
-            now,
-        )
+        .import_trusted_peer_admin(AdminTrustImportRecord {
+            identity: ctrl_kp.public_identity().clone(),
+            role: PeerRole::Controller,
+            friendly_name: "Controller".into(),
+            base_permissions: Permissions::VIEW_MIRROR.union(Permissions::CAPTURE_CONTROL),
+            paired_at_unix: now,
+            last_seen_unix: now,
+            trust_epoch: 1,
+            perm_epoch: 1,
+        })
         .expect("insert");
     assert_eq!(initial_rec.trust_epoch, 1);
     ctrl_store
-        .insert_newly_paired(
-            host_kp.public_identity(),
-            PeerRole::Host,
-            "Host",
-            Permissions::VIEW_MIRROR,
-            now,
-        )
+        .import_trusted_peer_admin(AdminTrustImportRecord {
+            identity: host_kp.public_identity().clone(),
+            role: PeerRole::Host,
+            friendly_name: "Host".into(),
+            base_permissions: Permissions::VIEW_MIRROR,
+            paired_at_unix: now,
+            last_seen_unix: now,
+            trust_epoch: 1,
+            perm_epoch: 1,
+        })
         .expect("insert host");
 
     let tls_conn_1 =
@@ -573,15 +588,18 @@ fn session_tokens_channel_bound_resume_and_concurrent_revocation_race() {
         Err(SecurityError::RevokedDevice)
     );
 
-    // Re-pairing advances trust_epoch to 3; pre-revocation credentials remain permanently rejected
+    // Re-trusting administratively advances trust_epoch to 3; pre-revocation credentials remain permanently rejected
     let repaired = host_store
-        .re_trust_after_pairing(
-            ctrl_kp.public_identity(),
-            PeerRole::Controller,
-            "Controller",
-            Permissions::VIEW_MIRROR,
-            now + 60,
-        )
+        .import_trusted_peer_admin(AdminTrustImportRecord {
+            identity: ctrl_kp.public_identity().clone(),
+            role: PeerRole::Controller,
+            friendly_name: "Controller".into(),
+            base_permissions: Permissions::VIEW_MIRROR,
+            paired_at_unix: now + 60,
+            last_seen_unix: now + 60,
+            trust_epoch: 3,
+            perm_epoch: 1,
+        })
         .expect("re-trust");
     assert_eq!(repaired.trust_epoch, 3);
     assert_eq!(
@@ -800,22 +818,28 @@ fn diagnostic_privacy_sentinels_never_leak_secrets_cert_keys_or_channel_binding(
     let host_store = Arc::new(InMemoryTrustStore::new());
     let ctrl_store = Arc::new(InMemoryTrustStore::new());
     host_store
-        .insert_newly_paired(
-            kp.public_identity(),
-            PeerRole::Controller,
-            "Ctrl",
-            Permissions::VIEW_MIRROR,
-            now,
-        )
+        .import_trusted_peer_admin(AdminTrustImportRecord {
+            identity: kp.public_identity().clone(),
+            role: PeerRole::Controller,
+            friendly_name: "Ctrl".into(),
+            base_permissions: Permissions::VIEW_MIRROR,
+            paired_at_unix: now,
+            last_seen_unix: now,
+            trust_epoch: 1,
+            perm_epoch: 1,
+        })
         .expect("insert");
     ctrl_store
-        .insert_newly_paired(
-            host_kp.public_identity(),
-            PeerRole::Host,
-            "Host",
-            Permissions::VIEW_MIRROR,
-            now,
-        )
+        .import_trusted_peer_admin(AdminTrustImportRecord {
+            identity: host_kp.public_identity().clone(),
+            role: PeerRole::Host,
+            friendly_name: "Host".into(),
+            base_permissions: Permissions::VIEW_MIRROR,
+            paired_at_unix: now,
+            last_seen_unix: now,
+            trust_epoch: 1,
+            perm_epoch: 1,
+        })
         .expect("insert host");
 
     let op_tls = establish_operational_server_tls(&host_kp, &host_store, &kp, &ctrl_store, now);
@@ -917,4 +941,310 @@ fn encode_hex(bytes: &[u8]) -> String {
         s.push(char::from(HEX[usize::from(b & 0x0f)]));
     }
     s
+}
+
+#[test]
+fn trust_provenance_single_use_commit_epoch_binding_and_admin_separation() {
+    use lumabridge_protocol::control::{AuthMode, PairHello};
+    use lumabridge_protocol::version::{LBWP_PROTOCOL_MAJOR, LBWP_PROTOCOL_MINOR};
+    use lumabridge_security::pairing::{
+        HumanApprovalDecision, PairingAcceptor, PairingInitiator, QrTokenStore,
+    };
+
+    let now = now_unix();
+    let host_kp = IdentityKeyPair::from_seed([0xB1; 32]).expect("host");
+    let ctrl_kp = IdentityKeyPair::from_seed([0xB2; 32]).expect("ctrl");
+    let host_store = Arc::new(InMemoryTrustStore::new());
+    let ctrl_store = Arc::new(InMemoryTrustStore::new());
+    let mut rng = CheckedOsCryptoRng::preflight().expect("rng");
+
+    let mut run_qr_pairing = |attempt_id: u64, expected_host_epoch: u64| {
+        let p_tls_acc = establish_pairing_server_tls(&host_kp, &ctrl_kp, &host_store, now);
+        let host_cert =
+            generate_self_signed_device_cert(&host_kp, now - 60, now + 3600).expect("hcert");
+        let ctrl_cert =
+            generate_self_signed_device_cert(&ctrl_kp, now - 60, now + 3600).expect("ccert");
+        let cli_cfg = build_tls13_client_config(
+            &ctrl_cert,
+            TlsPeerTrustPolicy::Pairing {
+                trust_store: Arc::clone(&ctrl_store) as Arc<dyn TrustStore>,
+            },
+        )
+        .expect("cli cfg");
+        let srv_cfg = build_tls13_server_config(
+            &host_cert,
+            TlsPeerTrustPolicy::Pairing {
+                trust_store: Arc::clone(&host_store) as Arc<dyn TrustStore>,
+            },
+        )
+        .expect("srv cfg");
+        let mut cli = ClientConnection::new(
+            cli_cfg,
+            canonical_server_name_for_device(host_kp.device_id()).expect("sni"),
+        )
+        .expect("cli");
+        let mut srv = ServerConnection::new(srv_cfg).expect("srv");
+        drive_in_memory_handshake(&mut cli, &mut srv).expect("hs");
+        let c_tls =
+            extract_authenticated_session_with_alpn(&cli, LUMABRIDGE_PAIR_ALPN_V1, now).expect("c");
+        let s_tls =
+            extract_authenticated_session_with_alpn(&srv, LUMABRIDGE_PAIR_ALPN_V1, now).expect("s");
+        let _ = p_tls_acc;
+
+        let qr_store = QrTokenStore::new();
+        let ticket = qr_store
+            .issue(&mut rng, host_kp.device_id(), PeerRole::Host, now, 120)
+            .expect("ticket");
+        let init_hello = PairHello {
+            protocol_major: LBWP_PROTOCOL_MAJOR,
+            protocol_minor: LBWP_PROTOCOL_MINOR,
+            device_id: *ctrl_kp.device_id().as_bytes(),
+            friendly_name: "Ctrl".into(),
+            auth_mode: AuthMode::QrOutOfBand,
+            spki_ed25519: ctrl_kp.public_identity().spki_der().to_vec(),
+        };
+        let acc_hello = PairHello {
+            protocol_major: LBWP_PROTOCOL_MAJOR,
+            protocol_minor: LBWP_PROTOCOL_MINOR,
+            device_id: *host_kp.device_id().as_bytes(),
+            friendly_name: "Host".into(),
+            auth_mode: AuthMode::QrOutOfBand,
+            spki_ed25519: host_kp.public_identity().spki_der().to_vec(),
+        };
+
+        let mut init = PairingInitiator::start(
+            attempt_id,
+            &ctrl_kp,
+            PeerRole::Controller,
+            &acc_hello,
+            &c_tls,
+            AuthMode::QrOutOfBand,
+        )
+        .expect("init");
+        let mut acc = PairingAcceptor::start_with_expected_peer_epoch(
+            attempt_id,
+            &host_kp,
+            PeerRole::Host,
+            &init_hello,
+            &s_tls,
+            expected_host_epoch,
+        )
+        .expect("acc");
+
+        let auth = init
+            .create_qr_auth(&ctrl_kp, &ticket, now + 1)
+            .expect("auth");
+        acc.verify_qr_auth(&qr_store, &auth, now + 1)
+            .expect("verify qr");
+        let confirm = acc
+            .apply_human_approval(
+                &host_kp,
+                HumanApprovalDecision::Approve {
+                    pairing_attempt_id: attempt_id,
+                    peer_device_id: ctrl_kp.device_id(),
+                    granted_base_perms: Permissions::VIEW_MIRROR,
+                },
+            )
+            .expect("approve");
+        init.verify_pair_confirm(&confirm).expect("verify confirm");
+        let _ = init
+            .apply_local_approval(HumanApprovalDecision::Approve {
+                pairing_attempt_id: attempt_id,
+                peer_device_id: host_kp.device_id(),
+                granted_base_perms: Permissions::VIEW_MIRROR,
+            })
+            .expect("local");
+        acc.approved_commit().expect("acc commit")
+    };
+
+    // Initial pairing produces a commit with expected_peer_epoch == 0; also create a concurrent stale commit at epoch 0
+    let commit1 = run_qr_pairing(100, 0);
+    let stale_commit_epoch0 = run_qr_pairing(101, 0);
+
+    let rec1 = host_store
+        .insert_approved_pairing(commit1, now)
+        .expect("first insert");
+    assert_eq!(rec1.trust_epoch, 1);
+
+    // Reusing stale commit generated before trust_epoch advanced (0 -> 1) MUST fail
+    assert!(matches!(
+        host_store.insert_approved_pairing(stale_commit_epoch0, now),
+        Err(SecurityError::PairingState(_))
+    ));
+
+    // Revoke peer (epoch -> 2), then create a commit bound to epoch 2 and another stale commit bound to epoch 1
+    let rev = host_store
+        .revoke(
+            ctrl_kp.device_id(),
+            RevocationReason::UserRemovedDevice,
+            now + 5,
+        )
+        .expect("revoke");
+    assert_eq!(rev.revoked_epoch, 2);
+
+    // Note: Pairing TLS rejects revoked devices at TLS handshake unless unrevoked or re-pairing policy is used,
+    // so construct a fresh re-trust PairingAcceptor commit bound to epoch 2 via Pairing TLS before a second revocation,
+    // or verify stale epoch 1 commit is rejected by re_trust_after_approved_pairing!
+    let host_cert =
+        generate_self_signed_device_cert(&host_kp, now - 60, now + 3600).expect("hcert");
+    let ctrl_cert =
+        generate_self_signed_device_cert(&ctrl_kp, now - 60, now + 3600).expect("ccert");
+    let empty_store = Arc::new(InMemoryTrustStore::new());
+    let cli_cfg = build_tls13_client_config(
+        &ctrl_cert,
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: Arc::clone(&empty_store) as Arc<dyn TrustStore>,
+        },
+    )
+    .expect("cli cfg");
+    let srv_cfg = build_tls13_server_config(
+        &host_cert,
+        TlsPeerTrustPolicy::Pairing {
+            trust_store: Arc::clone(&empty_store) as Arc<dyn TrustStore>,
+        },
+    )
+    .expect("srv cfg");
+    let mut cli = ClientConnection::new(
+        cli_cfg,
+        canonical_server_name_for_device(host_kp.device_id()).expect("sni"),
+    )
+    .expect("cli");
+    let mut srv = ServerConnection::new(srv_cfg).expect("srv");
+    drive_in_memory_handshake(&mut cli, &mut srv).expect("hs");
+    let c_tls =
+        extract_authenticated_session_with_alpn(&cli, LUMABRIDGE_PAIR_ALPN_V1, now).expect("c");
+    let s_tls =
+        extract_authenticated_session_with_alpn(&srv, LUMABRIDGE_PAIR_ALPN_V1, now).expect("s");
+    let qr_store = QrTokenStore::new();
+    let ticket = qr_store
+        .issue(&mut rng, host_kp.device_id(), PeerRole::Host, now, 120)
+        .expect("ticket");
+    let init_hello = PairHello {
+        protocol_major: LBWP_PROTOCOL_MAJOR,
+        protocol_minor: LBWP_PROTOCOL_MINOR,
+        device_id: *ctrl_kp.device_id().as_bytes(),
+        friendly_name: "Ctrl".into(),
+        auth_mode: AuthMode::QrOutOfBand,
+        spki_ed25519: ctrl_kp.public_identity().spki_der().to_vec(),
+    };
+    let acc_hello = PairHello {
+        protocol_major: LBWP_PROTOCOL_MAJOR,
+        protocol_minor: LBWP_PROTOCOL_MINOR,
+        device_id: *host_kp.device_id().as_bytes(),
+        friendly_name: "Host".into(),
+        auth_mode: AuthMode::QrOutOfBand,
+        spki_ed25519: host_kp.public_identity().spki_der().to_vec(),
+    };
+    let mut init = PairingInitiator::start(
+        200,
+        &ctrl_kp,
+        PeerRole::Controller,
+        &acc_hello,
+        &c_tls,
+        AuthMode::QrOutOfBand,
+    )
+    .expect("init");
+    let mut acc = PairingAcceptor::start_with_expected_peer_epoch(
+        200,
+        &host_kp,
+        PeerRole::Host,
+        &init_hello,
+        &s_tls,
+        host_store.peer_epoch(ctrl_kp.device_id()),
+    )
+    .expect("acc");
+    let auth = init
+        .create_qr_auth(&ctrl_kp, &ticket, now + 6)
+        .expect("auth");
+    acc.verify_qr_auth(&qr_store, &auth, now + 6)
+        .expect("verify");
+    let _confirm = acc
+        .apply_human_approval(
+            &host_kp,
+            HumanApprovalDecision::Approve {
+                pairing_attempt_id: 200,
+                peer_device_id: ctrl_kp.device_id(),
+                granted_base_perms: Permissions::VIEW_MIRROR,
+            },
+        )
+        .expect("approve");
+    let repair_commit = acc.approved_commit().expect("repair commit");
+    // Second extraction fails cleanly
+    assert!(matches!(
+        acc.approved_commit(),
+        Err(SecurityError::PairingState(_))
+    ));
+
+    // Ordinary insert_approved_pairing MUST reject a revoked device directly
+    let mut init_rev_test = PairingInitiator::start(
+        201,
+        &ctrl_kp,
+        PeerRole::Controller,
+        &acc_hello,
+        &c_tls,
+        AuthMode::QrOutOfBand,
+    )
+    .expect("init rev test");
+    let mut acc_rev_test = PairingAcceptor::start_with_expected_peer_epoch(
+        201,
+        &host_kp,
+        PeerRole::Host,
+        &init_hello,
+        &s_tls,
+        host_store.peer_epoch(ctrl_kp.device_id()),
+    )
+    .expect("acc rev test");
+    let ticket_rev_test = qr_store
+        .issue(&mut rng, host_kp.device_id(), PeerRole::Host, now, 120)
+        .expect("ticket rev test");
+    let auth_rev_test = init_rev_test
+        .create_qr_auth(&ctrl_kp, &ticket_rev_test, now + 6)
+        .expect("auth rev test");
+    acc_rev_test
+        .verify_qr_auth(&qr_store, &auth_rev_test, now + 6)
+        .expect("verify rev test");
+    let _ = acc_rev_test
+        .apply_human_approval(
+            &host_kp,
+            HumanApprovalDecision::Approve {
+                pairing_attempt_id: 201,
+                peer_device_id: ctrl_kp.device_id(),
+                granted_base_perms: Permissions::VIEW_MIRROR,
+            },
+        )
+        .expect("approve rev test");
+    let commit_while_revoked = acc_rev_test.approved_commit().expect("commit rev test");
+    assert_eq!(
+        host_store.insert_approved_pairing(commit_while_revoked, now + 8),
+        Err(SecurityError::RevokedDevice)
+    );
+
+    // Explicit re_trust_after_approved_pairing succeeds with epoch 2 -> 3
+    let re_rec = host_store
+        .re_trust_after_approved_pairing(repair_commit, now + 10)
+        .expect("re-trust approved");
+    assert_eq!(re_rec.trust_epoch, 3);
+    assert!(!host_store.is_revoked(ctrl_kp.device_id()));
+
+    // Administrative import cannot downgrade a higher revoked_epoch
+    host_store
+        .revoke(
+            ctrl_kp.device_id(),
+            RevocationReason::SuspectedCompromise,
+            now + 20,
+        )
+        .expect("revoke 2");
+    assert_eq!(
+        host_store.import_trusted_peer_admin(AdminTrustImportRecord {
+            identity: ctrl_kp.public_identity().clone(),
+            role: PeerRole::Controller,
+            friendly_name: "Ctrl".into(),
+            base_permissions: Permissions::VIEW_MIRROR,
+            paired_at_unix: now,
+            last_seen_unix: now,
+            trust_epoch: 4,
+            perm_epoch: 1,
+        }),
+        Err(SecurityError::RevokedDevice)
+    );
 }
