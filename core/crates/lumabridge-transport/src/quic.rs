@@ -421,6 +421,26 @@ impl QuicPeerLink {
         ))
     }
 
+    /// Non-blocking poll for the next reliable frame arriving on `channel` (zero OS timer allocation).
+    pub async fn try_recv_stream_frame(
+        &self,
+        channel: ChannelId,
+    ) -> Result<Option<RawStreamFrame>, TransportError> {
+        let mut rx = match channel {
+            ChannelId::Control => self.rx_control.lock().await,
+            ChannelId::Media => self.rx_media_stream.lock().await,
+            ChannelId::Feedback => self.rx_feedback.lock().await,
+            ChannelId::Input => self.rx_input.lock().await,
+        };
+        match rx.try_recv() {
+            Ok(frame) => Ok(Some(frame)),
+            Err(mpsc::error::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::error::TryRecvError::Disconnected) => Err(TransportError::ConnectionClosed(
+                "QUIC stream receiver closed",
+            )),
+        }
+    }
+
     /// Non-blocking poll for reliable stream records (used to prioritize `ProtectedBlank` over datagrams).
     pub async fn try_recv_media_stream_frame(&self) -> Option<RawStreamFrame> {
         self.rx_media_stream.lock().await.try_recv().ok()
@@ -437,6 +457,15 @@ impl QuicPeerLink {
             c.datagrams_received = c.datagrams_received.saturating_add(1);
         }
         Ok(bytes.to_vec())
+    }
+
+    /// Finish the outbound control stream and await peer ACK/stop (bounded) before pairing teardown.
+    pub async fn flush_control_and_finish(&self) {
+        let stream_opt = self.tx_control.lock().await.take();
+        if let Some(mut stream) = stream_opt {
+            let _ = stream.finish();
+            let _ = tokio::time::timeout(Duration::from_millis(150), stream.stopped()).await;
+        }
     }
 
     /// Close immediately (e.g., on peer revocation, fatal framing error, or drop).

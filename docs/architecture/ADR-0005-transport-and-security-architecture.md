@@ -3,12 +3,13 @@
 ## Metadados
 
 - **ID:** ADR-0005
-- **Status:** Proposed *(sujeita a benchmarks comparativos de transporte e testes formais de handshake/segurança em M1)*
-- **Data:** 2026-11-23
+- **Status:** Accepted *(qualificada empiricamente em M1.3.1, M1.4 e M1.5; sujeita ao gate de aprovação humana externa dos PRs empilhados #41/#43/#44 em `dev` e validação adicional em LAN real / `tc netem` na `M2`)*
+- **Data:** 2026-11-23 *(atualizada em 2026-11-27 para fechamento da M1)*
 - **Relações:**
   - Materializa os requisitos de conectividade e segurança da [ADR-0003 - Visão oficial da plataforma universal](./ADR-0003-universal-platform-vision.md).
   - Opera sobre a fronteira definida na [ADR-0004 - Linguagem do núcleo e fronteiras nativas](./ADR-0004-core-language-and-native-boundaries.md).
-  - Especificação detalhada de mensagens em [wire-protocol-v1.md](../protocol/wire-protocol-v1.md) (`Draft`).
+  - Especificação detalhada de mensagens em [wire-protocol-v1.md](../protocol/wire-protocol-v1.md) (`v1.0`).
+  - Relatórios experimentais em [m1-4-transport-report.md](../transport/m1-4-transport-report.md) e [m1-5-integration-report.md](./m1-5-integration-report.md).
 
 ## Contexto
 
@@ -31,7 +32,7 @@ Duas falhas arquiteturais comuns precisam ser evitadas explicitamente desde o pr
   - Destinado a ambientes corporativos/acadêmicos que bloqueiam tráfego UDP e a transportes estritamente orientados a fluxo TCP, como túneis de desenvolvimento `adb reverse` / `adb forward`.
   - Mantém exatamente o mesmo contrato lógico de mensagens e proteção TLS 1.3 do protocolo, mas exige política ainda mais agressiva de descarte **antes da escrita no socket** quando a janela TCP congestionar.
 
-> **Status experimental:** A escolha entre QUIC puro com datagramas, QUIC com *unidirectional streams* por quadro/GOP e TCP/TLS 1.3 permanece `Proposed` até execução de testes comparativos reais (Ethernet limpo, Wi-Fi com jitter/perda simulada de 0,5%–5% e enlace USB).
+> **Status experimental:** A escolha híbrida com `QUIC / TLS 1.3` (datagramas RFC 9221 + streams confiáveis de controle/feedback/`ProtectedBlank`) e fallback `TCP / TLS 1.3` foi qualificada empiricamente nos benchmarks e testes da `M1.4` e `M1.5` ([m1-4-transport-report.md](../transport/m1-4-transport-report.md) e [m1-5-integration-report.md](./m1-5-integration-report.md)), promovendo esta ADR para `Accepted`; medições complementares em LAN física (`tc netem` 0,5%–5%) seguem no escopo da `M2`.
 
 ### 1.2 Framing, MTU, fragmentação e remontagem
 

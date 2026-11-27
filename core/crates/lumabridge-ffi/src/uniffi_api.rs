@@ -185,6 +185,26 @@ impl FfiPocSession {
     }
 }
 
+/// Privacy-sanitized operational node telemetry record exposed over `UniFFI` (`M1.5`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct FfiNodeTelemetry {
+    pub frames_sent: u64,
+    pub frames_delivered: u64,
+    pub dropped_frames: u64,
+    pub protected_blanks: u64,
+}
+
+/// Supported wire protocol version advertised through `UniFFI`.
+#[must_use]
+#[uniffi::export]
+pub fn ffi_node_protocol_version() -> String {
+    format!(
+        "{}.{}",
+        lumabridge_protocol::version::LBWP_PROTOCOL_MAJOR,
+        lumabridge_protocol::version::LBWP_PROTOCOL_MINOR
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +212,7 @@ mod tests {
     #[test]
     fn uniffi_session_roundtrip() {
         assert_eq!(ffi_poc_abi_version_string(), "1.0");
+        assert_eq!(ffi_node_protocol_version(), "1.0");
         let session = FfiPocSession::new(8, 1024).expect("create");
         session.start().expect("start");
         session

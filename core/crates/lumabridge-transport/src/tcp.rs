@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, watch, Mutex as AsyncMutex, Notify};
+use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, Notify};
 use tokio::task::JoinHandle;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
@@ -190,6 +190,7 @@ pub struct TcpPeerLink {
     tx_input: mpsc::Sender<Vec<u8>>,
     tx_protected_blank: mpsc::Sender<Vec<u8>>,
     tx_media: mpsc::Sender<Vec<u8>>,
+    tx_flush: mpsc::Sender<oneshot::Sender<()>>,
     rx_control: AsyncMutex<mpsc::Receiver<RawStreamFrame>>,
     rx_media_queue: Arc<StdMutex<BoundedMediaRxQueue>>,
     rx_media_notify: Arc<Notify>,
@@ -213,6 +214,7 @@ impl TcpPeerLink {
         let (tx_inp_out, mut rx_inp_out) = mpsc::channel::<Vec<u8>>(config.max_input_queue);
         let (tx_blank_out, mut rx_blank_out) = mpsc::channel::<Vec<u8>>(16);
         let (tx_media_out, mut rx_media_out) = mpsc::channel::<Vec<u8>>(media_queue_cap);
+        let (tx_flush_out, mut rx_flush_out) = mpsc::channel::<oneshot::Sender<()>>(16);
 
         let (tx_ctrl_in, rx_ctrl_in) = mpsc::channel(config.max_control_queue);
         let (tx_fb_in, rx_fb_in) = mpsc::channel(config.max_feedback_queue);
@@ -253,6 +255,11 @@ impl TcpPeerLink {
                             c.stream_media_records_sent = c.stream_media_records_sent.saturating_add(1);
                         }
                         b
+                    }
+                    Some(ack) = rx_flush_out.recv() => {
+                        let _ = writer.flush().await;
+                        let _ = ack.send(());
+                        continue;
                     }
                     else => break,
                 };
@@ -347,6 +354,7 @@ impl TcpPeerLink {
             tx_input: tx_inp_out,
             tx_protected_blank: tx_blank_out,
             tx_media: tx_media_out,
+            tx_flush: tx_flush_out,
             rx_control: AsyncMutex::new(rx_ctrl_in),
             rx_media_queue,
             rx_media_notify,
@@ -368,6 +376,14 @@ impl TcpPeerLink {
         self.counters
             .lock()
             .map_or_else(|_| TcpCounters::default(), |c| TcpCounters { ..*c })
+    }
+
+    /// Wait until all queued outbound frames on higher-priority queues have been written and flushed.
+    pub async fn flush_tx(&self) {
+        let (tx, rx) = oneshot::channel();
+        if self.tx_flush.send(tx).await.is_ok() {
+            let _ = tokio::time::timeout(Duration::from_millis(500), rx).await;
+        }
     }
 
     /// Encode and send a frame respecting channel priority (`ProtectedBlank` preempts normal media).
@@ -451,6 +467,38 @@ impl TcpPeerLink {
         rx.recv()
             .await
             .ok_or(TransportError::ConnectionClosed("TCP stream RX closed"))
+    }
+
+    /// Non-blocking poll for the next reliable frame arriving on `channel` (zero OS timer allocation).
+    pub async fn try_recv_stream_frame(
+        &self,
+        channel: ChannelId,
+    ) -> Result<Option<RawStreamFrame>, TransportError> {
+        if channel == ChannelId::Media {
+            let Ok(mut q) = self.rx_media_queue.lock() else {
+                return Err(TransportError::ConnectionClosed("TCP media queue poisoned"));
+            };
+            if let Some(frame) = q.buf.pop_front() {
+                return Ok(Some(frame));
+            }
+            if q.closed {
+                return Err(TransportError::ConnectionClosed("TCP media RX closed"));
+            }
+            return Ok(None);
+        }
+        let mut rx = match channel {
+            ChannelId::Control => self.rx_control.lock().await,
+            ChannelId::Feedback => self.rx_feedback.lock().await,
+            ChannelId::Input => self.rx_input.lock().await,
+            ChannelId::Media => unreachable!(),
+        };
+        match rx.try_recv() {
+            Ok(frame) => Ok(Some(frame)),
+            Err(mpsc::error::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                Err(TransportError::ConnectionClosed("TCP stream RX closed"))
+            }
+        }
     }
 
     pub fn close_immediately(&self) {

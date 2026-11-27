@@ -5,7 +5,11 @@
 //! Minimal M1.1 core runtime validating lifecycle state transitions,
 //! bounded FIFO buffering, deterministic backpressure, synchronous copy vs
 //! explicit owned-buffer release, cooperative shutdown without self-join,
-//! and panic containment boundaries (ADR-0004).
+//! and panic containment boundaries (ADR-0004), plus M1.5 operational node orchestration.
+
+pub mod contracts;
+pub mod node;
+pub mod telemetry;
 
 use std::collections::VecDeque;
 use std::panic::{self, AssertUnwindSafe};

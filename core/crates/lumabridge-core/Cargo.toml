@@ -4,8 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Minimal M1.1 proof-of-concept core runtime with bounded queues and explicit ownership."
+description = "LumaBridge shared session orchestration, pairing/authorization workflow, adaptive media contracts, and telemetry runtime."
 
 [features]
 default = []
 poc-fault-injection = []
+
+[dependencies]
+lumabridge-protocol = { version = "0.1.0", path = "../lumabridge-protocol" }
+lumabridge-security = { version = "0.1.0", path = "../lumabridge-security" }
+lumabridge-transport = { version = "0.1.0", path = "../lumabridge-transport" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
+zeroize = { version = "1.9.2", features = ["derive"] }

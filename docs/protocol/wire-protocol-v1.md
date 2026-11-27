@@ -1,8 +1,8 @@
 # Especificação do Protocolo de Rede LumaBridge (`LBWP v1`)
 
-> **Status do documento: `Draft` — Revisão Candidata à Estabilização (`M1.2` / `M1.2.1`)**
+> **Status do documento: `v1.0` — Estabilizado (`M1.2` – `M1.5`; aguardando gate de merge em `dev`)**
 >
-> Este documento especifica o protocolo binário **LumaBridge Wire Protocol (`LBWP v1`)** implementado pelo crate `lumabridge-protocol` (`M1.2`). Ele permanece em estado **`Draft` (revisão candidata à estabilização)** — **`LBWP v1.0` NÃO é declarado definitivamente congelado** nesta etapa enquanto segurança/identidade/autorização (`M1.3`: transcript de pareamento, TLS Exporter / channel binding, Trust Store, assinaturas SPKI e confirmação SPAKE2), transporte operacional (`M1.4`: `QUIC` / `TCP+TLS 1.3`, `DPLPMTUD`, descoberta e entrega confiável de `ProtectedBlank`) e integração operacional de sessões/componentes (`M1.5`) permanecerem pendentes.
+> Este documento especifica o protocolo binário **LumaBridge Wire Protocol (`LBWP v1.0`)** implementado em `core/crates/lumabridge-protocol` e integrado operacionalmente através de `lumabridge-security` (`M1.3`/`M1.3.1`), `lumabridge-transport` (`M1.4`) e `lumabridge-core`/`lumabridge-ffi` (`M1.5`). A compatibilidade binária de `LBWP 1.0` está congelada para o fluxo da `M2`, permanecendo a declaração formal de encerramento completo da `M1` condicionada ao gate humano de revisão/merge dos PRs empilhados em `dev`.
 >
 > **Separação estrita entre `LBWP`, `LBIF` e `C ABI`:**
 > - **`LBWP` (`v1.0`):** protocolo de rede multiplataforma independente de transporte (QUIC, TCP/TLS 1.3, futuro USB/WAN), implementado em `core/crates/lumabridge-protocol`.

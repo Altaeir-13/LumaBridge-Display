@@ -28,4 +28,9 @@ include = [
   "LbCoreMetrics",
   "LbGlobalResourceCounters",
   "LbAbiLayoutSignature",
+  "LbNodeHandle",
+  "LbNodeRole",
+  "LbNodeTransportKind",
+  "LbNodeConfig",
+  "LbNodeTelemetry",
 ]

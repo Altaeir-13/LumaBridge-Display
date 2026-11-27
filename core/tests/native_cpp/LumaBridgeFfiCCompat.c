@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "lumabridge_ffi.h"
+#include "lumabridge_display.h"
+#include "lumabridge_media.h"
+#include "lumabridge_input.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -23,6 +26,13 @@ _Static_assert((sizeof(LbOwnedBuffer) % sizeof(void *)) == 0u, "LbOwnedBuffer mu
 _Static_assert((sizeof(LbCoreConfig) % sizeof(void *)) == 0u, "LbCoreConfig must align cleanly");
 _Static_assert((sizeof(LbCoreMetrics) % 8u) == 0u, "LbCoreMetrics must be 8-byte aligned");
 _Static_assert((sizeof(LbGlobalResourceCounters) % 8u) == 0u, "LbGlobalResourceCounters must be 8-byte aligned");
+_Static_assert((sizeof(LbNodeConfig) % 8u) == 0u, "LbNodeConfig must be 8-byte aligned");
+_Static_assert((sizeof(LbNodeTelemetry) % 8u) == 0u, "LbNodeTelemetry must be 8-byte aligned");
+_Static_assert(sizeof(LbNodeHandle *) == sizeof(void *), "Opaque LbNodeHandle pointer size check");
+_Static_assert(sizeof(LbDisplayGeometry) > 0u, "LbDisplayGeometry defined");
+_Static_assert(sizeof(LbFrameDescriptor) > 0u, "LbFrameDescriptor defined");
+_Static_assert(sizeof(LbOpaqueSurfaceHandle) > 0u, "LbOpaqueSurfaceHandle defined");
+_Static_assert(sizeof(LbNormalizedInputEvent) > 0u, "LbNormalizedInputEvent defined");
 
 void LbC11GetLayoutSignature(LbAbiLayoutSignature *out_sig) {
     if (out_sig == NULL) {
