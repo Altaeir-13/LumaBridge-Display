@@ -17,6 +17,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 zeroize = { version = "1.9.2", features = ["derive"] }
 
+[dev-dependencies]
+lumabridge-security = { version = "0.1.0", path = "../lumabridge-security", features = ["quic", "test-utils"] }
+
 [[bench]]
 name = "transport_bench"
 harness = false

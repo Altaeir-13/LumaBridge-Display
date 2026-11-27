@@ -371,14 +371,19 @@ impl LumaBridgeNode {
             }
         };
 
-        let mut acceptor = PairingAcceptor::start(
+        let expected_peer_epoch = self
+            .trust_store
+            .peer_epoch(conn.tls_session().peer_identity().device_id());
+        let mut acceptor = PairingAcceptor::start_with_expected_peer_epoch(
             attempt_id,
             &self.identity,
             self.config.role,
             &peer_hello,
             conn.tls_session(),
+            expected_peer_epoch,
         )?;
 
+        let mut completion_unix = now_unix;
         match (peer_hello.auth_mode, first_auth) {
             (AuthMode::PinSpake2, ControlMessage::PairSpakeMsg(p_a)) => {
                 let Some(win) = pin_window else {
@@ -387,13 +392,15 @@ impl LumaBridgeNode {
                     )));
                 };
                 let mut rng = CheckedOsCryptoRng::preflight()?;
+                let attempt_start = std::time::Instant::now();
                 let p_b = acceptor.handle_spake2_exchange(win, &p_a, now_unix, &mut rng)?;
                 conn.send_pairing_message(&ControlMessage::PairSpakeMsg(p_b))
                     .await?;
                 let ControlMessage::PairSpakeMsg(c_a) = conn.recv_pairing_message().await? else {
                     return Err(NodeError::Protocol("expected PairSpakeMsg KeyConfirmation"));
                 };
-                match acceptor.verify_spake2_confirmation_and_reply(&c_a) {
+                completion_unix = now_unix.saturating_add(attempt_start.elapsed().as_secs());
+                match acceptor.verify_spake2_confirmation_and_reply(&c_a, completion_unix) {
                     Ok(c_b) => {
                         conn.send_pairing_message(&ControlMessage::PairSpakeMsg(c_b))
                             .await?;
@@ -445,7 +452,7 @@ impl LumaBridgeNode {
         let commit = acceptor.approved_commit()?;
         let rec = self
             .trust_store
-            .insert_approved_pairing(&commit, now_unix)?;
+            .insert_approved_pairing(commit, completion_unix)?;
         Ok(rec)
     }
 
@@ -494,13 +501,17 @@ impl LumaBridgeNode {
             conn.close();
             return Err(NodeError::Protocol("expected acceptor PairHello"));
         };
-        let mut init = PairingInitiator::start(
+        let expected_peer_epoch = self
+            .trust_store
+            .peer_epoch(conn.tls_session().peer_identity().device_id());
+        let mut init = PairingInitiator::start_with_expected_peer_epoch(
             attempt_id,
             &self.identity,
             self.config.role,
             &peer_hello,
             conn.tls_session(),
             AuthMode::PinSpake2,
+            expected_peer_epoch,
         )?;
         let p_a = init.begin_spake2(pin, &mut rng)?;
         conn.send_pairing_message(&ControlMessage::PairSpakeMsg(p_a))
@@ -542,9 +553,7 @@ impl LumaBridgeNode {
         let prompt = init.approval_prompt()?;
         let decision = consent_cb(&prompt);
         let commit = init.apply_local_approval(decision)?;
-        let rec = self
-            .trust_store
-            .insert_approved_pairing(&commit, now_unix)?;
+        let rec = self.trust_store.insert_approved_pairing(commit, now_unix)?;
         conn.close();
         Ok(rec)
     }
@@ -602,13 +611,17 @@ impl LumaBridgeNode {
             conn.close();
             return Err(NodeError::Protocol("expected acceptor PairHello"));
         };
-        let mut init = PairingInitiator::start(
+        let expected_peer_epoch = self
+            .trust_store
+            .peer_epoch(conn.tls_session().peer_identity().device_id());
+        let mut init = PairingInitiator::start_with_expected_peer_epoch(
             attempt_id,
             &self.identity,
             self.config.role,
             &peer_hello,
             conn.tls_session(),
             AuthMode::QrOutOfBand,
+            expected_peer_epoch,
         )?;
         let qr_auth = init.create_qr_auth(&self.identity, ticket, now_unix)?;
         conn.send_pairing_message(&ControlMessage::PairQrAuth(qr_auth))
@@ -629,9 +642,7 @@ impl LumaBridgeNode {
         let prompt = init.approval_prompt()?;
         let decision = consent_cb(&prompt);
         let commit = init.apply_local_approval(decision)?;
-        let rec = self
-            .trust_store
-            .insert_approved_pairing(&commit, now_unix)?;
+        let rec = self.trust_store.insert_approved_pairing(commit, now_unix)?;
         conn.close();
         Ok(rec)
     }

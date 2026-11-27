@@ -40,7 +40,7 @@ fuzz_target!(|data: &[u8]| {
     );
 
     let store = InMemoryTrustStore::new();
-    let _ = store.insert_newly_paired(
+    let _ = store.insert_trusted_peer_for_testing(
         ctrl_kp.public_identity(),
         PeerRole::Controller,
         "FuzzPeer",

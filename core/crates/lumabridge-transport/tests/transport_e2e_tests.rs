@@ -95,7 +95,7 @@ fn setup_paired_stores(
     let controller_store = Arc::new(InMemoryTrustStore::new());
     let now = now_unix();
     host_store
-        .insert_newly_paired(
+        .insert_trusted_peer_for_testing(
             &controller.public_id,
             controller.role,
             "Controller",
@@ -104,7 +104,7 @@ fn setup_paired_stores(
         )
         .expect("insert controller");
     controller_store
-        .insert_newly_paired(&host.public_id, host.role, "Host", base_perms, now)
+        .insert_trusted_peer_for_testing(&host.public_id, host.role, "Host", base_perms, now)
         .expect("insert host");
     (host_store, controller_store)
 }
@@ -948,7 +948,7 @@ async fn hello_ack_remote_perms_are_clamped_by_local_trust_store() {
     let host_store = Arc::new(InMemoryTrustStore::new());
     let controller_store = Arc::new(InMemoryTrustStore::new());
     host_store
-        .insert_newly_paired(
+        .insert_trusted_peer_for_testing(
             &controller.public_id,
             controller.role,
             "Controller",
@@ -957,7 +957,7 @@ async fn hello_ack_remote_perms_are_clamped_by_local_trust_store() {
         )
         .expect("host pair");
     controller_store
-        .insert_newly_paired(
+        .insert_trusted_peer_for_testing(
             &host.public_id,
             host.role,
             "Host",
