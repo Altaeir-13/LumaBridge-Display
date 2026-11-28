@@ -95,6 +95,7 @@ jobs:
           cargo fmt --all --check
           cbindgen --config crates/lumabridge-ffi/cbindgen.toml --crate lumabridge-ffi --output "$RUNNER_TEMP/lumabridge_ffi.generated.h"
           diff -u <(tr -d '\r' < crates/lumabridge-ffi/include/lumabridge_ffi.h) <(tr -d '\r' < "$RUNNER_TEMP/lumabridge_ffi.generated.h")
+          cc -std=c11 -Wall -Wextra -Werror -Icrates/lumabridge-ffi/include -Iinclude -c tests/native_cpp/LumaBridgeFfiCCompat.c -o "$RUNNER_TEMP/ccompat.o"
           cargo clippy --locked --workspace --all-targets -- -D warnings
           cargo clippy --locked --workspace --all-targets --features poc-fault-injection -- -D warnings
           cargo clippy --locked --workspace --all-targets --features uniffi -- -D warnings
@@ -124,10 +125,11 @@ jobs:
           echo "Using Android NDK version: $NDK_VERSION"
 
           cd core
-          cargo ndk -t arm64-v8a -P 29 --manifest-path Cargo.toml -- build --locked -p lumabridge-protocol -p lumabridge-security -p lumabridge-transport --release
+          cargo ndk -t arm64-v8a -P 29 --manifest-path Cargo.toml -- build --locked -p lumabridge-protocol -p lumabridge-security -p lumabridge-transport -p lumabridge-core --release
           test -f "target/aarch64-linux-android/release/liblumabridge_protocol.rlib"
           test -f "target/aarch64-linux-android/release/liblumabridge_security.rlib"
           test -f "target/aarch64-linux-android/release/liblumabridge_transport.rlib"
+          test -f "target/aarch64-linux-android/release/liblumabridge_core.rlib"
 
           cargo ndk -t arm64-v8a -P 29 --manifest-path Cargo.toml -- build --locked -p lumabridge-ffi --features uniffi --release
           SO_PATH="target/aarch64-linux-android/release/liblumabridge_ffi.so"
@@ -139,6 +141,7 @@ jobs:
           grep -q "Type:[[:space:]]*DYN" "$RUNNER_TEMP/android-so-elf.txt"
           "$READELF" --dyn-syms -W "$SO_PATH" > "$RUNNER_TEMP/android-so-syms.txt"
           grep -q "lb_core_create" "$RUNNER_TEMP/android-so-syms.txt"
+          grep -q "lb_node_create" "$RUNNER_TEMP/android-so-syms.txt"
           grep -q "uniffi_lumabridge_ffi" "$RUNNER_TEMP/android-so-syms.txt"
           if grep -q "lb_core_poc_trigger_panic" "$RUNNER_TEMP/android-so-syms.txt"; then
             echo "Unexpected lb_core_poc_trigger_panic export found in Android .so" >&2

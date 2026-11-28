@@ -1269,6 +1269,60 @@ bool TestPanicContainmentAndDefaultDllIsolation(const std::wstring& faultDllPath
     return true;
 }
 
+bool TestNodeFfiAbiAndLoopbackSmoke() {
+    auto make_node_cfg = [](uint32_t role, const char* name) {
+        LbNodeConfig cfg{};
+        cfg.abi = MakeHeader<LbNodeConfig>();
+        cfg.role = role;
+        cfg.transport_kind = static_cast<uint32_t>(LB_NODE_TRANSPORT_KIND_QUIC_DATAGRAM);
+        cfg.max_virtual_displays = 1U;
+        cfg.reserved0 = 0U;
+        cfg.heartbeat_timeout_ms = 4000U;
+        const size_t name_len = std::strlen(name);
+        std::memcpy(cfg.friendly_name, name, name_len);
+        cfg.friendly_name_len = static_cast<uint32_t>(name_len);
+        cfg.reserved1 = 0U;
+        return cfg;
+    };
+
+    LbNodeHandle* host = nullptr;
+    LbNodeHandle* ctrl = nullptr;
+    const LbNodeConfig host_cfg = make_node_cfg(static_cast<uint32_t>(LB_NODE_ROLE_HOST), "CppHost");
+    const LbNodeConfig ctrl_cfg = make_node_cfg(static_cast<uint32_t>(LB_NODE_ROLE_CONTROLLER), "CppCtrl");
+    REQUIRE_STATUS(lb_node_create(&host_cfg, &host), LB_STATUS_OK, "lb_node_create host");
+    REQUIRE_STATUS(lb_node_create(&ctrl_cfg, &ctrl), LB_STATUS_OK, "lb_node_create ctrl");
+
+    uint8_t host_id[32]{};
+    REQUIRE_STATUS(lb_node_local_device_id(host, host_id, 16U), LB_STATUS_BUFFER_TOO_SMALL, "device id small buf");
+    REQUIRE_STATUS(lb_node_local_device_id(host, host_id, 32U), LB_STATUS_OK, "lb_node_local_device_id");
+
+    uint32_t trusted = 0U;
+    REQUIRE_STATUS(lb_node_is_peer_trusted(ctrl, host_id, 32U, &trusted), LB_STATUS_OK, "pre-pair not trusted");
+    REQUIRE_TRUE(trusted == 0U, "peer must start untrusted");
+
+    LbNodeTelemetry tel{};
+    tel.abi = MakeHeader<LbNodeTelemetry>();
+    REQUIRE_STATUS(
+        lb_node_run_loopback_selftest(host, ctrl, static_cast<uint32_t>(LB_NODE_TRANSPORT_KIND_QUIC_DATAGRAM), 6U, &tel),
+        LB_STATUS_OK,
+        "lb_node_run_loopback_selftest");
+    REQUIRE_TRUE(tel.frames_sent == 6ULL && tel.frames_delivered >= 1ULL && tel.protected_blanks == 1ULL,
+                 "loopback telemetry counts");
+
+    REQUIRE_STATUS(lb_node_is_peer_trusted(ctrl, host_id, 32U, &trusted), LB_STATUS_OK, "post-pair trusted");
+    REQUIRE_TRUE(trusted == 1U, "peer must be trusted after loopback");
+    REQUIRE_STATUS(lb_node_revoke_peer(ctrl, host_id, 32U), LB_STATUS_OK, "lb_node_revoke_peer");
+    REQUIRE_STATUS(lb_node_is_peer_trusted(ctrl, host_id, 32U, &trusted), LB_STATUS_OK, "post-revoke query");
+    REQUIRE_TRUE(trusted == 0U, "peer must be untrusted after revoke");
+
+    REQUIRE_STATUS(lb_node_destroy(host), LB_STATUS_OK, "lb_node_destroy host");
+    REQUIRE_STATUS(lb_node_destroy(ctrl), LB_STATUS_OK, "lb_node_destroy ctrl");
+    REQUIRE_STATUS(lb_node_destroy(nullptr), LB_STATUS_OK, "lb_node_destroy null");
+
+    std::printf("[PASS] TestNodeFfiAbiAndLoopbackSmoke\n");
+    return true;
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t* argv[]) {
@@ -1294,6 +1348,7 @@ int wmain(int argc, wchar_t* argv[]) {
     if (!TestAbruptDisconnectRacingConcurrentSubmitters()) return 1;
     if (!TestDeferredRustBufferReleaseAfterDestroy()) return 1;
     if (!TestLifecycle100CyclesAndProcessTelemetry()) return 1;
+    if (!TestNodeFfiAbiAndLoopbackSmoke()) return 1;
 
     if (!faultDllPath.empty()) {
         if (!TestPanicContainmentAndDefaultDllIsolation(faultDllPath)) return 1;

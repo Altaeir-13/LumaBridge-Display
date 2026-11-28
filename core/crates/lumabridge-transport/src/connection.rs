@@ -113,12 +113,29 @@ impl PeerTransportLink {
         }
     }
 
+    pub async fn try_recv_stream_frame(
+        &self,
+        channel: ChannelId,
+    ) -> Result<Option<RawStreamFrame>, TransportError> {
+        match self {
+            Self::Quic { link, .. } => link.try_recv_stream_frame(channel).await,
+            Self::Tcp(link) => link.try_recv_stream_frame(channel).await,
+        }
+    }
+
     pub fn close_immediately(&self, reason: &[u8]) {
         match self {
             Self::Quic { link, .. } => {
                 link.close_immediately(ErrorCode::UnauthorizedPeer as u32, reason);
             }
             Self::Tcp(link) => link.close_immediately(),
+        }
+    }
+
+    pub async fn flush_tx(&self) {
+        match self {
+            Self::Quic { link, .. } => link.flush_control_and_finish().await,
+            Self::Tcp(link) => link.flush_tx().await,
         }
     }
 }
@@ -402,6 +419,10 @@ impl PairingConnection {
         Ok(msg)
     }
 
+    pub async fn flush(&self) {
+        self.link.flush_tx().await;
+    }
+
     pub fn close(self) {
         self.link.close_immediately(b"pairing_done");
     }
@@ -597,6 +618,11 @@ impl OperationalConnection {
         self.active_session_id = Some(session_id);
         self.effective_perms = effective_perms;
         self.phase = ConnectionPhase::OperationalSessionActive;
+    }
+
+    /// Update active session permissions after `PermissionUpdate` or local elevation.
+    pub fn set_effective_perms(&mut self, effective_perms: Permissions) {
+        self.effective_perms = effective_perms;
     }
 
     /// Compute live MTU-aware [`PacketBudget`] for media packetization on this connection.
@@ -936,6 +962,32 @@ impl OperationalConnection {
         self.recv_cbor_on_channel(ChannelId::Input).await
     }
 
+    /// Non-blocking poll for queued `Control` message without allocating an OS timer.
+    pub async fn try_recv_control_message(
+        &mut self,
+    ) -> Result<Option<ControlMessage>, TransportError> {
+        self.try_recv_cbor_on_channel(ChannelId::Control).await
+    }
+
+    /// Non-blocking poll for queued `Feedback` message without allocating an OS timer.
+    pub async fn try_recv_feedback_message(
+        &mut self,
+    ) -> Result<Option<ControlMessage>, TransportError> {
+        self.try_recv_cbor_on_channel(ChannelId::Feedback).await
+    }
+
+    async fn try_recv_cbor_on_channel(
+        &mut self,
+        channel: ChannelId,
+    ) -> Result<Option<ControlMessage>, TransportError> {
+        while let Some(raw) = self.link.try_recv_stream_frame(channel).await? {
+            if let Some(msg) = self.validate_and_decode_cbor_frame(channel, raw).await? {
+                return Ok(Some(msg));
+            }
+        }
+        Ok(None)
+    }
+
     async fn recv_cbor_on_channel(
         &mut self,
         channel: ChannelId,
@@ -947,59 +999,69 @@ impl OperationalConnection {
             )
             .await
             .map_err(|_| TransportError::Timeout("channel read exceeded heartbeat timeout"))??;
-            self.last_rx_activity = Instant::now();
-
-            let ctx = ValidationContext {
-                alpn: Alpn::Operational,
-                channel,
-                direction: opposite_dir(self.direction),
-                phase: self.phase,
-                effective_perms: self.effective_perms,
-                active_session_id: self.active_session_id,
-            };
-            let msg_type = match validate_frame_context(&ctx, raw.header) {
-                FrameContextDecision::AllowKnown(m) => m,
-                FrameContextDecision::IgnoreUnknownOptional => continue,
-                FrameContextDecision::Reject(err) => {
-                    if err.fatal {
-                        let _ = self
-                            .send_control_message(&ControlMessage::ErrorNotice(ErrorNotice {
-                                code: err.code,
-                                fatal: true,
-                                related_msg_type: raw.header.msg_type,
-                                context_ascii: err.reason.to_owned(),
-                            }))
-                            .await;
-                    }
-                    return Err(err.into());
-                }
-                FrameContextDecision::AllowMediaFragment => {
-                    return Err(TransportError::InvalidConfig(
-                        "unexpected media decision on CBOR channel",
-                    ));
-                }
-            };
-            let msg = ControlMessage::decode_cbor(
-                msg_type,
-                &raw.payload,
-                CborDecodeOptions {
-                    unknown_fields: UnknownFieldPolicy::SkipBounded,
-                    mode: CborDecodeMode::StrictDeterministic,
-                    limits: self.config.cbor_limits,
-                },
-            )?;
-            validate_message_context(&ctx, &msg)?;
-            self.verify_message_sequence(&msg)?;
-            if let ControlMessage::ErrorNotice(notice) = &msg {
-                if notice.fatal {
-                    return Err(TransportError::RemoteErrorNotice {
-                        code: notice.code,
-                        fatal: notice.fatal,
-                    });
-                }
+            if let Some(msg) = self.validate_and_decode_cbor_frame(channel, raw).await? {
+                return Ok(msg);
             }
-            return Ok(msg);
         }
+    }
+
+    async fn validate_and_decode_cbor_frame(
+        &mut self,
+        channel: ChannelId,
+        raw: RawStreamFrame,
+    ) -> Result<Option<ControlMessage>, TransportError> {
+        self.last_rx_activity = Instant::now();
+
+        let ctx = ValidationContext {
+            alpn: Alpn::Operational,
+            channel,
+            direction: opposite_dir(self.direction),
+            phase: self.phase,
+            effective_perms: self.effective_perms,
+            active_session_id: self.active_session_id,
+        };
+        let msg_type = match validate_frame_context(&ctx, raw.header) {
+            FrameContextDecision::AllowKnown(m) => m,
+            FrameContextDecision::IgnoreUnknownOptional => return Ok(None),
+            FrameContextDecision::Reject(err) => {
+                if err.fatal {
+                    let _ = self
+                        .send_control_message(&ControlMessage::ErrorNotice(ErrorNotice {
+                            code: err.code,
+                            fatal: true,
+                            related_msg_type: raw.header.msg_type,
+                            context_ascii: err.reason.to_owned(),
+                        }))
+                        .await;
+                }
+                return Err(err.into());
+            }
+            FrameContextDecision::AllowMediaFragment => {
+                return Err(TransportError::InvalidConfig(
+                    "unexpected media decision on CBOR channel",
+                ));
+            }
+        };
+        let msg = ControlMessage::decode_cbor(
+            msg_type,
+            &raw.payload,
+            CborDecodeOptions {
+                unknown_fields: UnknownFieldPolicy::SkipBounded,
+                mode: CborDecodeMode::StrictDeterministic,
+                limits: self.config.cbor_limits,
+            },
+        )?;
+        validate_message_context(&ctx, &msg)?;
+        self.verify_message_sequence(&msg)?;
+        if let ControlMessage::ErrorNotice(notice) = &msg {
+            if notice.fatal {
+                return Err(TransportError::RemoteErrorNotice {
+                    code: notice.code,
+                    fatal: notice.fatal,
+                });
+            }
+        }
+        Ok(Some(msg))
     }
 
     fn verify_message_sequence(&mut self, msg: &ControlMessage) -> Result<(), TransportError> {
@@ -1603,6 +1665,8 @@ impl OperationalConnection {
                 teardown_virtual_displays: true,
             });
             let _ = self.send_control_message(&msg).await;
+            self.link.flush_tx().await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
         self.link.close_immediately(b"session_closed");
     }

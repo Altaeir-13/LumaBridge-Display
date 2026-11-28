@@ -231,15 +231,16 @@ try {
         $prodDll = Join-Path $outDir 'lumabridge_ffi.dll'
 
         $cObj = Join-Path $outDir 'LumaBridgeFfiCCompat.obj'
+        $incContracts = Join-Path $coreDir 'include'
         Invoke-NativeChecked -Label ("CL C11 ({0})" -f $mode) -Executable 'cl.exe' -Arguments (@(
             '/nologo', '/std:c11', '/W4', '/WX', $crtFlag) + $optFlags + @(
-            ("/I{0}" -f $incFfi), '/c', $cCompat, ("/Fo{0}" -f $cObj), ("/Fd{0}\" -f $outDir)
+            ("/I{0}" -f $incFfi), ("/I{0}" -f $incContracts), '/c', $cCompat, ("/Fo{0}" -f $cObj), ("/Fd{0}\" -f $outDir)
         )) -WorkingDirectory $resolvedRoot | Out-Null
 
         $harnessExe = Join-Path $outDir 'LumaBridgeFfiHarness.exe'
         Invoke-NativeChecked -Label ("CL C++20 HARNESS ({0})" -f $mode) -Executable 'cl.exe' -Arguments (@(
             '/nologo', '/std:c++20', '/W4', '/WX', '/EHsc', $crtFlag) + $optFlags + @(
-            ("/I{0}" -f $incFfi), $cppHarness, $cObj,
+            ("/I{0}" -f $incFfi), ("/I{0}" -f $incContracts), $cppHarness, $cObj,
             ("/Fo{0}\" -f $outDir), ("/Fd{0}\" -f $outDir), ("/Fe:{0}" -f $harnessExe),
             '/link', $dllLib, 'psapi.lib'
         )) -WorkingDirectory $resolvedRoot | Out-Null

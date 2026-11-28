@@ -91,6 +91,45 @@ typedef uint32_t LbEncodedCodec;
 #endif // __cplusplus
 
 /**
+ * Operational node role across `lb_node_*`.
+ */
+enum LbNodeRole
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  LB_NODE_ROLE_HOST = 1,
+  LB_NODE_ROLE_CONTROLLER = 2,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum LbNodeRole LbNodeRole;
+#else
+typedef uint32_t LbNodeRole;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Transport mode exposed across `lb_node_*`.
+ */
+enum LbNodeTransportKind
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  LB_NODE_TRANSPORT_KIND_QUIC_DATAGRAM = 1,
+  LB_NODE_TRANSPORT_KIND_QUIC_STREAM = 2,
+  LB_NODE_TRANSPORT_KIND_TCP_TLS = 3,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum LbNodeTransportKind LbNodeTransportKind;
+#else
+typedef uint32_t LbNodeTransportKind;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
  * Opaque native handle owning a `CoreSession`.
  *
  * # Caller Contract & DLL/DSO Lifetime
@@ -101,6 +140,14 @@ typedef uint32_t LbEncodedCodec;
  *   remains unreleased.
  */
 typedef struct LbCoreHandle LbCoreHandle;
+
+/**
+ * Opaque native handle owning an isolated Tokio runtime and [`LumaBridgeNode`].
+ *
+ * # Caller Contract
+ * - Destroyed strictly once via `lb_node_destroy`.
+ */
+typedef struct LbNodeHandle LbNodeHandle;
 
 /**
  * Version and size header prefixed to all versioned C ABI structures.
@@ -237,6 +284,38 @@ typedef struct LbAbiLayoutSignature {
   uint32_t offset_owned_release;
   uint32_t offset_config_on_output;
 } LbAbiLayoutSignature;
+
+/**
+ * Configuration passed to `lb_node_create`.
+ */
+typedef struct LbNodeConfig {
+  struct LbAbiHeader abi;
+  uint32_t role;
+  uint32_t transport_kind;
+  uint16_t max_virtual_displays;
+  uint16_t reserved0;
+  uint32_t heartbeat_timeout_ms;
+  uint8_t friendly_name[48];
+  uint32_t friendly_name_len;
+  uint32_t reserved1;
+} LbNodeConfig;
+
+/**
+ * Privacy-sanitized operational node telemetry output structure.
+ */
+typedef struct LbNodeTelemetry {
+  struct LbAbiHeader abi;
+  uint64_t frames_sent;
+  uint64_t frames_delivered;
+  uint64_t dropped_frames;
+  uint64_t idr_requests;
+  uint64_t protected_blanks;
+  uint64_t unauthorized_input_drops;
+  uint64_t clock_sync_rtt_us;
+  uint64_t e2e_p50_us;
+  uint64_t e2e_p95_us;
+  uint64_t e2e_p99_us;
+} LbNodeTelemetry;
 
 #ifdef __cplusplus
 extern "C" {
@@ -412,6 +491,66 @@ LbStatus lb_core_layout_signature(struct LbAbiLayoutSignature *out_sig);
 LbStatus lb_core_poc_trigger_panic(struct LbCoreHandle *handle,
                                    uint32_t mode);
 #endif
+
+/**
+ * Create an operational [`LbNodeHandle`] with a freshly generated Ed25519 identity and certificate.
+ *
+ * # Safety
+ * - `config` must pass 16-byte `LbAbiHeader` + full `LbNodeConfig` validation.
+ * - `out_handle` must be aligned, writable, and non-null.
+ */
+LbStatus lb_node_create(const struct LbNodeConfig *config, struct LbNodeHandle **out_handle);
+
+/**
+ * Destroy an [`LbNodeHandle`], shutting down its Tokio runtime and clearing credentials.
+ *
+ * # Safety
+ * `handle` must be null or a valid pointer produced by [`lb_node_create`] with no concurrent use.
+ */
+LbStatus lb_node_destroy(struct LbNodeHandle *handle);
+
+/**
+ * Copy the node's 32-byte canonical `DeviceId` (`SHA-256(Ed25519 SPKI)`) into `out_id`.
+ *
+ * # Safety
+ * `out_id` must be valid for writing `out_len` bytes (requires `out_len >= 32`).
+ */
+LbStatus lb_node_local_device_id(const struct LbNodeHandle *handle,
+                                 uint8_t *out_id,
+                                 size_t out_len);
+
+/**
+ * Revoke a peer by 32-byte `DeviceId`, terminating active connections via `ConnectionRegistry`.
+ *
+ * # Safety
+ * `peer_id` must point to at least 32 readable bytes (`id_len >= 32`).
+ */
+LbStatus lb_node_revoke_peer(struct LbNodeHandle *handle, const uint8_t *peer_id, size_t id_len);
+
+/**
+ * Query whether `peer_id` is currently trusted and non-revoked in `handle`'s `TrustStore`.
+ *
+ * # Safety
+ * `peer_id` must point to 32 readable bytes; `out_trusted` must be aligned and writable.
+ */
+LbStatus lb_node_is_peer_trusted(const struct LbNodeHandle *handle,
+                                 const uint8_t *peer_id,
+                                 size_t id_len,
+                                 uint32_t *out_trusted);
+
+/**
+ * Execute an end-to-end encrypted loopback self-test (SPAKE2 pairing + mTLS `SessionOpen` +
+ * `frame_count` synthetic 1080p60 frames + `ProtectedBlank`) between two initialized [`LbNodeHandle`]s.
+ *
+ * # Safety
+ * - `host` and `receiver` must be distinct, aligned, valid handles (`Host` and `Controller`).
+ * - `out_telemetry` must satisfy `LbAbiHeader` validation before writing.
+ */
+LbStatus lb_node_run_loopback_selftest(struct LbNodeHandle *host,
+                                       struct LbNodeHandle *receiver,
+                                       uint32_t transport_kind,
+                                       uint32_t frame_count,
+                                       struct LbNodeTelemetry *out_telemetry);
 
 #ifdef __cplusplus
 }  // extern "C"

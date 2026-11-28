@@ -767,12 +767,23 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 [[package]]
 name = "lumabridge-core"
 version = "0.1.0"
+dependencies = [
+ "lumabridge-protocol",
+ "lumabridge-security",
+ "lumabridge-transport",
+ "tokio",
+ "zeroize",
+]
 
 [[package]]
 name = "lumabridge-ffi"
 version = "0.1.0"
 dependencies = [
  "lumabridge-core",
+ "lumabridge-protocol",
+ "lumabridge-security",
+ "lumabridge-transport",
+ "tokio",
  "uniffi",
 ]
 
