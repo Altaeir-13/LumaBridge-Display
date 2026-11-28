@@ -31,10 +31,9 @@
 12. **ChannelBinding & Key Privacy (`channel_binding.rs`, `certificate.rs`):** `ChannelBinding` redacts all bytes (`ChannelBinding([REDACTED])`) and `GeneratedDeviceCertificate` redacts `pkcs8_der`.
 13. **Secret Lifecycle (`secret.rs`, `channel_binding.rs`, `identity.rs`, `pairing.rs`):** `Zeroize`/`ZeroizeOnDrop` across `ChannelBinding`, `IdentityKeyPair::from_seed_zeroizing`, `PairingInitiator`/`PairingAcceptor` `Drop`, and `PinAttemptLease`.
 14. **Adversarial Review Resolutions (`M1.3.1` & External Review Remediation):**
-    - Added monotonic `pin_generation` tracking in `PinPairingWindow`/`PinAttemptLease` so stale leases after PIN rotation cannot poison or destroy the new PIN (`pairing.rs`).
-    - Hardened `PinAttemptLease::finish_success(now_unix)` and `PairingAcceptor::verify_spake2_confirmation_and_reply(&peer_msg, now_unix)` to differentiate attempt reservation time (`reserved_at_secs`) from confirmation time (`now_unix`), fail atomically with `SecurityError::PairingWindowClosed` / `InvalidTimestamp` on expiry, close, PIN rotation, backwards clock, or concurrent winner consumption, and enter `PairingStage::Failed` (`pairing.rs`).
+    - Added monotonic `pin_generation` tracking and explicit `now_mono_secs` monotonic clock boundaries (`PinPairingWindow`, `PinAttemptLease::finish_success(now_mono_secs)`, `PairingAcceptor::handle_spake2_exchange`, `PairingAcceptor::verify_spake2_confirmation_and_reply(&peer_msg, now_mono_secs)`), returning `0` in `remaining_attempts` when `now_mono_secs < opened_at_secs` without destroying the active PIN, separating process-local monotonic PIN deadlines from wall-clock Unix timestamps used for X.509 certificates and cross-device QR tickets, and failing atomically on expiry, close, PIN rotation, backwards clock, or concurrent winner consumption (`pairing.rs`).
     - Hardened trust provenance: sealed `ApprovedPairingCommit` (private fields, non-`Clone`, `channel_binding_digest`, `expected_peer_epoch`), made `PairingAcceptor::approved_commit(&mut self)` single-use, removed ordinary bypass APIs (`insert_newly_paired` / `re_trust_after_pairing`), separated ordinary pairing (`insert_approved_pairing` / `re_trust_after_approved_pairing` consuming `ApprovedPairingCommit` by value and enforcing `expected_peer_epoch` + replay rejection) from explicit administrative import (`import_trusted_peer_admin` / `AdminTrustImportRecord`) and `#[cfg(any(test, feature = "test-utils"))]` fixtures (`insert_trusted_peer_for_testing` / `re_trust_peer_for_testing`) (`pairing.rs`, `trust_store.rs`).
-    - Bounded `PrefetchedCryptoRng` CSPRNG failure recovery: refill/post-failure draws zeroize remaining prefetched bytes, increment `failed_draws`, emit a deterministic canonical non-zero abort pattern (`0x01`) so any external scalar rejection loop terminates in 1 bounded draw, and `begin_spake2` / `handle_spake2_exchange` enforce `ensure_healthy()` immediately while zeroizing/dropping ephemeral shares/states (`secret.rs`, `pairing.rs`).
+    - Isolated and bounded `PrefetchedCryptoRng` CSPRNG failure recovery: narrowed `PrefetchedCryptoRng` and `CheckedOsCryptoRng::prefetch_spake_entropy` to `pub(crate)` so no external caller can invoke or consume `PrefetchedCryptoRng` outside `begin_spake2`/`handle_spake2_exchange`; refill/post-failure draws zeroize remaining prefetched bytes, increment `failed_draws`, emit a deterministic canonical non-zero abort pattern (`0x01`) so any external scalar rejection loop terminates in 1 bounded draw, and `begin_spake2` / `handle_spake2_exchange` enforce `ensure_healthy()` immediately while zeroizing/dropping ephemeral shares/states (`secret.rs`, `pairing.rs`).
     - Made `PendingPermissionUpgrade` single-use (non-`Copy`/`Clone`, consumed by value) and enforced `perm_epoch` monotonicity across `InMemoryTrustStore::update_base_permissions` and `elevate_permissions_atomic` (`trust_store.rs`, `authorization.rs`).
     - Enforced `ticket.acceptor_role == self.peer_role` in `PairingInitiator::create_qr_auth`, rejected `pairing_attempt_id == 0` and control-char `friendly_name` in `start()`, and zeroized expired PIN state on `remaining_attempts` (`pairing.rs`).
     - Tightened handshake completion checks to `HandshakeKind::Full | HandshakeKind::FullWithHelloRetryRequest`, rejected `update_session_permissions` on revoked sessions, and activated real negative `PairConfirm` / ALPN mismatch tests (`tls.rs`, `channel_binding.rs`, `session_token.rs`, `pairing_and_tls_tests.rs`).
@@ -89,21 +88,23 @@
 
 ## 6. AddressSanitizer Fuzzing Campaigns (`nightly-2026-04-01`, Windows MSVC)
 
-### M1.3.1 Final Re-qualification (`>= 60 s` per Affected Target on Hardened Code)
+### M1.3.1 Final Re-qualification (`>= 60 s` per Affected Target on Final Hardened Code)
 | Target | Duration | Executions | Throughput (exec/s) | Peak RSS (MB) | Crashes / Sanitizer Errors |
 |---|---|---:|---:|---:|---:|
-| `fuzz_spake2_messages` (`lumabridge-security`) | 62 s (`-max_total_time=61`) | 27,738 | 447 | 382 | 0 |
-| `fuzz_qr_pairing` (`lumabridge-security`) | 62 s (`-max_total_time=61`) | 27,278 | 439 | 369 | 0 |
-| `fuzz_session_authz` (`lumabridge-security`) | 62 s (`-max_total_time=61`) | 31,474 | 507 | 452 | 0 |
-| **Total Final M1.3.1 Security Fuzzing** | **3 × 62 s** | **86,490** | — | **452 max** | **0** |
+| `fuzz_spake2_messages` (`lumabridge-security`) | 62 s (`-max_total_time=61`) | 18,606 | 300 | 275 | 0 |
+| `fuzz_qr_pairing` (`lumabridge-security`) | 62 s (`-max_total_time=61`) | 20,121 | 324 | 286 | 0 |
+| `fuzz_session_authz` (`lumabridge-security`) | 62 s (`-max_total_time=61`) | 23,572 | 380 | 432 | 0 |
+| **Total Final M1.3.1 Security Fuzzing** | **3 × 62 s** | **62,299** | — | **432 max** | **0** |
 
-### M1.3.1 Earlier Intermediate Campaign (Preserved Historical Evidence)
+### M1.3.1 Prior 62 s & 31 s Campaigns (Preserved Historical Evidence)
 | Target | Duration | Executions | Throughput (exec/s) | Peak RSS (MB) | Crashes / Sanitizer Errors |
 |---|---|---:|---:|---:|---:|
-| `fuzz_spake2_messages` (`lumabridge-security`) | 31 s | 13,400 | 432 | 212 | 0 |
-| `fuzz_qr_pairing` (`lumabridge-security`) | 31 s | 14,096 | 454 | 216 | 0 |
-| `fuzz_session_authz` (`lumabridge-security`) | 31 s | 16,030 | 517 | 301 | 0 |
-| **Total Intermediate M1.3.1 Fuzzing** | **3 × 31 s** | **43,526** | — | **301 max** | **0** |
+| `fuzz_spake2_messages` (`77dc2b59`) | 62 s | 27,738 | 447 | 382 | 0 |
+| `fuzz_qr_pairing` (`77dc2b59`) | 62 s | 27,278 | 439 | 369 | 0 |
+| `fuzz_session_authz` (`77dc2b59`) | 62 s | 31,474 | 507 | 452 | 0 |
+| `fuzz_spake2_messages` (earlier) | 31 s | 13,400 | 432 | 212 | 0 |
+| `fuzz_qr_pairing` (earlier) | 31 s | 14,096 | 454 | 216 | 0 |
+| `fuzz_session_authz` (earlier) | 31 s | 16,030 | 517 | 301 | 0 |
 
 *(Historical M1.3 baseline also covered `fuzz_spki_identity`, `fuzz_x509_cert`, `fuzz_cbor_control`, and `fuzz_contextual_validation` over `7 x 61 s` / `7,644,551` executions with `0` crashes.)*
 

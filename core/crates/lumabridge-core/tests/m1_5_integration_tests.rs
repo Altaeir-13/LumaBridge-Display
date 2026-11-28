@@ -130,7 +130,7 @@ async fn spake2_pairing_3attempt_budget_input_authz_resume_and_revocation() {
     let mut rng = CheckedOsCryptoRng::preflight().expect("rng");
 
     let pin_win = PinPairingWindow::new();
-    let real_pin = pin_win.open_with_new_pin(&mut rng, now).expect("pin");
+    let real_pin = pin_win.open_with_new_pin(&mut rng, 1_000).expect("pin");
     let wrong_pin = PinSecret::new(if real_pin.expose_bytes() == b"99999999" {
         "11111111"
     } else {
@@ -181,10 +181,12 @@ async fn spake2_pairing_3attempt_budget_input_authz_resume_and_revocation() {
         assert!(acc_res.is_err());
         assert!(init_res.is_err());
     }
-    assert_eq!(pin_win.remaining_attempts(now), 0);
+    assert_eq!(pin_win.remaining_attempts(1_020), 0);
 
     // Open fresh PIN window and complete SPAKE2 pairing with local human consent.
-    let fresh_pin = pin_win.open_with_new_pin(&mut rng, now).expect("fresh pin");
+    let fresh_pin = pin_win
+        .open_with_new_pin(&mut rng, 2_000)
+        .expect("fresh pin");
     let (acc_ok, init_ok) = tokio::join!(
         async {
             let link = pair_srv
@@ -687,7 +689,7 @@ async fn pairing_error_and_closed_window_enforce_rate_limiter_and_clock_sync_cla
 
     // After backoff expires and PIN succeeds, record_success clears backoff cleanly.
     let pin_win = PinPairingWindow::new();
-    let real_pin = pin_win.open_with_new_pin(&mut rng, now).expect("pin");
+    let real_pin = pin_win.open_with_new_pin(&mut rng, 20).expect("pin");
     let (acc_ok, init_ok) = tokio::join!(
         async {
             let link = pair_srv
@@ -1031,6 +1033,7 @@ fn two_process_1080p60_synthetic_stream_quic_and_tcp() {
                 "180",
                 "--fps",
                 "60",
+                "--ci-auto-approve-pairing",
                 "--endpoint-out",
                 rendezvous.to_str().expect("utf8"),
                 "--json-report",
@@ -1058,6 +1061,7 @@ fn two_process_1080p60_synthetic_stream_quic_and_tcp() {
                 "180",
                 "--fps",
                 "60",
+                "--ci-auto-approve-pairing",
                 "--endpoint-out",
                 rendezvous.to_str().expect("utf8"),
                 "--json-report",
@@ -1116,7 +1120,7 @@ async fn pin_window_close_between_reservation_and_confirmation_fails_closed() {
         TransportKind::TcpTls,
     ));
     let pin_win = Arc::new(PinPairingWindow::new());
-    let pin = pin_win.open_with_new_pin(&mut rng, now).expect("open pin");
+    let pin = pin_win.open_with_new_pin(&mut rng, 1).expect("open pin");
 
     let pair_srv = rx
         .bind_server(
@@ -1236,4 +1240,127 @@ async fn pin_window_close_between_reservation_and_confirmation_fails_closed() {
         "peer must NOT be trusted after closed-window confirmation"
     );
     conn.close();
+}
+
+#[tokio::test]
+async fn pin_window_monotonic_deadline_immune_to_wall_clock_jumps() {
+    let mut rng = CheckedOsCryptoRng::preflight().expect("rng");
+    let rx = Arc::new(make_node(
+        "MonoRx",
+        PeerRole::Controller,
+        TransportKind::QuicDatagram,
+    ));
+    let host = make_node("MonoHost", PeerRole::Host, TransportKind::QuicDatagram);
+
+    // Open PIN window at monotonic t=0 while wall clock for certs is around now_unix().
+    let pin_win = PinPairingWindow::new();
+    let pin = pin_win.open_with_new_pin(&mut rng, 0).expect("open pin");
+
+    let pair_srv = rx
+        .bind_server(
+            TransportKind::QuicDatagram,
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            true,
+        )
+        .await
+        .expect("bind");
+    let pair_addr = pair_srv.local_addr().expect("addr");
+
+    // Simulate a +500s forward wall-clock jump (well beyond 90s PIN TTL) while monotonic clock
+    // is only at 5,000 ms (5s). Pairing MUST still succeed using monotonic PIN window!
+    let cert_wall_now = now_unix();
+    let jumped_wall_now = cert_wall_now.saturating_add(500);
+    let (acc_res, init_res) = tokio::join!(
+        async {
+            let link = pair_srv
+                .accept_link(LUMABRIDGE_PAIR_ALPN_V1, jumped_wall_now)
+                .await
+                .expect("accept");
+            rx.accept_pairing_over_link(link, Some(&pin_win), None, jumped_wall_now, 5_000, |p| {
+                HumanApprovalDecision::Approve {
+                    pairing_attempt_id: p.pairing_attempt_id,
+                    peer_device_id: p.peer_device_id,
+                    granted_base_perms: Permissions::EXTEND_DISPLAY,
+                }
+            })
+            .await
+        },
+        host.pair_with_pin(
+            TransportKind::QuicDatagram,
+            pair_addr,
+            rx.device_id(),
+            &pin,
+            jumped_wall_now,
+            |p| HumanApprovalDecision::Approve {
+                pairing_attempt_id: p.pairing_attempt_id,
+                peer_device_id: p.peer_device_id,
+                granted_base_perms: Permissions::EXTEND_DISPLAY,
+            },
+        ),
+    );
+    assert!(
+        acc_res.is_ok() && init_res.is_ok(),
+        "monotonic PIN deadline must ignore +500s wall-clock jump: acc={acc_res:?}, init={init_res:?}"
+    );
+    pair_srv.close();
+}
+
+#[test]
+fn lumabridge_node_rejects_pairing_without_ci_auto_approve_on_non_tty() {
+    use std::process::{Command, Stdio};
+
+    let bin = env!("CARGO_BIN_EXE_lumabridge_node");
+    let dir = std::env::temp_dir().join(format!("lb-m15-reject-no-ci-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let rendezvous = dir.join("rendezvous.txt");
+
+    let mut rx_child = Command::new(bin)
+        .args([
+            "--mode",
+            "receiver",
+            "--transport",
+            "tcp-tls",
+            "--frames",
+            "10",
+            "--endpoint-out",
+            rendezvous.to_str().expect("utf8"),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn rx");
+
+    for _ in 0..100 {
+        if rendezvous.exists()
+            && std::fs::read_to_string(&rendezvous).is_ok_and(|s| s.split('|').count() == 4)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let tx_status = Command::new(bin)
+        .args([
+            "--mode",
+            "host",
+            "--transport",
+            "tcp-tls",
+            "--frames",
+            "10",
+            "--endpoint-out",
+            rendezvous.to_str().expect("utf8"),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("run tx");
+    let rx_status = rx_child.wait().expect("wait rx");
+    assert!(
+        !tx_status.success() && !rx_status.success(),
+        "non-TTY lumabridge_node without --ci-auto-approve-pairing must fail closed"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

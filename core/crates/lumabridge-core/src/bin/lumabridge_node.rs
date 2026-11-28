@@ -19,12 +19,14 @@ use lumabridge_protocol::media::fragmentation::FrameKind;
 use lumabridge_protocol::version::CodecId;
 use lumabridge_security::authorization::AuthorizationPolicyContext;
 use lumabridge_security::identity::{DeviceId, PeerRole};
-use lumabridge_security::pairing::{HumanApprovalDecision, PinPairingWindow};
+use lumabridge_security::pairing::{
+    HumanApprovalDecision, PairingApprovalPrompt, PinPairingWindow,
+};
 use lumabridge_security::secret::{CheckedOsCryptoRng, PinSecret};
 use lumabridge_security::tls::{LUMABRIDGE_ALPN_V1, LUMABRIDGE_PAIR_ALPN_V1};
 use lumabridge_transport::config::{TransportConfig, TransportKind};
 use lumabridge_transport::queue::OutboundVideoFrame;
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -48,6 +50,7 @@ struct CliArgs {
     peer_device_hex: Option<String>,
     pin: Option<Zeroizing<String>>,
     synthetic_media: bool,
+    ci_auto_approve_pairing: bool,
     frames: u32,
     fps: u32,
     h264_annexb_file: Option<PathBuf>,
@@ -111,6 +114,52 @@ fn to_hex_lower(bytes: &[u8; 32]) -> String {
     s
 }
 
+fn prompt_local_pairing_approval(
+    prompt: &PairingApprovalPrompt,
+    ci_auto_approve: bool,
+) -> HumanApprovalDecision {
+    if ci_auto_approve {
+        return HumanApprovalDecision::Approve {
+            pairing_attempt_id: prompt.pairing_attempt_id,
+            peer_device_id: prompt.peer_device_id,
+            granted_base_perms: Permissions::EXTEND_DISPLAY,
+        };
+    }
+    eprintln!(
+        "[LB-PAIRING] Local consent required: attempt={} peer_id={} fingerprint={} untrusted_name={:?} mode={:?}",
+        prompt.pairing_attempt_id,
+        to_hex_lower(prompt.peer_device_id.as_bytes()),
+        prompt.peer_fingerprint,
+        prompt.untrusted_friendly_name,
+        prompt.auth_mode
+    );
+    if !std::io::stdin().is_terminal() {
+        eprintln!(
+            "[LB-PAIRING] Non-interactive stdin without --ci-auto-approve-pairing; rejecting pairing."
+        );
+        return HumanApprovalDecision::Reject {
+            pairing_attempt_id: prompt.pairing_attempt_id,
+            peer_device_id: prompt.peer_device_id,
+        };
+    }
+    eprint!("[LB-PAIRING] Approve pairing for this peer? [y/N]: ");
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_ok() {
+        let ans = line.trim().to_ascii_lowercase();
+        if ans == "y" || ans == "yes" {
+            return HumanApprovalDecision::Approve {
+                pairing_attempt_id: prompt.pairing_attempt_id,
+                peer_device_id: prompt.peer_device_id,
+                granted_base_perms: Permissions::EXTEND_DISPLAY,
+            };
+        }
+    }
+    HumanApprovalDecision::Reject {
+        pairing_attempt_id: prompt.pairing_attempt_id,
+        peer_device_id: prompt.peer_device_id,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn parse_args() -> Result<CliArgs, NodeError> {
     let mut mode: Option<CliMode> = None;
@@ -122,6 +171,7 @@ fn parse_args() -> Result<CliArgs, NodeError> {
     let mut op_endpoint = None;
     let mut peer_device_hex = None;
     let mut pin: Option<Zeroizing<String>> = None;
+    let mut ci_auto_approve_pairing = false;
     let mut frames = 180u32;
     let mut fps = 60u32;
     let mut h264_annexb_file = None;
@@ -140,6 +190,13 @@ fn parse_args() -> Result<CliArgs, NodeError> {
                 .read_line(&mut line)
                 .map_err(|_| NodeError::InvalidConfig("failed reading PIN from stdin"))?;
             pin = Some(Zeroizing::new(line.trim().to_owned()));
+            continue;
+        }
+        if flag == "--ci-auto-approve-pairing" {
+            eprintln!(
+                "[WARN] --ci-auto-approve-pairing enabled (isolated CI/test fixture approval only)."
+            );
+            ci_auto_approve_pairing = true;
             continue;
         }
         let val = it
@@ -214,6 +271,7 @@ fn parse_args() -> Result<CliArgs, NodeError> {
         peer_device_hex,
         pin,
         synthetic_media,
+        ci_auto_approve_pairing,
         frames,
         fps: fps.max(1),
         h264_annexb_file,
@@ -248,7 +306,8 @@ async fn run_receiver(mut args: CliArgs) -> Result<SessionTelemetrySummary, Node
     )?;
 
     let pin_window = PinPairingWindow::new();
-    let generated_pin = pin_window.open_with_new_pin(&mut rng, now_unix())?;
+    let pair_clock = Instant::now();
+    let generated_pin = pin_window.open_with_new_pin(&mut rng, 0)?;
     let pair_srv = node
         .bind_server(args.transport, args.bind_addr, true)
         .await?;
@@ -288,9 +347,9 @@ async fn run_receiver(mut args: CliArgs) -> Result<SessionTelemetrySummary, Node
     }
     drop(ready_line);
 
-    let pair_clock = Instant::now();
+    let ci_auto_approve = args.ci_auto_approve_pairing;
     loop {
-        if pin_window.remaining_attempts(now_unix()) == 0 {
+        if pin_window.remaining_attempts(pair_clock.elapsed().as_secs()) == 0 {
             return Err(NodeError::Security(
                 lumabridge_security::error::SecurityError::PairingState(
                     "PIN pairing attempts exhausted",
@@ -312,11 +371,7 @@ async fn run_receiver(mut args: CliArgs) -> Result<SessionTelemetrySummary, Node
                 None,
                 now_unix(),
                 now_ms,
-                |p| HumanApprovalDecision::Approve {
-                    pairing_attempt_id: p.pairing_attempt_id,
-                    peer_device_id: p.peer_device_id,
-                    granted_base_perms: Permissions::EXTEND_DISPLAY,
-                },
+                |p| prompt_local_pairing_approval(p, ci_auto_approve),
             )
             .await
             .is_ok()
@@ -498,6 +553,7 @@ async fn run_host(mut args: CliArgs) -> Result<SessionTelemetrySummary, NodeErro
 
     let pin_secret = PinSecret::new(pin_str.as_str())?;
     drop(pin_str);
+    let ci_auto_approve = args.ci_auto_approve_pairing;
     let paired_rec = node
         .pair_with_pin(
             args.transport,
@@ -505,11 +561,7 @@ async fn run_host(mut args: CliArgs) -> Result<SessionTelemetrySummary, NodeErro
             rx_device_id,
             &pin_secret,
             now_unix(),
-            |p| HumanApprovalDecision::Approve {
-                pairing_attempt_id: p.pairing_attempt_id,
-                peer_device_id: p.peer_device_id,
-                granted_base_perms: Permissions::EXTEND_DISPLAY,
-            },
+            |p| prompt_local_pairing_approval(p, ci_auto_approve),
         )
         .await?;
 

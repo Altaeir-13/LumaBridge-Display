@@ -202,12 +202,12 @@ impl UdpImpairmentProxy {
                             continue;
                         }
                         let pkt = buf_c[..len].to_vec();
-                        let delay_ms = compute_delay_and_pace(&mut prng, prof, len, &mut next_free_tx_up);
+                        let (mut deliver_at, immediate) =
+                            schedule_deliver_at(&mut prng, prof, len, &mut next_free_tx_up);
                         let dup = prng.hit_ppm(prof.duplicate_ppm);
-                        if up_heap.is_empty() && delay_ms == 0 && !dup {
+                        if up_heap.is_empty() && immediate && !dup {
                             let _ = upstream_sock.send(&pkt).await;
                         } else {
-                            let mut deliver_at = tokio::time::Instant::now() + Duration::from_millis(delay_ms);
                             if prof.reorder_ppm == 0 {
                                 deliver_at = deliver_at.max(last_scheduled_up);
                                 last_scheduled_up = deliver_at;
@@ -236,12 +236,12 @@ impl UdpImpairmentProxy {
                             continue;
                         }
                         let pkt = buf_u[..len].to_vec();
-                        let delay_ms = compute_delay_and_pace(&mut prng, prof, len, &mut next_free_tx_down);
+                        let (mut deliver_at, immediate) =
+                            schedule_deliver_at(&mut prng, prof, len, &mut next_free_tx_down);
                         let dup = prng.hit_ppm(prof.duplicate_ppm);
-                        if down_heap.is_empty() && delay_ms == 0 && !dup {
+                        if down_heap.is_empty() && immediate && !dup {
                             let _ = client_sock.send_to(&pkt, dest).await;
                         } else {
-                            let mut deliver_at = tokio::time::Instant::now() + Duration::from_millis(delay_ms);
                             if prof.reorder_ppm == 0 {
                                 deliver_at = deliver_at.max(last_scheduled_down);
                                 last_scheduled_down = deliver_at;
@@ -284,28 +284,31 @@ impl UdpImpairmentProxy {
     }
 }
 
-fn compute_delay_and_pace(
+fn schedule_deliver_at(
     prng: &mut SeededPrng,
     prof: ImpairmentProfile,
     len: usize,
     next_free_tx: &mut tokio::time::Instant,
-) -> u64 {
-    let mut delay = prof.base_delay_ms + prng.range_u64(prof.jitter_ms);
+) -> (tokio::time::Instant, bool) {
+    let mut prop_delay_ms = prof.base_delay_ms + prng.range_u64(prof.jitter_ms);
     if prng.hit_ppm(prof.reorder_ppm) {
-        delay += prof.extra_reorder_delay_ms.max(5);
+        prop_delay_ms += prof.extra_reorder_delay_ms.max(5);
     }
-    if let Some(bps) = prof.bandwidth_cap_bps {
+    let now = tokio::time::Instant::now();
+    let ser_ready = if let Some(bps) = prof.bandwidth_cap_bps {
         let wire_bits = (len as u64).saturating_mul(8);
         let ser_us = wire_bits.saturating_mul(1_000_000) / bps.max(1_000);
-        let now = tokio::time::Instant::now();
         if *next_free_tx < now {
             *next_free_tx = now;
         }
         *next_free_tx += Duration::from_micros(ser_us);
-        let q_ms = u64::try_from((*next_free_tx - now).as_millis()).unwrap_or(1_000);
-        delay = delay.saturating_add(q_ms.min(500));
-    }
-    delay
+        *next_free_tx
+    } else {
+        now
+    };
+    let deliver_at = ser_ready + Duration::from_millis(prop_delay_ms);
+    let immediate = prop_delay_ms == 0 && prof.bandwidth_cap_bps.is_none();
+    (deliver_at, immediate)
 }
 
 /// Real loopback TCP forwarding proxy adding controlled delay and dynamic bandwidth throttling.

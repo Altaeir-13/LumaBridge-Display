@@ -430,7 +430,8 @@ async fn run_ffi_loopback_session(
     let now = now_unix_secs();
     let mut rng = CheckedOsCryptoRng::preflight()?;
     let pin_win = PinPairingWindow::new();
-    let pin = pin_win.open_with_new_pin(&mut rng, now)?;
+    let pair_clock = Instant::now();
+    let pin = pin_win.open_with_new_pin(&mut rng, 0)?;
     let pair_srv = rx
         .bind_server(kind, SocketAddr::from(([127, 0, 0, 1], 0)), true)
         .await?;
@@ -442,7 +443,8 @@ async fn run_ffi_loopback_session(
 
     let accept_pair = async {
         let link = pair_srv.accept_link(LUMABRIDGE_PAIR_ALPN_V1, now).await?;
-        rx.accept_pairing_over_link(link, Some(&pin_win), None, now, 100, |p| {
+        let now_mono_ms = u64::try_from(pair_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+        rx.accept_pairing_over_link(link, Some(&pin_win), None, now, now_mono_ms, |p| {
             HumanApprovalDecision::Approve {
                 pairing_attempt_id: p.pairing_attempt_id,
                 peer_device_id: p.peer_device_id,
