@@ -1094,3 +1094,62 @@ async fn operational_connection_windowed_loss_persists_through_cooldown_and_reco
     proxy.shutdown().await;
     srv.close();
 }
+
+#[tokio::test]
+async fn udp_proxy_enforces_bandwidth_cap_without_clamping() {
+    use tokio::net::UdpSocket;
+
+    let rx = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind rx");
+    let rx_addr = rx.local_addr().expect("addr");
+    let proxy = UdpImpairmentProxy::start(
+        rx_addr,
+        0xCAFE_8000,
+        ImpairmentProfile {
+            base_delay_ms: 6,
+            bandwidth_cap_bps: Some(8_000_000),
+            ..ImpairmentProfile::default()
+        },
+    )
+    .await
+    .expect("proxy");
+    let tx = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind tx");
+    tx.connect(proxy.listen_addr()).await.expect("connect");
+
+    // Send 600 x 1,200 B = 720,000 B (5.76 Mbit) in paced bursts at ~19.2 Mbps offered (> 8 Mbps cap)
+    // without overflowing the OS loopback UDP socket buffer. At 8 Mbps cap, delivery MUST take >= 0.72 s
+    // and measured wire rate MUST stay <= 8.05 Mbps.
+    let total_pkts = 600usize;
+    let t0 = tokio::time::Instant::now();
+    let tx_task = tokio::spawn(async move {
+        let pkt = vec![0x5Au8; 1_200];
+        for idx in 0..total_pkts {
+            tx.send(&pkt).await.expect("send");
+            if (idx + 1) % 16 == 0 {
+                tokio::time::sleep(Duration::from_millis(8)).await;
+            }
+        }
+    });
+
+    let mut rbuf = [0u8; 2048];
+    let mut rx_bytes = 0usize;
+    for _ in 0..total_pkts {
+        let n = tokio::time::timeout(Duration::from_secs(5), rx.recv(&mut rbuf))
+            .await
+            .expect("recv timeout")
+            .expect("recv");
+        rx_bytes += n;
+    }
+    tx_task.await.expect("tx join");
+    let elapsed_s = t0.elapsed().as_secs_f64();
+    let mbps = (rx_bytes as f64 * 8.0) / (elapsed_s * 1_000_000.0);
+    assert_eq!(rx_bytes, total_pkts * 1_200);
+    assert!(
+        mbps <= 8.05,
+        "UdpImpairmentProxy must enforce 8 Mbps cap without 500ms backlog clamp (measured {mbps:.2} Mbps in {elapsed_s:.3}s)"
+    );
+    proxy.shutdown().await;
+}
