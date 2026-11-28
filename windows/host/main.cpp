@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cwchar>
 #include <fstream>
+#include <iostream>
 #include <string>
 
 namespace {
@@ -1038,6 +1039,15 @@ wmain(
     HostGateConfig gateConfig{};
 #ifdef LUMABRIDGE_ENABLE_FFI_POC
     lumabridge::host::M2LanStreamConfig lanConfig{};
+    struct PinScopeGuard {
+        std::string& Pin;
+        ~PinScopeGuard() noexcept {
+            if (!Pin.empty()) {
+                SecureZeroMemory(Pin.data(), Pin.size());
+                Pin.clear();
+            }
+        }
+    } lanPinGuard{lanConfig.pin};
     bool enableLanStream = false;
     std::string lanRemoteIp{};
     uint16_t lanPairPort = 0U;
@@ -1388,21 +1398,26 @@ wmain(
             std::fprintf(
                 stderr,
                 "[LB-HOST][SECURITY WARNING] --lan-pin exposes the pairing PIN in process arguments; omit it for interactive no-echo prompt or use --lan-pin-stdin.\n");
-            lanConfig.pin = NarrowAsciiFromWide(argv[++i]);
+            std::string cliPin = NarrowAsciiFromWide(argv[++i]);
+            lanConfig.pin = cliPin;
+            if (!cliPin.empty())
+            {
+                SecureZeroMemory(cliPin.data(), cliPin.size());
+                cliPin.clear();
+            }
         }
         else if (arg == L"--lan-pin-stdin")
         {
-            std::string stdinPin{};
-            if (!std::getline(std::cin, stdinPin))
+            lanConfig.pin.clear();
+            if (!std::getline(std::cin, lanConfig.pin))
             {
                 std::fprintf(stderr, "Failed reading pairing PIN from stdin.\n");
                 return EXIT_FAILURE;
             }
-            while (!stdinPin.empty() && (stdinPin.back() == '\r' || stdinPin.back() == '\n'))
+            while (!lanConfig.pin.empty() && (lanConfig.pin.back() == '\r' || lanConfig.pin.back() == '\n'))
             {
-                stdinPin.pop_back();
+                lanConfig.pin.pop_back();
             }
-            lanConfig.pin = std::move(stdinPin);
         }
         else if (arg == L"--lan-peer-id" && (i + 1) < argc)
         {
@@ -1620,14 +1635,13 @@ wmain(
                 (void)SetConsoleMode(hStdin, origMode & ~static_cast<DWORD>(ENABLE_ECHO_INPUT));
                 std::fprintf(stdout, "[LB-HOST] Enter 8-digit pairing PIN (input hidden): ");
                 std::fflush(stdout);
-                std::string hiddenPin{};
-                if (std::getline(std::cin, hiddenPin))
+                lanConfig.pin.clear();
+                if (std::getline(std::cin, lanConfig.pin))
                 {
-                    while (!hiddenPin.empty() && (hiddenPin.back() == '\r' || hiddenPin.back() == '\n'))
+                    while (!lanConfig.pin.empty() && (lanConfig.pin.back() == '\r' || lanConfig.pin.back() == '\n'))
                     {
-                        hiddenPin.pop_back();
+                        lanConfig.pin.pop_back();
                     }
-                    lanConfig.pin = std::move(hiddenPin);
                 }
                 std::fprintf(stdout, "\n");
             }

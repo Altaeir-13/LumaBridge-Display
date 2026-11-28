@@ -28,7 +28,7 @@ use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use zeroize::Zeroize as _;
+use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CliMode {
@@ -46,7 +46,7 @@ struct CliArgs {
     pair_endpoint: Option<SocketAddr>,
     op_endpoint: Option<SocketAddr>,
     peer_device_hex: Option<String>,
-    pin: Option<String>,
+    pin: Option<Zeroizing<String>>,
     synthetic_media: bool,
     frames: u32,
     fps: u32,
@@ -121,7 +121,7 @@ fn parse_args() -> Result<CliArgs, NodeError> {
     let mut pair_endpoint = None;
     let mut op_endpoint = None;
     let mut peer_device_hex = None;
-    let mut pin: Option<String> = None;
+    let mut pin: Option<Zeroizing<String>> = None;
     let mut frames = 180u32;
     let mut fps = 60u32;
     let mut h264_annexb_file = None;
@@ -135,12 +135,11 @@ fn parse_args() -> Result<CliArgs, NodeError> {
             continue;
         }
         if flag == "--pin-stdin" {
-            let mut line = String::new();
+            let mut line = Zeroizing::new(String::new());
             std::io::stdin()
                 .read_line(&mut line)
                 .map_err(|_| NodeError::InvalidConfig("failed reading PIN from stdin"))?;
-            pin = Some(line.trim().to_owned());
-            line.zeroize();
+            pin = Some(Zeroizing::new(line.trim().to_owned()));
             continue;
         }
         let val = it
@@ -184,9 +183,9 @@ fn parse_args() -> Result<CliArgs, NodeError> {
             "--peer-device-hex" => peer_device_hex = Some(val),
             "--pin" => {
                 eprintln!("[WARN] --pin exposes pairing secret on command line; prefer --pin-stdin or --rendezvous-in.");
-                pin = Some(val);
+                pin = Some(Zeroizing::new(val));
             }
-            "--ci-synthetic-pin" => pin = Some(val),
+            "--ci-synthetic-pin" => pin = Some(Zeroizing::new(val)),
             "--frames" => {
                 frames = val
                     .parse()
@@ -224,7 +223,8 @@ fn parse_args() -> Result<CliArgs, NodeError> {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn run_receiver(args: CliArgs) -> Result<SessionTelemetrySummary, NodeError> {
+async fn run_receiver(mut args: CliArgs) -> Result<SessionTelemetrySummary, NodeError> {
+    drop(args.pin.take());
     let startup_now = now_unix();
     let mut rng = CheckedOsCryptoRng::preflight()?;
     let node = LumaBridgeNode::generate(
@@ -257,14 +257,14 @@ async fn run_receiver(args: CliArgs) -> Result<SessionTelemetrySummary, NodeErro
         .await?;
     let pair_addr = pair_srv.local_addr()?;
     let op_addr = op_srv.local_addr()?;
-    let mut ready_line = {
+    let ready_line = Zeroizing::new({
         let pin_ascii = core::str::from_utf8(generated_pin.expose_bytes())
             .map_err(|_| NodeError::InvalidConfig("non-ASCII PIN"))?;
         format!(
             "{pair_addr}|{op_addr}|{}|{pin_ascii}",
             to_hex_lower(node.device_id().as_bytes()),
         )
-    };
+    });
     if let Some(ref out_path) = args.pair_port_out {
         let tmp_path = out_path.with_extension("tmp");
         let mut opts = std::fs::OpenOptions::new();
@@ -284,9 +284,9 @@ async fn run_receiver(args: CliArgs) -> Result<SessionTelemetrySummary, NodeErro
         std::fs::rename(&tmp_path, out_path)
             .map_err(|_| NodeError::InvalidConfig("failed finalizing --endpoint-out"))?;
     } else {
-        println!("READY {ready_line}");
+        println!("READY {}", ready_line.as_str());
     }
-    ready_line.zeroize();
+    drop(ready_line);
 
     let pair_clock = Instant::now();
     loop {
@@ -352,13 +352,22 @@ async fn run_receiver(args: CliArgs) -> Result<SessionTelemetrySummary, NodeErro
         .await?;
 
     session.set_media_origin_synthetic(args.synthetic_media);
-    let _ = session.send_clock_sync_ping(1, 0).await;
     let start = Instant::now();
+    let mut clock_sync_seq = 1u64;
+    let t1_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(0);
+    let _ = session.send_clock_sync_ping(clock_sync_seq, t1_us).await;
+    let mut next_clock_ping_at = start + Duration::from_secs(1);
     let deadline = start + Duration::from_secs(20);
     let mut last_seq = 0u32;
     while Instant::now() < deadline
         && session.telemetry_summary().frames_delivered < u64::from(args.frames)
     {
+        if Instant::now() >= next_clock_ping_at {
+            clock_sync_seq = clock_sync_seq.saturating_add(1);
+            let t1_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(0);
+            let _ = session.send_clock_sync_ping(clock_sync_seq, t1_us).await;
+            next_clock_ping_at = Instant::now() + Duration::from_secs(1);
+        }
         let ctrl_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(0);
         match session.try_recv_control().await {
             Ok(Some(ControlMessage::SessionClose(_))) => break,
@@ -421,7 +430,7 @@ async fn run_receiver(args: CliArgs) -> Result<SessionTelemetrySummary, NodeErro
 }
 
 #[allow(clippy::too_many_lines)]
-async fn run_host(args: CliArgs) -> Result<SessionTelemetrySummary, NodeError> {
+async fn run_host(mut args: CliArgs) -> Result<SessionTelemetrySummary, NodeError> {
     let startup_now = now_unix();
     let mut rng = CheckedOsCryptoRng::preflight()?;
     let node = LumaBridgeNode::generate(
@@ -446,9 +455,10 @@ async fn run_host(args: CliArgs) -> Result<SessionTelemetrySummary, NodeError> {
 
     let rdv_path = args.rendezvous_in.as_ref().or(args.pair_port_out.as_ref());
     let (pair_addr, op_addr, rx_device_id, pin_str) = if let Some(ep_path) = rdv_path {
-        let mut contents = String::new();
+        let mut contents = Zeroizing::new(String::new());
         for _ in 0..160 {
             if let Ok(raw) = std::fs::read_to_string(ep_path) {
+                let raw = Zeroizing::new(raw);
                 if raw.trim().split('|').count() == 4 {
                     contents = raw;
                     break;
@@ -468,7 +478,7 @@ async fn run_host(args: CliArgs) -> Result<SessionTelemetrySummary, NodeError> {
                 .parse::<SocketAddr>()
                 .map_err(|_| NodeError::InvalidConfig("bad op addr"))?,
             parse_device_id_hex(parts[2])?,
-            parts[3].to_owned(),
+            Zeroizing::new(parts[3].to_owned()),
         )
     } else {
         let ep = args.pair_endpoint.ok_or(NodeError::InvalidConfig(
@@ -479,15 +489,15 @@ async fn run_host(args: CliArgs) -> Result<SessionTelemetrySummary, NodeError> {
             Some(hex) => parse_device_id_hex(hex)?,
             None => DeviceId::from_bytes([0u8; 32]),
         };
-        let explicit_pin = args.pin.clone().ok_or(NodeError::InvalidConfig(
+        let explicit_pin = args.pin.take().ok_or(NodeError::InvalidConfig(
             "host manual --connect requires --pin-stdin, --ci-synthetic-pin, or --rendezvous-in",
         ))?;
         (ep, op_ep, hint_id, explicit_pin)
     };
+    drop(args.pin.take());
 
-    let pin_secret = PinSecret::new(&pin_str)?;
-    let mut pin_str = pin_str;
-    pin_str.zeroize();
+    let pin_secret = PinSecret::new(pin_str.as_str())?;
+    drop(pin_str);
     let paired_rec = node
         .pair_with_pin(
             args.transport,
@@ -535,14 +545,23 @@ async fn run_host(args: CliArgs) -> Result<SessionTelemetrySummary, NodeError> {
     };
 
     session.set_media_origin_synthetic(args.synthetic_media);
-    let _ = session.send_clock_sync_ping(1, 0).await;
     let start = Instant::now();
+    let mut clock_sync_seq = 1u64;
+    let t1_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(0);
+    let _ = session.send_clock_sync_ping(clock_sync_seq, t1_us).await;
+    let mut next_clock_ping_at = start + Duration::from_secs(1);
     let interval = Duration::from_micros(1_000_000 / u64::from(args.fps));
     let mut next_tick = start;
     let mut gop_id = 1u16;
     let mut force_idr = false;
 
     for fid in 1..=args.frames {
+        if Instant::now() >= next_clock_ping_at {
+            clock_sync_seq = clock_sync_seq.saturating_add(1);
+            let t1_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(0);
+            let _ = session.send_clock_sync_ping(clock_sync_seq, t1_us).await;
+            next_clock_ping_at = Instant::now() + Duration::from_secs(1);
+        }
         let (is_idr, payload) = if annexb_access_units.is_empty() {
             let key = fid == 1 || fid % 60 == 1 || force_idr;
             let mut buf = if key {
