@@ -592,6 +592,10 @@ NvencH264Encoder::Initialize(
         return m_metrics.LastHResult;
     }
 
+    m_activeEncodeConfig = encodeCfg;
+    m_activeInitParams = initParams;
+    m_activeInitParams.encodeConfig = &m_activeEncodeConfig;
+
     m_bitstreamBuffer = createBs.bitstreamBuffer;
     m_initialized = true;
     m_forceIdrNextFrame = true;
@@ -687,6 +691,74 @@ NvencH264Encoder::RequestForceIdrOnNextFrame() noexcept
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_forceIdrNextFrame = true;
+}
+
+HRESULT
+NvencH264Encoder::UpdateDynamicBitrate(
+    uint32_t targetBitrateBps,
+    uint32_t maxBitrateBps
+    ) noexcept
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_initialized || m_encoder == nullptr || m_nvencFn.nvEncReconfigureEncoder == nullptr)
+    {
+        return E_NOT_VALID_STATE;
+    }
+
+    const uint32_t clampedTarget = (std::max)(1000000U, (std::min)(targetBitrateBps, 100000000U));
+    const uint32_t clampedMax = (maxBitrateBps == 0U)
+        ? (std::max)(clampedTarget, clampedTarget + clampedTarget / 3U)
+        : (std::max)(clampedTarget, (std::min)(maxBitrateBps, 120000000U));
+
+    if (m_config.BitrateBps == clampedTarget && m_config.MaxBitrateBps == clampedMax)
+    {
+        return S_OK;
+    }
+
+    if (m_hooks != nullptr)
+    {
+        const NVENCSTATUS hookSt = m_hooks->OnPreReconfigureEncoder(clampedTarget, clampedMax);
+        if (hookSt != NV_ENC_SUCCESS)
+        {
+            m_metrics.LastNvencStatus = hookSt;
+            m_metrics.LastHResult = HResultFromNvencStatus(hookSt);
+            return m_metrics.LastHResult;
+        }
+    }
+
+    NV_ENC_CONFIG nextEncodeConfig = m_activeEncodeConfig;
+    nextEncodeConfig.rcParams.averageBitRate = clampedTarget;
+    nextEncodeConfig.rcParams.maxBitRate = clampedMax;
+    nextEncodeConfig.rcParams.vbvBufferSize = (std::max)(
+        clampedTarget / (std::max)(1U, m_config.TargetFps),
+        clampedTarget / 120U);
+    nextEncodeConfig.rcParams.vbvInitialDelay = nextEncodeConfig.rcParams.vbvBufferSize;
+
+    NV_ENC_INITIALIZE_PARAMS nextInitParams = m_activeInitParams;
+    nextInitParams.encodeConfig = &nextEncodeConfig;
+
+    NV_ENC_RECONFIGURE_PARAMS reconf{};
+    reconf.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+    reconf.reInitEncodeParams = nextInitParams;
+    reconf.resetEncoder = 0U;
+    reconf.forceIDR = 0U;
+
+    const NVENCSTATUS st = m_nvencFn.nvEncReconfigureEncoder(m_encoder, &reconf);
+    m_metrics.LastNvencStatus = st;
+    if (st != NV_ENC_SUCCESS)
+    {
+        m_metrics.LastHResult = HResultFromNvencStatus(st);
+        return m_metrics.LastHResult;
+    }
+
+    m_activeEncodeConfig = nextEncodeConfig;
+    m_activeInitParams = nextInitParams;
+    m_activeInitParams.encodeConfig = &m_activeEncodeConfig;
+    m_config.BitrateBps = clampedTarget;
+    m_config.MaxBitrateBps = clampedMax;
+    m_metrics.ConfiguredBitrateBps = clampedTarget;
+    m_metrics.LastHResult = S_OK;
+    return S_OK;
 }
 
 HRESULT

@@ -118,39 +118,63 @@ impl ClockSyncTracker {
     }
 }
 
+/// Explicit methodology classification distinguishing measured, estimated, synthetic,
+/// and unavailable telemetry values (`M2` telemetry audit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MeasurementOrigin {
+    #[default]
+    Unavailable,
+    Measured,
+    Estimated,
+    Synthetic,
+}
+
+impl MeasurementOrigin {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::Measured => "measured",
+            Self::Estimated => "estimated",
+            Self::Synthetic => "synthetic",
+        }
+    }
+}
+
 /// Exact quantile breakdown (`p50`, `p95`, `p99`) in microseconds for one telemetry stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StagePercentiles {
+    pub origin: MeasurementOrigin,
     pub samples: usize,
     pub p50_us: u64,
     pub p95_us: u64,
     pub p99_us: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct BoundedSamples {
+    origin: MeasurementOrigin,
     values: VecDeque<u64>,
 }
 
-impl Default for BoundedSamples {
-    fn default() -> Self {
-        Self {
-            values: VecDeque::with_capacity(256),
-        }
-    }
-}
-
 impl BoundedSamples {
-    fn push(&mut self, value_us: u64) {
+    fn push_with_origin(&mut self, value_us: u64, origin: MeasurementOrigin) {
         if self.values.len() >= MAX_LATENCY_RESERVOIR_SAMPLES {
             self.values.pop_front();
         }
+        self.origin = origin;
         self.values.push_back(value_us);
     }
 
     fn percentiles(&self) -> StagePercentiles {
         if self.values.is_empty() {
-            return StagePercentiles::default();
+            return StagePercentiles {
+                origin: MeasurementOrigin::Unavailable,
+                samples: 0,
+                p50_us: 0,
+                p95_us: 0,
+                p99_us: 0,
+            };
         }
         let mut sorted: Vec<u64> = self.values.iter().copied().collect();
         sorted.sort_unstable();
@@ -158,6 +182,7 @@ impl BoundedSamples {
         let idx =
             |num: usize, den: usize| -> usize { ((n.saturating_sub(1)).saturating_mul(num)) / den };
         StagePercentiles {
+            origin: self.origin,
             samples: n,
             p50_us: sorted[idx(50, 100)],
             p95_us: sorted[idx(95, 100)],
@@ -183,6 +208,8 @@ pub struct SessionTelemetrySummary {
     pub protected_blanks: u64,
     pub unauthorized_input_drops: u64,
     pub clock_sync_rtt_us: u64,
+    pub clock_sync_valid_samples: u64,
+    pub clock_sync_origin: MeasurementOrigin,
     pub timestamp_measurement_errors: u64,
 }
 
@@ -205,14 +232,16 @@ impl SessionTelemetrySummary {
                 "  \"protected_blanks\": {},\n",
                 "  \"unauthorized_input_drops\": {},\n",
                 "  \"clock_sync_rtt_us\": {},\n",
+                "  \"clock_sync_samples\": {},\n",
+                "  \"clock_sync_origin\": \"{}\",\n",
                 "  \"timestamp_measurement_errors\": {},\n",
                 "  \"stages_us\": {{\n",
-                "    \"capture\": {{ \"samples\": {}, \"p50\": {}, \"p95\": {}, \"p99\": {} }},\n",
-                "    \"encode\": {{ \"samples\": {}, \"p50\": {}, \"p95\": {}, \"p99\": {} }},\n",
-                "    \"network\": {{ \"samples\": {}, \"p50\": {}, \"p95\": {}, \"p99\": {} }},\n",
-                "    \"decode\": {{ \"samples\": {}, \"p50\": {}, \"p95\": {}, \"p99\": {} }},\n",
-                "    \"present\": {{ \"samples\": {}, \"p50\": {}, \"p95\": {}, \"p99\": {} }},\n",
-                "    \"end_to_end\": {{ \"samples\": {}, \"p50\": {}, \"p95\": {}, \"p99\": {} }}\n",
+                "    \"capture\": {{ \"origin\": \"{}\", \"samples\": {}, \"p50\": {}, \"p95\": {}, \"p99\": {} }},\n",
+                "    \"encode\": {{ \"origin\": \"{}\", \"samples\": {}, \"p50\": {}, \"p95\": {}, \"p99\": {} }},\n",
+                "    \"network\": {{ \"origin\": \"{}\", \"samples\": {}, \"p50\": {}, \"p95\": {}, \"p99\": {} }},\n",
+                "    \"decode\": {{ \"origin\": \"{}\", \"samples\": {}, \"p50\": {}, \"p95\": {}, \"p99\": {} }},\n",
+                "    \"present\": {{ \"origin\": \"{}\", \"samples\": {}, \"p50\": {}, \"p95\": {}, \"p99\": {} }},\n",
+                "    \"end_to_end\": {{ \"origin\": \"{}\", \"samples\": {}, \"p50\": {}, \"p95\": {}, \"p99\": {} }}\n",
                 "  }}\n",
                 "}}\n"
             ),
@@ -224,27 +253,35 @@ impl SessionTelemetrySummary {
             self.protected_blanks,
             self.unauthorized_input_drops,
             self.clock_sync_rtt_us,
+            self.clock_sync_valid_samples,
+            self.clock_sync_origin.as_str(),
             self.timestamp_measurement_errors,
+            self.capture.origin.as_str(),
             self.capture.samples,
             self.capture.p50_us,
             self.capture.p95_us,
             self.capture.p99_us,
+            self.encode.origin.as_str(),
             self.encode.samples,
             self.encode.p50_us,
             self.encode.p95_us,
             self.encode.p99_us,
+            self.network.origin.as_str(),
             self.network.samples,
             self.network.p50_us,
             self.network.p95_us,
             self.network.p99_us,
+            self.decode.origin.as_str(),
             self.decode.samples,
             self.decode.p50_us,
             self.decode.p95_us,
             self.decode.p99_us,
+            self.present.origin.as_str(),
             self.present.samples,
             self.present.p50_us,
             self.present.p95_us,
             self.present.p99_us,
+            self.end_to_end.origin.as_str(),
             self.end_to_end.samples,
             self.end_to_end.p50_us,
             self.end_to_end.p95_us,
@@ -270,6 +307,7 @@ pub struct LatencyPercentileTracker {
     pub protected_blanks: u64,
     pub unauthorized_input_drops: u64,
     pub last_clock_sync_rtt_us: u64,
+    pub clock_sync_valid_samples: u64,
     pub timestamp_measurement_errors: u64,
 }
 
@@ -291,10 +329,12 @@ impl LatencyPercentileTracker {
             protected_blanks: 0,
             unauthorized_input_drops: 0,
             last_clock_sync_rtt_us: 0,
+            clock_sync_valid_samples: 0,
             timestamp_measurement_errors: 0,
         }
     }
 
+    /// Record real measured stage latencies across the full pipeline.
     pub fn record_stage_latencies(
         &mut self,
         capture_us: u64,
@@ -303,17 +343,86 @@ impl LatencyPercentileTracker {
         decode_us: u64,
         present_us: u64,
     ) {
-        self.capture.push(capture_us);
-        self.encode.push(encode_us);
-        self.network.push(network_us);
-        self.decode.push(decode_us);
-        self.present.push(present_us);
+        self.record_stage_latencies_with_origin(
+            capture_us,
+            encode_us,
+            network_us,
+            decode_us,
+            present_us,
+            MeasurementOrigin::Measured,
+        );
+    }
+
+    /// Record synthetic stage latencies (e.g. FFmpeg/test fixtures) with explicit `Synthetic` provenance.
+    pub fn record_synthetic_stage_latencies(
+        &mut self,
+        capture_us: u64,
+        encode_us: u64,
+        network_us: u64,
+        decode_us: u64,
+        present_us: u64,
+    ) {
+        self.record_stage_latencies_with_origin(
+            capture_us,
+            encode_us,
+            network_us,
+            decode_us,
+            present_us,
+            MeasurementOrigin::Synthetic,
+        );
+    }
+
+    fn record_stage_latencies_with_origin(
+        &mut self,
+        capture_us: u64,
+        encode_us: u64,
+        network_us: u64,
+        decode_us: u64,
+        present_us: u64,
+        origin: MeasurementOrigin,
+    ) {
+        self.capture.push_with_origin(capture_us, origin);
+        self.encode.push_with_origin(encode_us, origin);
+        self.network.push_with_origin(network_us, origin);
+        self.decode.push_with_origin(decode_us, origin);
+        self.present.push_with_origin(present_us, origin);
         let e2e = capture_us
             .saturating_add(encode_us)
             .saturating_add(network_us)
             .saturating_add(decode_us)
             .saturating_add(present_us);
-        self.end_to_end.push(e2e);
+        self.end_to_end.push_with_origin(e2e, origin);
+    }
+
+    /// Record receiver-observed upstream latencies without fabricating `capture` or uncalibrated `network`.
+    pub fn record_rx_transport_latencies(
+        &mut self,
+        encode_us: u64,
+        encode_origin: MeasurementOrigin,
+        network_us: Option<u64>,
+        clock_sync_valid_samples: u64,
+    ) {
+        self.clock_sync_valid_samples = self.clock_sync_valid_samples.max(clock_sync_valid_samples);
+        self.encode.push_with_origin(encode_us, encode_origin);
+        if let Some(net_us) = network_us {
+            self.network
+                .push_with_origin(net_us, MeasurementOrigin::Estimated);
+            self.end_to_end.push_with_origin(
+                encode_us.saturating_add(net_us),
+                MeasurementOrigin::Estimated,
+            );
+        }
+    }
+
+    /// Record receiver-measured hardware decode and optional swapchain present durations without
+    /// inserting synthetic placeholder values when presentation timing is unavailable (e.g. headless).
+    pub fn record_rx_decode_present(&mut self, decode_us: u64, present_us: Option<u64>) {
+        self.decode
+            .push_with_origin(decode_us, MeasurementOrigin::Measured);
+        if let Some(pres_us) = present_us {
+            self.present
+                .push_with_origin(pres_us, MeasurementOrigin::Measured);
+        }
     }
 
     #[must_use]
@@ -333,7 +442,58 @@ impl LatencyPercentileTracker {
             protected_blanks: self.protected_blanks,
             unauthorized_input_drops: self.unauthorized_input_drops,
             clock_sync_rtt_us: self.last_clock_sync_rtt_us,
+            clock_sync_valid_samples: self.clock_sync_valid_samples,
+            clock_sync_origin: if self.clock_sync_valid_samples > 0 {
+                MeasurementOrigin::Measured
+            } else {
+                MeasurementOrigin::Unavailable
+            },
             timestamp_measurement_errors: self.timestamp_measurement_errors,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn telemetry_tracks_all_four_measurement_origins_without_fabrication() {
+        let mut rx_uncal = LatencyPercentileTracker::new("quic-datagram");
+        rx_uncal.record_rx_transport_latencies(1_200, MeasurementOrigin::Measured, None, 0);
+        rx_uncal.record_rx_decode_present(850, None);
+        let s1 = rx_uncal.summary();
+        assert_eq!(s1.capture.origin, MeasurementOrigin::Unavailable);
+        assert_eq!(s1.capture.samples, 0);
+        assert_eq!(s1.encode.origin, MeasurementOrigin::Measured);
+        assert_eq!(s1.encode.samples, 1);
+        assert_eq!(s1.network.origin, MeasurementOrigin::Unavailable);
+        assert_eq!(s1.network.samples, 0);
+        assert_eq!(s1.decode.origin, MeasurementOrigin::Measured);
+        assert_eq!(s1.present.origin, MeasurementOrigin::Unavailable);
+        assert_eq!(s1.present.samples, 0);
+        assert_eq!(s1.end_to_end.origin, MeasurementOrigin::Unavailable);
+        assert_eq!(s1.clock_sync_origin, MeasurementOrigin::Unavailable);
+
+        let mut rx_cal = LatencyPercentileTracker::new("tcp-tls");
+        rx_cal.record_rx_transport_latencies(900, MeasurementOrigin::Synthetic, Some(1_500), 2);
+        rx_cal.record_rx_decode_present(700, Some(300));
+        let s2 = rx_cal.summary();
+        assert_eq!(s2.encode.origin, MeasurementOrigin::Synthetic);
+        assert_eq!(s2.network.origin, MeasurementOrigin::Estimated);
+        assert_eq!(s2.end_to_end.origin, MeasurementOrigin::Estimated);
+        assert_eq!(s2.decode.origin, MeasurementOrigin::Measured);
+        assert_eq!(s2.present.origin, MeasurementOrigin::Measured);
+        assert_eq!(s2.clock_sync_origin, MeasurementOrigin::Measured);
+        let json = s2.to_sanitized_json();
+        assert!(json.contains("\"clock_sync_samples\": 2"), "{json}");
+        assert!(
+            json.contains("\"clock_sync_origin\": \"measured\""),
+            "{json}"
+        );
+        assert!(json.contains("\"origin\": \"synthetic\""), "{json}");
+        assert!(json.contains("\"origin\": \"estimated\""), "{json}");
+        assert!(json.contains("\"origin\": \"unavailable\""), "{json}");
+        assert!(json.contains("\"origin\": \"measured\""), "{json}");
     }
 }

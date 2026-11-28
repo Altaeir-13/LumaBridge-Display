@@ -254,7 +254,7 @@ try {
             '/Iwindows\driver\LumaBridgeIddDriver', '/Iwindows\host', ("/I{0}" -f $incFfi),
             'windows\host\main.cpp', 'windows\host\FrameConsumer.cpp',
             'windows\host\NvencH264Encoder.cpp', 'windows\host\H264BitstreamValidator.cpp',
-            'windows\host\FfiPocAdapter.cpp',
+            'windows\host\FfiPocAdapter.cpp', 'windows\host\M2LanStreamer.cpp',
             ("/Fo{0}\" -f $outDir), ("/Fd{0}\" -f $outDir), ("/Fe:{0}" -f $hostPocExe),
             '/link', $dllLib, 'd3d11.lib', 'dxgi.lib', 'advapi32.lib', 'user32.lib', 'gdi32.lib',
             'mfplat.lib', 'mfuuid.lib', 'wmcodecdspuuid.lib', 'ole32.lib', 'psapi.lib'

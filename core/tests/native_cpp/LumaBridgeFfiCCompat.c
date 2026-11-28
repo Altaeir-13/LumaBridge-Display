@@ -28,7 +28,14 @@ _Static_assert((sizeof(LbCoreMetrics) % 8u) == 0u, "LbCoreMetrics must be 8-byte
 _Static_assert((sizeof(LbGlobalResourceCounters) % 8u) == 0u, "LbGlobalResourceCounters must be 8-byte aligned");
 _Static_assert((sizeof(LbNodeConfig) % 8u) == 0u, "LbNodeConfig must be 8-byte aligned");
 _Static_assert((sizeof(LbNodeTelemetry) % 8u) == 0u, "LbNodeTelemetry must be 8-byte aligned");
+_Static_assert((sizeof(LbHostConnectConfig) % 8u) == 0u, "LbHostConnectConfig must be 8-byte aligned");
+_Static_assert((sizeof(LbHostFeedback) % 8u) == 0u, "LbHostFeedback must be 8-byte aligned");
+_Static_assert((sizeof(LbReceiverStartConfig) % 8u) == 0u, "LbReceiverStartConfig must be 8-byte aligned");
+_Static_assert((sizeof(LbReceiverEndpoints) % 8u) == 0u, "LbReceiverEndpoints must be 8-byte aligned");
+_Static_assert((sizeof(LbReceiverMediaEvent) % 8u) == 0u, "LbReceiverMediaEvent must be 8-byte aligned");
 _Static_assert(sizeof(LbNodeHandle *) == sizeof(void *), "Opaque LbNodeHandle pointer size check");
+_Static_assert(sizeof(LbHostSessionHandle *) == sizeof(void *), "Opaque LbHostSessionHandle pointer size check");
+_Static_assert(sizeof(LbReceiverSessionHandle *) == sizeof(void *), "Opaque LbReceiverSessionHandle pointer size check");
 _Static_assert(sizeof(LbDisplayGeometry) > 0u, "LbDisplayGeometry defined");
 _Static_assert(sizeof(LbFrameDescriptor) > 0u, "LbFrameDescriptor defined");
 _Static_assert(sizeof(LbOpaqueSurfaceHandle) > 0u, "LbOpaqueSurfaceHandle defined");
