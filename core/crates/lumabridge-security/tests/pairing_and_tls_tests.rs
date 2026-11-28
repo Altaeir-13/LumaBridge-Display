@@ -1189,6 +1189,8 @@ fn pin_confirmation_rejects_expiry_close_rotation_and_concurrent_winner_determin
         Err(SecurityError::PairingWindowClosed)
     );
     assert_eq!(acc_g1.stage(), PairingStage::Failed);
+    // Backwards monotonic clock before gen 2 opened_at_secs reports 0 without destroying gen 2.
+    assert_eq!(window.remaining_attempts(base_t + 5), 0);
     assert_eq!(
         window.remaining_attempts(base_t + 7),
         MAX_PIN_FAILED_ATTEMPTS

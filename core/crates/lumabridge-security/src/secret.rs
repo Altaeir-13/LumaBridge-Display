@@ -47,7 +47,7 @@ impl CheckedOsCryptoRng {
     }
 
     /// Fetch 1024 bytes of checked OS entropy upfront for single-shot SPAKE2 ephemeral draws.
-    pub fn prefetch_spake_entropy(&mut self) -> Result<PrefetchedCryptoRng, SecurityError> {
+    pub(crate) fn prefetch_spake_entropy(&mut self) -> Result<PrefetchedCryptoRng, SecurityError> {
         #[cfg(test)]
         {
             if test_hooks::take_prefetch_fail() {
@@ -152,7 +152,7 @@ impl rand_core::TryCryptoRng for CheckedOsCryptoRng {}
 /// non-zero scalar rejection loop terminates in a single bounded draw rather than spinning forever.
 /// Callers MUST enforce [`PrefetchedCryptoRng::ensure_healthy`] and zeroize/discard all outputs on error.
 #[derive(Zeroize, ZeroizeOnDrop)]
-pub struct PrefetchedCryptoRng {
+pub(crate) struct PrefetchedCryptoRng {
     bytes: Zeroizing<Vec<u8>>,
     offset: usize,
     rng_failed: bool,
