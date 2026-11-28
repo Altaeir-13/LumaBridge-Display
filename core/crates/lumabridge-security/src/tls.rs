@@ -266,6 +266,64 @@ pub fn extract_authenticated_session_with_alpn<D>(
     })
 }
 
+/// Inspect a completed QUIC (`quinn`) connection, verify ALPN (`lumabridge/1` or `lumabridge-pair/1`),
+/// validate the peer self-signed Ed25519 mTLS certificate, and export RFC 9266 `tls-exporter`
+/// channel binding directly from the active QUIC TLS 1.3 handshake.
+///
+/// Security invariant: callers MUST build `quinn` configs strictly via [`build_tls13_client_config`] /
+/// [`build_tls13_server_config`] so TLS resumption and 0-RTT early data remain disabled.
+#[cfg(feature = "quic")]
+pub fn extract_authenticated_quic_session(
+    conn: &quinn::Connection,
+    expected_alpn: &[u8],
+    now_unix_secs: u64,
+) -> Result<AuthenticatedTlsSession, SecurityError> {
+    let handshake_any = conn
+        .handshake_data()
+        .ok_or(SecurityError::TlsHandshakeFailed(
+            "QUIC handshake incomplete",
+        ))?;
+    let handshake = handshake_any
+        .downcast::<quinn::crypto::rustls::HandshakeData>()
+        .map_err(|_| SecurityError::TlsHandshakeFailed("unexpected QUIC handshake provider"))?;
+    let Some(alpn) = handshake.protocol else {
+        return Err(SecurityError::AlpnMismatch);
+    };
+    if alpn.as_slice() != expected_alpn {
+        return Err(SecurityError::AlpnMismatch);
+    }
+
+    let peer_any = conn
+        .peer_identity()
+        .ok_or(SecurityError::TlsHandshakeFailed(
+            "QUIC peer did not present mTLS certificate",
+        ))?;
+    let peer_certs = peer_any
+        .downcast::<Vec<CertificateDer<'static>>>()
+        .map_err(|_| SecurityError::CertificateValidation("unexpected QUIC peer identity type"))?;
+    if peer_certs.len() != 1 {
+        return Err(SecurityError::CertificateValidation(
+            "expected single self-signed Ed25519 leaf certificate",
+        ));
+    }
+    let peer_cert = verify_self_signed_ed25519_cert(peer_certs[0].as_ref(), now_unix_secs)?;
+
+    let mut out = zeroize::Zeroizing::new([0u8; crate::channel_binding::CHANNEL_BINDING_LEN]);
+    conn.export_keying_material(
+        out.as_mut(),
+        crate::channel_binding::TLS_EXPORTER_CHANNEL_BINDING_LABEL,
+        b"",
+    )
+    .map_err(|_| SecurityError::ChannelBindingMismatch)?;
+    let channel_binding = ChannelBinding::from_tls13_exporter(*out);
+
+    Ok(AuthenticatedTlsSession {
+        peer_cert,
+        channel_binding,
+        negotiated_alpn: alpn,
+    })
+}
+
 /// Construct a client `ServerName` placeholder for IP/LAN P2P connections authenticated by Ed25519 cert.
 pub fn canonical_server_name_for_device(
     device_id: DeviceId,

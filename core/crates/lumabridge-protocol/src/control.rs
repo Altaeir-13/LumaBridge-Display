@@ -799,6 +799,8 @@ pub struct SessionResumeRequest {
     pub session_id: u64,
     pub resume_token: Vec<u8>,
     pub last_good_frames: Vec<DisplayFrameCursor>,
+    /// Optional 32-byte HKDF channel-binding proof bound to the new TLS 1.3 `tls-exporter`.
+    pub channel_proof: Option<[u8; 32]>,
 }
 
 impl fmt::Debug for SessionResumeRequest {
@@ -807,16 +809,37 @@ impl fmt::Debug for SessionResumeRequest {
             .field("session_id", &self.session_id)
             .field("resume_token", &"[REDACTED]")
             .field("last_good_frames", &self.last_good_frames)
+            .field(
+                "channel_proof",
+                &self.channel_proof.as_ref().map(|_| "[REDACTED]"),
+            )
             .finish()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SessionResumeResponse {
     pub accepted: bool,
     pub session_id: u64,
     pub preserved_displays: Vec<ActiveDisplayConfig>,
     pub idr_requested_displays: Vec<u16>,
+    /// Optional rotated single-use 32-byte resume token issued upon accepted resumption.
+    pub rotated_resume_token: Option<Vec<u8>>,
+}
+
+impl fmt::Debug for SessionResumeResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionResumeResponse")
+            .field("accepted", &self.accepted)
+            .field("session_id", &self.session_id)
+            .field("preserved_displays", &self.preserved_displays)
+            .field("idr_requested_displays", &self.idr_requested_displays)
+            .field(
+                "rotated_resume_token",
+                &self.rotated_resume_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1633,6 +1656,16 @@ fn validate_session_resume_response(m: &SessionResumeResponse) -> Result<(), Cbo
         return Err(CborError::ValueOutOfRange(
             "rejected SessionResumeResponse must return empty display lists",
         ));
+    }
+    if let Some(tok) = &m.rotated_resume_token {
+        if !m.accepted {
+            return Err(CborError::ValueOutOfRange(
+                "rejected SessionResumeResponse forbids rotated_resume_token",
+            ));
+        }
+        if tok.len() != OPAQUE_TOKEN_LEN {
+            return Err(CborError::ValueOutOfRange("rotated_resume_token"));
+        }
     }
     Ok(())
 }
@@ -2466,7 +2499,8 @@ fn encode_session_resume_request(
     m: &SessionResumeRequest,
     out: &mut Vec<u8>,
 ) -> Result<(), CborError> {
-    let mut map = CborMapEncoder::start(out, 3)?;
+    let count = 3 + usize::from(m.channel_proof.is_some());
+    let mut map = CborMapEncoder::start(out, count)?;
     map.put_u64(1, m.session_id)?;
     map.put_bytes(2, &m.resume_token)?;
     map.put_array_with(3, m.last_good_frames.len(), |arr| {
@@ -2479,6 +2513,9 @@ fn encode_session_resume_request(
         }
         Ok(())
     })?;
+    if let Some(proof) = &m.channel_proof {
+        map.put_bytes(4, proof)?;
+    }
     map.finish()
 }
 
@@ -2508,7 +2545,7 @@ fn decode_frame_cursor(r: &mut CborReader<'_>) -> Result<DisplayFrameCursor, Cbo
 fn decode_session_resume_request(
     r: &mut CborReader<'_>,
 ) -> Result<SessionResumeRequest, CborError> {
-    let (mut sid, mut tok, mut cursors) = (None, None, None);
+    let (mut sid, mut tok, mut cursors, mut proof) = (None, None, None, None);
     r.read_map(0, |r, k| {
         match k {
             1 => sid = Some(r.read_u64("session_id")?),
@@ -2521,6 +2558,12 @@ fn decode_session_resume_request(
                 })?;
                 cursors = Some(list);
             }
+            4 => {
+                let raw = r.read_bytes(32, "channel_proof")?;
+                let arr = <[u8; 32]>::try_from(raw.as_slice())
+                    .map_err(|_| CborError::ValueOutOfRange("channel_proof"))?;
+                proof = Some(arr);
+            }
             _ => return Ok(false),
         }
         Ok(true)
@@ -2529,6 +2572,7 @@ fn decode_session_resume_request(
         session_id: req(sid, "session_id")?,
         resume_token: req(tok, "resume_token")?,
         last_good_frames: req(cursors, "last_good_frames")?,
+        channel_proof: proof,
     })
 }
 
@@ -2536,7 +2580,8 @@ fn encode_session_resume_response(
     m: &SessionResumeResponse,
     out: &mut Vec<u8>,
 ) -> Result<(), CborError> {
-    let mut map = CborMapEncoder::start(out, 4)?;
+    let count = 4 + usize::from(m.rotated_resume_token.is_some());
+    let mut map = CborMapEncoder::start(out, count)?;
     map.put_bool(1, m.accepted)?;
     map.put_u64(2, m.session_id)?;
     map.put_array_with(3, m.preserved_displays.len(), |arr| {
@@ -2551,13 +2596,16 @@ fn encode_session_resume_response(
         }
         Ok(())
     })?;
+    if let Some(tok) = &m.rotated_resume_token {
+        map.put_bytes(5, tok)?;
+    }
     map.finish()
 }
 
 fn decode_session_resume_response(
     r: &mut CborReader<'_>,
 ) -> Result<SessionResumeResponse, CborError> {
-    let (mut acc, mut sid, mut displays, mut idrs) = (None, None, None, None);
+    let (mut acc, mut sid, mut displays, mut idrs, mut rotated) = (None, None, None, None, None);
     r.read_map(0, |r, k| {
         match k {
             1 => acc = Some(r.read_bool("accepted")?),
@@ -2583,6 +2631,7 @@ fn decode_session_resume_response(
                 })?;
                 idrs = Some(list);
             }
+            5 => rotated = Some(r.read_bytes(OPAQUE_TOKEN_LEN, "rotated_resume_token")?),
             _ => return Ok(false),
         }
         Ok(true)
@@ -2592,6 +2641,7 @@ fn decode_session_resume_response(
         session_id: req(sid, "session_id")?,
         preserved_displays: req(displays, "preserved_displays")?,
         idr_requested_displays: req(idrs, "idr_requested_displays")?,
+        rotated_resume_token: rotated,
     })
 }
 

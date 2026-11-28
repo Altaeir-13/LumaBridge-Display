@@ -194,12 +194,14 @@ fn sample_session_and_media_messages() -> Vec<ControlMessage> {
                 display_id: 1,
                 last_good_frame_id: 777,
             }],
+            channel_proof: None,
         }),
         ControlMessage::SessionResumeResponse(SessionResumeResponse {
             accepted: true,
             session_id: sid,
             preserved_displays: vec![active_display],
             idr_requested_displays: vec![1],
+            rotated_resume_token: None,
         }),
         ControlMessage::SessionClose(SessionClose {
             session_id: sid,
@@ -1995,4 +1997,74 @@ fn normative_large_payload_ceilings_64kib_control_and_8mib_media() {
         ),
         Err(FragmentationError::FrameNotRepresentable { .. })
     ));
+}
+
+#[test]
+fn session_resume_optional_channel_proof_and_rotated_token() {
+    let sid = 0x55AA_1122_3344_5566;
+    let proof = [0x42u8; 32];
+    let req = ControlMessage::SessionResumeRequest(SessionResumeRequest {
+        session_id: sid,
+        resume_token: vec![0x11u8; 32],
+        last_good_frames: vec![DisplayFrameCursor {
+            display_id: 0,
+            last_good_frame_id: 120,
+        }],
+        channel_proof: Some(proof),
+    });
+    let dbg_req = format!("{req:?}");
+    assert!(!dbg_req.contains("4242"));
+    assert!(dbg_req.contains("[REDACTED]"));
+
+    let enc = req.encode_cbor().expect("encode req");
+    let dec = ControlMessage::decode_cbor(
+        MsgType::SessionResumeRequest,
+        &enc,
+        CborDecodeOptions::default(),
+    )
+    .expect("decode req");
+    assert_eq!(dec, req);
+
+    let rotated = vec![0x77u8; 32];
+    let resp = ControlMessage::SessionResumeResponse(SessionResumeResponse {
+        accepted: true,
+        session_id: sid,
+        preserved_displays: vec![ActiveDisplayConfig {
+            display_id: 0,
+            mode: DisplayMode::Extend,
+            width: 1920,
+            height: 1080,
+            fps_num: 60,
+            fps_den: 1,
+            scale_milli: 1000,
+            rotation_deg: RotationDeg::Deg0,
+            codec_id: CodecId::H264,
+            color_format: ColorFormat::Nv12_8Bit,
+            initial_bitrate_bps: 12_000_000,
+            capture_mode: CaptureMode::WindowsIddVirtualMonitor,
+        }],
+        idr_requested_displays: vec![0],
+        rotated_resume_token: Some(rotated),
+    });
+    let dbg_resp = format!("{resp:?}");
+    assert!(!dbg_resp.contains("7777"));
+    assert!(dbg_resp.contains("[REDACTED]"));
+
+    let enc_resp = resp.encode_cbor().expect("encode resp");
+    let dec_resp = ControlMessage::decode_cbor(
+        MsgType::SessionResumeResponse,
+        &enc_resp,
+        CborDecodeOptions::default(),
+    )
+    .expect("decode resp");
+    assert_eq!(dec_resp, resp);
+
+    let bad_rejected = ControlMessage::SessionResumeResponse(SessionResumeResponse {
+        accepted: false,
+        session_id: sid,
+        preserved_displays: Vec::new(),
+        idr_requested_displays: Vec::new(),
+        rotated_resume_token: Some(vec![0x88u8; 32]),
+    });
+    assert!(bad_rejected.encode_cbor().is_err());
 }

@@ -395,6 +395,7 @@ SessionResumeRequest = {
   1 => session-id,               ; session_id != 0 (obrig.)
   2 => bstr .size 32,            ; resume_token opaco 256-bit (obrig., redigido)
   3 => [0*16 DisplayFrameCursor],; last_good_frames (obrig., display_ids unicos)
+  ? 4 => bstr .size 32,          ; channel_proof HKDF vinculado ao tls-exporter da nova conexao (opc., redigido)
 }
 
 SessionResumeResponse = {
@@ -402,6 +403,7 @@ SessionResumeResponse = {
   2 => session-id,               ; session_id != 0 (obrig.)
   3 => [0*16 ActiveDisplayConfig], ; preserved_displays (>=1 se accepted, 0 se rejeitado)
   4 => [0*16 display-id],        ; idr_requested_displays (obrig.)
+  ? 5 => bstr .size 32,          ; rotated_resume_token opaco 256-bit de uso unico (opc. se accepted, proibido se !accepted, redigido)
 }
 
 SessionClose = {

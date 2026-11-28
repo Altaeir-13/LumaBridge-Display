@@ -5,6 +5,7 @@ members = [
     "crates/lumabridge-ffi",
     "crates/lumabridge-protocol",
     "crates/lumabridge-security",
+    "crates/lumabridge-transport",
 ]
 exclude = [
     "crates/lumabridge-protocol/fuzz",
