@@ -1461,6 +1461,8 @@ pub unsafe extern "C" fn lb_node_receiver_start(
             };
 
             let start = Instant::now();
+            let mut rx_ping_seq = 1u64;
+            let mut next_rx_ping_at = Instant::now();
             let push_media_event = |ev: NodeMediaEvent, session_id: u64, now_us: u64| match ev {
                 NodeMediaEvent::Frame(f) => {
                     let mut vflags = 0u32;
@@ -1512,10 +1514,16 @@ pub unsafe extern "C" fn lb_node_receiver_start(
                     break;
                 }
                 while let Ok((dec_us, pres_us)) = timing_rx.try_recv() {
-                    session.record_decode_present_latency(dec_us, pres_us);
+                    session
+                        .record_decode_present_latency(dec_us, (pres_us > 0).then_some(pres_us));
                 }
                 let now_u = now_unix_secs();
                 let now_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(0);
+                if Instant::now() >= next_rx_ping_at {
+                    let _ = session.send_clock_sync_ping(rx_ping_seq, now_us).await;
+                    rx_ping_seq = rx_ping_seq.saturating_add(1);
+                    next_rx_ping_at = Instant::now() + Duration::from_secs(1);
+                }
                 match session.try_recv_control().await {
                     Ok(Some(ControlMessage::SessionClose(_)))
                     | Err(NodeError::Transport(TransportError::ConnectionClosed(_))) => {
@@ -1594,7 +1602,7 @@ pub unsafe extern "C" fn lb_node_receiver_start(
                 }
             }
             while let Ok((dec_us, pres_us)) = timing_rx.try_recv() {
-                session.record_decode_present_latency(dec_us, pres_us);
+                session.record_decode_present_latency(dec_us, (pres_us > 0).then_some(pres_us));
             }
             if let Ok(mut g) = queue_bg.0.lock() {
                 g.telemetry = Some(session.telemetry_summary());

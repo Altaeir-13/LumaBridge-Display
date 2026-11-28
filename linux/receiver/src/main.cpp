@@ -5,14 +5,16 @@
 #include "lumabridge_ffi.h"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
+#include <fcntl.h>
 #include <string>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -33,6 +35,13 @@ LbAbiHeader MakeAbiHeader() noexcept {
     return hdr;
 }
 
+void SecureScrub(void* ptr, size_t len) noexcept {
+    volatile unsigned char* p = static_cast<volatile unsigned char*>(ptr);
+    for (size_t i = 0U; i < len; ++i) {
+        p[i] = 0U;
+    }
+}
+
 uint32_t MapTransportKind(const std::string& transport) noexcept {
     if (transport == "quic-stream") {
         return static_cast<uint32_t>(LB_NODE_TRANSPORT_KIND_QUIC_STREAM);
@@ -45,18 +54,35 @@ uint32_t MapTransportKind(const std::string& transport) noexcept {
 
 bool WriteTextFileAtomically(const std::string& path, const std::string& content, bool restrictPerms) {
     const std::string tmpPath = path + ".tmp";
-    {
-        std::ofstream ofs(tmpPath, std::ios::out | std::ios::trunc);
-        if (!ofs.is_open()) {
-            return false;
-        }
-        ofs << content;
-        if (!ofs.good()) {
-            return false;
-        }
+    const mode_t mode = restrictPerms ? static_cast<mode_t>(S_IRUSR | S_IWUSR)
+                                      : static_cast<mode_t>(S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    const int fd = ::open(tmpPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, mode);
+    if (fd < 0) {
+        return false;
     }
-    if (restrictPerms) {
-        (void)::chmod(tmpPath.c_str(), S_IRUSR | S_IWUSR);
+    size_t offset = 0U;
+    bool writeOk = true;
+    while (offset < content.size()) {
+        const ssize_t n = ::write(fd, content.data() + offset, content.size() - offset);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            writeOk = false;
+            break;
+        }
+        offset += static_cast<size_t>(n);
+    }
+    if (writeOk && restrictPerms) {
+        (void)::fchmod(fd, S_IRUSR | S_IWUSR);
+    }
+    (void)::fsync(fd);
+    if (::close(fd) != 0) {
+        writeOk = false;
+    }
+    if (!writeOk) {
+        (void)::unlink(tmpPath.c_str());
+        return false;
     }
     return std::rename(tmpPath.c_str(), path.c_str()) == 0;
 }
@@ -148,14 +174,17 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    const std::string readyLine =
+    std::string readyLine =
         std::string(reinterpret_cast<const char*>(ep.pair_addr_utf8)) + "|" +
         std::string(reinterpret_cast<const char*>(ep.op_addr_utf8)) + "|" +
         std::string(reinterpret_cast<const char*>(ep.device_id_hex)) + "|" +
         std::string(reinterpret_cast<const char*>(ep.pin_ascii));
 
     if (!cfg.endpointOut.empty()) {
-        if (!WriteTextFileAtomically(cfg.endpointOut, readyLine, true)) {
+        const bool wroteRdv = WriteTextFileAtomically(cfg.endpointOut, readyLine, true);
+        SecureScrub(readyLine.data(), readyLine.size());
+        SecureScrub(ep.pin_ascii, sizeof(ep.pin_ascii));
+        if (!wroteRdv) {
             std::fprintf(stderr, "[LB-LINUX-RX] Failed writing --endpoint-out.\n");
             (void)lb_node_receiver_stop(rxSess);
             (void)lb_node_destroy(node);
@@ -173,6 +202,8 @@ int main(int argc, char** argv) {
                     DisplayBackendName(renderer.Backend()),
                     decoder.GetStats().backendName.c_str());
         std::fflush(stdout);
+        SecureScrub(readyLine.data(), readyLine.size());
+        SecureScrub(ep.pin_ascii, sizeof(ep.pin_ascii));
     }
 
     bool quitRequested = false;
@@ -251,7 +282,9 @@ int main(int argc, char** argv) {
                         break;
                     }
                 }
-                (void)lb_node_receiver_record_timing(rxSess, decUs, presUs);
+                const uint64_t reportedPresUs =
+                    (renderer.Backend() == DisplayBackend::Headless) ? 0ULL : presUs;
+                (void)lb_node_receiver_record_timing(rxSess, decUs, reportedPresUs);
             }
 
             if (cfg.maxFrames > 0ULL &&

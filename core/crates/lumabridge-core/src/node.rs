@@ -5,7 +5,9 @@
 //! and `lumabridge-transport` for Phase 1 SPAKE2/QR pairing, Phase 2 mTLS sessions, adaptive GOP
 //! recovery, `ProtectedBlank` signaling, default-deny input authorization, and live revocation.
 
-use crate::telemetry::{ClockSyncTracker, LatencyPercentileTracker, SessionTelemetrySummary};
+use crate::telemetry::{
+    ClockSyncTracker, LatencyPercentileTracker, MeasurementOrigin, SessionTelemetrySummary,
+};
 use core::fmt;
 use lumabridge_protocol::control::{
     ActiveDisplayConfig, AuthMode, CloseReasonCode, ControlMessage, DisplayFrameCursor,
@@ -729,6 +731,7 @@ impl LumaBridgeNode {
                     policy_ctx: self.config.policy_ctx,
                     clock_sync: ClockSyncTracker::new(),
                     telemetry: LatencyPercentileTracker::new(transport_label),
+                    media_origin_synthetic: false,
                     next_update_seq: 1,
                 })
             }
@@ -780,6 +783,7 @@ impl LumaBridgeNode {
                     policy_ctx: self.config.policy_ctx,
                     clock_sync: ClockSyncTracker::new(),
                     telemetry: LatencyPercentileTracker::new(transport_label),
+                    media_origin_synthetic: false,
                     next_update_seq: 1,
                 })
             }
@@ -881,6 +885,7 @@ impl LumaBridgeNode {
             policy_ctx: self.config.policy_ctx,
             clock_sync: ClockSyncTracker::new(),
             telemetry: LatencyPercentileTracker::new(format!("{kind:?}")),
+            media_origin_synthetic: false,
             next_update_seq: 1,
         })
     }
@@ -973,6 +978,7 @@ impl LumaBridgeNode {
             policy_ctx: self.config.policy_ctx,
             clock_sync: ClockSyncTracker::new(),
             telemetry: LatencyPercentileTracker::new(format!("{kind:?}")),
+            media_origin_synthetic: false,
             next_update_seq: 1,
         };
         Ok((session, resp))
@@ -1016,6 +1022,7 @@ pub struct ActiveNodeSession {
     policy_ctx: AuthorizationPolicyContext,
     clock_sync: ClockSyncTracker,
     telemetry: LatencyPercentileTracker,
+    media_origin_synthetic: bool,
     next_update_seq: u64,
 }
 
@@ -1060,11 +1067,16 @@ impl ActiveNodeSession {
         self.telemetry.summary()
     }
 
-    /// Record platform-measured hardware decode + swapchain/display present durations (microseconds)
+    /// Record platform-measured hardware decode + optional swapchain/display present durations (microseconds)
     /// into receiver stage percentile histograms.
-    pub fn record_decode_present_latency(&mut self, decode_us: u64, present_us: u64) {
+    pub fn record_decode_present_latency(&mut self, decode_us: u64, present_us: Option<u64>) {
         self.telemetry
             .record_rx_decode_present(decode_us, present_us);
+    }
+
+    /// Tag receiver-observed encode timings as synthetic (e.g. canned Annex-B or CI feeds).
+    pub fn set_media_origin_synthetic(&mut self, is_synthetic: bool) {
+        self.media_origin_synthetic = is_synthetic;
     }
 
     /// Transmit an encoded frame, updating TX telemetry and signaling `EnqueueOutcome`.
@@ -1125,9 +1137,23 @@ impl ActiveNodeSession {
             Some(MediaRxEvent::Frame(f)) => {
                 self.telemetry.frames_delivered = self.telemetry.frames_delivered.saturating_add(1);
                 let encode_us = f.encode_done_ts_us.saturating_sub(f.capture_ts_us);
-                let net_us = local_now_us.saturating_sub(f.encode_done_ts_us);
-                self.telemetry
-                    .record_rx_transport_latencies(encode_us, net_us);
+                let encode_origin = if self.media_origin_synthetic {
+                    MeasurementOrigin::Synthetic
+                } else {
+                    MeasurementOrigin::Measured
+                };
+                let network_us = self.clock_sync.smoothed_offset_us().map(|offset_us| {
+                    let sender_in_rx_clock =
+                        i128::from(f.encode_done_ts_us) - i128::from(offset_us);
+                    let delta = i128::from(local_now_us) - sender_in_rx_clock;
+                    u64::try_from(delta.max(0)).unwrap_or(u64::MAX)
+                });
+                self.telemetry.record_rx_transport_latencies(
+                    encode_us,
+                    encode_origin,
+                    network_us,
+                    self.clock_sync.valid_samples(),
+                );
                 Ok(Some(NodeMediaEvent::Frame(f)))
             }
             Some(MediaRxEvent::ProtectedBlank(b)) => {
@@ -1341,6 +1367,7 @@ impl ActiveNodeSession {
             ControlMessage::ClockSyncPong(pong) => {
                 if let Some(sample) = self.clock_sync.process_pong(&pong, now_us) {
                     self.telemetry.last_clock_sync_rtt_us = sample.rtt_us;
+                    self.telemetry.clock_sync_valid_samples = self.clock_sync.valid_samples();
                     return Ok(Some(NodeSignalEvent::ClockSyncUpdated {
                         rtt_us: sample.rtt_us,
                         offset_us: sample.clock_offset_us,

@@ -222,7 +222,8 @@ PrintUsage()
         "  --lan-remote <ip>                Pair & stream live NVENC H.264 frames over LAN to Linux receiver\n"
         "  --lan-pair-port <port>           Receiver pairing port (required with --lan-remote)\n"
         "  --lan-op-port <port>             Receiver operational port (defaults to --lan-pair-port)\n"
-        "  --lan-pin <pin>                  8-digit pairing PIN displayed by receiver\n"
+        "  --lan-pin <pin>                  [DEPRECATED] 8-digit PIN via CLI arg (prefer interactive prompt or --lan-pin-stdin)\n"
+        "  --lan-pin-stdin                  Read 8-digit pairing PIN securely from stdin without CLI arg exposure\n"
         "  --lan-peer-id <64-hex>           Optional expected 64-hex receiver DeviceId\n"
         "  --lan-transport <mode>           quic-datagram|quic-stream|tcp-tls (default: quic-datagram)\n"
 #endif
@@ -1384,7 +1385,24 @@ wmain(
         }
         else if (arg == L"--lan-pin" && (i + 1) < argc)
         {
+            std::fprintf(
+                stderr,
+                "[LB-HOST][SECURITY WARNING] --lan-pin exposes the pairing PIN in process arguments; omit it for interactive no-echo prompt or use --lan-pin-stdin.\n");
             lanConfig.pin = NarrowAsciiFromWide(argv[++i]);
+        }
+        else if (arg == L"--lan-pin-stdin")
+        {
+            std::string stdinPin{};
+            if (!std::getline(std::cin, stdinPin))
+            {
+                std::fprintf(stderr, "Failed reading pairing PIN from stdin.\n");
+                return EXIT_FAILURE;
+            }
+            while (!stdinPin.empty() && (stdinPin.back() == '\r' || stdinPin.back() == '\n'))
+            {
+                stdinPin.pop_back();
+            }
+            lanConfig.pin = std::move(stdinPin);
         }
         else if (arg == L"--lan-peer-id" && (i + 1) < argc)
         {
@@ -1578,11 +1596,46 @@ wmain(
     const uint64_t lanStartQpc = QueryHostQpcNow();
 #ifdef LUMABRIDGE_ENABLE_FFI_POC
     lumabridge::host::M2LanStreamer lanStreamer;
+    auto scrubPin = [&lanConfig]() noexcept {
+        if (!lanConfig.pin.empty()) {
+            SecureZeroMemory(lanConfig.pin.data(), lanConfig.pin.size());
+            lanConfig.pin.clear();
+        }
+    };
     if (enableLanStream)
     {
+        if (lanConfig.pin.empty() && !lanRemoteIp.empty() && lanPairPort != 0U)
+        {
+            HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+            DWORD origMode = 0U;
+            if (hStdin != INVALID_HANDLE_VALUE && GetConsoleMode(hStdin, &origMode))
+            {
+                struct ConsoleEchoGuard {
+                    HANDLE Handle;
+                    DWORD OrigMode;
+                    ~ConsoleEchoGuard() noexcept {
+                        (void)SetConsoleMode(Handle, OrigMode);
+                    }
+                } echoGuard{hStdin, origMode};
+                (void)SetConsoleMode(hStdin, origMode & ~static_cast<DWORD>(ENABLE_ECHO_INPUT));
+                std::fprintf(stdout, "[LB-HOST] Enter 8-digit pairing PIN (input hidden): ");
+                std::fflush(stdout);
+                std::string hiddenPin{};
+                if (std::getline(std::cin, hiddenPin))
+                {
+                    while (!hiddenPin.empty() && (hiddenPin.back() == '\r' || hiddenPin.back() == '\n'))
+                    {
+                        hiddenPin.pop_back();
+                    }
+                    lanConfig.pin = std::move(hiddenPin);
+                }
+                std::fprintf(stdout, "\n");
+            }
+        }
         if (lanRemoteIp.empty() || lanPairPort == 0U || lanConfig.pin.empty())
         {
-            std::fprintf(stderr, "[LB-HOST] --lan-remote requires --lan-pair-port and --lan-pin.\n");
+            scrubPin();
+            std::fprintf(stderr, "[LB-HOST] --lan-remote requires --lan-pair-port and a pairing PIN (interactive no-echo prompt or --lan-pin-stdin).\n");
             if (verifyH264Decode) { asyncH264Worker.StopAndDrain(false); }
             (void)SetConsoleCtrlHandler(ConsoleCtrlHandler, FALSE);
             g_ConsoleStopEvent = nullptr;
@@ -1599,7 +1652,9 @@ wmain(
         lanConfig.height = static_cast<uint16_t>((prewarmHeight > 0U) ? prewarmHeight : 1080U);
         lanConfig.fps = static_cast<uint16_t>(stimulusFps);
         lanConfig.initialBitrateBps = nvencBitrateBps;
-        if (!lanStreamer.Start(lanConfig))
+        const bool startedLan = lanStreamer.Start(lanConfig);
+        scrubPin();
+        if (!startedLan)
         {
             if (verifyH264Decode) { asyncH264Worker.StopAndDrain(false); }
             (void)SetConsoleCtrlHandler(ConsoleCtrlHandler, FALSE);

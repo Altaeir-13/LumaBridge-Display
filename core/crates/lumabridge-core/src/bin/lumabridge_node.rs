@@ -24,9 +24,11 @@ use lumabridge_security::secret::{CheckedOsCryptoRng, PinSecret};
 use lumabridge_security::tls::{LUMABRIDGE_ALPN_V1, LUMABRIDGE_PAIR_ALPN_V1};
 use lumabridge_transport::config::{TransportConfig, TransportKind};
 use lumabridge_transport::queue::OutboundVideoFrame;
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use zeroize::Zeroize as _;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CliMode {
@@ -44,7 +46,8 @@ struct CliArgs {
     pair_endpoint: Option<SocketAddr>,
     op_endpoint: Option<SocketAddr>,
     peer_device_hex: Option<String>,
-    pin: String,
+    pin: Option<String>,
+    synthetic_media: bool,
     frames: u32,
     fps: u32,
     h264_annexb_file: Option<PathBuf>,
@@ -108,6 +111,7 @@ fn to_hex_lower(bytes: &[u8; 32]) -> String {
     s
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_args() -> Result<CliArgs, NodeError> {
     let mut mode: Option<CliMode> = None;
     let mut transport = TransportKind::QuicDatagram;
@@ -117,7 +121,7 @@ fn parse_args() -> Result<CliArgs, NodeError> {
     let mut pair_endpoint = None;
     let mut op_endpoint = None;
     let mut peer_device_hex = None;
-    let mut pin = String::from("04291738");
+    let mut pin: Option<String> = None;
     let mut frames = 180u32;
     let mut fps = 60u32;
     let mut h264_annexb_file = None;
@@ -128,6 +132,15 @@ fn parse_args() -> Result<CliArgs, NodeError> {
     while let Some(flag) = it.next() {
         if flag == "--send-blank-end" {
             send_blank_end = true;
+            continue;
+        }
+        if flag == "--pin-stdin" {
+            let mut line = String::new();
+            std::io::stdin()
+                .read_line(&mut line)
+                .map_err(|_| NodeError::InvalidConfig("failed reading PIN from stdin"))?;
+            pin = Some(line.trim().to_owned());
+            line.zeroize();
             continue;
         }
         let val = it
@@ -169,7 +182,11 @@ fn parse_args() -> Result<CliArgs, NodeError> {
                     })?);
             }
             "--peer-device-hex" => peer_device_hex = Some(val),
-            "--pin" => pin = val,
+            "--pin" => {
+                eprintln!("[WARN] --pin exposes pairing secret on command line; prefer --pin-stdin or --rendezvous-in.");
+                pin = Some(val);
+            }
+            "--ci-synthetic-pin" => pin = Some(val),
             "--frames" => {
                 frames = val
                     .parse()
@@ -186,6 +203,7 @@ fn parse_args() -> Result<CliArgs, NodeError> {
         }
     }
 
+    let synthetic_media = true;
     Ok(CliArgs {
         mode: mode.ok_or(NodeError::InvalidConfig("--mode is required"))?,
         transport,
@@ -196,6 +214,7 @@ fn parse_args() -> Result<CliArgs, NodeError> {
         op_endpoint,
         peer_device_hex,
         pin,
+        synthetic_media,
         frames,
         fps: fps.max(1),
         h264_annexb_file,
@@ -229,7 +248,6 @@ async fn run_receiver(args: CliArgs) -> Result<SessionTelemetrySummary, NodeErro
     )?;
 
     let pin_window = PinPairingWindow::new();
-    let _ = PinSecret::new(&args.pin)?;
     let generated_pin = pin_window.open_with_new_pin(&mut rng, now_unix())?;
     let pair_srv = node
         .bind_server(args.transport, args.bind_addr, true)
@@ -239,26 +257,36 @@ async fn run_receiver(args: CliArgs) -> Result<SessionTelemetrySummary, NodeErro
         .await?;
     let pair_addr = pair_srv.local_addr()?;
     let op_addr = op_srv.local_addr()?;
-    let pin_ascii = core::str::from_utf8(generated_pin.expose_bytes())
-        .map_err(|_| NodeError::InvalidConfig("non-ASCII PIN"))?;
-    let ready_line = format!(
-        "{pair_addr}|{op_addr}|{}|{pin_ascii}",
-        to_hex_lower(node.device_id().as_bytes()),
-    );
+    let mut ready_line = {
+        let pin_ascii = core::str::from_utf8(generated_pin.expose_bytes())
+            .map_err(|_| NodeError::InvalidConfig("non-ASCII PIN"))?;
+        format!(
+            "{pair_addr}|{op_addr}|{}|{pin_ascii}",
+            to_hex_lower(node.device_id().as_bytes()),
+        )
+    };
     if let Some(ref out_path) = args.pair_port_out {
         let tmp_path = out_path.with_extension("tmp");
-        std::fs::write(&tmp_path, ready_line.as_bytes())
-            .map_err(|_| NodeError::InvalidConfig("failed writing --endpoint-out temp file"))?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt as _;
-            let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
         }
+        let mut file = opts
+            .open(&tmp_path)
+            .map_err(|_| NodeError::InvalidConfig("failed creating --endpoint-out temp file"))?;
+        file.write_all(ready_line.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(|_| NodeError::InvalidConfig("failed writing --endpoint-out temp file"))?;
+        drop(file);
         std::fs::rename(&tmp_path, out_path)
             .map_err(|_| NodeError::InvalidConfig("failed finalizing --endpoint-out"))?;
     } else {
         println!("READY {ready_line}");
     }
+    ready_line.zeroize();
 
     let pair_clock = Instant::now();
     loop {
@@ -323,6 +351,8 @@ async fn run_receiver(args: CliArgs) -> Result<SessionTelemetrySummary, NodeErro
         )
         .await?;
 
+    session.set_media_origin_synthetic(args.synthetic_media);
+    let _ = session.send_clock_sync_ping(1, 0).await;
     let start = Instant::now();
     let deadline = start + Duration::from_secs(20);
     let mut last_seq = 0u32;
@@ -342,6 +372,12 @@ async fn run_receiver(args: CliArgs) -> Result<SessionTelemetrySummary, NodeErro
                 lumabridge_transport::error::TransportError::ConnectionClosed(_),
             )) if last_seq > 0 => break,
             Err(e) => return Err(e),
+        }
+        while let Ok(Some(fb_msg)) = session.try_recv_feedback().await {
+            let fb_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(0);
+            let _ = session
+                .handle_control_or_feedback(fb_msg, fb_us, now_unix())
+                .await?;
         }
         let now_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(0);
         match session
@@ -443,10 +479,15 @@ async fn run_host(args: CliArgs) -> Result<SessionTelemetrySummary, NodeError> {
             Some(hex) => parse_device_id_hex(hex)?,
             None => DeviceId::from_bytes([0u8; 32]),
         };
-        (ep, op_ep, hint_id, args.pin.clone())
+        let explicit_pin = args.pin.clone().ok_or(NodeError::InvalidConfig(
+            "host manual --connect requires --pin-stdin, --ci-synthetic-pin, or --rendezvous-in",
+        ))?;
+        (ep, op_ep, hint_id, explicit_pin)
     };
 
     let pin_secret = PinSecret::new(&pin_str)?;
+    let mut pin_str = pin_str;
+    pin_str.zeroize();
     let paired_rec = node
         .pair_with_pin(
             args.transport,
@@ -493,8 +534,9 @@ async fn run_host(args: CliArgs) -> Result<SessionTelemetrySummary, NodeError> {
         Vec::new()
     };
 
-    let start = Instant::now();
+    session.set_media_origin_synthetic(args.synthetic_media);
     let _ = session.send_clock_sync_ping(1, 0).await;
+    let start = Instant::now();
     let interval = Duration::from_micros(1_000_000 / u64::from(args.fps));
     let mut next_tick = start;
     let mut gop_id = 1u16;

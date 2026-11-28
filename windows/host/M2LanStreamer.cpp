@@ -127,7 +127,10 @@ bool M2LanStreamer::Start(const M2LanStreamConfig& cfg) noexcept {
     connCfg.initial_bitrate_bps = cfg.initialBitrateBps;
     connCfg.timeout_ms = 10000U;
 
-    if (lb_node_host_connect(impl->node, &connCfg, &impl->session) != LB_STATUS_OK || impl->session == nullptr) {
+    const LbStatus connectSt = lb_node_host_connect(impl->node, &connCfg, &impl->session);
+    SecureZeroMemory(connCfg.pin_ascii, sizeof(connCfg.pin_ascii));
+    connCfg.pin_len = 0U;
+    if (connectSt != LB_STATUS_OK || impl->session == nullptr) {
         (void)lb_node_destroy(impl->node);
         delete impl;
         std::fprintf(stderr, "[M2-LAN] lb_node_host_connect failed (pairing/mTLS handshake error).\n");
@@ -423,7 +426,8 @@ int RunM2NvencLoopbackSelfTest() noexcept {
                 decoderValidator.SubmitPacket(decPkt);
                 const uint64_t t1 = QueryQpcNow();
                 const uint64_t decUs = (t1 >= t0) ? ((t1 - t0) * 1000000ULL) / qpcFreq : 0ULL;
-                (void)lb_node_receiver_record_timing(rxSess, decUs, 50ULL);
+                // No physical swapchain presentation in headless loopback selftest -> report present_us=0 (Unavailable).
+                (void)lb_node_receiver_record_timing(rxSess, decUs, 0ULL);
                 ++rxFrames;
             } else if (evt.kind == static_cast<uint32_t>(LB_RECEIVER_EVENT_KIND_PROTECTED_BLANK)) {
                 gotBlank = true;
