@@ -670,3 +670,427 @@ async fn tx_scheduler_saturation_and_tcp_capacity_change_preserve_control_and_go
     proxy.shutdown().await;
     srv.close();
 }
+
+#[tokio::test]
+async fn udp_proxy_preserves_fifo_order_without_reorder_or_jitter() {
+    let rx_sock = tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind rx");
+    let rx_addr = rx_sock.local_addr().expect("rx addr");
+    let proxy = UdpImpairmentProxy::start(
+        rx_addr,
+        0xF1F0,
+        ImpairmentProfile {
+            base_delay_ms: 4,
+            jitter_ms: 0,
+            reorder_ppm: 0,
+            ..ImpairmentProfile::default()
+        },
+    )
+    .await
+    .expect("start proxy");
+
+    let tx_sock = tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind tx");
+    tx_sock.connect(proxy.listen_addr()).await.expect("connect");
+
+    let count = 32u32;
+    for seq in 0..count {
+        let mut buf = [0u8; 64];
+        buf[..4].copy_from_slice(&seq.to_be_bytes());
+        tx_sock.send(&buf).await.expect("send");
+    }
+
+    let mut received = Vec::with_capacity(count as usize);
+    let mut rbuf = [0u8; 128];
+    for _ in 0..count {
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), rx_sock.recv_from(&mut rbuf))
+            .await
+            .expect("recv timeout")
+            .expect("recv");
+        assert_eq!(n, 64);
+        received.push(u32::from_be_bytes([rbuf[0], rbuf[1], rbuf[2], rbuf[3]]));
+    }
+    let expected: Vec<u32> = (0..count).collect();
+    assert_eq!(
+        received, expected,
+        "UdpImpairmentProxy must preserve strict FIFO order when jitter_ms=0 and reorder_ppm=0"
+    );
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn quic_datagram_delivers_large_idr_under_delay_jitter_without_self_expiring() {
+    let mut rng = CheckedOsCryptoRng::preflight().expect("rng");
+    let s_kp = IdentityKeyPair::generate(&mut rng).expect("skp");
+    let r_kp = IdentityKeyPair::generate(&mut rng).expect("rkp");
+    let now = now_unix();
+    let s_cert = generate_self_signed_device_cert(&s_kp, now, now + 3600).expect("sc");
+    let r_cert = generate_self_signed_device_cert(&r_kp, now, now + 3600).expect("rc");
+    let s_id = s_kp.public_identity().clone();
+    let r_id = r_kp.public_identity().clone();
+    let r_dev_id = r_id.device_id();
+
+    let s_store = Arc::new(InMemoryTrustStore::new());
+    let r_store = Arc::new(InMemoryTrustStore::new());
+    let perms = Permissions::EXTEND_DISPLAY;
+    s_store
+        .insert_trusted_peer_for_testing(&r_id, PeerRole::Controller, "Rx", perms, now)
+        .expect("s");
+    r_store
+        .insert_trusted_peer_for_testing(&s_id, PeerRole::Host, "Tx", perms, now)
+        .expect("r");
+
+    let cfg = TransportConfig {
+        kind: TransportKind::QuicDatagram,
+        heartbeat_timeout_ms: 8_000,
+        min_bitrate_bps: 2_000_000,
+        initial_bitrate_bps: 15_000_000,
+        max_bitrate_bps: 40_000_000,
+        ..TransportConfig::default()
+    };
+    let srv = TransportServer::bind(
+        TransportKind::QuicDatagram,
+        SocketAddr::from(([127, 0, 0, 1], 0)),
+        &r_cert,
+        TlsPeerTrustPolicy::Trusted {
+            trust_store: r_store.clone(),
+            expected_role: PeerRole::Host,
+        },
+        cfg.clone(),
+    )
+    .await
+    .expect("srv");
+    let proxy = UdpImpairmentProxy::start(
+        srv.local_addr().expect("addr"),
+        0x1080_65A0,
+        ImpairmentProfile {
+            base_delay_ms: 4,
+            jitter_ms: 1,
+            ..ImpairmentProfile::default()
+        },
+    )
+    .await
+    .expect("proxy");
+
+    let (cli_res, srv_res) = tokio::join!(
+        connect_client_link(
+            TransportKind::QuicDatagram,
+            proxy.listen_addr(),
+            &s_cert,
+            TlsPeerTrustPolicy::PinnedPeer {
+                trust_store: s_store.clone(),
+                expected_role: PeerRole::Controller,
+                expected_device_id: r_id.device_id(),
+            },
+            r_id.device_id(),
+            LUMABRIDGE_ALPN_V1,
+            now,
+            &cfg,
+        ),
+        srv.accept_link(LUMABRIDGE_ALPN_V1, now),
+    );
+    let mut cli = OperationalConnection::from_link(cli_res.expect("cli"), cfg.clone(), true, None)
+        .expect("c");
+    let mut rx =
+        OperationalConnection::from_link(srv_res.expect("srv"), cfg, false, None).expect("r");
+
+    let rx_task = tokio::spawn(async move {
+        rx.handshake_acceptor(r_dev_id, r_store.as_ref(), PeerRole::Host, caps())
+            .await
+            .expect("ha");
+        rx.set_active_session(77, perms);
+        let mut delivered = 0usize;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        while delivered < 4 && tokio::time::Instant::now() < deadline {
+            if let Ok(Some(MediaRxEvent::Frame(_))) =
+                rx.recv_media_event(Duration::from_millis(50)).await
+            {
+                delivered += 1;
+            }
+        }
+        delivered
+    });
+
+    cli.handshake_initiator(
+        s_id.device_id(),
+        s_store.as_ref(),
+        PeerRole::Controller,
+        "0.1.0",
+        caps(),
+    )
+    .await
+    .expect("hi");
+    cli.set_active_session(77, perms);
+
+    for fid in 1u32..=4 {
+        let is_idr = fid == 1;
+        cli.send_video_frame(OutboundVideoFrame {
+            session_id: 77,
+            display_id: 0,
+            codec_id: CodecId::H264,
+            frame_id: fid,
+            gop_id: 1,
+            capture_ts_us: u64::from(fid) * 16_667,
+            encode_done_ts_us: u64::from(fid) * 16_667,
+            kind: if is_idr {
+                FrameKind::Keyframe { chain_reset: true }
+            } else {
+                FrameKind::InterFrame
+            },
+            has_codec_config: is_idr,
+            mirror_source: false,
+            payload: vec![0xAB; if is_idr { 65_000 } else { 24_000 }],
+        })
+        .await
+        .expect("send");
+    }
+
+    let delivered = rx_task.await.expect("rx join");
+    assert_eq!(
+        delivered, 4,
+        "65 KB IDR + P-frames must deliver intact under 4ms delay / 1ms jitter without self-expiring"
+    );
+    proxy.shutdown().await;
+    srv.close();
+}
+
+#[test]
+fn windowed_loss_allows_bitrate_advisor_recovery_after_transient_loss() {
+    use lumabridge_transport::metrics::{BitrateAdvisor, CongestionSnapshot};
+
+    let mut advisor = BitrateAdvisor::new(2_000_000, 15_000_000, 40_000_000);
+    // Transient 2% loss interval drops advised bitrate.
+    let drop_snap = CongestionSnapshot {
+        packet_loss_ppm: 25_000,
+        rtt_us: 20_000,
+        tx_queue_frames: 0,
+        ..CongestionSnapshot::default()
+    };
+    let reduced = advisor
+        .update(&drop_snap, 100_000)
+        .expect("transient loss must reduce bitrate");
+    assert!(reduced < 15_000_000);
+
+    // Once windowed interval loss resets to 0 ppm, clean intervals allow AIMD recovery.
+    let clean_snap = CongestionSnapshot {
+        packet_loss_ppm: 0,
+        rtt_us: 10_000,
+        tx_queue_frames: 0,
+        ..CongestionSnapshot::default()
+    };
+    let mut now_us = 250_000u64;
+    let mut recovered = reduced;
+    for _ in 0..4 {
+        if let Some(next) = advisor.update(&clean_snap, now_us) {
+            recovered = next;
+        }
+        now_us += 150_000;
+    }
+    assert!(
+        recovered > reduced,
+        "BitrateAdvisor must recover upward ({recovered}) above {reduced} once transient loss ends"
+    );
+}
+
+#[tokio::test]
+async fn operational_connection_windowed_loss_persists_through_cooldown_and_recovers() {
+    let mut rng = CheckedOsCryptoRng::preflight().expect("rng");
+    let s_kp = IdentityKeyPair::generate(&mut rng).expect("skp");
+    let r_kp = IdentityKeyPair::generate(&mut rng).expect("rkp");
+    let now = now_unix();
+    let s_cert =
+        generate_self_signed_device_cert(&s_kp, now.saturating_sub(60), now + 3600).expect("sc");
+    let r_cert =
+        generate_self_signed_device_cert(&r_kp, now.saturating_sub(60), now + 3600).expect("rc");
+    let s_id = s_kp.public_identity().clone();
+    let r_id = r_kp.public_identity().clone();
+    let r_dev_id = r_id.device_id();
+
+    let s_store = Arc::new(InMemoryTrustStore::new());
+    let r_store = Arc::new(InMemoryTrustStore::new());
+    let perms = Permissions::EXTEND_DISPLAY;
+    s_store
+        .insert_trusted_peer_for_testing(&r_id, PeerRole::Controller, "Rx", perms, now)
+        .expect("s");
+    r_store
+        .insert_trusted_peer_for_testing(&s_id, PeerRole::Host, "Tx", perms, now)
+        .expect("r");
+
+    let cfg = TransportConfig {
+        kind: TransportKind::QuicDatagram,
+        heartbeat_timeout_ms: 8_000,
+        min_bitrate_bps: 2_000_000,
+        initial_bitrate_bps: 15_000_000,
+        max_bitrate_bps: 40_000_000,
+        ..TransportConfig::default()
+    };
+    let srv = TransportServer::bind(
+        TransportKind::QuicDatagram,
+        SocketAddr::from(([127, 0, 0, 1], 0)),
+        &r_cert,
+        TlsPeerTrustPolicy::Trusted {
+            trust_store: r_store.clone(),
+            expected_role: PeerRole::Host,
+        },
+        cfg.clone(),
+    )
+    .await
+    .expect("srv");
+    let proxy = UdpImpairmentProxy::start(
+        srv.local_addr().expect("addr"),
+        0x7777_1111,
+        ImpairmentProfile {
+            base_delay_ms: 1,
+            drop_ppm: 120_000,
+            ..ImpairmentProfile::default()
+        },
+    )
+    .await
+    .expect("proxy");
+
+    let (cli_res, srv_res) = tokio::join!(
+        connect_client_link(
+            TransportKind::QuicDatagram,
+            proxy.listen_addr(),
+            &s_cert,
+            TlsPeerTrustPolicy::PinnedPeer {
+                trust_store: s_store.clone(),
+                expected_role: PeerRole::Controller,
+                expected_device_id: r_id.device_id(),
+            },
+            r_id.device_id(),
+            LUMABRIDGE_ALPN_V1,
+            now,
+            &cfg,
+        ),
+        srv.accept_link(LUMABRIDGE_ALPN_V1, now),
+    );
+    let mut cli = OperationalConnection::from_link(cli_res.expect("cli"), cfg.clone(), true, None)
+        .expect("c");
+    let mut rx =
+        OperationalConnection::from_link(srv_res.expect("srv"), cfg, false, None).expect("r");
+
+    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    let rx_task = tokio::spawn(async move {
+        rx.handshake_acceptor(r_dev_id, r_store.as_ref(), PeerRole::Host, caps())
+            .await
+            .expect("ha");
+        rx.set_active_session(88, perms);
+        while !*stop_rx.borrow() {
+            tokio::select! {
+                res = rx.recv_media_event(Duration::from_millis(20)) => {
+                    if res.is_err() {
+                        break;
+                    }
+                }
+                _ = stop_rx.changed() => {
+                    if *stop_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    cli.handshake_initiator(
+        s_id.device_id(),
+        s_store.as_ref(),
+        PeerRole::Controller,
+        "0.1.0",
+        caps(),
+    )
+    .await
+    .expect("hi");
+    cli.set_active_session(88, perms);
+
+    let mut min_advised = 15_000_000u64;
+    let mut saw_nonzero_loss = false;
+    for fid in 1u32..=12 {
+        let is_idr = fid == 1;
+        cli.send_video_frame(OutboundVideoFrame {
+            session_id: 88,
+            display_id: 0,
+            codec_id: CodecId::H264,
+            frame_id: fid,
+            gop_id: 1,
+            capture_ts_us: u64::from(fid) * 16_667,
+            encode_done_ts_us: u64::from(fid) * 16_667,
+            kind: if is_idr {
+                FrameKind::Keyframe { chain_reset: true }
+            } else {
+                FrameKind::InterFrame
+            },
+            has_codec_config: is_idr,
+            mirror_source: false,
+            payload: vec![0xCD; 24_000],
+        })
+        .await
+        .expect("send");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let (snap, suggested) = cli.poll_congestion_and_advise_bitrate();
+        if snap.packet_loss_ppm > 0 {
+            saw_nonzero_loss = true;
+        }
+        if let Some(bps) = suggested {
+            min_advised = min_advised.min(bps);
+        }
+    }
+    assert!(
+        saw_nonzero_loss && min_advised < 15_000_000,
+        "lossy QUIC phase must report non-zero windowed loss and reduce bitrate (saw={saw_nonzero_loss}, min_advised={min_advised})"
+    );
+
+    // Clear loss, let QUIC finish declaring losses for already-sent frames,
+    // and then pump clean frames across multiple 100ms advisor intervals.
+    proxy.set_profile(ImpairmentProfile::default());
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let (_, settle_bps) = cli.poll_congestion_and_advise_bitrate();
+    let mut post_loss_bps = settle_bps.unwrap_or_else(|| cli.snapshot_congestion().pacing_rate_bps);
+    post_loss_bps = post_loss_bps.min(min_advised);
+
+    let mut recovered = post_loss_bps;
+    let mut final_loss_ppm = u32::MAX;
+    for fid in 13u32..=44 {
+        let is_idr = fid == 13;
+        cli.send_video_frame(OutboundVideoFrame {
+            session_id: 88,
+            display_id: 0,
+            codec_id: CodecId::H264,
+            frame_id: fid,
+            gop_id: 2,
+            capture_ts_us: u64::from(fid) * 16_667,
+            encode_done_ts_us: u64::from(fid) * 16_667,
+            kind: if is_idr {
+                FrameKind::Keyframe { chain_reset: true }
+            } else {
+                FrameKind::InterFrame
+            },
+            has_codec_config: is_idr,
+            mirror_source: false,
+            payload: vec![0xCE; 24_000],
+        })
+        .await
+        .expect("clean send");
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        let (snap, suggested) = cli.poll_congestion_and_advise_bitrate();
+        final_loss_ppm = snap.packet_loss_ppm;
+        if fid <= 16 {
+            // Any tail losses detected from pre-clear in-flight QUIC packets settle here.
+            post_loss_bps = post_loss_bps.min(snap.pacing_rate_bps);
+        }
+        if let Some(bps) = suggested {
+            recovered = bps;
+        }
+    }
+    assert!(
+        final_loss_ppm == 0 && recovered > post_loss_bps,
+        "after clearing impairment, OperationalConnection windowed loss must drop to 0 ({final_loss_ppm}) and recover bitrate ({recovered} > {post_loss_bps})"
+    );
+
+    let _ = stop_tx.send(true);
+    let _ = rx_task.await;
+    proxy.shutdown().await;
+    srv.close();
+}

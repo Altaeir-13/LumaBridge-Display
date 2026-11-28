@@ -48,7 +48,7 @@ O crate [`core/crates/lumabridge-transport/`](../../core/crates/lumabridge-trans
 - **`lumabridge-transport` (`tests/impairment_and_recovery_tests.rs`, `3/3` PASS):**
   - Perda `8%`, duplicação `5%`, reordenação `8%` e jitter via [`UdpImpairmentProxy`](../../core/crates/lumabridge-transport/src/impairment.rs): transição para `AwaitingIdr` e recuperação em novo `IDR` limpo sem entregar `P-frames` fora de ordem/corrompidos.
   - `ProtectedBlank` entregue confiavelmente sob perda pesada (`20%` UDP drop + `20 ms` jitter), suprimindo imediatamente quadros `P` dependentes subsequentes no TX e RX.
-  - Saturação de fila `MediaTxScheduler` (`chain_broken` + `force_idr_requested`) e mudança dinâmica de banda (`1 Mbps -> 12 Mbps`) no `TcpImpairmentProxy` preservando entrega de controle.
+  - Saturação de fila `MediaTxScheduler` (`chain_broken` + `force_idr_requested`) e mudança dinâmica de banda (`150 kbps -> 12 Mbps`) no `TcpImpairmentProxy` preservando entrega de controle.
 
 ---
 
@@ -85,39 +85,50 @@ Executado em `--bench` (perfil `bench` otimizado, Windows x64, loopback real OS 
 
 ## 4. Qualificação Ampliada Não Administrativa — Perfil Representativo `1080p60` (`~11,85 Mbps`, `180` quadros)
 
-Para superar a limitação de carga do baseline histórico (`45` quadros, `< 1 Mbps`), [`transport_bench.rs`](../../core/crates/lumabridge-transport/benches/transport_bench.rs) foi ampliado com uma suíte representativa **`1080p60` (`180` quadros @ `60 fps`, `IDR = 65.000 B` a cada `60` quadros, `P-frame = 24.000 B`, taxa oferecida nominal `~11,85 Mbps`)** executada em perfil `--bench` otimizado no Windows x64 (`rustc 1.100.0`, loopback real OS + proxies determinísticos), diferenciando explicitamente as 6 dimensões exigidas sem ocultar resultados desfavoráveis:
+Para superar a limitação de carga do baseline histórico (`45` quadros, `< 1 Mbps`), [`transport_bench.rs`](../../core/crates/lumabridge-transport/benches/transport_bench.rs) foi ampliado com uma suíte representativa **`1080p60` (`180` quadros @ `60 fps`, `IDR = 65.000 B` a cada `60` quadros, `P-frame = 24.000 B`, taxa oferecida nominal `~11,85 Mbps`)** executada em perfil `--bench` otimizado no Windows x64 (`rustc 1.100.0`, loopback real OS + proxies determinísticos), diferenciando explicitamente as 6 dimensões exigidas sem ocultar resultados desfavoráveis.
 
-### 4.1 Tabela Consolidada (`1080p60` — Latência, Goodput, Entrega, Recuperação de GOP, Saturação e Ambiente)
+### 4.1 Investigação Causal Pré-Correção (`4ef26a30`) vs Defeitos Corrigidos
 
-| Cenário | Transporte | Latência Quadro `p50 / p95 / p99` (ms) | Latência Controle `p95` (ms) | Taxa Oferecida / Goodput (Mbps) | Taxa de Entrega | Recuperação GOP (`idr_req / idr_sent`, `p95 / max` ms) | Saturação (`tx_drop / rx_dep / advised_Mbps`) | Condições Ambientais |
-|---|---|---:|---:|---:|---:|---:|---:|---|
-| `1080p60-Clean-12Mbps` | `QuicDatagram` | `0.36 / 0.44 / 12.30` | `1.00` | `11.85 / 11.70` | `180/180 (100.0%)` | `0/3, —` | `0 / 0 / 40.00` | Sockets OS loopback limpos, sem proxy |
-| `1080p60-Clean-12Mbps` | `QuicStream` | `0.41 / 0.60 / 0.65` | `1.00` | `11.85 / 11.68` | `180/180 (100.0%)` | `0/3, —` | `0 / 0 / 40.00` | Sockets OS loopback limpos, sem proxy |
-| `1080p60-Clean-12Mbps` | `TcpTls` | `0.17 / 0.23 / 0.28` | `0.00` | `11.85 / 11.69` | `180/180 (100.0%)` | `0/3, —` | `0 / 0 / 40.00` | Sockets OS loopback limpos, sem proxy |
-| `1080p60-LAN-Delay-4ms` | `QuicDatagram` | `0.00 / 0.00 / 0.00` | `32.00` | `2.11 / 0.00` | `0/180 (0.0%)` | `16/3, —` | `0 / 176 / 2.00` | Loopback + proxy UDP delay `4ms` jitter `1ms` (sem perda L3) |
-| `1080p60-LAN-Delay-4ms` | `QuicStream` | `3729.09 / 4200.98 / 4262.35` | `81.00` | `3.37 / 1.71` | `120/180 (66.7%)` | `16/4, 4819.71/4819.71` | `0 / 53 / 2.00` | Loopback + proxy UDP delay `4ms` jitter `1ms` (sem perda L3) |
-| `1080p60-LAN-Delay-4ms` | `TcpTls` | `66.87 / 116.77 / 129.40` | `71.00` | `11.85 / 11.35` | `180/180 (100.0%)` | `0/3, —` | `0 / 0 / 40.00` | Loopback + proxy TCP delay `4ms` (sem perda L3) |
-| `1080p60-Saturated-8Mbps` | `QuicDatagram` | `1018.94 / 1518.13 / 1533.97` | `47.00` | `2.22 / 0.74` | `60/180 (33.3%)` | `16/3, —` | `0 / 117 / 2.00` | Loopback + teto `8 Mbps` user-space (`< 11,85 Mbps` oferecidos) |
-| `1080p60-Saturated-8Mbps` | `QuicStream` | `2758.20 / 3684.55 / 3798.24` | `79.00` | `3.97 / 3.03` | `180/180 (100.0%)` | `0/3, —` | `0 / 0 / 2.00` | Loopback + teto `8 Mbps` user-space (`< 11,85 Mbps` oferecidos) |
-| `1080p60-Saturated-8Mbps` | `TcpTls` | `1150.21 / 2188.59 / 2246.86` | `565.00` | `11.85 / 4.09` | `72/180 (40.0%)` | `0/3, —` | `0 / 0 / 40.00` | Loopback + teto `8 Mbps` user-space (`< 11,85 Mbps` oferecidos) |
-| `1080p60-WiFi-Mild-0.5pct-UDP` | `QuicDatagram` | `0.00 / 0.00 / 0.00` | `139.00` | `2.11 / 0.00` | `0/180 (0.0%)` | `16/3, —` | `0 / 152 / 2.00` | Proxy UDP `0,5%` perda (`8ms` delay, `4ms` jitter); TCP perda L3 **`BLOCKED_BY_ENVIRONMENT`** |
-| `1080p60-WiFi-Mild-0.5pct-UDP` | `QuicStream` | `4215.01 / 4737.25 / 4831.42` | `93.00` | `2.97 / 2.24` | `180/180 (100.0%)` | `0/3, —` | `0 / 0 / 2.00` | Proxy UDP `0,5%` perda (`8ms` delay, `4ms` jitter); TCP perda L3 **`BLOCKED_BY_ENVIRONMENT`** |
-| `1080p60-WiFi-Mild-0.5pct-UDP` | `TcpTls` | **`BLOCKED_BY_ENVIRONMENT`** | — | — | — | — | — | `TcpImpairmentProxy` user-space não injeta perda L3 de segmentos TCP |
-| `1080p60-WiFi-Harsh-2pct-UDP` | `QuicDatagram` | `0.00 / 0.00 / 0.00` | `438.00` | `2.10 / 0.00` | `0/180 (0.0%)` | `16/3, —` | `0 / 1 / 2.00` | Proxy UDP `2%` perda + `2%` reordenação; TCP perda L3 **`BLOCKED_BY_ENVIRONMENT`** |
-| `1080p60-WiFi-Harsh-2pct-UDP` | `QuicStream` | `0.00 / 0.00 / 0.00` | `114.00` | `1.06 / 0.00` | `0/180 (0.0%)` | `16/2, —` | `0 / 52 / 2.00` | Proxy UDP `2%` perda + `2%` reordenação; TCP perda L3 **`BLOCKED_BY_ENVIRONMENT`** |
-| `1080p60-WiFi-Harsh-2pct-UDP` | `TcpTls` | **`BLOCKED_BY_ENVIRONMENT`** | — | — | — | — | — | `TcpImpairmentProxy` user-space não injeta perda L3 de segmentos TCP |
+Na execução pré-correção em `4ef26a30`, o cenário `1080p60-LAN-Delay-4ms` (com `drop_ppm = 0`, `jitter_ms = 1`, `reorder_ppm = 0`) havia reportado `0/180` entregas em `QuicDatagram` (`loss_ppm = 30429`) e `60/180` (`p95 = 3309.84 ms`, `loss_ppm = 69077`) em `QuicStream`, além de imprimir percentis inválidos `0.00` quando havia `0` amostras entregues. A investigação empírica comprovou 5 causas combinadas de código/harness (e 1 limitação de timer do SO):
 
-*(Observação: `—` na coluna `Recuperação GOP` indica que nenhuma recuperação por keyframe foi concluída durante a janela, seja por ausência de solicitação (`0` pedidos) ou por perda contínua impedindo a remontagem do `IDR`.)*
+1. **Sonda empírica de timer Windows (SO):** `tokio::time::sleep(4ms) x10` mediu `p50 = 15.29–15.39 ms` e `p95 = 15.68–15.83 ms` na linha base `4ef26a30`, e `p50 = 15.55 ms` / `p95 = 15.95 ms` na execução final pós-correções.
+2. **Defeito corrigido — reordenação e bloqueio no proxy UDP (`impairment.rs`):** `UdpImpairmentProxy` usava `tokio::spawn(sleep)` não ordenado com jitter independente por pacote, reordenando datagramas além do `packet_threshold = 3` do QUIC mesmo com `reorder_ppm = 0`. Substituído por fila ordenada dual-direction (`BinaryHeap<Reverse<ScheduledUdpPacket>>` + `sleep_until_opt`), serialização full-duplex separada (`next_free_tx_up`, `next_free_tx_down`) e preservação estrita de FIFO quando `prof.reorder_ppm == 0`.
+3. **Defeito corrigido — `initial_window` e tolerância de reordenação QUIC (`quic.rs`):** o padrão `~12–14 KB` exigia 5+ RTTs de slow-start (`~31 ms/RTT` sob timer Windows) para escoar um único `IDR` de `65 KB`, excedendo `fragment_timeout_us = 150 ms`. Ajustado para `CubicConfig::initial_window(128 * 1024)`, `initial_rtt(10 ms)` e `packet_threshold(6)` em `build_quinn_transport_config`.
+4. **Defeito corrigido — rajada/pacing por fragmento e amostragem janelada alinhada ao `BitrateAdvisor` (`connection.rs` / `metrics.rs`):** `TokenBucketPacer` possuía rajada de `64 KiB` (`< 65 KB` do `IDR`) e dormia entre fragmentos; a rajada foi elevada para `128 * 1024`, o *pacing* de `QuicDatagram` passou a ocorrer uma vez por quadro antes da emissão dos fragmentos (limitado a `(fragment_timeout_us / 2).max(1_000)`), e `poll_congestion_and_advise_bitrate` / `snapshot_congestion` passaram a calcular `loss_ppm` janelado sincronizado com o cooldown de `100 ms` (`min_adjust_interval_us`) do `BitrateAdvisor`, impedindo mascaramento de perdas durante cooldown ou congelamento quando `delta_sent < 10`.
+5. **Defeito corrigido — dreno de feedback no emissor e representação de ausência de entregas (`transport_bench.rs`):** o loop TX ignorava `recv_feedback_message()` quando estava atrasado em relação a `next_tick` (`fb_rx = 0` apesar de `idr_req = 16`), e formatava `0` entregas como `0.00`. Adicionado dreno não bloqueante incondicional de `MediaFeedback` por quadro e conversão dos percentis para `Option<f64>`, exibindo `—` quando `0` amostras são entregues.
 
-### 4.2 Diagnóstico Técnico das 6 Dimensões em `1080p60`
+### 4.2 Tabela Consolidada Pós-Correção (`1080p60` — Latência, Goodput, Entrega, Recuperação de GOP, Saturação e Ambiente)
 
-1. **Latência (`Clean` vs Proxy Windows):** Em sockets diretos (`1080p60-Clean-12Mbps`), todas as modalidades sustentam `180/180` quadros com `p95 <= 0,60 ms` de mídia e `<= 1,00 ms` de controle. Sob qualquer proxy com `tokio::time::sleep` no Windows (`15,6 ms` de granularidade de timer por rajada/pacote), tanto a fila de pacing quanto o proxy inflam a latência em múltiplos de `15,6 ms`.
-2. **Goodput vs Taxa Oferecida:** Em `Clean`, os três transportes entregam `11,68–11,70 Mbps` de `11,85 Mbps` oferecidos (`98,6%–98,7%`). Em `Saturated-8Mbps`, `TcpTls` atingiu `4,09 Mbps` efetivos (`72/180`), `QuicStream` reteve `180/180` em fila acumulando `3,68 s` em `p95` (`3,03 Mbps`), e `QuicDatagram` entregou apenas `60/180` (`0,74 Mbps`) porque o proxy/pacer quebrou remontagem dos quadros `P` após recuo do `BitrateAdvisor` para `2,00 Mbps`.
-3. **Taxa de Entrega e Recuperação de GOP (achado desfavorável preservado):**
-   - No benchmark CBR fixo (`transport_bench.rs` **não** reduz o tamanho de `IDR = 65 KB` quando `BitrateAdvisor` recua `advised_Mbps` para `2,00 Mbps`), sempre que `UdpImpairmentProxy` gera atraso/jitter ou perda com `tokio::time::sleep` no Windows (`15,6 ms`), o `TokenBucketPacer` espaça os `57` datagramas de cada `IDR` acima de `150 ms` (`DEFAULT_FRAGMENT_TIMEOUT_US`), provocando descarte por timeout de remontagem (`0/180` em `LAN-Delay-4ms`, `WiFi-Mild` e `WiFi-Harsh` com apenas `3` `IDR` enviados).
-   - Em `WiFi-Mild-0.5pct-UDP`, `QuicStream` entregou `180/180` (`4,74 s` `p95`), ao passo que em `WiFi-Harsh-2pct-UDP` colapsou (`0/180`) por bloqueio e atraso acumulado superior à janela.
-   - Esse achado empírico confirma duas exigências arquiteturais para `M2` e pós-MVP: (i) acoplamento real do `BitrateAdvisor` ao encoder (`UpdateDynamicBitrate` presente em `M2`), e (ii) eliminação de `sleep` por pacote em granularidade de `15,6 ms` / adição futura de NACK seletivo ou FEC leve (`ADR-0005` §1.4) antes de promover `ADR-0005` a `Accepted`.
-4. **Saturação e Isolamento de Controle:** Em `Saturated-8Mbps`, `Control/Feedback` (`Heartbeat`) permaneceu entregue em `47–79 ms` no `QUIC` versus `565,00 ms` no `TcpTls` multiplexado, evidenciando o benefício da separação de streams no QUIC sob saturação de mídia.
+*(Baseline histórico de `45` quadros revalidado no mesmo código final: `Clean-Loopback` — `QuicDatagram`: `0.53 / 16.28 / 16.62 ms`, `45/45`, `0.79 Mbps`; `QuicStream`: `0.37 / 16.07 / 16.10 ms`, `45/45`, `0.80 Mbps`; `TcpTls`: `0.24 / 16.03 / 16.13 ms`, `45/45`, `0.77 Mbps`; `WiFi-Harsh-2pct` — `QuicDatagram`: `46.86 / 108.92 / 110.17 ms`, `30/45`, `idr = 4`, `0.27 Mbps`; `QuicStream`: `46.58 / 141.20 / 186.25 ms`, `45/45`, `0.74 Mbps`; `TcpTls`: `16.75 / 32.49 / 32.61 ms`, `45/45`, `0.79 Mbps`.)*
+
+| Cenário | Transporte | Latência Quadro `p50 / p95 / p99` (ms) | Latência Controle `p95` (ms) | Taxa Oferecida / Goodput (Mbps) | Taxa de Entrega | Recuperação GOP (`idr_req / idr_sent`, `p95 / max` ms) | Saturação (`tx_drop / rx_dep / advised_Mbps`) | Diag (`rtt_ms / loss_ppm / cwnd / fb_rx`) | Condições Ambientais |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---|
+| `1080p60-Clean-12Mbps` | `QuicDatagram` | `0.34 / 0.41 / 0.69` | `1.00` | `11.85 / 11.67` | `180/180 (100.0%)` | `0/3, —` | `0 / 0 / 40.00` | `0.66 / 0 / 135434 / 0` | Sockets OS loopback limpos, sem proxy |
+| `1080p60-Clean-12Mbps` | `QuicStream` | `0.34 / 0.47 / 0.67` | `1.00` | `11.85 / 11.70` | `180/180 (100.0%)` | `0/3, —` | `0 / 0 / 40.00` | `1.81 / 0 / 242032 / 0` | Sockets OS loopback limpos, sem proxy |
+| `1080p60-Clean-12Mbps` | `TcpTls` | `0.16 / 0.24 / 0.31` | `0.00` | `11.85 / 11.68` | `180/180 (100.0%)` | `0/3, —` | `0 / 0 / 40.00` | `0.00 / 0 / 0 / 0` | Sockets OS loopback limpos, sem proxy |
+| `1080p60-LAN-Delay-4ms` | `QuicDatagram` | `14.54 / 17.22 / 44.81` | `17.00` | `11.85 / 11.59` | `180/180 (100.0%)` | `0/3, —` | `0 / 0 / 40.00` | `19.37 / 0 / 308292 / 0` | Loopback + proxy UDP delay `4ms` jitter `1ms` (sem perda L3) |
+| `1080p60-LAN-Delay-4ms` | `QuicStream` | `14.40 / 17.20 / 33.63` | `14.00` | `11.85 / 11.64` | `180/180 (100.0%)` | `0/3, —` | `0 / 0 / 40.00` | `19.80 / 0 / 332254 / 0` | Loopback + proxy UDP delay `4ms` jitter `1ms` (sem perda L3) |
+| `1080p60-LAN-Delay-4ms` | `TcpTls` | `73.50 / 116.80 / 130.31` | `93.00` | `11.85 / 11.16` | `180/180 (100.0%)` | `0/3, —` | `0 / 0 / 40.00` | `0.00 / 0 / 0 / 0` | Loopback + proxy TCP delay `4ms` (sem perda L3) |
+| `1080p60-Saturated-8Mbps` | `QuicDatagram` | `125.02 / 273.45 / 313.50` | `174.00` | `2.52 / 2.50` | `180/180 (100.0%)` | `0/3, —` | `0 / 0 / 2.00` | `45.07 / 0 / 676443 / 0` | Loopback + teto `8 Mbps` user-space (`< 11,85 Mbps` oferecidos) |
+| `1080p60-Saturated-8Mbps` | `QuicStream` | `527.88 / 575.05 / 578.98` | `511.00` | `11.85 / 9.96` | `180/180 (100.0%)` | `0/3, —` | `0 / 0 / 2.00` | `526.78 / 0 / 3365040 / 0` | Loopback + teto `8 Mbps` user-space (`< 11,85 Mbps` oferecidos) |
+| `1080p60-Saturated-8Mbps` | `TcpTls` | `1144.13 / 2163.42 / 2239.75` | `555.00` | `11.85 / 4.10` | `72/180 (40.0%)` | `0/3, —` | `0 / 0 / 40.00` | `0.00 / 0 / 0 / 0` | Loopback + teto `8 Mbps` user-space (`< 11,85 Mbps` oferecidos) |
+| `1080p60-WiFi-Mild-0.5pct-UDP` | `QuicDatagram` | `109.54 / 174.12 / 217.30` | `48.00` | `3.26 / 1.31` | `66/180 (36.7%)` | `36/12, 297.39/3869.72` | `0 / 78 / 2.00` | `31.51 / 0 / 27348 / 35` | Proxy UDP `0,5%` perda (`8ms` delay, `4ms` jitter); TCP perda L3 **`BLOCKED_BY_ENVIRONMENT`** |
+| `1080p60-WiFi-Mild-0.5pct-UDP` | `QuicStream` | `1250.23 / 1823.46 / 1888.39` | `49.00` | `8.54 / 5.91` | `180/180 (100.0%)` | `0/3, —` | `0 / 0 / 2.75` | `31.56 / 7692 / 24045 / 0` | Proxy UDP `0,5%` perda (`8ms` delay, `4ms` jitter); TCP perda L3 **`BLOCKED_BY_ENVIRONMENT`** |
+| `1080p60-WiFi-Mild-0.5pct-UDP` | `TcpTls` | **`BLOCKED_BY_ENVIRONMENT`** | — | — | — | — | — | — | `TcpImpairmentProxy` user-space não injeta perda L3 de segmentos TCP |
+| `1080p60-WiFi-Harsh-2pct-UDP` | `QuicDatagram` | `—` | `1591.00` | `2.36 / 0.00` | `0/180 (0.0%)` | `16/4, —` | `0 / 5 / 2.00` | `45.20 / 130434 / 2624 / 16` | Proxy UDP `2%` perda + `2%` reordenação; TCP perda L3 **`BLOCKED_BY_ENVIRONMENT`** |
+| `1080p60-WiFi-Harsh-2pct-UDP` | `QuicStream` | `401.98 / 2303.55 / 2303.55` | `93.00` | `1.11 / 0.16` | `15/180 (8.3%)` | `16/2, —` | `0 / 35 / 2.00` | `47.99 / 217391 / 5407 / 16` | Proxy UDP `2%` perda + `2%` reordenação; TCP perda L3 **`BLOCKED_BY_ENVIRONMENT`** |
+| `1080p60-WiFi-Harsh-2pct-UDP` | `TcpTls` | **`BLOCKED_BY_ENVIRONMENT`** | — | — | — | — | — | — | `TcpImpairmentProxy` user-space não injeta perda L3 de segmentos TCP |
+
+*(Observação: `—` nas colunas de latência de quadro indica `0` quadros entregues — nunca exibido como `0.00`; na coluna `Recuperação GOP`, `—` indica que nenhuma recuperação por keyframe foi concluída durante a janela.)*
+
+### 4.3 Defeitos Corrigidos vs Limitações Experimentais e Arquiteturais Remanescentes
+
+1. **Latência (`Clean` vs `LAN-Delay-4ms`):** Após as correções no proxy/QUIC/pacer, `1080p60-LAN-Delay-4ms` passou de `0/180` (`QuicDatagram`) e `60/180` em `3,31 s` (`QuicStream`) para **`180/180 (100.0%)` com `p95 = 17.22 ms` (`QuicDatagram`) e `17.20 ms` (`QuicStream`)**, mantendo goodput de `11.59` e `11.64 Mbps` e `advised_Mbps = 40.00`. A base em `~15,6–17,2 ms` decorre da granularidade de sleep medida no Windows (`15.55 ms` `p50`).
+2. **Saturação (`Saturated-8Mbps`) e isolamento de controle:** Com teto de `8 Mbps` (`< 11,85 Mbps` oferecidos), `QuicDatagram` entregou **`180/180 (100.0%)` em `273.45 ms` `p95`** (`advised_Mbps = 2.00`, controle `174.00 ms`), enquanto `QuicStream` acumulou fila (`575.05 ms` `p95`, controle `511.00 ms`, `advised = 2.00`) e `TcpTls` caiu para **`72/180 (40.0%)` com `2163.42 ms` `p95`** e controle em `555.00 ms`.
+3. **Limitação real sob perda UDP em `1080p60` (`WiFi-Mild-0.5pct` / `WiFi-Harsh-2pct`) — achado desfavorável preservado:**
+   - Em `WiFi-Mild-0.5pct-UDP`, `QuicDatagram` entregou **`66/180 (36.7%)`** (`p95 = 174.12 ms`, `goodput = 1.31 Mbps`, `fb_rx = 35`, `idr_sent = 12`, recuperação GOP `p95/max = 297.39 / 3869.72 ms`), enquanto `QuicStream` entregou **`180/180` com `p95 = 1823.46 ms`** (`loss_ppm = 7692`, `advised = 2.75 Mbps`).
+   - Em `WiFi-Harsh-2pct-UDP` (`2%` perda + `2%` reordenação, `57` datagramas por `IDR` de `65 KB` sem NACK/FEC), perder `1` entre `57` datagramas invalida o `IDR` inteiro (`P(sucesso) ≈ 0.98^57 ≈ 31,6%`), levando `cwnd` ao piso (`2624` / `5407` bytes, `loss_ppm = 130434` / `217391`, `advised = 2.00 Mbps`), resultando em **`0/180` em `QuicDatagram`** (latências `—`) e **`15/180 (8.3%)` em `QuicStream`** (`p95 = 2303.55 ms`).
+   - Essa limitação é real para transporte QUIC de datagrama puro sem NACK seletivo ou FEC sobre carga CBR de `65 KB/IDR` com baixa cadência de feedback (`rtt ~32–48 ms`), e mantém o bloqueio normativo para promoção de `ADR-0005` até acoplamento ao encoder (`M2`), mitigação NACK/FEC (`ADR-0005` §1.4) e validação física / `tc netem`.
 
 ---
 
@@ -146,7 +157,7 @@ for PROFILE in \
   "clean:" \
   "wifi-mild:netem delay 8ms 4ms loss 0.5%" \
   "wifi-harsh:netem delay 12ms 8ms loss 2% 25% reorder 2% 50%" \
-  "sat-8m:netem delay 6ms && sudo tc qdisc add dev lo parent 1:1 handle 10: tbf rate 8mbit burst 32kbit latency 50ms"
+  "sat-8m:custom"
 do
   NAME="${PROFILE%%:*}"
   QDISC="${PROFILE#*:}"
