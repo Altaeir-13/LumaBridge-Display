@@ -182,7 +182,7 @@ fn parse_args() -> Result<CliArgs, NodeError> {
 
 #[allow(clippy::too_many_lines)]
 async fn run_receiver(args: CliArgs) -> Result<SessionTelemetrySummary, NodeError> {
-    let now = now_unix();
+    let startup_now = now_unix();
     let mut rng = CheckedOsCryptoRng::preflight()?;
     let node = LumaBridgeNode::generate(
         NodeConfig {
@@ -200,13 +200,13 @@ async fn run_receiver(args: CliArgs) -> Result<SessionTelemetrySummary, NodeErro
             max_connections: 8,
         },
         &mut rng,
-        now,
-        3600,
+        startup_now.saturating_sub(300),
+        7_200,
     )?;
 
     let pin_window = PinPairingWindow::new();
     let _ = PinSecret::new(&args.pin)?;
-    let generated_pin = pin_window.open_with_new_pin(&mut rng, now)?;
+    let generated_pin = pin_window.open_with_new_pin(&mut rng, now_unix())?;
     let pair_srv = node
         .bind_server(args.transport, args.bind_addr, true)
         .await?;
@@ -231,8 +231,10 @@ async fn run_receiver(args: CliArgs) -> Result<SessionTelemetrySummary, NodeErro
         println!("READY {ready_line}");
     }
 
-    let pair_link = pair_srv.accept_link(LUMABRIDGE_PAIR_ALPN_V1, now).await?;
-    node.accept_pairing_over_link(pair_link, Some(&pin_window), None, now, 1_000, |p| {
+    let pair_link = pair_srv
+        .accept_link(LUMABRIDGE_PAIR_ALPN_V1, now_unix())
+        .await?;
+    node.accept_pairing_over_link(pair_link, Some(&pin_window), None, now_unix(), 1_000, |p| {
         HumanApprovalDecision::Approve {
             pairing_attempt_id: p.pairing_attempt_id,
             peer_device_id: p.peer_device_id,
@@ -242,7 +244,7 @@ async fn run_receiver(args: CliArgs) -> Result<SessionTelemetrySummary, NodeErro
     .await?;
     pair_srv.close();
 
-    let op_link = op_srv.accept_link(LUMABRIDGE_ALPN_V1, now).await?;
+    let op_link = op_srv.accept_link(LUMABRIDGE_ALPN_V1, now_unix()).await?;
     let mut session = node
         .accept_operational_session(
             op_link,
@@ -262,7 +264,7 @@ async fn run_receiver(args: CliArgs) -> Result<SessionTelemetrySummary, NodeErro
                     capture_mode: CaptureMode::WindowsIddVirtualMonitor,
                 }]
             },
-            now,
+            now_unix(),
         )
         .await?;
 
@@ -277,7 +279,7 @@ async fn run_receiver(args: CliArgs) -> Result<SessionTelemetrySummary, NodeErro
             Ok(Some(ControlMessage::SessionClose(_))) => break,
             Ok(Some(msg)) => {
                 let _ = session
-                    .handle_control_or_feedback(msg, ctrl_us, now)
+                    .handle_control_or_feedback(msg, ctrl_us, now_unix())
                     .await?;
             }
             Ok(None) => {}
@@ -309,7 +311,9 @@ async fn run_receiver(args: CliArgs) -> Result<SessionTelemetrySummary, NodeErro
             match session.try_recv_feedback().await {
                 Ok(Some(msg)) => {
                     let fb_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(0);
-                    let _ = session.handle_control_or_feedback(msg, fb_us, now).await?;
+                    let _ = session
+                        .handle_control_or_feedback(msg, fb_us, now_unix())
+                        .await?;
                 }
                 Ok(None) => break,
                 Err(NodeError::Transport(
@@ -327,7 +331,7 @@ async fn run_receiver(args: CliArgs) -> Result<SessionTelemetrySummary, NodeErro
 
 #[allow(clippy::too_many_lines)]
 async fn run_host(args: CliArgs) -> Result<SessionTelemetrySummary, NodeError> {
-    let now = now_unix();
+    let startup_now = now_unix();
     let mut rng = CheckedOsCryptoRng::preflight()?;
     let node = LumaBridgeNode::generate(
         NodeConfig {
@@ -345,8 +349,8 @@ async fn run_host(args: CliArgs) -> Result<SessionTelemetrySummary, NodeError> {
             max_connections: 8,
         },
         &mut rng,
-        now,
-        3600,
+        startup_now.saturating_sub(300),
+        7_200,
     )?;
 
     let (pair_addr, op_addr, rx_device_id, pin_str) = if let Some(ref ep_path) = args.pair_port_out
@@ -392,7 +396,7 @@ async fn run_host(args: CliArgs) -> Result<SessionTelemetrySummary, NodeError> {
         pair_addr,
         rx_device_id,
         &pin_secret,
-        now,
+        now_unix(),
         |p| HumanApprovalDecision::Approve {
             pairing_attempt_id: p.pairing_attempt_id,
             peer_device_id: p.peer_device_id,
@@ -420,7 +424,7 @@ async fn run_host(args: CliArgs) -> Result<SessionTelemetrySummary, NodeError> {
                 latency_profile: LatencyProfile::LowLatency,
             }],
             Permissions::EXTEND_DISPLAY,
-            now,
+            now_unix(),
         )
         .await?;
 
@@ -473,7 +477,9 @@ async fn run_host(args: CliArgs) -> Result<SessionTelemetrySummary, NodeError> {
         }
         while let Some(msg) = session.try_recv_feedback().await? {
             let fb_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(0);
-            let _ = session.handle_control_or_feedback(msg, fb_us, now).await?;
+            let _ = session
+                .handle_control_or_feedback(msg, fb_us, now_unix())
+                .await?;
         }
         next_tick += interval;
         let now_i = Instant::now();

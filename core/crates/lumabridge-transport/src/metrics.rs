@@ -60,6 +60,20 @@ impl BitrateAdvisor {
         self.current_bps
     }
 
+    /// Configured cooldown window between consecutive bitrate adjustments.
+    #[must_use]
+    pub const fn min_adjust_interval_us(&self) -> u64 {
+        self.min_adjust_interval_us
+    }
+
+    /// Returns `true` when `BitrateAdvisor::update` is within its post-adjustment cooldown
+    /// and will return `None` without inspecting congestion snapshots.
+    #[must_use]
+    pub const fn is_in_cooldown(&self, now_us: u64) -> bool {
+        self.last_adjust_us != 0
+            && now_us.saturating_sub(self.last_adjust_us) < self.min_adjust_interval_us
+    }
+
     /// Update recommended bitrate from transport telemetry (`packet_loss_ppm`, RTT, TX queue depth,
     /// and any encoder/backpressure drops). Returns `Some(new_bps)` when a significant change occurs.
     pub fn update(&mut self, snap: &CongestionSnapshot, now_us: u64) -> Option<u64> {
