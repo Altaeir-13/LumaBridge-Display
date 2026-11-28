@@ -456,6 +456,10 @@ pub struct OperationalConnection {
     started_at: Instant,
     tx_idr_requests_emitted: u64,
     tx_protected_blanks_sent: u64,
+    last_loss_sample_sent: u64,
+    last_loss_sample_lost: u64,
+    last_loss_sample_us: u64,
+    last_interval_loss_ppm: u32,
     registry: Option<ConnectionRegistry>,
     registry_conn_id: Option<u64>,
 }
@@ -483,7 +487,7 @@ impl OperationalConnection {
         let pacer_bps = config
             .pacing_target_bps
             .unwrap_or(config.initial_bitrate_bps);
-        let pacer = TokenBucketPacer::new(pacer_bps, 64 * 1024);
+        let pacer = TokenBucketPacer::new(pacer_bps, 128 * 1024);
         let bitrate_advisor = BitrateAdvisor::new(
             config.min_bitrate_bps,
             config.initial_bitrate_bps,
@@ -524,6 +528,10 @@ impl OperationalConnection {
             started_at: now,
             tx_idr_requests_emitted: 0,
             tx_protected_blanks_sent: 0,
+            last_loss_sample_sent: 0,
+            last_loss_sample_lost: 0,
+            last_loss_sample_us: 0,
+            last_interval_loss_ppm: 0,
             registry,
             registry_conn_id,
         })
@@ -1061,11 +1069,19 @@ impl OperationalConnection {
 
             match self.link.transport_kind() {
                 TransportKind::QuicDatagram => {
+                    // Pace per frame BEFORE emitting fragments so OS timer quantization never
+                    // stalls mid-frame and self-expires large IDRs against fragment_timeout_us.
+                    let max_frame_pace = Duration::from_micros(
+                        (self.config.reassembly_config.fragment_timeout_us / 2).max(1_000),
+                    );
+                    let delay = self
+                        .pacer
+                        .consume_or_delay(prepared.total_bytes, self.elapsed_us())
+                        .min(max_frame_pace);
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
                     for pkt in &prepared.packets {
-                        let delay = self.pacer.consume_or_delay(pkt.len(), self.elapsed_us());
-                        if !delay.is_zero() {
-                            tokio::time::sleep(delay).await;
-                        }
                         if let PeerTransportLink::Quic { link, .. } = &self.link {
                             if let Err(err) = link.send_media_datagram(pkt) {
                                 self.scheduler.notify_chain_broken(Some(prepared.gop_id));
@@ -1466,12 +1482,43 @@ impl OperationalConnection {
         self.send_feedback_message(&msg).await
     }
 
+    fn compute_loss_ppm(delta_sent: u64, delta_lost: u64) -> u32 {
+        if delta_sent == 0 {
+            return 0;
+        }
+        u32::try_from((delta_lost.saturating_mul(1_000_000) / delta_sent).min(1_000_000))
+            .unwrap_or(1_000_000)
+    }
+
     /// Sample live transport congestion metrics and run [`BitrateAdvisor`].
     pub fn poll_congestion_and_advise_bitrate(&mut self) -> (CongestionSnapshot, Option<u64>) {
+        let now_us = self.elapsed_us();
+        let in_cooldown = self.bitrate_advisor.is_in_cooldown(now_us);
         let snap = self.snapshot_congestion();
-        let suggested = self.bitrate_advisor.update(&snap, self.elapsed_us());
+        let suggested = self.bitrate_advisor.update(&snap, now_us);
         if let Some(new_bps) = suggested {
             self.pacer.set_target_bps(new_bps);
+        }
+        if !in_cooldown {
+            if let PeerTransportLink::Quic { link, .. } = &self.link {
+                let qs = link.stats();
+                let delta_sent = qs
+                    .path
+                    .sent_packets
+                    .saturating_sub(self.last_loss_sample_sent);
+                let window_elapsed = now_us.saturating_sub(self.last_loss_sample_us)
+                    >= self.bitrate_advisor.min_adjust_interval_us();
+                if delta_sent >= 10 || window_elapsed {
+                    self.last_interval_loss_ppm = if delta_sent == 0 {
+                        0
+                    } else {
+                        snap.packet_loss_ppm
+                    };
+                    self.last_loss_sample_sent = qs.path.sent_packets;
+                    self.last_loss_sample_lost = qs.path.lost_packets;
+                    self.last_loss_sample_us = now_us;
+                }
+            }
         }
         (snap, suggested)
     }
@@ -1485,11 +1532,24 @@ impl OperationalConnection {
             PeerTransportLink::Quic { link, .. } => {
                 let qs = link.stats();
                 let qc = link.counters();
-                let total_sent = qs.path.sent_packets.max(1);
-                let loss_ppm = u32::try_from(
-                    (qs.path.lost_packets.saturating_mul(1_000_000) / total_sent).min(1_000_000),
-                )
-                .unwrap_or(1_000_000);
+                let delta_sent = qs
+                    .path
+                    .sent_packets
+                    .saturating_sub(self.last_loss_sample_sent);
+                let delta_lost = qs
+                    .path
+                    .lost_packets
+                    .saturating_sub(self.last_loss_sample_lost);
+                let window_elapsed = self.elapsed_us().saturating_sub(self.last_loss_sample_us)
+                    >= self.bitrate_advisor.min_adjust_interval_us();
+                let loss_ppm =
+                    if delta_sent >= 10 || (delta_sent > 0 && (delta_lost > 0 || window_elapsed)) {
+                        Self::compute_loss_ppm(delta_sent, delta_lost)
+                    } else if window_elapsed {
+                        0
+                    } else {
+                        self.last_interval_loss_ppm
+                    };
                 CongestionSnapshot {
                     rtt_us: link.rtt_us(),
                     packet_loss_ppm: loss_ppm,

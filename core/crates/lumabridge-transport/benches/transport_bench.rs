@@ -76,10 +76,10 @@ struct Profile1080p60 {
 struct Row1080p60 {
     scenario: &'static str,
     kind: TransportKind,
-    frame_p50_ms: f64,
-    frame_p95_ms: f64,
-    frame_p99_ms: f64,
-    ctrl_p95_ms: f64,
+    frame_p50_ms: Option<f64>,
+    frame_p95_ms: Option<f64>,
+    frame_p99_ms: Option<f64>,
+    ctrl_p95_ms: Option<f64>,
     offered_mbps: f64,
     goodput_mbps: f64,
     delivered_frames: usize,
@@ -91,6 +91,10 @@ struct Row1080p60 {
     tx_drops: u64,
     rx_dep_drops: usize,
     advised_mbps: f64,
+    rtt_ms: f64,
+    loss_ppm: u32,
+    cwnd_bytes: u64,
+    fb_rx: u64,
     env_note: &'static str,
 }
 
@@ -562,6 +566,7 @@ async fn run_1080p60(kind: TransportKind, spec: &Profile1080p60) -> Row1080p60 {
     let mut offered_bytes = 0usize;
     let mut idr_sent = 0u64;
     let mut gop_id = 1u16;
+    let mut fb_rx = 0u64;
 
     for fid in 1..=spec.frames {
         let next_tick = wall_start + frame_period * fid;
@@ -612,7 +617,16 @@ async fn run_1080p60(kind: TransportKind, spec: &Profile1080p60) -> Row1080p60 {
                 .await;
         }
 
-        // Poll feedback opportunistically until next 60 Hz frame deadline without 15 ms sleep stalls.
+        // Drain all queued remote MediaFeedback non-blockingly on every frame, even if TX
+        // fell behind `next_tick` under proxy delay/congestion.
+        while let Ok(Ok(ControlMessage::MediaFeedback(fb))) =
+            tokio::time::timeout(Duration::ZERO, cli.recv_feedback_message()).await
+        {
+            fb_rx += 1;
+            cli.on_remote_feedback(&fb);
+        }
+
+        // Wait until next 60 Hz frame deadline while polling arriving feedback.
         loop {
             let now_i = Instant::now();
             if now_i >= next_tick {
@@ -622,6 +636,7 @@ async fn run_1080p60(kind: TransportKind, spec: &Profile1080p60) -> Row1080p60 {
                 biased;
                 fb_res = cli.recv_feedback_message() => {
                     if let Ok(ControlMessage::MediaFeedback(fb)) = fb_res {
+                        fb_rx += 1;
                         cli.on_remote_feedback(&fb);
                     } else if fb_res.is_err() {
                         break;
@@ -679,10 +694,10 @@ async fn run_1080p60(kind: TransportKind, spec: &Profile1080p60) -> Row1080p60 {
     Row1080p60 {
         scenario: spec.name,
         kind,
-        frame_p50_ms: percentile(&frame_lats, 50),
-        frame_p95_ms: percentile(&frame_lats, 95),
-        frame_p99_ms: percentile(&frame_lats, 99),
-        ctrl_p95_ms: percentile(&ctrl_lats, 95),
+        frame_p50_ms: percentile_opt(&frame_lats, 50),
+        frame_p95_ms: percentile_opt(&frame_lats, 95),
+        frame_p99_ms: percentile_opt(&frame_lats, 99),
+        ctrl_p95_ms: percentile_opt(&ctrl_lats, 95),
         offered_mbps: (offered_bytes as f64 * 8.0) / (tx_wall_s * 1_000_000.0),
         goodput_mbps: (delivered_bytes as f64 * 8.0) / (total_wall_s * 1_000_000.0),
         delivered_frames: delivered,
@@ -696,6 +711,10 @@ async fn run_1080p60(kind: TransportKind, spec: &Profile1080p60) -> Row1080p60 {
             .saturating_add(tx_snap.dropped_broken_gop_frames),
         rx_dep_drops,
         advised_mbps: tx_snap.pacing_rate_bps as f64 / 1_000_000.0,
+        rtt_ms: tx_snap.rtt_us as f64 / 1000.0,
+        loss_ppm: tx_snap.packet_loss_ppm,
+        cwnd_bytes: tx_snap.cwnd_bytes,
+        fb_rx,
         env_note: spec.env_note,
     }
 }
@@ -844,10 +863,25 @@ fn main() {
         },
     ];
 
+    let mut sleep_probe_ms = rt.block_on(async {
+        let mut samples = Vec::with_capacity(10);
+        for _ in 0..10 {
+            let t = Instant::now();
+            tokio::time::sleep(Duration::from_millis(4)).await;
+            samples.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        samples
+    });
+    sleep_probe_ms.sort_by(f64::total_cmp);
     println!();
+    println!(
+        "=== Empirical OS Timer Probe: tokio::time::sleep(4ms) x10 -> p50={:.2} ms, p95={:.2} ms ===",
+        percentile(&sleep_probe_ms, 50),
+        percentile(&sleep_probe_ms, 95),
+    );
     println!("=== Expanded Non-Admin 1080p60 Qualification (~11.85 Mbps, 180 frames @ 60 fps) ===");
-    println!("| Scenario | Transport | Frame p50/p95/p99 (ms) | Ctrl p95 (ms) | Offered/Goodput (Mbps) | Delivery | GOP Rec (idr_req/sent, p95/max ms) | Saturation (tx_drop/rx_dep/advised_Mbps) | Environment |");
-    println!("|---|---|---|---|---|---|---|---|---|");
+    println!("| Scenario | Transport | Frame p50/p95/p99 (ms) | Ctrl p95 (ms) | Offered/Goodput (Mbps) | Delivery | GOP Rec (idr_req/sent, p95/max ms) | Saturation (tx_drop/rx_dep/advised_Mbps) | Diag (rtt_ms/loss_ppm/cwnd/fb_rx) | Environment |");
+    println!("|---|---|---|---|---|---|---|---|---|---|");
     for sc in &profiles_1080p60 {
         for kind in [
             TransportKind::QuicDatagram,
@@ -856,25 +890,30 @@ fn main() {
         ] {
             if sc.udp_loss_only && kind == TransportKind::TcpTls {
                 println!(
-                    "| {} | TcpTls | BLOCKED_BY_ENVIRONMENT | — | — | — | — | — | User-space TcpImpairmentProxy lacks L3 segment loss (requires Linux tc netem) |",
+                    "| {} | TcpTls | BLOCKED_BY_ENVIRONMENT | — | — | — | — | — | — | User-space TcpImpairmentProxy lacks L3 segment loss (requires Linux tc netem) |",
                     sc.name
                 );
                 continue;
             }
             let r = rt.block_on(run_1080p60(kind, sc));
             let del_pct = (r.delivered_frames as f64 / f64::from(r.total_frames)) * 100.0;
+            let frame_str = match (r.frame_p50_ms, r.frame_p95_ms, r.frame_p99_ms) {
+                (Some(p50), Some(p95), Some(p99)) => format!("{p50:.2}/{p95:.2}/{p99:.2}"),
+                _ => "—".to_owned(),
+            };
+            let ctrl_str = r
+                .ctrl_p95_ms
+                .map_or_else(|| "—".to_owned(), |v| format!("{v:.2}"));
             let gop_rec_str = match (r.gop_rec_p95_ms, r.gop_rec_max_ms) {
                 (Some(p95), Some(max)) => format!("{p95:.2}/{max:.2}"),
                 _ => "—".to_owned(),
             };
             println!(
-                "| {} | {:?} | {:.2}/{:.2}/{:.2} | {:.2} | {:.2}/{:.2} | {}/{} ({:.1}%) | {}/{}, {} | {}/{}/{:.2} | {} |",
+                "| {} | {:?} | {} | {} | {:.2}/{:.2} | {}/{} ({:.1}%) | {}/{}, {} | {}/{}/{:.2} | {:.2}/{}/{}/{} | {} |",
                 r.scenario,
                 r.kind,
-                r.frame_p50_ms,
-                r.frame_p95_ms,
-                r.frame_p99_ms,
-                r.ctrl_p95_ms,
+                frame_str,
+                ctrl_str,
                 r.offered_mbps,
                 r.goodput_mbps,
                 r.delivered_frames,
@@ -886,6 +925,10 @@ fn main() {
                 r.tx_drops,
                 r.rx_dep_drops,
                 r.advised_mbps,
+                r.rtt_ms,
+                r.loss_ppm,
+                r.cwnd_bytes,
+                r.fb_rx,
                 r.env_note
             );
         }

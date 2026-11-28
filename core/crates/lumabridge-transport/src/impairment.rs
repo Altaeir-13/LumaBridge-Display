@@ -5,6 +5,8 @@
 //! reordering, dynamic bandwidth caps, and link cuts) over real loopback OS sockets.
 
 use crate::error::{map_io_error, TransportError};
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -68,6 +70,36 @@ pub struct ImpairmentProfile {
     pub min_drop_payload_bytes: usize,
 }
 
+#[derive(Eq, PartialEq)]
+struct ScheduledUdpPacket {
+    deliver_at: tokio::time::Instant,
+    seq: u64,
+    pkt: Vec<u8>,
+    dup: bool,
+}
+
+impl Ord for ScheduledUdpPacket {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.deliver_at
+            .cmp(&other.deliver_at)
+            .then_with(|| self.seq.cmp(&other.seq))
+    }
+}
+
+impl PartialOrd for ScheduledUdpPacket {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
+    if let Some(t) = deadline {
+        tokio::time::sleep_until(t).await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
 /// Real loopback UDP forwarding proxy simulating LAN/Wi-Fi impairments for QUIC tests & benchmarks.
 pub struct UdpImpairmentProxy {
     listen_addr: SocketAddr,
@@ -78,6 +110,7 @@ pub struct UdpImpairmentProxy {
 
 impl UdpImpairmentProxy {
     /// Start an impairment proxy forwarding between `127.0.0.1:0` and `upstream`.
+    #[allow(clippy::too_many_lines)]
     pub async fn start(
         upstream: SocketAddr,
         seed: u64,
@@ -107,13 +140,53 @@ impl UdpImpairmentProxy {
             let mut last_client: Option<SocketAddr> = None;
             let mut buf_c = vec![0u8; 65_536];
             let mut buf_u = vec![0u8; 65_536];
-            let mut next_free_tx = tokio::time::Instant::now();
+            let mut next_free_tx_up = tokio::time::Instant::now();
+            let mut next_free_tx_down = tokio::time::Instant::now();
+            let mut last_scheduled_up = next_free_tx_up;
+            let mut last_scheduled_down = next_free_tx_down;
+            let mut up_seq = 0u64;
+            let mut down_seq = 0u64;
+            let mut up_heap: BinaryHeap<Reverse<ScheduledUdpPacket>> = BinaryHeap::new();
+            let mut down_heap: BinaryHeap<Reverse<ScheduledUdpPacket>> = BinaryHeap::new();
 
             loop {
+                let next_deadline = match (up_heap.peek(), down_heap.peek()) {
+                    (Some(u), Some(d)) => Some(u.0.deliver_at.min(d.0.deliver_at)),
+                    (Some(u), None) => Some(u.0.deliver_at),
+                    (None, Some(d)) => Some(d.0.deliver_at),
+                    (None, None) => None,
+                };
                 tokio::select! {
                     changed = stop_rx.changed() => {
                         if changed.is_err() || *stop_rx.borrow() {
                             break;
+                        }
+                    }
+                    () = sleep_until_opt(next_deadline), if next_deadline.is_some() => {
+                        let now = tokio::time::Instant::now();
+                        while let Some(head) = up_heap.peek() {
+                            if head.0.deliver_at > now {
+                                break;
+                            }
+                            if let Some(Reverse(item)) = up_heap.pop() {
+                                let _ = upstream_sock.send(&item.pkt).await;
+                                if item.dup {
+                                    let _ = upstream_sock.send(&item.pkt).await;
+                                }
+                            }
+                        }
+                        while let Some(head) = down_heap.peek() {
+                            if head.0.deliver_at > now {
+                                break;
+                            }
+                            if let Some(Reverse(item)) = down_heap.pop() {
+                                if let Some(dest) = last_client {
+                                    let _ = client_sock.send_to(&item.pkt, dest).await;
+                                    if item.dup {
+                                        let _ = client_sock.send_to(&item.pkt, dest).await;
+                                    }
+                                }
+                            }
                         }
                     }
                     res = client_sock.recv_from(&mut buf_c) => {
@@ -129,21 +202,23 @@ impl UdpImpairmentProxy {
                             continue;
                         }
                         let pkt = buf_c[..len].to_vec();
-                        let delay_ms = compute_delay_and_pace(&mut prng, prof, len, &mut next_free_tx);
+                        let delay_ms = compute_delay_and_pace(&mut prng, prof, len, &mut next_free_tx_up);
                         let dup = prng.hit_ppm(prof.duplicate_ppm);
-                        if delay_ms == 0 && !dup {
+                        if up_heap.is_empty() && delay_ms == 0 && !dup {
                             let _ = upstream_sock.send(&pkt).await;
                         } else {
-                            let up = Arc::clone(&upstream_sock);
-                            tokio::spawn(async move {
-                                if delay_ms > 0 {
-                                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                                }
-                                let _ = up.send(&pkt).await;
-                                if dup {
-                                    let _ = up.send(&pkt).await;
-                                }
-                            });
+                            let mut deliver_at = tokio::time::Instant::now() + Duration::from_millis(delay_ms);
+                            if prof.reorder_ppm == 0 {
+                                deliver_at = deliver_at.max(last_scheduled_up);
+                                last_scheduled_up = deliver_at;
+                            }
+                            up_seq = up_seq.wrapping_add(1);
+                            up_heap.push(Reverse(ScheduledUdpPacket {
+                                deliver_at,
+                                seq: up_seq,
+                                pkt,
+                                dup,
+                            }));
                         }
                     }
                     res = upstream_sock.recv(&mut buf_u) => {
@@ -161,21 +236,23 @@ impl UdpImpairmentProxy {
                             continue;
                         }
                         let pkt = buf_u[..len].to_vec();
-                        let delay_ms = compute_delay_and_pace(&mut prng, prof, len, &mut next_free_tx);
+                        let delay_ms = compute_delay_and_pace(&mut prng, prof, len, &mut next_free_tx_down);
                         let dup = prng.hit_ppm(prof.duplicate_ppm);
-                        if delay_ms == 0 && !dup {
+                        if down_heap.is_empty() && delay_ms == 0 && !dup {
                             let _ = client_sock.send_to(&pkt, dest).await;
                         } else {
-                            let cli = Arc::clone(&client_sock);
-                            tokio::spawn(async move {
-                                if delay_ms > 0 {
-                                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                                }
-                                let _ = cli.send_to(&pkt, dest).await;
-                                if dup {
-                                    let _ = cli.send_to(&pkt, dest).await;
-                                }
-                            });
+                            let mut deliver_at = tokio::time::Instant::now() + Duration::from_millis(delay_ms);
+                            if prof.reorder_ppm == 0 {
+                                deliver_at = deliver_at.max(last_scheduled_down);
+                                last_scheduled_down = deliver_at;
+                            }
+                            down_seq = down_seq.wrapping_add(1);
+                            down_heap.push(Reverse(ScheduledUdpPacket {
+                                deliver_at,
+                                seq: down_seq,
+                                pkt,
+                                dup,
+                            }));
                         }
                     }
                 }

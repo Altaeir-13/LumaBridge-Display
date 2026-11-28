@@ -139,6 +139,11 @@ impl QuicTransportEndpoint {
 fn build_quinn_transport_config(config: &TransportConfig) -> Arc<quinn::TransportConfig> {
     let mut t = quinn::TransportConfig::default();
     t.initial_mtu(config.initial_mtu);
+    let mut cubic = quinn::congestion::CubicConfig::default();
+    cubic.initial_window(128 * 1024);
+    t.congestion_controller_factory(Arc::new(cubic));
+    t.initial_rtt(Duration::from_millis(10));
+    t.packet_threshold(6);
     if let Some(mtu_cfg) = build_quic_mtu_discovery_config(config) {
         t.mtu_discovery_config(Some(mtu_cfg));
     } else {
