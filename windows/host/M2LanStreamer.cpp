@@ -13,6 +13,7 @@
 #include <Windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
+#include <io.h>
 #include <wrl/client.h>
 
 #include "H264BitstreamValidator.h"
@@ -20,6 +21,7 @@
 #include "lumabridge_ffi.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -60,6 +62,86 @@ uint64_t QueryQpcFreqSafe() noexcept {
     LARGE_INTEGER li{};
     (void)QueryPerformanceFrequency(&li);
     return (li.QuadPart > 0) ? static_cast<uint64_t>(li.QuadPart) : 10000000ULL;
+}
+
+extern "C" LbStatus PromptLocalHostPairingApproval(
+    void* /*userCtx*/,
+    const LbPairingApprovalPrompt* prompt,
+    LbPairingApprovalDecision* outDecision) noexcept {
+    if (prompt == nullptr || outDecision == nullptr) {
+        return LB_STATUS_INVALID_ARGUMENT;
+    }
+    *outDecision = LbPairingApprovalDecision{};
+    outDecision->abi = MakeAbiHeader<LbPairingApprovalDecision>();
+    outDecision->pairing_attempt_id = prompt->pairing_attempt_id;
+    std::memcpy(
+        outDecision->peer_device_id_hex,
+        prompt->peer_device_id_hex,
+        sizeof(outDecision->peer_device_id_hex));
+
+    const char* modeLabel = (prompt->auth_mode == static_cast<uint32_t>(LB_PAIRING_AUTH_MODE_QR)) ? "QR" : "PIN";
+    std::fprintf(
+        stderr,
+        "[LB-PAIRING] Local consent required: attempt=%llu peer_id=%s fingerprint=%s untrusted_name=%s mode=%s\n",
+        static_cast<unsigned long long>(prompt->pairing_attempt_id),
+        reinterpret_cast<const char*>(prompt->peer_device_id_hex),
+        reinterpret_cast<const char*>(prompt->cert_fingerprint_hex),
+        reinterpret_cast<const char*>(prompt->untrusted_friendly_name_utf8),
+        modeLabel);
+    if (_isatty(_fileno(stdin)) == 0) {
+        std::fprintf(
+            stderr,
+            "[LB-PAIRING] Non-interactive stdin; rejecting LAN pairing.\n");
+        return LB_STATUS_OK;
+    }
+    std::fprintf(stderr, "[LB-PAIRING] Approve pairing for this peer? [y/N]: ");
+    std::fflush(stderr);
+    char line[64]{};
+    if (std::fgets(line, sizeof(line), stdin) != nullptr) {
+        std::string ans(line);
+        while (!ans.empty() && (ans.back() == '\n' || ans.back() == '\r' || ans.back() == ' ' || ans.back() == '\t')) {
+            ans.pop_back();
+        }
+        for (char& ch : ans) {
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        }
+        if (ans == "y" || ans == "yes") {
+            outDecision->approved = 1U;
+            outDecision->granted_base_perms = LB_PERM_EXTEND_DISPLAY;
+        }
+    }
+    return LB_STATUS_OK;
+}
+
+extern "C" LbStatus SelftestOnlyLoopbackApprovalCallback(
+    void* userCtx,
+    const LbPairingApprovalPrompt* prompt,
+    LbPairingApprovalDecision* outDecision) noexcept {
+    if (prompt == nullptr || outDecision == nullptr) {
+        return LB_STATUS_INVALID_ARGUMENT;
+    }
+    *outDecision = LbPairingApprovalDecision{};
+    outDecision->abi = MakeAbiHeader<LbPairingApprovalDecision>();
+    outDecision->pairing_attempt_id = prompt->pairing_attempt_id;
+    std::memcpy(
+        outDecision->peer_device_id_hex,
+        prompt->peer_device_id_hex,
+        sizeof(outDecision->peer_device_id_hex));
+    if (prompt->pairing_attempt_id == 0ULL || prompt->peer_device_id_hex[0] == 0U) {
+        return LB_STATUS_OK;
+    }
+    if (userCtx != nullptr) {
+        const char* expectedPeerHex = reinterpret_cast<const char*>(userCtx);
+        if (std::strncmp(
+                expectedPeerHex,
+                reinterpret_cast<const char*>(prompt->peer_device_id_hex),
+                sizeof(prompt->peer_device_id_hex)) != 0) {
+            return LB_STATUS_OK;
+        }
+    }
+    outDecision->approved = 1U;
+    outDecision->granted_base_perms = LB_PERM_EXTEND_DISPLAY;
+    return LB_STATUS_OK;
 }
 
 } // namespace
@@ -125,7 +207,13 @@ bool M2LanStreamer::Start(const M2LanStreamConfig& cfg) noexcept {
     connCfg.fps_num = cfg.fps;
     connCfg.fps_den = 1U;
     connCfg.initial_bitrate_bps = cfg.initialBitrateBps;
-    connCfg.timeout_ms = 10000U;
+    connCfg.timeout_ms = cfg.useSelftestLoopbackApproval ? 10000U : 60000U;
+    connCfg.approval_cb = cfg.useSelftestLoopbackApproval
+                              ? &SelftestOnlyLoopbackApprovalCallback
+                              : &PromptLocalHostPairingApproval;
+    connCfg.approval_user_ctx = cfg.useSelftestLoopbackApproval && !cfg.peerDeviceIdHex.empty()
+                                    ? const_cast<char*>(cfg.peerDeviceIdHex.c_str())
+                                    : nullptr;
 
     const LbStatus connectSt = lb_node_host_connect(impl->node, &connCfg, &impl->session);
     SecureZeroMemory(connCfg.pin_ascii, sizeof(connCfg.pin_ascii));
@@ -357,6 +445,8 @@ int RunM2NvencLoopbackSelfTest() noexcept {
     rxStart.fps_num = static_cast<uint16_t>(kFps);
     rxStart.fps_den = 1U;
     rxStart.enable_mdns = 0U;
+    rxStart.approval_cb = &SelftestOnlyLoopbackApprovalCallback;
+    rxStart.approval_user_ctx = nullptr;
 
     LbReceiverSessionHandle* rxSess = nullptr;
     if (lb_node_receiver_start(rxNode, &rxStart, &rxSess) != LB_STATUS_OK || rxSess == nullptr) {
@@ -385,6 +475,7 @@ int RunM2NvencLoopbackSelfTest() noexcept {
     streamCfg.height = static_cast<uint16_t>(kHeight);
     streamCfg.fps = static_cast<uint16_t>(kFps);
     streamCfg.initialBitrateBps = encCfg.BitrateBps;
+    streamCfg.useSelftestLoopbackApproval = true;
 
     M2LanStreamer streamer;
     if (!streamer.Start(streamCfg)) {

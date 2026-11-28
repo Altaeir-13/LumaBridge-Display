@@ -13,7 +13,7 @@ use lumabridge_core::node::{
 };
 use lumabridge_core::telemetry::SessionTelemetrySummary;
 use lumabridge_protocol::control::{
-    ActiveDisplayConfig, CaptureMode, CloseReasonCode, CodecCapability, ColorFormat,
+    ActiveDisplayConfig, AuthMode, CaptureMode, CloseReasonCode, CodecCapability, ColorFormat,
     ControlMessage, DisplayMode, DisplayRequest, InputCapabilities, LatencyProfile,
     NodeCapabilities, OsGraphicsPlatform, Permissions, RoleFlags, RotationDeg,
 };
@@ -22,7 +22,9 @@ use lumabridge_protocol::media::header::VideoFlags;
 use lumabridge_protocol::version::CodecId;
 use lumabridge_security::authorization::AuthorizationPolicyContext;
 use lumabridge_security::identity::{DeviceId, PeerRole};
-use lumabridge_security::pairing::{HumanApprovalDecision, PinPairingWindow};
+use lumabridge_security::pairing::{
+    HumanApprovalDecision, PairingApprovalPrompt, PinPairingWindow,
+};
 use lumabridge_security::secret::{CheckedOsCryptoRng, PinSecret};
 use lumabridge_security::tls::{LUMABRIDGE_ALPN_V1, LUMABRIDGE_PAIR_ALPN_V1};
 use lumabridge_security::trust_store::{RevocationReason, TrustStore};
@@ -30,6 +32,8 @@ use lumabridge_transport::config::{TransportConfig, TransportKind};
 use lumabridge_transport::error::TransportError;
 use lumabridge_transport::queue::OutboundVideoFrame;
 use std::collections::VecDeque;
+use std::ffi::c_void;
+use std::mem::size_of;
 use std::net::SocketAddr;
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
@@ -587,9 +591,56 @@ async fn run_ffi_loopback_session(
 }
 
 pub const LB_MAX_RX_BUFFERED_EVENTS: usize = 8;
+pub const LB_PERM_EXTEND_DISPLAY: u32 = 1 << 1;
+
+/// cbindgen:ignore
+const _: () = assert!(LB_PERM_EXTEND_DISPLAY == Permissions::EXTEND_DISPLAY.raw());
+
+/// Authentication mode presented to the local operator approval callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum LbPairingAuthMode {
+    Pin = 1,
+    Qr = 2,
+}
+
+/// Sanitized pairing consent prompt delivered to `LbPairingApprovalCallback`.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct LbPairingApprovalPrompt {
+    pub abi: LbAbiHeader,
+    pub pairing_attempt_id: u64,
+    pub auth_mode: u32,
+    pub offered_base_perms: u32,
+    pub peer_device_id_hex: [u8; 65],
+    pub cert_fingerprint_hex: [u8; 65],
+    pub untrusted_friendly_name_utf8: [u8; 65],
+    pub reserved0: [u8; 5],
+}
+
+/// Explicit local operator decision returned by `LbPairingApprovalCallback`.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct LbPairingApprovalDecision {
+    pub abi: LbAbiHeader,
+    pub pairing_attempt_id: u64,
+    pub peer_device_id_hex: [u8; 65],
+    pub approved: u8,
+    pub reserved0: [u8; 2],
+    pub granted_base_perms: u32,
+}
+
+/// Synchronous local operator pairing approval callback (`noexcept` required on native side).
+pub type LbPairingApprovalCallback = Option<
+    extern "C" fn(
+        user_ctx: *mut c_void,
+        prompt: *const LbPairingApprovalPrompt,
+        out_decision: *mut LbPairingApprovalDecision,
+    ) -> LbStatus,
+>;
 
 /// Host connection configuration for `lb_node_host_connect` (M2 live LAN pipeline).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct LbHostConnectConfig {
     pub abi: LbAbiHeader,
@@ -609,6 +660,8 @@ pub struct LbHostConnectConfig {
     pub fps_den: u16,
     pub initial_bitrate_bps: u32,
     pub timeout_ms: u32,
+    pub approval_cb: LbPairingApprovalCallback,
+    pub approval_user_ctx: *mut c_void,
 }
 
 /// Live network feedback signals exposed by `lb_node_host_get_telemetry`.
@@ -623,7 +676,7 @@ pub struct LbHostFeedback {
 }
 
 /// Receiver listener startup configuration for `lb_node_receiver_start`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct LbReceiverStartConfig {
     pub abi: LbAbiHeader,
@@ -638,6 +691,8 @@ pub struct LbReceiverStartConfig {
     pub reserved0: u8,
     pub reserved1: u16,
     pub reserved2: u32,
+    pub approval_cb: LbPairingApprovalCallback,
+    pub approval_user_ctx: *mut c_void,
 }
 
 /// Bound listener endpoints and ephemeral pairing PIN emitted by `lb_node_receiver_get_endpoints`.
@@ -804,6 +859,90 @@ fn push_rx_event(shared: &(Mutex<ReceiverSharedQueue>, Condvar), item: QueuedRxI
     shared.1.notify_all();
 }
 
+fn format_device_id_hex(id: DeviceId) -> String {
+    use core::fmt::Write as _;
+    let mut out = String::with_capacity(64);
+    for b in id.as_bytes() {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+fn invoke_ffi_pairing_approval(
+    cb: extern "C" fn(
+        user_ctx: *mut c_void,
+        prompt: *const LbPairingApprovalPrompt,
+        out_decision: *mut LbPairingApprovalDecision,
+    ) -> LbStatus,
+    user_ctx: *mut c_void,
+    prompt: &PairingApprovalPrompt,
+) -> HumanApprovalDecision {
+    let reject = HumanApprovalDecision::Reject {
+        pairing_attempt_id: prompt.pairing_attempt_id,
+        peer_device_id: prompt.peer_device_id,
+    };
+    let peer_hex = format_device_id_hex(prompt.peer_device_id);
+    let mut ffi_prompt = LbPairingApprovalPrompt {
+        abi: LbAbiHeader::new::<LbPairingApprovalPrompt>(),
+        pairing_attempt_id: prompt.pairing_attempt_id,
+        auth_mode: match prompt.auth_mode {
+            AuthMode::PinSpake2 => LbPairingAuthMode::Pin as u32,
+            AuthMode::QrOutOfBand => LbPairingAuthMode::Qr as u32,
+        },
+        offered_base_perms: prompt.offered_base_perms.map_or(0, Permissions::raw),
+        peer_device_id_hex: [0u8; 65],
+        cert_fingerprint_hex: [0u8; 65],
+        untrusted_friendly_name_utf8: [0u8; 65],
+        reserved0: [0u8; 5],
+    };
+    write_fixed_cstr(&mut ffi_prompt.peer_device_id_hex, &peer_hex);
+    write_fixed_cstr(
+        &mut ffi_prompt.cert_fingerprint_hex,
+        &prompt.peer_fingerprint,
+    );
+    write_fixed_cstr(
+        &mut ffi_prompt.untrusted_friendly_name_utf8,
+        &prompt.untrusted_friendly_name,
+    );
+
+    let mut ffi_decision = LbPairingApprovalDecision {
+        abi: LbAbiHeader::new::<LbPairingApprovalDecision>(),
+        pairing_attempt_id: 0,
+        peer_device_id_hex: [0u8; 65],
+        approved: 0,
+        reserved0: [0u8; 2],
+        granted_base_perms: 0,
+    };
+
+    let status =
+        tokio::task::block_in_place(|| cb(user_ctx, &raw const ffi_prompt, &raw mut ffi_decision));
+    if status != LbStatus::Ok {
+        return reject;
+    }
+    if ffi_decision.abi.abi_major != crate::LB_FFI_ABI_MAJOR
+        || ffi_decision.abi.abi_minor != crate::LB_FFI_ABI_MINOR
+        || ffi_decision.abi.struct_size as usize != size_of::<LbPairingApprovalDecision>()
+        || ffi_decision.abi.reserved != 0
+        || ffi_decision.reserved0 != [0u8; 2]
+        || ffi_decision.approved != 1
+        || ffi_decision.pairing_attempt_id != prompt.pairing_attempt_id
+        || ffi_decision.peer_device_id_hex != ffi_prompt.peer_device_id_hex
+    {
+        return reject;
+    }
+    let Ok(granted_base_perms) = Permissions::from_raw(ffi_decision.granted_base_perms) else {
+        return reject;
+    };
+    if granted_base_perms.raw() == 0 {
+        return reject;
+    }
+    HumanApprovalDecision::Approve {
+        pairing_attempt_id: prompt.pairing_attempt_id,
+        peer_device_id: prompt.peer_device_id,
+        granted_base_perms,
+    }
+}
+
 /// Pair via SPAKE2 and open a live Phase 2 mTLS operational streaming session as `Host`.
 ///
 /// # Safety
@@ -876,6 +1015,11 @@ pub unsafe extern "C" fn lb_node_host_connect(
             did
         };
 
+        let Some(approval_cb) = cfg.approval_cb else {
+            return LbStatus::InvalidArgument;
+        };
+        let approval_ctx = cfg.approval_user_ctx as usize;
+
         // SAFETY: Validated non-null aligned `node`.
         let wrapper = unsafe { &*node };
         if wrapper.node.config().role != PeerRole::Host {
@@ -894,10 +1038,8 @@ pub unsafe extern "C" fn lb_node_host_connect(
                         peer_hint,
                         &pin_secret,
                         now_unix_secs(),
-                        |p| HumanApprovalDecision::Approve {
-                            pairing_attempt_id: p.pairing_attempt_id,
-                            peer_device_id: p.peer_device_id,
-                            granted_base_perms: Permissions::EXTEND_DISPLAY,
+                        |p| {
+                            invoke_ffi_pairing_approval(approval_cb, approval_ctx as *mut c_void, p)
                         },
                     )
                     .await?;
@@ -1314,17 +1456,22 @@ pub unsafe extern "C" fn lb_node_receiver_start(
             return LbStatus::InvalidArgument;
         };
 
+        let Some(approval_cb) = cfg.approval_cb else {
+            return LbStatus::InvalidArgument;
+        };
+        let approval_ctx = cfg.approval_user_ctx as usize;
+
         // SAFETY: Validated non-null aligned `node`.
         let wrapper = unsafe { &*node };
         if wrapper.node.config().role != PeerRole::Controller {
             return LbStatus::InvalidArgument;
         }
 
+        let pin_clock = Instant::now();
         let init_res = wrapper.runtime.block_on(async {
-            let now = now_unix_secs();
             let mut rng = CheckedOsCryptoRng::preflight()?;
             let pin_win = PinPairingWindow::new();
-            let pin = pin_win.open_with_new_pin(&mut rng, now)?;
+            let pin = pin_win.open_with_new_pin(&mut rng, 0)?;
             let pair_srv = wrapper.node.bind_server(kind, bind_addr, true).await?;
             let op_srv = wrapper.node.bind_server(kind, bind_addr, false).await?;
             let pair_addr = pair_srv.local_addr()?;
@@ -1388,9 +1535,8 @@ pub unsafe extern "C" fn lb_node_receiver_start(
                 None
             };
             let accept_res = async {
-                let pair_clock = Instant::now();
                 loop {
-                    if *stop_rx.borrow() || pin_win.remaining_attempts(now_unix_secs()) == 0 {
+                    if *stop_rx.borrow() || pin_win.remaining_attempts(pin_clock.elapsed().as_secs()) == 0 {
                         return Ok::<_, NodeError>(None);
                     }
                     let pair_link = tokio::select! {
@@ -1400,7 +1546,7 @@ pub unsafe extern "C" fn lb_node_receiver_start(
                             Err(_) => continue,
                         },
                     };
-                    let now_ms = u64::try_from(pair_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    let now_ms = u64::try_from(pin_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
                     if node_ref
                         .accept_pairing_over_link(
                             pair_link,
@@ -1408,10 +1554,12 @@ pub unsafe extern "C" fn lb_node_receiver_start(
                             None,
                             now_unix_secs(),
                             now_ms,
-                            |p| HumanApprovalDecision::Approve {
-                                pairing_attempt_id: p.pairing_attempt_id,
-                                peer_device_id: p.peer_device_id,
-                                granted_base_perms: Permissions::EXTEND_DISPLAY,
+                            |p| {
+                                invoke_ffi_pairing_approval(
+                                    approval_cb,
+                                    approval_ctx as *mut c_void,
+                                    p,
+                                )
                             },
                         )
                         .await
@@ -2087,6 +2235,26 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn ffi_live_host_and_receiver_streaming_blank_and_telemetry_json() {
+        extern "C" fn test_only_approve_pairing(
+            _user_ctx: *mut c_void,
+            prompt: *const LbPairingApprovalPrompt,
+            out_decision: *mut LbPairingApprovalDecision,
+        ) -> LbStatus {
+            if prompt.is_null() || out_decision.is_null() {
+                return LbStatus::InvalidArgument;
+            }
+            // SAFETY: Valid pointers supplied by `invoke_ffi_pairing_approval`.
+            let p = unsafe { &*prompt };
+            let d = unsafe { &mut *out_decision };
+            d.abi = LbAbiHeader::new::<LbPairingApprovalDecision>();
+            d.pairing_attempt_id = p.pairing_attempt_id;
+            d.peer_device_id_hex = p.peer_device_id_hex;
+            d.approved = 1;
+            d.reserved0 = [0; 2];
+            d.granted_base_perms = LB_PERM_EXTEND_DISPLAY;
+            LbStatus::Ok
+        }
+
         let host_cfg = make_cfg(LbNodeRole::Host, "LiveFfiHost");
         let rx_cfg = make_cfg(LbNodeRole::Controller, "LiveFfiRx");
         let mut host_node: *mut LbNodeHandle = ptr::null_mut();
@@ -2116,6 +2284,8 @@ mod tests {
             reserved0: 0,
             reserved1: 0,
             reserved2: 0,
+            approval_cb: Some(test_only_approve_pairing),
+            approval_user_ctx: ptr::null_mut(),
         };
         let mut rx_sess: *mut LbReceiverSessionHandle = ptr::null_mut();
         assert_eq!(
@@ -2165,6 +2335,8 @@ mod tests {
             fps_den: 1,
             initial_bitrate_bps: 15_000_000,
             timeout_ms: 8_000,
+            approval_cb: Some(test_only_approve_pairing),
+            approval_user_ctx: ptr::null_mut(),
         };
         let mut host_sess: *mut LbHostSessionHandle = ptr::null_mut();
         assert_eq!(
@@ -2307,6 +2479,201 @@ mod tests {
         assert_eq!(host_tel.protected_blanks, 1);
 
         assert_eq!(unsafe { lb_node_host_close(host_sess) }, LbStatus::Ok);
+        assert_eq!(unsafe { lb_node_receiver_stop(rx_sess) }, LbStatus::Ok);
+        assert_eq!(unsafe { lb_node_destroy(host_node) }, LbStatus::Ok);
+        assert_eq!(unsafe { lb_node_destroy(rx_node) }, LbStatus::Ok);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn ffi_live_host_and_receiver_rejects_missing_denying_or_mismatched_approval() {
+        extern "C" fn deny_pairing(
+            _user_ctx: *mut c_void,
+            prompt: *const LbPairingApprovalPrompt,
+            out_decision: *mut LbPairingApprovalDecision,
+        ) -> LbStatus {
+            if prompt.is_null() || out_decision.is_null() {
+                return LbStatus::InvalidArgument;
+            }
+            let p = unsafe { &*prompt };
+            let d = unsafe { &mut *out_decision };
+            d.abi = LbAbiHeader::new::<LbPairingApprovalDecision>();
+            d.pairing_attempt_id = p.pairing_attempt_id;
+            d.peer_device_id_hex = p.peer_device_id_hex;
+            d.approved = 0;
+            d.reserved0 = [0; 2];
+            d.granted_base_perms = LB_PERM_EXTEND_DISPLAY;
+            LbStatus::Ok
+        }
+
+        extern "C" fn mismatch_attempt_id(
+            _user_ctx: *mut c_void,
+            prompt: *const LbPairingApprovalPrompt,
+            out_decision: *mut LbPairingApprovalDecision,
+        ) -> LbStatus {
+            if prompt.is_null() || out_decision.is_null() {
+                return LbStatus::InvalidArgument;
+            }
+            let p = unsafe { &*prompt };
+            let d = unsafe { &mut *out_decision };
+            d.abi = LbAbiHeader::new::<LbPairingApprovalDecision>();
+            d.pairing_attempt_id = p.pairing_attempt_id.wrapping_add(1);
+            d.peer_device_id_hex = p.peer_device_id_hex;
+            d.approved = 1;
+            d.reserved0 = [0; 2];
+            d.granted_base_perms = LB_PERM_EXTEND_DISPLAY;
+            LbStatus::Ok
+        }
+
+        extern "C" fn mismatch_peer_id(
+            _user_ctx: *mut c_void,
+            prompt: *const LbPairingApprovalPrompt,
+            out_decision: *mut LbPairingApprovalDecision,
+        ) -> LbStatus {
+            if prompt.is_null() || out_decision.is_null() {
+                return LbStatus::InvalidArgument;
+            }
+            let p = unsafe { &*prompt };
+            let d = unsafe { &mut *out_decision };
+            d.abi = LbAbiHeader::new::<LbPairingApprovalDecision>();
+            d.pairing_attempt_id = p.pairing_attempt_id;
+            d.peer_device_id_hex = p.peer_device_id_hex;
+            d.peer_device_id_hex[0] = if d.peer_device_id_hex[0] == b'0' {
+                b'1'
+            } else {
+                b'0'
+            };
+            d.approved = 1;
+            d.reserved0 = [0; 2];
+            d.granted_base_perms = LB_PERM_EXTEND_DISPLAY;
+            LbStatus::Ok
+        }
+
+        extern "C" fn approve_valid(
+            _user_ctx: *mut c_void,
+            prompt: *const LbPairingApprovalPrompt,
+            out_decision: *mut LbPairingApprovalDecision,
+        ) -> LbStatus {
+            if prompt.is_null() || out_decision.is_null() {
+                return LbStatus::InvalidArgument;
+            }
+            let p = unsafe { &*prompt };
+            let d = unsafe { &mut *out_decision };
+            d.abi = LbAbiHeader::new::<LbPairingApprovalDecision>();
+            d.pairing_attempt_id = p.pairing_attempt_id;
+            d.peer_device_id_hex = p.peer_device_id_hex;
+            d.approved = 1;
+            d.reserved0 = [0; 2];
+            d.granted_base_perms = LB_PERM_EXTEND_DISPLAY;
+            LbStatus::Ok
+        }
+
+        let host_cfg = make_cfg(LbNodeRole::Host, "NegApprovalHost");
+        let rx_cfg = make_cfg(LbNodeRole::Controller, "NegApprovalRx");
+        let mut host_node: *mut LbNodeHandle = ptr::null_mut();
+        let mut rx_node: *mut LbNodeHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe { lb_node_create(&raw const host_cfg, &raw mut host_node) },
+            LbStatus::Ok
+        );
+        assert_eq!(
+            unsafe { lb_node_create(&raw const rx_cfg, &raw mut rx_node) },
+            LbStatus::Ok
+        );
+
+        let mut bind_buf = [0u8; 64];
+        let bind_str = b"127.0.0.1:0";
+        bind_buf[..bind_str.len()].copy_from_slice(bind_str);
+        let mut rx_start_cfg = LbReceiverStartConfig {
+            abi: LbAbiHeader::new::<LbReceiverStartConfig>(),
+            transport_kind: LbNodeTransportKind::QuicDatagram as u32,
+            bind_addr_len: u32::try_from(bind_str.len()).unwrap_or(0),
+            bind_addr_utf8: bind_buf,
+            width: 1920,
+            height: 1080,
+            fps_num: 60,
+            fps_den: 1,
+            enable_mdns: 0,
+            reserved0: 0,
+            reserved1: 0,
+            reserved2: 0,
+            approval_cb: None,
+            approval_user_ctx: ptr::null_mut(),
+        };
+        let mut rx_sess: *mut LbReceiverSessionHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe { lb_node_receiver_start(rx_node, &raw const rx_start_cfg, &raw mut rx_sess) },
+            LbStatus::InvalidArgument
+        );
+
+        rx_start_cfg.approval_cb = Some(approve_valid);
+        assert_eq!(
+            unsafe { lb_node_receiver_start(rx_node, &raw const rx_start_cfg, &raw mut rx_sess) },
+            LbStatus::Ok
+        );
+
+        let mut ep = LbReceiverEndpoints {
+            abi: LbAbiHeader::new::<LbReceiverEndpoints>(),
+            pair_addr_utf8: [0u8; 64],
+            op_addr_utf8: [0u8; 64],
+            device_id_hex: [0u8; 65],
+            pin_ascii: [0u8; 17],
+            reserved0: [0u8; 6],
+        };
+        assert_eq!(
+            unsafe { lb_node_receiver_get_endpoints(rx_sess, &raw mut ep) },
+            LbStatus::Ok
+        );
+        let cstr_len = |s: &[u8]| s.iter().position(|&b| b == 0).unwrap_or(s.len());
+        let pair_len = cstr_len(&ep.pair_addr_utf8);
+        let op_len = cstr_len(&ep.op_addr_utf8);
+        let did_len = cstr_len(&ep.device_id_hex);
+        let pin_len = cstr_len(&ep.pin_ascii);
+        let mut pin_16 = [0u8; 16];
+        pin_16[..pin_len].copy_from_slice(&ep.pin_ascii[..pin_len]);
+        let mut did_64 = [0u8; 64];
+        did_64[..did_len].copy_from_slice(&ep.device_id_hex[..did_len]);
+
+        let mut host_conn_cfg = LbHostConnectConfig {
+            abi: LbAbiHeader::new::<LbHostConnectConfig>(),
+            transport_kind: LbNodeTransportKind::QuicDatagram as u32,
+            reserved0: 0,
+            pair_addr_utf8: ep.pair_addr_utf8,
+            op_addr_utf8: ep.op_addr_utf8,
+            pin_ascii: pin_16,
+            peer_device_id_hex: did_64,
+            pair_addr_len: u32::try_from(pair_len).unwrap_or(0),
+            op_addr_len: u32::try_from(op_len).unwrap_or(0),
+            pin_len: u32::try_from(pin_len).unwrap_or(0),
+            peer_device_id_len: u32::try_from(did_len).unwrap_or(0),
+            width: 1920,
+            height: 1080,
+            fps_num: 60,
+            fps_den: 1,
+            initial_bitrate_bps: 15_000_000,
+            timeout_ms: 5_000,
+            approval_cb: None,
+            approval_user_ctx: ptr::null_mut(),
+        };
+        let mut host_sess: *mut LbHostSessionHandle = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                lb_node_host_connect(host_node, &raw const host_conn_cfg, &raw mut host_sess)
+            },
+            LbStatus::InvalidArgument
+        );
+
+        for bad_cb in [deny_pairing, mismatch_attempt_id, mismatch_peer_id] {
+            host_conn_cfg.approval_cb = Some(bad_cb);
+            assert_eq!(
+                unsafe {
+                    lb_node_host_connect(host_node, &raw const host_conn_cfg, &raw mut host_sess)
+                },
+                LbStatus::Faulted
+            );
+            assert!(host_sess.is_null());
+        }
+
         assert_eq!(unsafe { lb_node_receiver_stop(rx_sess) }, LbStatus::Ok);
         assert_eq!(unsafe { lb_node_destroy(host_node) }, LbStatus::Ok);
         assert_eq!(unsafe { lb_node_destroy(rx_node) }, LbStatus::Ok);

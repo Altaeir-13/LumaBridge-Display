@@ -45,7 +45,20 @@ int main() {
         LB_TEST_CHECK(loaded.width == 1920U && loaded.height == 1080U && loaded.fps == 60U);
         LB_TEST_CHECK(loaded.overlay);
         LB_TEST_CHECK(!loaded.allowSwFallback);
+        LB_TEST_CHECK(!loaded.ciAutoApprovePairing);
         std::remove(path.c_str());
+
+        const std::string badApprovalPath =
+            "/tmp/lumabridge_rx_bad_approval_" + std::to_string(static_cast<long long>(::getpid())) + ".conf";
+        {
+            std::FILE* fp = std::fopen(badApprovalPath.c_str(), "w");
+            LB_TEST_CHECK(fp != nullptr);
+            std::fprintf(fp, "ci_auto_approve_pairing=true\n");
+            std::fclose(fp);
+        }
+        ReceiverConfig rejected{};
+        LB_TEST_CHECK(!LoadReceiverConfigFile(badApprovalPath, rejected, err));
+        std::remove(badApprovalPath.c_str());
 
         ReceiverConfig bad{};
         bad.width = 100U;

@@ -1,7 +1,7 @@
 # Relatório Técnico e de Qualificação `M2` — Primeiro Fluxo Completo `Windows → Linux` (Extensão Real em LAN)
 
-> **Status da Milestone `M2`:** **Implementada e qualificada parcialmente** em loopback GPU real (`NVIDIA NVENC`) + receptor Linux nativo C++20 em CI sintético na branch `feature/m2-windows-linux-lan` (empilhada na cadeia `PR #45 -> PR #44 -> PR #43 -> PR #41 -> dev`; `PR #42` permanece independente). **Não** declarada concluída para hardware físico até execução do roteiro de aceite presencial (`M2_COMPLETE = False`).
-> **Gate de Governança:** Seguindo a política do repositório, os PRs `#41`–`#45` permanecem **`OPEN`** para revisão e aprovação externa explícita de integração sequencial (`#41 -> #43 -> #44 -> #45`; `#42` separado).
+> **Status da Milestone `M2`:** **Implementada e qualificada parcialmente** em loopback GPU real (`NVIDIA NVENC`) + receptor Linux nativo C++20 em CI sintético na branch `feature/m2-windows-linux-lan` (PR `#45` direcionado a `dev`, após integração sequencial dos PRs `#41`, `#43` e `#44` em `dev`; `PR #42` independente). **Não** declarada concluída para hardware físico até execução do roteiro de aceite presencial (`M2_COMPLETE = False`).
+> **Estado Normativo Preservado:** `ADR-0004` permanece `Accepted`, `ADR-0005` permanece `Proposed`, `LBWP` permanece `Draft / v1.0-rc`, armazenamento seguro nativo permanece **não qualificado**, e auditoria criptográfica externa independente permanece **pendente**.
 > **Gate Físico (`LAN` / `Hyprland` / `VA-API` / `IddCx`):** **`BLOCKED_BY_ENVIRONMENT`** para validação presencial em duas máquinas físicas separadas neste ambiente desktop Windows único (sem máquina Linux física com iGPU Intel/AMD `VA-API` + compositor `Wayland`/`Hyprland` conectada em `LAN` e sem sessão administrativa/test-signing autorizada para instalar o pacote `IddCx`).
 
 ---
@@ -23,6 +23,10 @@
   - Fluxo interativo padrão no host Windows solicita o PIN no console com eco desabilitado (`GetConsoleMode`/`SetConsoleMode` limpando `ENABLE_ECHO_INPUT` com guarda RAII de restauração), suportando alternativamente `--lan-pin-stdin` (Windows) e `--pin-stdin` (`lumabridge_node`).
   - O uso legado `--lan-pin` (Windows) e `--pin` (`lumabridge_node`) emite aviso explícito de depreciação/exposição em processo e foi removido dos comandos normais de uso em produção; credenciais sintéticas de CI usam flags/arquivos separados (`--ci-synthetic-pin` e `--rendezvous-in`).
   - Memória contendo o PIN é zerada imediatamente após consumo (`SecureZeroMemory` em C++ e `zeroize::Zeroize` em Rust), e `--endpoint-out` escreve registro atômico (`pair_addr|op_addr|device_id_hex|pin` com criação temporária, `fsync`/`flush` + `rename`) em modo `0600` (`OpenOptionsExt::mode(0o600)` / POSIX `open(..., S_IRUSR | S_IWUSR)`).
+- **Consentimento explícito na fronteira FFI e janela monotônica de PIN (`core/crates/lumabridge-ffi/src/node_ffi.rs`, `windows/host/M2LanStreamer.{h,cpp}`, `linux/receiver/src/{Config.h,Config.cpp,main.cpp}`):**
+  - `LbHostConnectConfig` e `LbReceiverStartConfig` exigem `approval_cb: LbPairingApprovalCallback` não nulo (`LbStatus::InvalidArgument` caso ausente). `invoke_ffi_pairing_approval` executa sob `tokio::task::block_in_place` e falha fechado (`HumanApprovalDecision::Reject`) salvo retorno `LbStatus::Ok`, `LbAbiHeader` válido, `approved == 1`, `reserved0 == [0, 0]`, correspondência exata de `pairing_attempt_id` e `peer_device_id_hex`, e `granted_base_perms` não vazio (`LB_PERM_EXTEND_DISPLAY`).
+  - Nos caminhos LAN reais, `M2LanStreamer::Start` vincula `PromptLocalHostPairingApproval` (`_isatty`, prompt `[y/N]`, `timeout_ms = 60000`) e o receptor Linux vincula `PromptLocalReceiverPairingApproval` (`::isatty`, prompt `[y/N]`). Aprovação automática é restrita a `--ci-auto-approve-pairing` (rejeitada em arquivos `.conf`) e `SelftestOnlyLoopbackApprovalCallback` (vinculado ao `device_id_hex` local no selftest).
+  - `lb_node_receiver_start` e `lumabridge_node` utilizam `Instant::now()` para abertura (`open_with_new_pin(&mut rng, 0)`), contagem de tentativas (`remaining_attempts`) e confirmação monotônica (`now_mono_ms`), mantendo `now_unix_secs()` restrito a certificados X.509 e metadados de auditoria.
 - **ABI FFI ao vivo aditiva (`core/crates/lumabridge-ffi/src/node_ffi.rs`, `core/crates/lumabridge-ffi/include/lumabridge_ffi.h`):**
   - Mantidos integralmente todos os `13` exports `lb_core_*` da `M1.1` e os `6` exports iniciais `lb_node_*` da `M1.5`;
   - Adicionados `12` novos exports `lb_node_host_*` e `lb_node_receiver_*` (`31` exports verificados por `DUMPBIN` em `lumabridge_ffi.dll`): `lb_node_host_connect`, `lb_node_host_submit_h264`, `lb_node_host_send_protected_blank`, `lb_node_host_get_telemetry`, `lb_node_host_close`, `lb_node_receiver_start`, `lb_node_receiver_get_endpoints`, `lb_node_receiver_poll_event`, `lb_node_receiver_record_timing`, `lb_node_receiver_get_telemetry`, `lb_node_receiver_export_telemetry_json`, `lb_node_receiver_stop`, com envio periódico (`1 s`) de `ClockSyncPing` em `lb_node_receiver_start` e sem alteração da ABI C `#[repr(C)]`.
@@ -58,7 +62,7 @@
 ### 3.1 Loopback Real com Hardware GPU **NVIDIA GeForce RTX 3060 Ti** (`lumabridge-host-ffi-poc.exe --m2-nvenc-loopback-selftest`)
 Executado em ambiente local Windows 11 x64 (`rustc 1.100.0`, MSVC `14.51.36231`, Windows SDK `10.0.28000.0`) após todas as correções:
 - **Saída direta verificada:**
-  `[M2-NVENC-SELFTEST] PASS encoded=60 rx_delivered=60 decoded=60 idr=2 reconf_bps=8000000 blank=1 enc_avg_us=2984 enc_p95_us=3305 dec_avg_us=1439 leaked_bufs=0`
+  `[M2-NVENC-SELFTEST] PASS encoded=60 rx_delivered=60 decoded=60 idr=2 reconf_bps=8000000 blank=1 enc_avg_us=5231 enc_p95_us=5181 dec_avg_us=3051 leaked_bufs=0`
 - **Telemetria sanitizada exportada pelo receptor (`lb_node_receiver_export_telemetry_json`):**
 
 ```json
@@ -70,27 +74,27 @@ Executado em ambiente local Windows 11 x64 (`rustc 1.100.0`, MSVC `14.51.36231`,
   "idr_requests": 0,
   "protected_blanks": 1,
   "unauthorized_input_drops": 0,
-  "clock_sync_rtt_us": 32005,
+  "clock_sync_rtt_us": 30819,
   "clock_sync_samples": 2,
   "clock_sync_origin": "measured",
   "timestamp_measurement_errors": 0,
   "stages_us": {
     "capture": { "origin": "unavailable", "samples": 0, "p50": 0, "p95": 0, "p99": 0 },
-    "encode": { "origin": "measured", "samples": 60, "p50": 2917, "p95": 3305, "p99": 3317 },
-    "network": { "origin": "estimated", "samples": 59, "p50": 9492, "p95": 9895, "p99": 9909 },
-    "decode": { "origin": "measured", "samples": 60, "p50": 84, "p95": 1758, "p99": 1871 },
+    "encode": { "origin": "measured", "samples": 60, "p50": 4455, "p95": 5181, "p99": 11100 },
+    "network": { "origin": "estimated", "samples": 60, "p50": 6763, "p95": 8312, "p99": 11443 },
+    "decode": { "origin": "measured", "samples": 60, "p50": 259, "p95": 3932, "p99": 4108 },
     "present": { "origin": "unavailable", "samples": 0, "p50": 0, "p95": 0, "p99": 0 },
-    "end_to_end": { "origin": "estimated", "samples": 59, "p50": 12424, "p95": 12450, "p99": 12494 }
+    "end_to_end": { "origin": "estimated", "samples": 60, "p50": 11176, "p95": 11661, "p99": 22543 }
   }
 }
 ```
 
-> **Nota sobre o loopback NVENC:** este autoteste exerce estímulo D3D11 NV12, encoding real NVENC (`60` quadros, `2` IDRs), reconfiguração dinâmica em voo para `8.000.000 bps`, transporte QUIC autenticado com `ProtectedBlank`, decodificação MFT no Windows (`60` quadros), `ClockSync` real (`clock_sync_samples = 2`, `clock_sync_rtt_us = 32005`, `clock_sync_origin = "measured"`) e contagem de vazamento FFI (`leaked_bufs = 0`) na mesma máquina. Como não há monitor virtual `IddCx` montado nem swapchain físico acoplado nesse autoteste, os estágios `capture` e `present` reportam explicitamente `"origin": "unavailable"` (`samples: 0`) em vez de zeros simulados, e `network` / `end_to_end` figuram como `"estimated"`.
+> **Nota sobre o loopback NVENC:** este autoteste exerce estímulo D3D11 NV12, encoding real NVENC (`60` quadros, `2` IDRs), reconfiguração dinâmica em voo para `8.000.000 bps`, transporte QUIC autenticado com `ProtectedBlank`, decodificação MFT no Windows (`60` quadros), `ClockSync` real (`clock_sync_samples = 2`, `clock_sync_rtt_us = 30819`, `clock_sync_origin = "measured"`) e contagem de vazamento FFI (`leaked_bufs = 0`) na mesma máquina. Como não há monitor virtual `IddCx` montado nem swapchain físico acoplado nesse autoteste, os estágios `capture` e `present` reportam explicitamente `"origin": "unavailable"` (`samples: 0`) em vez de zeros simulados, e `network` / `end_to_end` figuram como `"estimated"`.
 
 ### 3.2 Cobertura Automatizada Local & CI Remoto
-- **Rust Workspace (`core/`):** `cargo fmt --all --check`, `cargo clippy --locked --workspace --all-targets -- -D warnings`, `lumabridge-core` (`10` unit + `6` integração `m1_5`), `lumabridge-ffi` (`8` unit), `lumabridge-protocol`, `lumabridge-security`, `lumabridge-transport`, `cargo deny --locked`, e cross-build Android ARM64 (`cargo ndk -t arm64-v8a -P 29` para `protocol`/`security`/`transport`/`core` e `ffi --features uniffi`) verdes.
+- **Rust Workspace (`core/`):** `cargo fmt --all --check`, `cargo clippy --locked --workspace --all-targets -- -D warnings`, `lumabridge-core` (`10` unit + `8` integração `m1_5`), `lumabridge-ffi` (`9` unit, incluindo `ffi_live_host_and_receiver_rejects_missing_denying_or_mismatched_approval`), `lumabridge-protocol`, `lumabridge-security`, `lumabridge-transport`, `cargo deny --locked`, e cross-build Android ARM64 (`cargo ndk -t arm64-v8a -P 29` para `protocol`/`security`/`transport`/`core` e `ffi --features uniffi`) verdes.
 - **FFI PoC Windows (`Invoke-LumaBridgeFfiPocCi.ps1`):** `cbindgen` sem drift, `LumaBridgeFfiCCompat.c` (C11) + `LumaBridgeFfiHarness.cpp` (C++20) em Debug e Release (`12` testes nativos C11/C++20 aprovados), `31` exports verificados em `lumabridge_ffi.dll` e isolamento mantido para `lumabridge-host.exe` padrão.
-- **Receptor Linux C++20 CI (`.github/workflows/ci-m2-linux-receiver.yml`):** build CMake Release com `-Wall -Wextra -Werror`, execução direta do binário unitário `lumabridge-linux-receiver-tests` e teste E2E dois processos com **fonte sintética FFmpeg (`testsrc2` `1920×1080 @ 60 fps`, perfil H.264 High zerolatency)** transmitindo **`30` quadros por modalidade (`quic-datagram` e `tcp-tls`)** via `lumabridge_node` para `lumabridge-linux-receiver` sob **`Xvfb` (`1920x1080x24`) com `--allow-sw-fallback` explícito**, exigindo os gates mínimos **`frames_decoded >= 20`**, `decode_errors == 0`, `protected_blanks_rendered >= 1`, **`core_telemetry.frames_delivered >= 25`** e `core_telemetry.protected_blanks >= 1`. **Atenção:** esse workflow valida compilação C++20, ABI FFI e fluxo H.264 1080p60 sintético em runner VM sem GPU — **não** constitui qualificação física de hardware `VA-API`.
+- **Receptor Linux C++20 CI (`.github/workflows/ci-m2-linux-receiver.yml`):** build CMake Release com `-Wall -Wextra -Werror`, execução direta do binário unitário `lumabridge-linux-receiver-tests` (incluindo rejeição de `ci_auto_approve_pairing` em arquivos `.conf`) e teste E2E dois processos com **fonte sintética FFmpeg (`testsrc2` `1920×1080 @ 60 fps`, perfil H.264 High zerolatency)** transmitindo **`30` quadros por modalidade (`quic-datagram` e `tcp-tls`)** via `lumabridge_node` para `lumabridge-linux-receiver` sob **`Xvfb` (`1920x1080x24`) com `--allow-sw-fallback --ci-auto-approve-pairing` explícitos**, exigindo os gates mínimos **`frames_decoded >= 20`**, `decode_errors == 0`, `protected_blanks_rendered >= 1`, **`core_telemetry.frames_delivered >= 25`** e `core_telemetry.protected_blanks >= 1`. **Atenção:** esse workflow valida compilação C++20, ABI FFI e fluxo H.264 1080p60 sintético em runner VM sem GPU — **não** constitui qualificação física de hardware `VA-API`.
 
 ---
 

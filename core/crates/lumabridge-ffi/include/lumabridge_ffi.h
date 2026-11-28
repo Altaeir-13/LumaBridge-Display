@@ -21,6 +21,8 @@
 
 #define LB_MAX_RX_BUFFERED_EVENTS 8
 
+#define LB_PERM_EXTEND_DISPLAY (1 << 1)
+
 /**
  * Deterministic `uint32_t` return status across the C ABI.
  */
@@ -128,6 +130,25 @@ enum LbNodeTransportKind
 typedef enum LbNodeTransportKind LbNodeTransportKind;
 #else
 typedef uint32_t LbNodeTransportKind;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/**
+ * Authentication mode presented to the local operator approval callback.
+ */
+enum LbPairingAuthMode
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : uint32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  LB_PAIRING_AUTH_MODE_PIN = 1,
+  LB_PAIRING_AUTH_MODE_QR = 2,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum LbPairingAuthMode LbPairingAuthMode;
+#else
+typedef uint32_t LbPairingAuthMode;
 #endif // __STDC_VERSION__ >= 202311L
 #endif // __cplusplus
 
@@ -351,6 +372,39 @@ typedef struct LbNodeTelemetry {
 } LbNodeTelemetry;
 
 /**
+ * Sanitized pairing consent prompt delivered to `LbPairingApprovalCallback`.
+ */
+typedef struct LbPairingApprovalPrompt {
+  struct LbAbiHeader abi;
+  uint64_t pairing_attempt_id;
+  uint32_t auth_mode;
+  uint32_t offered_base_perms;
+  uint8_t peer_device_id_hex[65];
+  uint8_t cert_fingerprint_hex[65];
+  uint8_t untrusted_friendly_name_utf8[65];
+  uint8_t reserved0[5];
+} LbPairingApprovalPrompt;
+
+/**
+ * Explicit local operator decision returned by `LbPairingApprovalCallback`.
+ */
+typedef struct LbPairingApprovalDecision {
+  struct LbAbiHeader abi;
+  uint64_t pairing_attempt_id;
+  uint8_t peer_device_id_hex[65];
+  uint8_t approved;
+  uint8_t reserved0[2];
+  uint32_t granted_base_perms;
+} LbPairingApprovalDecision;
+
+/**
+ * Synchronous local operator pairing approval callback (`noexcept` required on native side).
+ */
+typedef LbStatus (*LbPairingApprovalCallback)(void *user_ctx,
+                                              const struct LbPairingApprovalPrompt *prompt,
+                                              struct LbPairingApprovalDecision *out_decision);
+
+/**
  * Host connection configuration for `lb_node_host_connect` (M2 live LAN pipeline).
  */
 typedef struct LbHostConnectConfig {
@@ -371,6 +425,8 @@ typedef struct LbHostConnectConfig {
   uint16_t fps_den;
   uint32_t initial_bitrate_bps;
   uint32_t timeout_ms;
+  LbPairingApprovalCallback approval_cb;
+  void *approval_user_ctx;
 } LbHostConnectConfig;
 
 /**
@@ -400,6 +456,8 @@ typedef struct LbReceiverStartConfig {
   uint8_t reserved0;
   uint16_t reserved1;
   uint32_t reserved2;
+  LbPairingApprovalCallback approval_cb;
+  void *approval_user_ctx;
 } LbReceiverStartConfig;
 
 /**

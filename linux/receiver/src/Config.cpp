@@ -191,6 +191,9 @@ bool LoadReceiverConfigFile(const std::string& path, ReceiverConfig& inOutCfg, s
             }
         } else if (key == "vaapi_device") {
             inOutCfg.vaapiDevice = val;
+        } else if (key == "ci_auto_approve_pairing") {
+            outError = "ci_auto_approve_pairing cannot be persisted in config files";
+            return false;
         } else if (key == "role" || key == "bitrate_bps") {
             // Shared keys tolerated for unified key=value files
         } else {
@@ -315,6 +318,9 @@ bool ParseReceiverCliArgs(int argc, char** argv, ReceiverConfig& outCfg, bool& o
             outCfg.headless = true;
         } else if (arg == "--mdns") {
             outCfg.enableMdns = true;
+        } else if (arg == "--ci-auto-approve-pairing") {
+            std::fprintf(stderr, "[WARN] --ci-auto-approve-pairing enabled (isolated CI/test fixture approval only).\n");
+            outCfg.ciAutoApprovePairing = true;
         } else if (arg == "--max-frames") {
             std::string v;
             if (!needVal("--max-frames", v) || !ParseU64Str(v, outCfg.maxFrames)) {

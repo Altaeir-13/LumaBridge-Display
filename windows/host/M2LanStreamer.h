@@ -19,6 +19,7 @@ struct M2LanStreamConfig {
     uint16_t height{1080U};
     uint16_t fps{60U};
     uint32_t initialBitrateBps{15000000U};
+    bool useSelftestLoopbackApproval{false};
 };
 
 #ifdef LUMABRIDGE_ENABLE_FFI_POC

@@ -19,6 +19,7 @@ struct ReceiverConfig {
     bool allowSwFallback{false};
     bool headless{false};
     bool enableMdns{false};
+    bool ciAutoApprovePairing{false};
     uint64_t maxFrames{0ULL};
     std::string vaapiDevice{};
     std::string endpointOut{};

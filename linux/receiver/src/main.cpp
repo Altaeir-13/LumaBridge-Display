@@ -5,6 +5,7 @@
 #include "lumabridge_ffi.h"
 
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -23,6 +24,80 @@ std::atomic<bool> g_StopRequested{false};
 
 extern "C" void HandlePosixSignal(int) {
     g_StopRequested.store(true, std::memory_order_release);
+}
+
+extern "C" LbStatus PromptLocalReceiverPairingApproval(
+    void* /*userCtx*/,
+    const LbPairingApprovalPrompt* prompt,
+    LbPairingApprovalDecision* outDecision) noexcept {
+    if (prompt == nullptr || outDecision == nullptr) {
+        return LB_STATUS_INVALID_ARGUMENT;
+    }
+    *outDecision = LbPairingApprovalDecision{};
+    outDecision->abi.abi_major = LB_FFI_ABI_MAJOR;
+    outDecision->abi.abi_minor = LB_FFI_ABI_MINOR;
+    outDecision->abi.struct_size = static_cast<uint32_t>(sizeof(LbPairingApprovalDecision));
+    outDecision->abi.reserved = 0U;
+    outDecision->pairing_attempt_id = prompt->pairing_attempt_id;
+    std::memcpy(
+        outDecision->peer_device_id_hex,
+        prompt->peer_device_id_hex,
+        sizeof(outDecision->peer_device_id_hex));
+
+    const char* modeLabel = (prompt->auth_mode == static_cast<uint32_t>(LB_PAIRING_AUTH_MODE_QR)) ? "QR" : "PIN";
+    std::fprintf(
+        stderr,
+        "[LB-PAIRING] Local consent required: attempt=%llu peer_id=%s fingerprint=%s untrusted_name=%s mode=%s\n",
+        static_cast<unsigned long long>(prompt->pairing_attempt_id),
+        reinterpret_cast<const char*>(prompt->peer_device_id_hex),
+        reinterpret_cast<const char*>(prompt->cert_fingerprint_hex),
+        reinterpret_cast<const char*>(prompt->untrusted_friendly_name_utf8),
+        modeLabel);
+    if (::isatty(STDIN_FILENO) == 0) {
+        std::fprintf(
+            stderr,
+            "[LB-PAIRING] Non-interactive stdin without --ci-auto-approve-pairing; rejecting pairing.\n");
+        return LB_STATUS_OK;
+    }
+    std::fprintf(stderr, "[LB-PAIRING] Approve pairing for this peer? [y/N]: ");
+    std::fflush(stderr);
+    char line[64]{};
+    if (std::fgets(line, sizeof(line), stdin) != nullptr) {
+        std::string ans(line);
+        while (!ans.empty() && (ans.back() == '\n' || ans.back() == '\r' || ans.back() == ' ' || ans.back() == '\t')) {
+            ans.pop_back();
+        }
+        for (char& ch : ans) {
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        }
+        if (ans == "y" || ans == "yes") {
+            outDecision->approved = 1U;
+            outDecision->granted_base_perms = LB_PERM_EXTEND_DISPLAY;
+        }
+    }
+    return LB_STATUS_OK;
+}
+
+extern "C" LbStatus CiAutoApproveReceiverPairingCallback(
+    void* /*userCtx*/,
+    const LbPairingApprovalPrompt* prompt,
+    LbPairingApprovalDecision* outDecision) noexcept {
+    if (prompt == nullptr || outDecision == nullptr) {
+        return LB_STATUS_INVALID_ARGUMENT;
+    }
+    *outDecision = LbPairingApprovalDecision{};
+    outDecision->abi.abi_major = LB_FFI_ABI_MAJOR;
+    outDecision->abi.abi_minor = LB_FFI_ABI_MINOR;
+    outDecision->abi.struct_size = static_cast<uint32_t>(sizeof(LbPairingApprovalDecision));
+    outDecision->abi.reserved = 0U;
+    outDecision->pairing_attempt_id = prompt->pairing_attempt_id;
+    std::memcpy(
+        outDecision->peer_device_id_hex,
+        prompt->peer_device_id_hex,
+        sizeof(outDecision->peer_device_id_hex));
+    outDecision->approved = 1U;
+    outDecision->granted_base_perms = LB_PERM_EXTEND_DISPLAY;
+    return LB_STATUS_OK;
 }
 
 template <typename T>
@@ -154,6 +229,10 @@ int main(int argc, char** argv) {
     startCfg.fps_num = cfg.fps;
     startCfg.fps_den = 1U;
     startCfg.enable_mdns = cfg.enableMdns ? 1U : 0U;
+    startCfg.approval_cb = cfg.ciAutoApprovePairing
+                               ? &CiAutoApproveReceiverPairingCallback
+                               : &PromptLocalReceiverPairingApproval;
+    startCfg.approval_user_ctx = nullptr;
 
     LbReceiverSessionHandle* rxSess = nullptr;
     if (lb_node_receiver_start(node, &startCfg, &rxSess) != LB_STATUS_OK || rxSess == nullptr) {

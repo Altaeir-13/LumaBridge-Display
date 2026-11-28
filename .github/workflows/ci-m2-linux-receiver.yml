@@ -85,7 +85,7 @@ jobs:
 
             xvfb-run -a -s "-screen 0 1920x1080x24" \
               "$RX_BIN" --transport "$TRANS" --bind 127.0.0.1:0 --windowed --overlay \
-              --allow-sw-fallback --max-frames 30 --endpoint-out "$RDV" --json-report "$RX_JSON" &
+              --allow-sw-fallback --ci-auto-approve-pairing --max-frames 30 --endpoint-out "$RDV" --json-report "$RX_JSON" &
             RX_PID=$!
 
             for _ in $(seq 1 80); do
@@ -97,7 +97,7 @@ jobs:
 
             "$TX_BIN" --mode host --transport "$TRANS" --rendezvous-in "$RDV" \
               --h264-annexb-file "$SAMPLE_H264" --frames 30 --fps 60 --send-blank-end \
-              --json-report "$TX_JSON"
+              --ci-auto-approve-pairing --json-report "$TX_JSON"
 
             wait "$RX_PID"
             cat "$RX_JSON"
