@@ -187,6 +187,10 @@ try {
 
     if (Get-Command 'cargo-deny.exe' -ErrorAction SilentlyContinue) {
         Invoke-NativeChecked -Label 'CARGO DENY CHECK' -Executable 'cargo' -Arguments @('deny', '--locked', 'check', 'advisories', 'licenses', 'bans', 'sources') -WorkingDirectory $coreDir | Out-Null
+        $protoFuzzDir = Join-Path $coreDir 'crates\lumabridge-protocol\fuzz'
+        $secFuzzDir = Join-Path $coreDir 'crates\lumabridge-security\fuzz'
+        Invoke-NativeChecked -Label 'CARGO DENY CHECK (PROTOCOL FUZZ)' -Executable 'cargo' -Arguments @('deny', '--locked', 'check', 'advisories', 'licenses', 'bans', 'sources') -WorkingDirectory $protoFuzzDir | Out-Null
+        Invoke-NativeChecked -Label 'CARGO DENY CHECK (SECURITY FUZZ)' -Executable 'cargo' -Arguments @('deny', '--locked', 'check', 'advisories', 'licenses', 'bans', 'sources') -WorkingDirectory $secFuzzDir | Out-Null
         $report.cargo_deny_checked = $true
     }
     elseif ($RequireCargoDeny) {
@@ -227,15 +231,16 @@ try {
         $prodDll = Join-Path $outDir 'lumabridge_ffi.dll'
 
         $cObj = Join-Path $outDir 'LumaBridgeFfiCCompat.obj'
+        $incContracts = Join-Path $coreDir 'include'
         Invoke-NativeChecked -Label ("CL C11 ({0})" -f $mode) -Executable 'cl.exe' -Arguments (@(
             '/nologo', '/std:c11', '/W4', '/WX', $crtFlag) + $optFlags + @(
-            ("/I{0}" -f $incFfi), '/c', $cCompat, ("/Fo{0}" -f $cObj), ("/Fd{0}\" -f $outDir)
+            ("/I{0}" -f $incFfi), ("/I{0}" -f $incContracts), '/c', $cCompat, ("/Fo{0}" -f $cObj), ("/Fd{0}\" -f $outDir)
         )) -WorkingDirectory $resolvedRoot | Out-Null
 
         $harnessExe = Join-Path $outDir 'LumaBridgeFfiHarness.exe'
         Invoke-NativeChecked -Label ("CL C++20 HARNESS ({0})" -f $mode) -Executable 'cl.exe' -Arguments (@(
             '/nologo', '/std:c++20', '/W4', '/WX', '/EHsc', $crtFlag) + $optFlags + @(
-            ("/I{0}" -f $incFfi), $cppHarness, $cObj,
+            ("/I{0}" -f $incFfi), ("/I{0}" -f $incContracts), $cppHarness, $cObj,
             ("/Fo{0}\" -f $outDir), ("/Fd{0}\" -f $outDir), ("/Fe:{0}" -f $harnessExe),
             '/link', $dllLib, 'psapi.lib'
         )) -WorkingDirectory $resolvedRoot | Out-Null
@@ -249,7 +254,7 @@ try {
             '/Iwindows\driver\LumaBridgeIddDriver', '/Iwindows\host', ("/I{0}" -f $incFfi),
             'windows\host\main.cpp', 'windows\host\FrameConsumer.cpp',
             'windows\host\NvencH264Encoder.cpp', 'windows\host\H264BitstreamValidator.cpp',
-            'windows\host\FfiPocAdapter.cpp',
+            'windows\host\FfiPocAdapter.cpp', 'windows\host\M2LanStreamer.cpp',
             ("/Fo{0}\" -f $outDir), ("/Fd{0}\" -f $outDir), ("/Fe:{0}" -f $hostPocExe),
             '/link', $dllLib, 'd3d11.lib', 'dxgi.lib', 'advapi32.lib', 'user32.lib', 'gdi32.lib',
             'mfplat.lib', 'mfuuid.lib', 'wmcodecdspuuid.lib', 'ole32.lib', 'psapi.lib'

@@ -6,6 +6,7 @@
 #include "VirtualDisplayStimulus.h"
 #ifdef LUMABRIDGE_ENABLE_FFI_POC
 #include "FfiPocAdapter.h"
+#include "M2LanStreamer.h"
 #endif
 
 #include <objbase.h>
@@ -17,6 +18,7 @@
 #include <cstdlib>
 #include <cwchar>
 #include <fstream>
+#include <iostream>
 #include <string>
 
 namespace {
@@ -217,6 +219,14 @@ PrintUsage()
         "  --quiet                          Suppress per-frame console output\n"
 #ifdef LUMABRIDGE_ENABLE_FFI_POC
         "  --ffi-poc-selftest               Run isolated M1.1 FFI PoC self-test and exit\n"
+        "  --m2-nvenc-loopback-selftest     Run M2 D3D11 + NVENC -> QUIC/TLS -> Decode loopback test\n"
+        "  --lan-remote <ip>                Pair & stream live NVENC H.264 frames over LAN to Linux receiver\n"
+        "  --lan-pair-port <port>           Receiver pairing port (required with --lan-remote)\n"
+        "  --lan-op-port <port>             Receiver operational port (defaults to --lan-pair-port)\n"
+        "  --lan-pin <pin>                  [DEPRECATED] 8-digit PIN via CLI arg (prefer interactive prompt or --lan-pin-stdin)\n"
+        "  --lan-pin-stdin                  Read 8-digit pairing PIN securely from stdin without CLI arg exposure\n"
+        "  --lan-peer-id <64-hex>           Optional expected 64-hex receiver DeviceId\n"
+        "  --lan-transport <mode>           quic-datagram|quic-stream|tcp-tls (default: quic-datagram)\n"
 #endif
         "  --help                           Show this help message\n");
 }
@@ -1027,6 +1037,22 @@ wmain(
     uint32_t prewarmWidth = 1920U;
     uint32_t prewarmHeight = 1080U;
     HostGateConfig gateConfig{};
+#ifdef LUMABRIDGE_ENABLE_FFI_POC
+    lumabridge::host::M2LanStreamConfig lanConfig{};
+    struct PinScopeGuard {
+        std::string& Pin;
+        ~PinScopeGuard() noexcept {
+            if (!Pin.empty()) {
+                SecureZeroMemory(Pin.data(), Pin.size());
+                Pin.clear();
+            }
+        }
+    } lanPinGuard{lanConfig.pin};
+    bool enableLanStream = false;
+    std::string lanRemoteIp{};
+    uint16_t lanPairPort = 0U;
+    uint16_t lanOpPort = 0U;
+#endif
 
     for (int i = 1; i < argc; ++i)
     {
@@ -1337,6 +1363,70 @@ wmain(
         {
             return lumabridge::host::RunLumaBridgeFfiPocSelfTest();
         }
+        else if (arg == L"--m2-nvenc-loopback-selftest")
+        {
+            return lumabridge::host::RunM2NvencLoopbackSelfTest();
+        }
+        else if (arg == L"--lan-remote" && (i + 1) < argc)
+        {
+            lanRemoteIp = NarrowAsciiFromWide(argv[++i]);
+            enableLanStream = true;
+            enableNvenc = true;
+        }
+        else if (arg == L"--lan-pair-port" && (i + 1) < argc)
+        {
+            uint64_t val = 0ULL;
+            if (!ParseUnsigned64(argv[++i], val) || val == 0ULL || val > 65535ULL)
+            {
+                std::fprintf(stderr, "Invalid --lan-pair-port value.\n");
+                return EXIT_FAILURE;
+            }
+            lanPairPort = static_cast<uint16_t>(val);
+        }
+        else if (arg == L"--lan-op-port" && (i + 1) < argc)
+        {
+            uint64_t val = 0ULL;
+            if (!ParseUnsigned64(argv[++i], val) || val == 0ULL || val > 65535ULL)
+            {
+                std::fprintf(stderr, "Invalid --lan-op-port value.\n");
+                return EXIT_FAILURE;
+            }
+            lanOpPort = static_cast<uint16_t>(val);
+        }
+        else if (arg == L"--lan-pin" && (i + 1) < argc)
+        {
+            std::fprintf(
+                stderr,
+                "[LB-HOST][SECURITY WARNING] --lan-pin exposes the pairing PIN in process arguments; omit it for interactive no-echo prompt or use --lan-pin-stdin.\n");
+            std::string cliPin = NarrowAsciiFromWide(argv[++i]);
+            lanConfig.pin = cliPin;
+            if (!cliPin.empty())
+            {
+                SecureZeroMemory(cliPin.data(), cliPin.size());
+                cliPin.clear();
+            }
+        }
+        else if (arg == L"--lan-pin-stdin")
+        {
+            lanConfig.pin.clear();
+            if (!std::getline(std::cin, lanConfig.pin))
+            {
+                std::fprintf(stderr, "Failed reading pairing PIN from stdin.\n");
+                return EXIT_FAILURE;
+            }
+            while (!lanConfig.pin.empty() && (lanConfig.pin.back() == '\r' || lanConfig.pin.back() == '\n'))
+            {
+                lanConfig.pin.pop_back();
+            }
+        }
+        else if (arg == L"--lan-peer-id" && (i + 1) < argc)
+        {
+            lanConfig.peerDeviceIdHex = NarrowAsciiFromWide(argv[++i]);
+        }
+        else if (arg == L"--lan-transport" && (i + 1) < argc)
+        {
+            lanConfig.transport = NarrowAsciiFromWide(argv[++i]);
+        }
 #endif
         else
         {
@@ -1518,6 +1608,79 @@ wmain(
     }
 
     const uint64_t hostQpcFreq = QueryHostQpcFreqSafe();
+    const uint64_t lanStartQpc = QueryHostQpcNow();
+#ifdef LUMABRIDGE_ENABLE_FFI_POC
+    lumabridge::host::M2LanStreamer lanStreamer;
+    auto scrubPin = [&lanConfig]() noexcept {
+        if (!lanConfig.pin.empty()) {
+            SecureZeroMemory(lanConfig.pin.data(), lanConfig.pin.size());
+            lanConfig.pin.clear();
+        }
+    };
+    if (enableLanStream)
+    {
+        if (lanConfig.pin.empty() && !lanRemoteIp.empty() && lanPairPort != 0U)
+        {
+            HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+            DWORD origMode = 0U;
+            if (hStdin != INVALID_HANDLE_VALUE && GetConsoleMode(hStdin, &origMode))
+            {
+                struct ConsoleEchoGuard {
+                    HANDLE Handle;
+                    DWORD OrigMode;
+                    ~ConsoleEchoGuard() noexcept {
+                        (void)SetConsoleMode(Handle, OrigMode);
+                    }
+                } echoGuard{hStdin, origMode};
+                (void)SetConsoleMode(hStdin, origMode & ~static_cast<DWORD>(ENABLE_ECHO_INPUT));
+                std::fprintf(stdout, "[LB-HOST] Enter 8-digit pairing PIN (input hidden): ");
+                std::fflush(stdout);
+                lanConfig.pin.clear();
+                if (std::getline(std::cin, lanConfig.pin))
+                {
+                    while (!lanConfig.pin.empty() && (lanConfig.pin.back() == '\r' || lanConfig.pin.back() == '\n'))
+                    {
+                        lanConfig.pin.pop_back();
+                    }
+                }
+                std::fprintf(stdout, "\n");
+            }
+        }
+        if (lanRemoteIp.empty() || lanPairPort == 0U || lanConfig.pin.empty())
+        {
+            scrubPin();
+            std::fprintf(stderr, "[LB-HOST] --lan-remote requires --lan-pair-port and a pairing PIN (interactive no-echo prompt or --lan-pin-stdin).\n");
+            if (verifyH264Decode) { asyncH264Worker.StopAndDrain(false); }
+            (void)SetConsoleCtrlHandler(ConsoleCtrlHandler, FALSE);
+            g_ConsoleStopEvent = nullptr;
+            CloseHandle(stopEvent);
+            h264Validator.Shutdown();
+            nvencEncoder.Shutdown();
+            stimulus.Stop();
+            return EXIT_FAILURE;
+        }
+        const uint16_t effectiveOpPort = (lanOpPort != 0U) ? lanOpPort : lanPairPort;
+        lanConfig.pairAddr = lanRemoteIp + ":" + std::to_string(lanPairPort);
+        lanConfig.opAddr = lanRemoteIp + ":" + std::to_string(effectiveOpPort);
+        lanConfig.width = static_cast<uint16_t>((prewarmWidth > 0U) ? prewarmWidth : 1920U);
+        lanConfig.height = static_cast<uint16_t>((prewarmHeight > 0U) ? prewarmHeight : 1080U);
+        lanConfig.fps = static_cast<uint16_t>(stimulusFps);
+        lanConfig.initialBitrateBps = nvencBitrateBps;
+        const bool startedLan = lanStreamer.Start(lanConfig);
+        scrubPin();
+        if (!startedLan)
+        {
+            if (verifyH264Decode) { asyncH264Worker.StopAndDrain(false); }
+            (void)SetConsoleCtrlHandler(ConsoleCtrlHandler, FALSE);
+            g_ConsoleStopEvent = nullptr;
+            CloseHandle(stopEvent);
+            h264Validator.Shutdown();
+            nvencEncoder.Shutdown();
+            stimulus.Stop();
+            return EXIT_FAILURE;
+        }
+    }
+#endif
     const ProcessResourceSample hostStartSample = SampleProcessResources(GetCurrentProcessId(), consumer.GetD3d11Device());
     ProcessResourceSample serverStartSample{};
     bool serverBaselineCaptured = false;
@@ -1573,7 +1736,14 @@ wmain(
          &nvencBoundDevice,
          &nvencWidth,
          &nvencHeight,
-         &nvencSubmitCount](
+         &nvencSubmitCount
+#ifdef LUMABRIDGE_ENABLE_FFI_POC
+         , &lanStreamer,
+         hostQpcFreq,
+         lanStartQpc,
+         stopEvent
+#endif
+         ](
             const lumabridge::ipc::FrameIpcGpuFrameHeader& gpuHeader,
             ID3D11Device* d3dDevice,
             ID3D11DeviceContext* d3dContext,
@@ -1672,6 +1842,33 @@ wmain(
             lumabridge::host::EncodedFramePacket pkt{};
             while (nvencEncoder.TryPopEncodedFrame(pkt))
             {
+#ifdef LUMABRIDGE_ENABLE_FFI_POC
+                if (lanStreamer.IsRunning())
+                {
+                    bool remoteForceIdr = false;
+                    uint32_t newBitrateBps = 0U;
+                    bool remoteClosed = false;
+                    (void)lanStreamer.SubmitEncodedPacket(
+                        pkt,
+                        hostQpcFreq,
+                        lanStartQpc,
+                        &remoteForceIdr,
+                        &newBitrateBps,
+                        &remoteClosed);
+                    if (remoteForceIdr)
+                    {
+                        nvencEncoder.RequestForceIdrOnNextFrame();
+                    }
+                    if (newBitrateBps >= 1000000U)
+                    {
+                        (void)nvencEncoder.UpdateDynamicBitrate(newBitrateBps);
+                    }
+                    if (remoteClosed)
+                    {
+                        (void)SetEvent(stopEvent);
+                    }
+                }
+#endif
                 if (!quiet)
                 {
                     std::printf(
@@ -1756,6 +1953,16 @@ wmain(
 
     h264Validator.Shutdown();
     nvencEncoder.Shutdown();
+#ifdef LUMABRIDGE_ENABLE_FFI_POC
+    if (lanStreamer.IsRunning())
+    {
+        const uint64_t endBlankUs =
+            ((QueryHostQpcNow() - lanStartQpc) * 1000000ULL) / ((hostQpcFreq > 0ULL) ? hostQpcFreq : 10000000ULL);
+        (void)lanStreamer.SendProtectedBlank(endBlankUs);
+        lanStreamer.Stop();
+    }
+#endif
+    (void)lanStartQpc;
 
     const HostGateEvaluation gateEval = EvaluateHostGates(
         config,

@@ -1,0 +1,51 @@
+[package]
+name = "lumabridge-security-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lumabridge-protocol = { path = "../../lumabridge-protocol" }
+lumabridge-security = { path = "..", features = ["test-utils"] }
+
+[[bin]]
+name = "fuzz_spki_identity"
+path = "fuzz_targets/fuzz_spki_identity.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_x509_cert"
+path = "fuzz_targets/fuzz_x509_cert.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_spake2_messages"
+path = "fuzz_targets/fuzz_spake2_messages.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_qr_pairing"
+path = "fuzz_targets/fuzz_qr_pairing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_session_authz"
+path = "fuzz_targets/fuzz_session_authz.rs"
+test = false
+doc = false
+bench = false

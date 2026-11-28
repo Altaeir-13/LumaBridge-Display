@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Versioned C ABI and UniFFI boundary over lumabridge-core (M1.1 PoC)."
+description = "Versioned C ABI and UniFFI boundary over lumabridge-core (M1.1 PoC + M1.5 operational node bridge)."
 
 [lib]
 name = "lumabridge_ffi"
@@ -23,4 +23,8 @@ uniffi-cli = ["uniffi", "uniffi/cli"]
 
 [dependencies]
 lumabridge-core = { version = "0.1.0", path = "../lumabridge-core" }
+lumabridge-protocol = { version = "0.1.0", path = "../lumabridge-protocol" }
+lumabridge-security = { version = "0.1.0", path = "../lumabridge-security" }
+lumabridge-transport = { version = "0.1.0", path = "../lumabridge-transport" }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 uniffi = { version = "0.32.2", optional = true }

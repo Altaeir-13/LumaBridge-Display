@@ -44,9 +44,19 @@ use lumabridge_protocol::validation::{
 };
 use lumabridge_protocol::version::{negotiate_version, Alpn, CodecId, ProtocolVersion};
 
+fn canonical_sample_spki(seed_byte: u8) -> Vec<u8> {
+    let mut spki = vec![
+        0x30, 0x2A, 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ];
+    spki.extend_from_slice(&[seed_byte; 32]);
+    spki
+}
+
 fn sample_pairing_and_handshake_messages() -> Vec<ControlMessage> {
     let dev_a = [0xAAu8; 32];
     let dev_b = [0xBBu8; 32];
+    let mut share_p256 = vec![0x04u8];
+    share_p256.extend_from_slice(&[0x5Au8; 64]);
     vec![
         ControlMessage::PairHello(PairHello {
             protocol_major: 1,
@@ -54,12 +64,12 @@ fn sample_pairing_and_handshake_messages() -> Vec<ControlMessage> {
             device_id: dev_a,
             friendly_name: "Pixel-Tablet".to_owned(),
             auth_mode: AuthMode::PinSpake2,
-            spki_ed25519: vec![0x30u8; 44],
+            spki_ed25519: canonical_sample_spki(0x31),
         }),
         ControlMessage::PairSpakeMsg(PairSpakeMsg {
             pairing_attempt_id: 42,
             step: SpakeStep::KeyConfirmation,
-            spake_payload: vec![0x5Au8; 64],
+            spake_payload: Vec::new(),
             key_confirmation: Some(vec![0xC3u8; 32]),
         }),
         ControlMessage::PairQrAuth(PairQrAuth {
@@ -70,7 +80,7 @@ fn sample_pairing_and_handshake_messages() -> Vec<ControlMessage> {
         ControlMessage::PairConfirm(PairConfirm {
             pairing_attempt_id: 42,
             accepted: true,
-            granted_base_perms: Permissions::VIEW_MIRROR.union(Permissions::EXTEND_DISPLAY),
+            granted_base_perms: Permissions::VIEW_MIRROR,
             confirm_signature: Some(vec![0x77u8; 64]),
         }),
         ControlMessage::PairCancel(PairCancel {
@@ -184,12 +194,14 @@ fn sample_session_and_media_messages() -> Vec<ControlMessage> {
                 display_id: 1,
                 last_good_frame_id: 777,
             }],
+            channel_proof: None,
         }),
         ControlMessage::SessionResumeResponse(SessionResumeResponse {
             accepted: true,
             session_id: sid,
             preserved_displays: vec![active_display],
             idr_requested_displays: vec![1],
+            rotated_resume_token: None,
         }),
         ControlMessage::SessionClose(SessionClose {
             session_id: sid,
@@ -352,6 +364,58 @@ fn control_message_semantic_and_privacy_invariants() {
     assert!(matches!(
         bad_confirm.encode_cbor(),
         Err(CborError::ValueOutOfRange(_))
+    ));
+    let mut bad_confirm_bytes = Vec::new();
+    let _ = ControlMessage::PairConfirm(PairConfirm {
+        pairing_attempt_id: 7,
+        accepted: false,
+        granted_base_perms: Permissions::NONE,
+        confirm_signature: Some(vec![0xAA; 64]),
+    })
+    .encode_cbor_into(&mut bad_confirm_bytes);
+    assert!(bad_confirm_bytes.is_empty());
+
+    // Consolidated M1.3 pairing/token wire contracts: KeyExchange 65 B SEC1, 44 B Ed25519 SPKI DER,
+    // strict UnknownFieldPolicy::Reject even if SkipBounded is passed, and rejected PairConfirm omits sig.
+    let mut valid_share = vec![0x04u8];
+    valid_share.extend_from_slice(&[0x42u8; 64]);
+    let kx = ControlMessage::PairSpakeMsg(PairSpakeMsg {
+        pairing_attempt_id: 77,
+        step: SpakeStep::KeyExchange,
+        spake_payload: valid_share,
+        key_confirmation: None,
+    });
+    let kx_wire = kx.encode_cbor().expect("KeyExchange encodes");
+    assert_eq!(
+        ControlMessage::decode_cbor(
+            MsgType::PairSpakeMsg,
+            &kx_wire,
+            CborDecodeOptions::default()
+        ),
+        Ok(kx)
+    );
+
+    // Unknown field inside PairHello must be rejected even with UnknownFieldPolicy::SkipBounded.
+    let mut pair_hello_unknown = Vec::new();
+    let mut map = CborMapEncoder::start(&mut pair_hello_unknown, 7).expect("start map");
+    map.put_u64(1, 1).unwrap();
+    map.put_u64(2, 0).unwrap();
+    map.put_bytes(3, &[0x11; 32]).unwrap();
+    map.put_text(4, "node").unwrap();
+    map.put_u64(5, 1).unwrap();
+    map.put_bytes(6, &canonical_sample_spki(0x22)).unwrap();
+    map.put_u64(99, 123).unwrap();
+    map.finish().unwrap();
+    assert!(matches!(
+        ControlMessage::decode_cbor(
+            MsgType::PairHello,
+            &pair_hello_unknown,
+            CborDecodeOptions {
+                unknown_fields: UnknownFieldPolicy::SkipBounded,
+                ..CborDecodeOptions::default()
+            }
+        ),
+        Err(CborError::TypeMismatch("unknown map field rejected"))
     ));
 
     // ErrorNotice forbids non-printable ASCII.
@@ -1933,4 +1997,74 @@ fn normative_large_payload_ceilings_64kib_control_and_8mib_media() {
         ),
         Err(FragmentationError::FrameNotRepresentable { .. })
     ));
+}
+
+#[test]
+fn session_resume_optional_channel_proof_and_rotated_token() {
+    let sid = 0x55AA_1122_3344_5566;
+    let proof = [0x42u8; 32];
+    let req = ControlMessage::SessionResumeRequest(SessionResumeRequest {
+        session_id: sid,
+        resume_token: vec![0x11u8; 32],
+        last_good_frames: vec![DisplayFrameCursor {
+            display_id: 0,
+            last_good_frame_id: 120,
+        }],
+        channel_proof: Some(proof),
+    });
+    let dbg_req = format!("{req:?}");
+    assert!(!dbg_req.contains("4242"));
+    assert!(dbg_req.contains("[REDACTED]"));
+
+    let enc = req.encode_cbor().expect("encode req");
+    let dec = ControlMessage::decode_cbor(
+        MsgType::SessionResumeRequest,
+        &enc,
+        CborDecodeOptions::default(),
+    )
+    .expect("decode req");
+    assert_eq!(dec, req);
+
+    let rotated = vec![0x77u8; 32];
+    let resp = ControlMessage::SessionResumeResponse(SessionResumeResponse {
+        accepted: true,
+        session_id: sid,
+        preserved_displays: vec![ActiveDisplayConfig {
+            display_id: 0,
+            mode: DisplayMode::Extend,
+            width: 1920,
+            height: 1080,
+            fps_num: 60,
+            fps_den: 1,
+            scale_milli: 1000,
+            rotation_deg: RotationDeg::Deg0,
+            codec_id: CodecId::H264,
+            color_format: ColorFormat::Nv12_8Bit,
+            initial_bitrate_bps: 12_000_000,
+            capture_mode: CaptureMode::WindowsIddVirtualMonitor,
+        }],
+        idr_requested_displays: vec![0],
+        rotated_resume_token: Some(rotated),
+    });
+    let dbg_resp = format!("{resp:?}");
+    assert!(!dbg_resp.contains("7777"));
+    assert!(dbg_resp.contains("[REDACTED]"));
+
+    let enc_resp = resp.encode_cbor().expect("encode resp");
+    let dec_resp = ControlMessage::decode_cbor(
+        MsgType::SessionResumeResponse,
+        &enc_resp,
+        CborDecodeOptions::default(),
+    )
+    .expect("decode resp");
+    assert_eq!(dec_resp, resp);
+
+    let bad_rejected = ControlMessage::SessionResumeResponse(SessionResumeResponse {
+        accepted: false,
+        session_id: sid,
+        preserved_displays: Vec::new(),
+        idr_requested_displays: Vec::new(),
+        rotated_resume_token: Some(vec![0x88u8; 32]),
+    });
+    assert!(bad_rejected.encode_cbor().is_err());
 }

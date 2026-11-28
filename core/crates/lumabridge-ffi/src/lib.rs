@@ -21,6 +21,9 @@ uniffi::setup_scaffolding!();
 #[cfg(feature = "uniffi")]
 pub mod uniffi_api;
 
+pub mod node_ffi;
+pub use node_ffi::*;
+
 use std::ffi::c_void;
 use std::mem::{align_of, offset_of, size_of};
 use std::panic::{self, AssertUnwindSafe};
@@ -271,7 +274,7 @@ fn validate_abi_header<T>(header: &LbAbiHeader) -> Result<(), LbStatus> {
 /// - If `ptr` is non-null and aligned for `LbAbiHeader`, at least 16 bytes at `ptr` must be readable.
 /// - If `validate_abi_header::<T>` succeeds and `ptr` is aligned for `T`, `size_of::<T>()` bytes
 ///   at `ptr` must be readable.
-unsafe fn read_and_validate_abi_input<T: Copy>(ptr: *const T) -> Result<T, LbStatus> {
+pub(crate) unsafe fn read_and_validate_abi_input<T: Copy>(ptr: *const T) -> Result<T, LbStatus> {
     if ptr.is_null() {
         return Err(LbStatus::InvalidArgument);
     }
@@ -297,7 +300,7 @@ unsafe fn read_and_validate_abi_input<T: Copy>(ptr: *const T) -> Result<T, LbSta
 ///   must be readable.
 /// - If `validate_abi_header::<T>` succeeds and `ptr` is aligned for `T`, `size_of::<T>()` bytes
 ///   at `ptr` must be writable.
-unsafe fn validate_abi_output<T>(ptr: *mut T) -> Result<(), LbStatus> {
+pub(crate) unsafe fn validate_abi_output<T>(ptr: *mut T) -> Result<(), LbStatus> {
     if ptr.is_null() {
         return Err(LbStatus::InvalidArgument);
     }
@@ -384,7 +387,7 @@ extern "C" fn lb_ffi_release_rust_vec(
     record_rust_buffer_released();
 }
 
-fn alloc_rust_owned_buffer(bytes: Vec<u8>) -> LbOwnedBuffer {
+pub(crate) fn alloc_rust_owned_buffer(bytes: Vec<u8>) -> LbOwnedBuffer {
     let data = bytes.as_ptr();
     let len = bytes.len();
     let capacity = bytes.capacity();
