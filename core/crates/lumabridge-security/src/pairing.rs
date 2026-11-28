@@ -145,7 +145,7 @@ struct ActivePinState {
     pin: PinSecret,
     pin_generation: u64,
     opened_at_secs: u64,
-    expires_at_unix: u64,
+    expires_at_secs: u64,
     failed_attempts: u32,
     in_flight_attempts: u32,
 }
@@ -171,14 +171,17 @@ impl PinPairingWindow {
         Self::default()
     }
 
-    /// Open (or rotate) the pairing window with a fresh CSPRNG 8-digit PIN valid for 90 seconds.
+    /// Open (or rotate) the pairing window with a fresh CSPRNG 8-digit PIN valid for 90 monotonic seconds.
+    ///
+    /// Callers MUST supply process-local monotonic seconds (`now_mono_secs`), keeping PIN TTL
+    /// independent of wall-clock jumps used by X.509 certificates or cross-device QR tickets.
     pub fn open_with_new_pin(
         &self,
         rng: &mut CheckedOsCryptoRng,
-        now_unix: u64,
+        now_mono_secs: u64,
     ) -> Result<PinSecret, SecurityError> {
         let pin = PinSecret::generate_numeric(rng)?;
-        let expires_at_unix = now_unix
+        let expires_at_secs = now_mono_secs
             .checked_add(PIN_TTL_SECS)
             .ok_or(SecurityError::InvalidTimestamp("PIN expiry overflow"))?;
         let mut guard = self
@@ -190,8 +193,8 @@ impl PinPairingWindow {
         guard.active = Some(ActivePinState {
             pin: pin.clone(),
             pin_generation: gen,
-            opened_at_secs: now_unix,
-            expires_at_unix,
+            opened_at_secs: now_mono_secs,
+            expires_at_secs,
             failed_attempts: 0,
             in_flight_attempts: 0,
         });
@@ -208,18 +211,21 @@ impl PinPairingWindow {
         Ok(())
     }
 
-    /// Remaining attempts before PIN destruction (`0` if closed, expired, or exhausted).
+    /// Remaining attempts before PIN destruction (`0` if closed, expired, before opening, or exhausted).
     ///
-    /// Clears and zeroizes expired PIN material if observed past `expires_at_unix`.
+    /// Clears and zeroizes expired PIN material if observed past `expires_at_secs`.
     #[must_use]
-    pub fn remaining_attempts(&self, now_unix: u64) -> u32 {
+    pub fn remaining_attempts(&self, now_mono_secs: u64) -> u32 {
         let Ok(mut guard) = self.inner.lock() else {
             return 0;
         };
         let Some(ref st) = guard.active else {
             return 0;
         };
-        if now_unix > st.expires_at_unix {
+        if now_mono_secs < st.opened_at_secs {
+            return 0;
+        }
+        if now_mono_secs > st.expires_at_secs {
             guard.active = None;
             return 0;
         }
@@ -228,7 +234,7 @@ impl PinPairingWindow {
     }
 
     /// Atomically reserve one PIN attempt slot under the 3-attempt budget across concurrent callers.
-    pub fn begin_attempt(&self, now_unix: u64) -> Result<PinAttemptLease, SecurityError> {
+    pub fn begin_attempt(&self, now_mono_secs: u64) -> Result<PinAttemptLease, SecurityError> {
         let mut guard = self
             .inner
             .lock()
@@ -241,12 +247,12 @@ impl PinPairingWindow {
         let Some(ref mut st) = guard.active else {
             return Err(SecurityError::PairingWindowClosed);
         };
-        if now_unix < st.opened_at_secs {
+        if now_mono_secs < st.opened_at_secs {
             return Err(SecurityError::InvalidTimestamp(
                 "attempt reservation precedes PIN window opening",
             ));
         }
-        if now_unix > st.expires_at_unix {
+        if now_mono_secs > st.expires_at_secs {
             guard.active = None;
             return Err(SecurityError::PairingWindowClosed);
         }
@@ -264,7 +270,7 @@ impl PinPairingWindow {
         Ok(PinAttemptLease {
             inner: Arc::clone(&self.inner),
             pin_generation,
-            reserved_at_secs: now_unix,
+            reserved_at_secs: now_mono_secs,
             pin: Some(pin_copy),
             resolved: false,
         })
@@ -290,7 +296,7 @@ impl PinAttemptLease {
 
     /// Atomically consume and destroy the active PIN upon cryptographic verification success,
     /// rejecting closed, expired, rotated, or concurrently consumed windows.
-    pub fn finish_success(mut self, now_unix: u64) -> Result<(), SecurityError> {
+    pub fn finish_success(mut self, now_mono_secs: u64) -> Result<(), SecurityError> {
         self.resolved = true;
         self.pin = None;
         let mut guard = self
@@ -305,7 +311,7 @@ impl PinAttemptLease {
             return Err(SecurityError::PairingWindowClosed);
         }
         st.in_flight_attempts = st.in_flight_attempts.saturating_sub(1);
-        if now_unix < self.reserved_at_secs || now_unix < st.opened_at_secs {
+        if now_mono_secs < self.reserved_at_secs || now_mono_secs < st.opened_at_secs {
             st.failed_attempts = st.failed_attempts.saturating_add(1);
             if st.failed_attempts >= MAX_PIN_FAILED_ATTEMPTS {
                 guard.active = None;
@@ -314,7 +320,7 @@ impl PinAttemptLease {
                 "confirmation timestamp precedes attempt reservation",
             ));
         }
-        if now_unix > st.expires_at_unix {
+        if now_mono_secs > st.expires_at_secs {
             guard.active = None;
             return Err(SecurityError::PairingWindowClosed);
         }
@@ -1165,7 +1171,7 @@ impl PairingAcceptor {
         &mut self,
         pin_window: &PinPairingWindow,
         peer_msg: &PairSpakeMsg,
-        now_unix: u64,
+        now_mono_secs: u64,
         rng: &mut CheckedOsCryptoRng,
     ) -> Result<PairSpakeMsg, SecurityError> {
         if self.stage != PairingStage::Init
@@ -1190,7 +1196,7 @@ impl PairingAcceptor {
         }
         validate_uncompressed_p256_share(&peer_msg.spake_payload).inspect_err(|_| self.fail())?;
 
-        let lease = pin_window.begin_attempt(now_unix).inspect_err(|_| {
+        let lease = pin_window.begin_attempt(now_mono_secs).inspect_err(|_| {
             self.stage = PairingStage::Failed;
         })?;
         let pin = lease.pin()?;
@@ -1263,12 +1269,12 @@ impl PairingAcceptor {
     }
 
     /// Verify initiator's `KeyConfirmation` (`cA`), emit acceptor `KeyConfirmation` (`cB`),
-    /// atomically consume/destroy the PIN at confirmation time `now_unix` (failing if expired,
-    /// closed, rotated, or consumed concurrently), and advance to `AwaitingApproval`.
+    /// atomically consume/destroy the PIN at monotonic confirmation time `now_mono_secs` (failing
+    /// if expired, closed, rotated, or consumed concurrently), and advance to `AwaitingApproval`.
     pub fn verify_spake2_confirmation_and_reply(
         &mut self,
         peer_msg: &PairSpakeMsg,
-        now_unix: u64,
+        now_mono_secs: u64,
     ) -> Result<PairSpakeMsg, SecurityError> {
         if self.stage != PairingStage::AuthExchanging || self.auth_mode != AuthMode::PinSpake2 {
             self.fail();
@@ -1314,7 +1320,7 @@ impl PairingAcceptor {
             self.fail();
             return Err(SecurityError::PairingState("missing PIN attempt lease"));
         };
-        if let Err(err) = lease.finish_success(now_unix) {
+        if let Err(err) = lease.finish_success(now_mono_secs) {
             self.fail();
             return Err(err);
         }
