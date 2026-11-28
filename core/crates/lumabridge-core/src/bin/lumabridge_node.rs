@@ -19,11 +19,14 @@ use lumabridge_protocol::media::fragmentation::FrameKind;
 use lumabridge_protocol::version::CodecId;
 use lumabridge_security::authorization::AuthorizationPolicyContext;
 use lumabridge_security::identity::{DeviceId, PeerRole};
-use lumabridge_security::pairing::{HumanApprovalDecision, PinPairingWindow};
+use lumabridge_security::pairing::{
+    HumanApprovalDecision, PairingApprovalPrompt, PinPairingWindow,
+};
 use lumabridge_security::secret::{CheckedOsCryptoRng, PinSecret};
 use lumabridge_security::tls::{LUMABRIDGE_ALPN_V1, LUMABRIDGE_PAIR_ALPN_V1};
 use lumabridge_transport::config::{TransportConfig, TransportKind};
 use lumabridge_transport::queue::OutboundVideoFrame;
+use std::io::IsTerminal as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -43,6 +46,7 @@ struct CliArgs {
     pair_endpoint: Option<SocketAddr>,
     peer_device_hex: Option<String>,
     pin: String,
+    ci_auto_approve_pairing: bool,
     frames: u32,
     fps: u32,
     json_report: Option<PathBuf>,
@@ -104,6 +108,52 @@ fn to_hex_lower(bytes: &[u8; 32]) -> String {
     s
 }
 
+fn prompt_local_pairing_approval(
+    prompt: &PairingApprovalPrompt,
+    ci_auto_approve: bool,
+) -> HumanApprovalDecision {
+    if ci_auto_approve {
+        return HumanApprovalDecision::Approve {
+            pairing_attempt_id: prompt.pairing_attempt_id,
+            peer_device_id: prompt.peer_device_id,
+            granted_base_perms: Permissions::EXTEND_DISPLAY,
+        };
+    }
+    eprintln!(
+        "[LB-PAIRING] Local consent required: attempt={} peer_id={} fingerprint={} untrusted_name={:?} mode={:?}",
+        prompt.pairing_attempt_id,
+        to_hex_lower(prompt.peer_device_id.as_bytes()),
+        prompt.peer_fingerprint,
+        prompt.untrusted_friendly_name,
+        prompt.auth_mode
+    );
+    if !std::io::stdin().is_terminal() {
+        eprintln!(
+            "[LB-PAIRING] Non-interactive stdin without --ci-auto-approve-pairing; rejecting pairing."
+        );
+        return HumanApprovalDecision::Reject {
+            pairing_attempt_id: prompt.pairing_attempt_id,
+            peer_device_id: prompt.peer_device_id,
+        };
+    }
+    eprint!("[LB-PAIRING] Approve pairing for this peer? [y/N]: ");
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_ok() {
+        let ans = line.trim().to_ascii_lowercase();
+        if ans == "y" || ans == "yes" {
+            return HumanApprovalDecision::Approve {
+                pairing_attempt_id: prompt.pairing_attempt_id,
+                peer_device_id: prompt.peer_device_id,
+                granted_base_perms: Permissions::EXTEND_DISPLAY,
+            };
+        }
+    }
+    HumanApprovalDecision::Reject {
+        pairing_attempt_id: prompt.pairing_attempt_id,
+        peer_device_id: prompt.peer_device_id,
+    }
+}
+
 fn parse_args() -> Result<CliArgs, NodeError> {
     let mut mode: Option<CliMode> = None;
     let mut transport = TransportKind::QuicDatagram;
@@ -112,12 +162,20 @@ fn parse_args() -> Result<CliArgs, NodeError> {
     let mut pair_endpoint = None;
     let mut peer_device_hex = None;
     let mut pin = String::from("04291738");
+    let mut ci_auto_approve_pairing = false;
     let mut frames = 180u32;
     let mut fps = 60u32;
     let mut json_report = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
+        if flag == "--ci-auto-approve-pairing" {
+            eprintln!(
+                "[WARN] --ci-auto-approve-pairing enabled (isolated CI/test fixture approval only)."
+            );
+            ci_auto_approve_pairing = true;
+            continue;
+        }
         let val = it
             .next()
             .ok_or(NodeError::InvalidConfig("missing value for CLI flag"))?;
@@ -174,6 +232,7 @@ fn parse_args() -> Result<CliArgs, NodeError> {
         pair_endpoint,
         peer_device_hex,
         pin,
+        ci_auto_approve_pairing,
         frames,
         fps: fps.max(1),
         json_report,
@@ -206,7 +265,8 @@ async fn run_receiver(args: CliArgs) -> Result<SessionTelemetrySummary, NodeErro
 
     let pin_window = PinPairingWindow::new();
     let _ = PinSecret::new(&args.pin)?;
-    let generated_pin = pin_window.open_with_new_pin(&mut rng, now_unix())?;
+    let pair_clock = Instant::now();
+    let generated_pin = pin_window.open_with_new_pin(&mut rng, 0)?;
     let pair_srv = node
         .bind_server(args.transport, args.bind_addr, true)
         .await?;
@@ -234,13 +294,16 @@ async fn run_receiver(args: CliArgs) -> Result<SessionTelemetrySummary, NodeErro
     let pair_link = pair_srv
         .accept_link(LUMABRIDGE_PAIR_ALPN_V1, now_unix())
         .await?;
-    node.accept_pairing_over_link(pair_link, Some(&pin_window), None, now_unix(), 1_000, |p| {
-        HumanApprovalDecision::Approve {
-            pairing_attempt_id: p.pairing_attempt_id,
-            peer_device_id: p.peer_device_id,
-            granted_base_perms: Permissions::EXTEND_DISPLAY,
-        }
-    })
+    let pair_mono_ms = u64::try_from(pair_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let ci_auto_approve = args.ci_auto_approve_pairing;
+    node.accept_pairing_over_link(
+        pair_link,
+        Some(&pin_window),
+        None,
+        now_unix(),
+        pair_mono_ms,
+        |p| prompt_local_pairing_approval(p, ci_auto_approve),
+    )
     .await?;
     pair_srv.close();
 
@@ -391,17 +454,14 @@ async fn run_host(args: CliArgs) -> Result<SessionTelemetrySummary, NodeError> {
     };
 
     let pin_secret = PinSecret::new(&pin_str)?;
+    let ci_auto_approve = args.ci_auto_approve_pairing;
     node.pair_with_pin(
         args.transport,
         pair_addr,
         rx_device_id,
         &pin_secret,
         now_unix(),
-        |p| HumanApprovalDecision::Approve {
-            pairing_attempt_id: p.pairing_attempt_id,
-            peer_device_id: p.peer_device_id,
-            granted_base_perms: Permissions::EXTEND_DISPLAY,
-        },
+        |p| prompt_local_pairing_approval(p, ci_auto_approve),
     )
     .await?;
 

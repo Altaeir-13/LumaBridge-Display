@@ -300,7 +300,7 @@ impl LumaBridgeNode {
         pin_window: Option<&PinPairingWindow>,
         qr_store: Option<&QrTokenStore>,
         now_unix: u64,
-        now_ms: u64,
+        now_mono_ms: u64,
         consent_cb: F,
     ) -> Result<TrustedPeerRecord, NodeError>
     where
@@ -312,13 +312,20 @@ impl LumaBridgeNode {
             conn.close();
             return Err(NodeError::Security(SecurityError::RevokedDevice));
         }
-        if let Err(err) = self.rate_limiter.check_allowed(peer_tls_id, now_ms) {
+        if let Err(err) = self.rate_limiter.check_allowed(peer_tls_id, now_mono_ms) {
             conn.close();
             return Err(NodeError::Security(err));
         }
 
         let res = self
-            .accept_pairing_inner(&conn, pin_window, qr_store, now_unix, now_ms, consent_cb)
+            .accept_pairing_inner(
+                &conn,
+                pin_window,
+                qr_store,
+                now_unix,
+                now_mono_ms,
+                consent_cb,
+            )
             .await;
         match res {
             Ok(rec) => {
@@ -327,7 +334,7 @@ impl LumaBridgeNode {
                 Ok(rec)
             }
             Err(err) => {
-                let _ = self.rate_limiter.record_failure(peer_tls_id, now_ms);
+                let _ = self.rate_limiter.record_failure(peer_tls_id, now_mono_ms);
                 conn.close();
                 Err(err)
             }
@@ -341,7 +348,7 @@ impl LumaBridgeNode {
         pin_window: Option<&PinPairingWindow>,
         qr_store: Option<&QrTokenStore>,
         now_unix: u64,
-        _now_ms: u64,
+        now_mono_ms: u64,
         consent_cb: F,
     ) -> Result<TrustedPeerRecord, NodeError>
     where
@@ -393,14 +400,18 @@ impl LumaBridgeNode {
                 };
                 let mut rng = CheckedOsCryptoRng::preflight()?;
                 let attempt_start = std::time::Instant::now();
-                let p_b = acceptor.handle_spake2_exchange(win, &p_a, now_unix, &mut rng)?;
+                let pin_reserve_mono_secs = now_mono_ms / 1_000;
+                let p_b =
+                    acceptor.handle_spake2_exchange(win, &p_a, pin_reserve_mono_secs, &mut rng)?;
                 conn.send_pairing_message(&ControlMessage::PairSpakeMsg(p_b))
                     .await?;
                 let ControlMessage::PairSpakeMsg(c_a) = conn.recv_pairing_message().await? else {
                     return Err(NodeError::Protocol("expected PairSpakeMsg KeyConfirmation"));
                 };
-                completion_unix = now_unix.saturating_add(attempt_start.elapsed().as_secs());
-                match acceptor.verify_spake2_confirmation_and_reply(&c_a, completion_unix) {
+                let elapsed_secs = attempt_start.elapsed().as_secs();
+                completion_unix = now_unix.saturating_add(elapsed_secs);
+                let pin_confirm_mono_secs = pin_reserve_mono_secs.saturating_add(elapsed_secs);
+                match acceptor.verify_spake2_confirmation_and_reply(&c_a, pin_confirm_mono_secs) {
                     Ok(c_b) => {
                         conn.send_pairing_message(&ControlMessage::PairSpakeMsg(c_b))
                             .await?;
