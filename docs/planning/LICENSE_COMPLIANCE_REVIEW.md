@@ -101,3 +101,4 @@ Em vez de aplicar uma proibição genérica simplista a toda tecnologia associad
   - [`THIRD_PARTY_NOTICES.md`](../../THIRD_PARTY_NOTICES.md) (registrando `nvEncodeAPI.h` MIT, revisão `IddSampleDriver` e dependências não redistribuídas de build/runtime/CI)
   - [`CONTRIBUTING.md`](../../CONTRIBUTING.md) (política prospectiva DCO 1.1 e fluxo de contribuição)
 - [x] Configuração de verificação automatizada de licenças (`cargo-deny --locked` em `core/deny.toml` ativo nos checks Rust de `M1.1.1`/`M1.2`).
+- [x] Extensão de política de licenças em `M1.3`: `BSD-2-Clause`, `BSD-3-Clause` e `ISC` adicionadas a `core/deny.toml` para suportar `lumabridge-security` (`ed25519-dalek`, `ring`, `rustls`, `pakery-spake2`), mais `deny.toml` dedicados em `core/crates/lumabridge-protocol/fuzz/deny.toml` e `core/crates/lumabridge-security/fuzz/deny.toml` restringindo a exceção `NCSA` exclusivamente a `libfuzzer-sys` (`cargo-deny --locked` aprovado em todos os workspaces).

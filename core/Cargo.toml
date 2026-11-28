@@ -4,9 +4,11 @@ members = [
     "crates/lumabridge-core",
     "crates/lumabridge-ffi",
     "crates/lumabridge-protocol",
+    "crates/lumabridge-security",
 ]
 exclude = [
     "crates/lumabridge-protocol/fuzz",
+    "crates/lumabridge-security/fuzz",
 ]
 
 [workspace.package]

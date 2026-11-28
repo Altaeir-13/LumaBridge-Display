@@ -7,7 +7,9 @@
 use core::fmt;
 use std::collections::BTreeSet;
 
-use crate::cbor::{CborArrayEncoder, CborDecodeOptions, CborMapEncoder, CborReader};
+use crate::cbor::{
+    CborArrayEncoder, CborDecodeOptions, CborMapEncoder, CborReader, UnknownFieldPolicy,
+};
 use crate::error::CborError;
 use crate::error::ErrorCode;
 use crate::framing::ChannelId;
@@ -153,7 +155,32 @@ impl Permissions {
     pub const fn union(self, other: Self) -> Self {
         Self((self.0 | other.0) & Self::VALID_V1_MASK)
     }
+
+    #[must_use]
+    pub const fn intersection(self, other: Self) -> Self {
+        Self((self.0 & other.0) & Self::VALID_V1_MASK)
+    }
 }
+
+/// Canonical RFC 8410/9295 Ed25519 `SubjectPublicKeyInfo` DER length in bytes.
+pub const ED25519_SPKI_DER_LEN: usize = 44;
+
+/// Fixed 12-byte ASN.1 DER prefix for Ed25519 `SubjectPublicKeyInfo` (`OID 1.3.101.112`, no params).
+pub const ED25519_SPKI_DER_PREFIX: [u8; 12] = [
+    0x30, 0x2A, 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
+
+/// Canonical Ed25519 signature length in bytes (`RFC 8032`).
+pub const ED25519_SIGNATURE_LEN: usize = 64;
+
+/// Canonical uncompressed P-256 SEC1 point length (`0x04 || x || y`, `RFC 9382` `P256-SHA256-HKDF-HMAC`).
+pub const SPAKE2_P256_PUBLIC_SHARE_LEN: usize = 65;
+
+/// Canonical HMAC-SHA256 SPAKE2 explicit key-confirmation tag length (`RFC 9382`).
+pub const SPAKE2_CONFIRM_MAC_LEN: usize = 32;
+
+/// Canonical out-of-band pairing and session resumption opaque token length (256-bit CSPRNG).
+pub const OPAQUE_TOKEN_LEN: usize = 32;
 
 /// Node capability role bitmask (`0..=0x1F`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -185,6 +212,11 @@ impl RoleFlags {
     pub const fn union(self, other: Self) -> Self {
         Self((self.0 | other.0) & Self::VALID_V1_MASK)
     }
+
+    #[must_use]
+    pub const fn intersection(self, other: Self) -> Self {
+        Self((self.0 & other.0) & Self::VALID_V1_MASK)
+    }
 }
 
 /// Supported input modalities bitmask (`0..=0x0F`).
@@ -215,6 +247,11 @@ impl InputCapabilities {
     #[must_use]
     pub const fn union(self, other: Self) -> Self {
         Self((self.0 | other.0) & Self::VALID_V1_MASK)
+    }
+
+    #[must_use]
+    pub const fn intersection(self, other: Self) -> Self {
+        Self((self.0 & other.0) & Self::VALID_V1_MASK)
     }
 }
 
@@ -1070,7 +1107,18 @@ impl ControlMessage {
         input: &[u8],
         options: CborDecodeOptions,
     ) -> Result<Self, CborError> {
-        let mut reader = CborReader::new(input, options)?;
+        let effective_options = if matches!(
+            msg_type,
+            MsgType::PairHello | MsgType::PairSpakeMsg | MsgType::PairQrAuth | MsgType::PairConfirm
+        ) {
+            CborDecodeOptions {
+                unknown_fields: UnknownFieldPolicy::Reject,
+                ..options
+            }
+        } else {
+            options
+        };
+        let mut reader = CborReader::new(input, effective_options)?;
         let msg = match msg_type {
             MsgType::PairHello => Self::PairHello(decode_pair_hello(&mut reader)?),
             MsgType::PairSpakeMsg => Self::PairSpakeMsg(decode_pair_spake_msg(&mut reader)?),
@@ -1267,35 +1315,52 @@ fn read_device_id(r: &mut CborReader<'_>, field: &'static str) -> Result<[u8; 32
 fn validate_pair_hello(m: &PairHello) -> Result<(), CborError> {
     require_range_u64(u64::from(m.protocol_major), 1, 65535, "protocol_major")?;
     require_range_u64(m.friendly_name.len() as u64, 1, 48, "friendly_name")?;
-    require_range_u64(m.spki_ed25519.len() as u64, 32, 128, "spki_ed25519")
+    if m.spki_ed25519.len() != ED25519_SPKI_DER_LEN
+        || !m.spki_ed25519.starts_with(&ED25519_SPKI_DER_PREFIX)
+    {
+        return Err(CborError::ValueOutOfRange("spki_ed25519"));
+    }
+    Ok(())
 }
 
 fn validate_pair_spake_msg(m: &PairSpakeMsg) -> Result<(), CborError> {
     require_nonzero(m.pairing_attempt_id, "pairing_attempt_id")?;
-    require_range_u64(m.spake_payload.len() as u64, 1, 256, "spake_payload")?;
     match (m.step, &m.key_confirmation) {
+        (SpakeStep::KeyExchange, None) => {
+            if m.spake_payload.len() != SPAKE2_P256_PUBLIC_SHARE_LEN || m.spake_payload[0] != 0x04 {
+                return Err(CborError::ValueOutOfRange("spake_payload"));
+            }
+            Ok(())
+        }
+        (SpakeStep::KeyExchange, Some(_)) => Err(CborError::ValueOutOfRange(
+            "key_confirmation forbidden during KeyExchange",
+        )),
         (SpakeStep::KeyConfirmation, None) => {
             Err(CborError::MissingRequiredField("key_confirmation"))
         }
-        (_, Some(kc)) => require_range_u64(kc.len() as u64, 16, 64, "key_confirmation"),
-        (SpakeStep::KeyExchange, None) => Ok(()),
+        (SpakeStep::KeyConfirmation, Some(kc)) => {
+            if !m.spake_payload.is_empty() {
+                return Err(CborError::ValueOutOfRange(
+                    "spake_payload must be empty during KeyConfirmation",
+                ));
+            }
+            if kc.len() != SPAKE2_CONFIRM_MAC_LEN {
+                return Err(CborError::ValueOutOfRange("key_confirmation"));
+            }
+            Ok(())
+        }
     }
 }
 
 fn validate_pair_qr_auth(m: &PairQrAuth) -> Result<(), CborError> {
     require_nonzero(m.pairing_attempt_id, "pairing_attempt_id")?;
-    require_range_u64(
-        m.one_time_pairing_token.len() as u64,
-        16,
-        64,
-        "one_time_pairing_token",
-    )?;
-    require_range_u64(
-        m.initiator_signature.len() as u64,
-        64,
-        128,
-        "initiator_signature",
-    )
+    if m.one_time_pairing_token.len() != OPAQUE_TOKEN_LEN {
+        return Err(CborError::ValueOutOfRange("one_time_pairing_token"));
+    }
+    if m.initiator_signature.len() != ED25519_SIGNATURE_LEN {
+        return Err(CborError::ValueOutOfRange("initiator_signature"));
+    }
+    Ok(())
 }
 
 fn validate_pair_confirm(m: &PairConfirm) -> Result<(), CborError> {
@@ -1314,9 +1379,13 @@ fn validate_pair_confirm(m: &PairConfirm) -> Result<(), CborError> {
         let Some(sig) = &m.confirm_signature else {
             return Err(CborError::MissingRequiredField("confirm_signature"));
         };
-        require_range_u64(sig.len() as u64, 64, 128, "confirm_signature")?;
-    } else if let Some(sig) = &m.confirm_signature {
-        require_range_u64(sig.len() as u64, 64, 128, "confirm_signature")?;
+        if sig.len() != ED25519_SIGNATURE_LEN {
+            return Err(CborError::ValueOutOfRange("confirm_signature"));
+        }
+    } else if m.confirm_signature.is_some() {
+        return Err(CborError::ValueOutOfRange(
+            "rejected PairConfirm must omit confirm_signature",
+        ));
     }
     Ok(())
 }
@@ -1445,7 +1514,9 @@ fn validate_session_open_response(m: &SessionOpenResponse) -> Result<(), CborErr
         let Some(tok) = &m.resume_token else {
             return Err(CborError::MissingRequiredField("resume_token"));
         };
-        require_range_u64(tok.len() as u64, 16, 64, "resume_token")?;
+        if tok.len() != OPAQUE_TOKEN_LEN {
+            return Err(CborError::ValueOutOfRange("resume_token"));
+        }
         if m.active_displays.is_empty() {
             return Err(CborError::ValueOutOfRange(
                 "accepted SessionOpenResponse requires >= 1 active display",
@@ -1527,7 +1598,9 @@ fn validate_display_config_update(m: &DisplayConfigUpdate) -> Result<(), CborErr
 
 fn validate_session_resume_request(m: &SessionResumeRequest) -> Result<(), CborError> {
     require_nonzero(m.session_id, "session_id")?;
-    require_range_u64(m.resume_token.len() as u64, 16, 64, "resume_token")?;
+    if m.resume_token.len() != OPAQUE_TOKEN_LEN {
+        return Err(CborError::ValueOutOfRange("resume_token"));
+    }
     require_range_u64(m.last_good_frames.len() as u64, 0, 16, "last_good_frames")?;
     check_unique_display_ids(m.last_good_frames.iter().map(|c| c.display_id))
 }
@@ -1694,7 +1767,7 @@ fn decode_pair_hello(r: &mut CborReader<'_>) -> Result<PairHello, CborError> {
             3 => did = Some(read_device_id(r, "device_id")?),
             4 => name = Some(r.read_text(48, "friendly_name")?),
             5 => mode = Some(AuthMode::from_u64(r.read_u64("auth_mode")?)?),
-            6 => spki = Some(r.read_bytes(128, "spki_ed25519")?),
+            6 => spki = Some(r.read_bytes(ED25519_SPKI_DER_LEN, "spki_ed25519")?),
             _ => return Ok(false),
         }
         Ok(true)
@@ -1727,8 +1800,8 @@ fn decode_pair_spake_msg(r: &mut CborReader<'_>) -> Result<PairSpakeMsg, CborErr
         match k {
             1 => id = Some(r.read_u64("pairing_attempt_id")?),
             2 => step = Some(SpakeStep::from_u64(r.read_u64("step")?)?),
-            3 => payload = Some(r.read_bytes(256, "spake_payload")?),
-            4 => kc = Some(r.read_bytes(64, "key_confirmation")?),
+            3 => payload = Some(r.read_bytes(SPAKE2_P256_PUBLIC_SHARE_LEN, "spake_payload")?),
+            4 => kc = Some(r.read_bytes(SPAKE2_CONFIRM_MAC_LEN, "key_confirmation")?),
             _ => return Ok(false),
         }
         Ok(true)
@@ -1754,8 +1827,8 @@ fn decode_pair_qr_auth(r: &mut CborReader<'_>) -> Result<PairQrAuth, CborError> 
     r.read_map(0, |r, k| {
         match k {
             1 => id = Some(r.read_u64("pairing_attempt_id")?),
-            2 => tok = Some(r.read_bytes(64, "one_time_pairing_token")?),
-            3 => sig = Some(r.read_bytes(128, "initiator_signature")?),
+            2 => tok = Some(r.read_bytes(OPAQUE_TOKEN_LEN, "one_time_pairing_token")?),
+            3 => sig = Some(r.read_bytes(ED25519_SIGNATURE_LEN, "initiator_signature")?),
             _ => return Ok(false),
         }
         Ok(true)
@@ -1786,7 +1859,7 @@ fn decode_pair_confirm(r: &mut CborReader<'_>) -> Result<PairConfirm, CborError>
             1 => id = Some(r.read_u64("pairing_attempt_id")?),
             2 => acc = Some(r.read_bool("accepted")?),
             3 => perms = Some(Permissions::from_raw(r.read_u32("granted_base_perms")?)?),
-            4 => sig = Some(r.read_bytes(128, "confirm_signature")?),
+            4 => sig = Some(r.read_bytes(ED25519_SIGNATURE_LEN, "confirm_signature")?),
             _ => return Ok(false),
         }
         Ok(true)
@@ -2248,7 +2321,7 @@ fn decode_session_open_response(r: &mut CborReader<'_>) -> Result<SessionOpenRes
         match k {
             1 => status = Some(SessionOpenStatus::from_u64(r.read_u64("status")?)?),
             2 => sid = Some(r.read_u64("session_id")?),
-            3 => tok = Some(r.read_bytes(64, "resume_token")?),
+            3 => tok = Some(r.read_bytes(OPAQUE_TOKEN_LEN, "resume_token")?),
             4 => {
                 let mut list = Vec::new();
                 r.read_array(1, 16, "active_displays", |r, _| {
@@ -2439,7 +2512,7 @@ fn decode_session_resume_request(
     r.read_map(0, |r, k| {
         match k {
             1 => sid = Some(r.read_u64("session_id")?),
-            2 => tok = Some(r.read_bytes(64, "resume_token")?),
+            2 => tok = Some(r.read_bytes(OPAQUE_TOKEN_LEN, "resume_token")?),
             3 => {
                 let mut list = Vec::new();
                 r.read_array(1, 16, "last_good_frames", |r, _| {

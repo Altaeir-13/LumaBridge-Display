@@ -171,7 +171,7 @@ Resolvendo as contradições da versão inicial do rascunho:
 
 ## 5. Catálogo Completo de Mensagens (`msg_type`) e Schemas CDDL (RFC 8610)
 
-> **Convenção para `M1.3`:** campos marcados com **`[M1.3-PROVISIONAL]`** definem apenas o envelope estrutural e seus limites sintáticos nesta etapa (`M1.2`). Seus formatos criptográficos exatos (transcript, TLS exporter label, DER vs raw SPKI, prova SPAKE2, assinaturas Ed25519) permanecem provisórios até a definição formal da `M1.3`.
+> **Convenção pós-consolidação `M1.3`:** os formatos anteriormente marcados `[M1.3-PROVISIONAL]` nas mensagens `Pair*` e `resume_token` foram consolidados nesta revisão mantendo o documento inteiro em **`Draft`** até a qualificação operacional dos transportes (`M1.4`) e integração (`M1.5`): **`spki_ed25519`** em `44 bytes` DER canônicos (`RFC 8410` / `RFC 9295`), **`SPAKE2`** em `P256-SHA256-HKDF-HMAC` (`65 B` SEC1 não comprimido em `KeyExchange`, `32 B` HMAC em `KeyConfirmation`), **`one_time_pairing_token`** e **`resume_token`** em `32 bytes` CSPRNG, assinaturas Ed25519 em `64 bytes` (`RFC 8032`), channel binding **`EXPORTER-Channel-Binding`** (`RFC 9266`, contexto vazio, `32 B`) sobre TLS 1.3 **`RFC 9846`**, e política estrita **`UnknownFieldPolicy::Reject`** nas mensagens de pareamento autenticadas/assinadas (`PairHello`, `PairSpakeMsg`, `PairQrAuth`, `PairConfirm`).
 
 ### 5.1 Resumo do Catálogo de Identificadores
 
@@ -240,30 +240,30 @@ error-code       = 1..12                       ; Tabela da Secao 5.8
 PairHello = {
   1 => 1..65535,                 ; protocol_major (obrig.)
   2 => 0..65535,                 ; protocol_minor (obrig.)
-  3 => device-id,                ; device_id 32B (obrig.)
-  4 => tstr .size (1..48),       ; friendly_name UTF-8 (obrig.)
+  3 => device-id,                ; device_id 32B == SHA-256(spki_ed25519) (obrig.)
+  4 => tstr .size (1..48),       ; friendly_name UTF-8 nao confiavel (obrig.)
   5 => auth-mode,                ; auth_mode (obrig.)
-  6 => bstr .size (32..128),     ; spki_ed25519 [M1.3-PROVISIONAL] (obrig.)
+  6 => bstr .size 44,            ; spki_ed25519 DER canonico RFC 8410/9295 (obrig.)
 }
 
 PairSpakeMsg = {
   1 => uint .gt 0,               ; pairing_attempt_id (obrig.)
-  2 => spake-step,               ; step (obrig.)
-  3 => bstr .size (1..256),      ; spake_payload [M1.3-PROVISIONAL] (obrig., redigido em Debug)
-  ? 4 => bstr .size (16..64),    ; key_confirmation [M1.3-PROVISIONAL] (obrig. se step==2, redigido em Debug)
+  2 => spake-step,               ; step (1=KeyExchange, 2=KeyConfirmation) (obrig.)
+  3 => bstr .size (0 / 65),      ; step==1: ponto SEC1 P-256 nao comprimido 65B (0x04..); step==2: vazio (obrig.)
+  ? 4 => bstr .size 32,          ; step==1: proibido; step==2: MAC HMAC-SHA256 RFC 9382 de 32B (redigido)
 }
 
 PairQrAuth = {
   1 => uint .gt 0,               ; pairing_attempt_id (obrig.)
-  2 => bstr .size (16..64),      ; one_time_pairing_token >= 128b [M1.3-PROVISIONAL] (obrig., redigido)
-  3 => bstr .size (64..128),     ; initiator_signature Ed25519 [M1.3-PROVISIONAL] (obrig., redigido)
+  2 => bstr .size 32,            ; one_time_pairing_token 256-bit CSPRNG (obrig., redigido)
+  3 => bstr .size 64,            ; initiator_signature Ed25519 64B (obrig., redigido)
 }
 
 PairConfirm = {
   1 => uint .gt 0,               ; pairing_attempt_id (obrig.)
   2 => bool,                     ; accepted (obrig.)
-  3 => permissions-mask,         ; granted_base_perms (obrig.; bits INPUT_* 0x0078 PROIBIDOS; ==0 se !accepted)
-  ? 4 => bstr .size (64..128),   ; confirm_signature [M1.3-PROVISIONAL] (obrig. se accepted==true, redigido)
+  3 => permissions-mask,         ; granted_base_perms (obrig.; bits INPUT_* 0x0078 PROIBIDOS; ==0 se !accepted; padrao max VIEW_MIRROR=1)
+  ? 4 => bstr .size 64,          ; confirm_signature Ed25519 64B (obrig. se accepted==true; proibido se accepted==false; redigido)
 }
 
 PairCancel = {
@@ -274,8 +274,8 @@ PairCancel = {
 ```
 
 **Regras semânticas e extensibilidade:**
-- Em `PairConfirm`, permissões de entrada (`0x0078`) **nunca** podem ser concedidas no pareamento inicial; `accepted == false` exige `granted_base_perms == 0`.
-- Campos desconhecidos opcionais dentro dos mapas `Pair*` são ignorados apenas após validação estrita de `LBWP-CBOR-v1` (sem permitir `msg_type` desconhecido no ALPN de pareamento).
+- Em `PairConfirm`, permissões de entrada (`0x0078`) **nunca** podem ser concedidas no pareamento inicial; `accepted == false` exige `granted_base_perms == 0` e ausência de `confirm_signature`.
+- Nas mensagens criptográficas de pareamento (`PairHello`, `PairSpakeMsg`, `PairQrAuth`, `PairConfirm`), **campos desconhecidos são estritamente rejeitados (`UnknownFieldPolicy::Reject`)** para impedir qualquer manipulação de contexto fora dos bytes assinados/autenticados; apenas `PairCancel` e mensagens operacionais pós-mTLS permitem campos opcionais desconhecidos limitados conforme perfil `LBWP-CBOR-v1`.
 
 ### 5.4 Handshake Operacional e Capacidades (`0x0200–0x0202`, `Channel 0`, ALPN `"lumabridge/1"`)
 
@@ -365,7 +365,7 @@ ActiveDisplayConfig = {
 SessionOpenResponse = {
   1 => session-status,           ; status (obrig.)
   2 => session-id,               ; session_id != 0 (obrig.)
-  ? 3 => bstr .size (16..64),    ; resume_token [M1.3-PROVISIONAL] (obrig. se status==0, redigido)
+  ? 3 => bstr .size 32,          ; resume_token opaco 256-bit (obrig. se status==0, redigido)
   4 => [0*16 ActiveDisplayConfig], ; active_displays (>=1 se status==0, 0 se rejeitado; display_ids unicos)
   5 => permissions-mask,         ; granted_perms (obrig.; ==0 se status!=0)
 }
@@ -393,7 +393,7 @@ DisplayFrameCursor = {
 
 SessionResumeRequest = {
   1 => session-id,               ; session_id != 0 (obrig.)
-  2 => bstr .size (16..64),      ; resume_token [M1.3-PROVISIONAL] (obrig., redigido)
+  2 => bstr .size 32,            ; resume_token opaco 256-bit (obrig., redigido)
   3 => [0*16 DisplayFrameCursor],; last_good_frames (obrig., display_ids unicos)
 }
 
@@ -697,14 +697,12 @@ Todos os vetores abaixo são verificados byte a byte nos testes independentes em
 
 Esta especificação (`M1.2` / `M1.2.1`) **não implementa** criptografia operacional, transporte de rede nem orquestração de sessões, mantendo separação estrita entre os sub-marcos seguintes:
 
-- **`M1.3` — Identidade, Pareamento, Segurança e Autorização (`lumabridge-security`):**
-  1. **Transcript oficial de pareamento:** definição exata da serialização canônica de entradas do transcript SPAKE2/QR.
-  2. **Label TLS Exporter e Channel Binding:** escolha definitiva entre `EXPORTER-Channel-Binding` puro da **RFC 9266** vs exporter específico da aplicação (`EXPORTER-lumabridge-pair-v1` com contexto via RFC 8446 §7.5), evitando mistura semântica dos dois mecanismos.
-  3. **Domain separation:** rótulos criptográficos distintos para confirmação de chave SPAKE2, assinatura QR, tokens de retomada e derivação de chaves.
-  4. **Representação SPKI e formato de assinatura:** travar `SubjectPublicKeyInfo` DER (44 bytes Ed25519) vs chave crua (32 bytes) nos campos `[M1.3-PROVISIONAL]` (`spki_ed25519`, `PairQrAuth`, `PairConfirm`).
-  5. **Confirmação de chave SPAKE2 (RFC 9382):** algoritmo exato de MAC/HKDF para `key_confirmation`.
-  6. **Trust Store, armazenamento nativo seguro, revogação, uso único e expiração de tokens:** ciclo de vida estrito e atômico de `one_time_pairing_token`, PINs CSPRNG e `resume_token`, rate limiting e ACL deny-by-default.
-  7. **Política de `0-RTT` e anti-replay operacional:** desabilitação de `0-RTT` para comandos mutantes/input/sessão e proteção criptográfica contra replay entre conexões.
+- **`M1.3` — Identidade, Pareamento, Segurança e Autorização (`lumabridge-security` — contratos consolidados em `Draft`):**
+  1. **Transcript oficial e separação de domínio:** contextos CBOR determinísticos versionados (`lumabridge.pair.spake2.aad.v1`, `lumabridge.pair.qr.auth.v1`, `lumabridge.pair.confirm.v1`, `lumabridge.session.resume.token.v1`).
+  2. **TLS Exporter e Channel Binding (`RFC 9266` / `RFC 9846`):** rótulo ASCII exato **`"EXPORTER-Channel-Binding"`** com **contexto vazio** e saída de **`32 bytes`** pós-handshake (`0-RTT`/early exporter proibidos).
+  3. **Representação SPKI e assinaturas:** **`44 bytes`** SubjectPublicKeyInfo DER (`RFC 8410`/`9295`, OID `1.3.101.112`) e assinaturas Ed25519 de **`64 bytes`** (`RFC 8032`).
+  4. **Confirmação de chave SPAKE2 (`RFC 9382`):** ciphersuite **`P256-SHA256-HKDF-HMAC`** (`65 B` SEC1 não comprimido em `KeyExchange` e MAC HMAC-SHA256 de `32 B` em `KeyConfirmation`).
+  5. **Trust Store, armazenamento, tokens e `0-RTT`:** armazenamento abstrato/em memória na `M1.3` (cofres nativos Windows/Linux/Android integrados junto à plataforma em `M3+`), tokens opacos de `32 B` com consumo único/atômico e `0-RTT`/resumption TLS desabilitados até qualificação em `M1.4`.
 - **`M1.4` — Transporte Operacional, Descoberta e Benchmarks de Rede (`lumabridge-transport`):**
   1. Transporte **`QUIC`** (streams dedicados + `RFC 9221` datagrams) e fallback **`TCP + TLS 1.3`** (`TCP_NODELAY` + descarte pré-socket).
   2. Descoberta LAN (`mDNS`), seleção de `effective_lbwp_packet_budget` e **`DPLPMTUD` (`RFC 8899`)**.
